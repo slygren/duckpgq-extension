@@ -106,18 +106,31 @@ public:
 	static unique_ptr<CommonTableExpressionInfo>
 	GenerateShortestPathCTE(CreatePropertyGraphInfo &pg_table, SubPath *edge_subpath, PathElement *path_element,
 	                        PathElement *next_vertex_element,
-	                        vector<unique_ptr<ParsedExpression>> &path_finding_conditions);
+	                        vector<unique_ptr<ParsedExpression>> &path_finding_conditions,
+	                        bool all_shortest = false);
 
 	static unique_ptr<ParsedExpression> CreatePathFindingFunction(vector<unique_ptr<PathReference>> &path_list,
 	                                                              CreatePropertyGraphInfo &pg_table,
 	                                                              const string &path_variable,
 	                                                              unique_ptr<SelectNode> &final_select_node,
-	                                                              vector<unique_ptr<ParsedExpression>> &conditions);
+	                                                              vector<unique_ptr<ParsedExpression>> &conditions,
+	                                                              bool all_shortest = false);
+
+	static void AddTraversalPathFinding(unique_ptr<SelectNode> &select_node,
+	                                    vector<unique_ptr<ParsedExpression>> &conditions, const string &prev_binding,
+	                                    const string &next_binding,
+	                                    const shared_ptr<PropertyGraphTable> &prev_vertex_table,
+	                                    const shared_ptr<PropertyGraphTable> &next_vertex_table,
+	                                    const vector<shared_ptr<PropertyGraphTable>> &edge_tables, bool undirected,
+	                                    idx_t lower, idx_t upper);
 
 	static void AddPathFinding(unique_ptr<SelectNode> &select_node, vector<unique_ptr<ParsedExpression>> &conditions,
 	                           const string &prev_binding, const string &edge_binding, const string &next_binding,
 	                           const shared_ptr<PropertyGraphTable> &edge_table, CreatePropertyGraphInfo &pg_table,
 	                           SubPath *subpath, PGQMatchType edge_type);
+
+	static void AddPathModeFilter(PGQPathMode mode, const string &path_cte,
+	                              vector<unique_ptr<ParsedExpression>> &conditions);
 
 	static void AddEdgeJoins(const shared_ptr<PropertyGraphTable> &edge_table,
 	                         const shared_ptr<PropertyGraphTable> &previous_vertex_table,
@@ -131,11 +144,21 @@ public:
 	                            vector<unique_ptr<ParsedExpression>> &conditions, unique_ptr<SelectNode> &select_node,
 	                            case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map,
 	                            CreatePropertyGraphInfo &pg_table, int32_t &extra_alias_counter,
-	                            MatchExpression &original_ref);
+	                            MatchExpression &original_ref, bool all_shortest = false);
+
+	// Process one OPTIONAL MATCH group: adds LEFT JOINs for each edge+vertex pair directly
+	// to select_node->from_table. Populates opt_alias_map with the new aliases.
+	// mandatory_alias_map is used to resolve already-bound variable bindings that carry no label.
+	static void ProcessOptionalPathList(const vector<unique_ptr<PathPattern>> &opt_patterns,
+	                                    unique_ptr<SelectNode> &select_node,
+	                                    case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &opt_alias_map,
+	                                    CreatePropertyGraphInfo &pg_table,
+	                                    int32_t &extra_alias_counter,
+	                                    const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &mandatory_alias_map);
 
 	static void CheckNamedSubpath(SubPath &subpath, MatchExpression &original_ref, CreatePropertyGraphInfo &pg_table,
 	                              unique_ptr<SelectNode> &final_select_node,
-	                              vector<unique_ptr<ParsedExpression>> &conditions);
+	                              vector<unique_ptr<ParsedExpression>> &conditions, bool all_shortest = false);
 
 	// Check whether columns to query are valid against the property graph, throws
 	// BinderException if error.

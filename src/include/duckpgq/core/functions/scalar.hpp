@@ -5,6 +5,7 @@ namespace duckdb {
 
 struct CoreScalarFunctions {
 	static void Register(ExtensionLoader &loader) {
+		RegisterAllShortestPathsScalarFunction(loader);
 		RegisterCheapestPathLengthScalarFunction(loader);
 		RegisterCSRCreationScalarFunctions(loader);
 		RegisterCSRDeletionScalarFunction(loader);
@@ -20,6 +21,7 @@ struct CoreScalarFunctions {
 	}
 
 private:
+	static void RegisterAllShortestPathsScalarFunction(ExtensionLoader &loader);
 	static void RegisterCheapestPathLengthScalarFunction(ExtensionLoader &loader);
 	static void RegisterCSRCreationScalarFunctions(ExtensionLoader &loader);
 	static void RegisterCSRDeletionScalarFunction(ExtensionLoader &loader);

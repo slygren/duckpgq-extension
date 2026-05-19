@@ -1,0 +1,41 @@
+# name: test/sql/pattern_matching/vl_compound_labels.test
+# group: [pattern_matching]
+
+require duckpgq
+
+statement ok
+CREATE TABLE Person(id BIGINT, name VARCHAR, mask BIGINT);
+
+statement ok
+CREATE TABLE knows(src BIGINT, dst BIGINT, emask BIGINT);
+
+statement ok
+INSERT INTO Person VALUES (0, 'Alice', 1), (1, 'Bob', 2), (2, 'Carol', 2);
+
+statement ok
+INSERT INTO knows VALUES (0, 1, 1), (1, 2, 2);
+
+statement ok
+-CREATE PROPERTY GRAPH pg
+VERTEX TABLES (
+    Person PROPERTIES (id, name) LABEL Person IN mask (Admin, User)
+)
+EDGE TABLES (
+    knows SOURCE KEY (src) REFERENCES Person (id)
+          DESTINATION KEY (dst) REFERENCES Person (id)
+          LABEL Knows IN emask (Colleague, Friend)
+);
+
+# Variable-length path with compound edge label — Colleague|Friend spans both sub-labels
+query II
+-FROM GRAPH_TABLE (pg
+    MATCH ANY SHORTEST (a:Person)-[e:Colleague|Friend]->*(b:Person)
+    COLUMNS (a.name, b.name)
+) t ORDER BY 1, 2;
+----
+Alice	Alice
+Alice	Bob
+Alice	Carol
+Bob	Bob
+Bob	Carol
+Carol	Carol

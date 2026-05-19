@@ -1,0 +1,70 @@
+# name: test/sql/pattern_matching/element_functions.test
+# description: element_id() and label() functions for graph elements
+# group: [pattern_matching]
+
+require duckpgq
+
+statement ok
+CREATE TABLE Person(id BIGINT, name VARCHAR);
+
+statement ok
+CREATE TABLE knows(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO Person VALUES (0, 'Alice'), (1, 'Bob'), (2, 'Carol');
+
+statement ok
+INSERT INTO knows VALUES (0, 1), (1, 2), (0, 2);
+
+statement ok
+-CREATE PROPERTY GRAPH pg
+VERTEX TABLES (
+    Person PROPERTIES (id, name) LABEL Person
+)
+EDGE TABLES (
+    knows SOURCE KEY (src) REFERENCES Person (id)
+          DESTINATION KEY (dst) REFERENCES Person (id)
+          LABEL Knows
+);
+
+# element_id() returns rowid of vertex/edge in the underlying table
+query III
+-FROM GRAPH_TABLE (pg
+    MATCH (a:Person)-[e:Knows]->(b:Person)
+    COLUMNS (element_id(a) AS aid, element_id(b) AS bid, element_id(e) AS eid)
+) t ORDER BY aid, bid;
+----
+0	1	0
+0	2	2
+1	2	1
+
+# label() returns the label of the element as a lowercase string
+query I
+-FROM GRAPH_TABLE (pg
+    MATCH (a:Person)-[:Knows]->(:Person)
+    COLUMNS (label(a) AS lbl)
+) t LIMIT 1;
+----
+person
+
+# label() in WHERE clause for filtering
+query I
+-FROM GRAPH_TABLE (pg
+    MATCH (a:Person)-[:Knows]->(b:Person)
+    WHERE label(a) = 'person' AND a.name = 'Alice'
+    COLUMNS (b.name AS friend)
+) t ORDER BY friend;
+----
+Bob
+Carol
+
+# element_id() in WHERE clause for filtering by identity
+query I
+-FROM GRAPH_TABLE (pg
+    MATCH (a:Person)-[:Knows]->(b:Person)
+    WHERE element_id(a) = 0
+    COLUMNS (b.name AS friend)
+) t ORDER BY friend;
+----
+Bob
+Carol

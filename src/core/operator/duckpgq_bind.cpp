@@ -7,11 +7,25 @@
 #include "duckdb/main/extension_callback_manager.hpp"
 
 #include "duckdb/planner/operator_extension.hpp"
+#include "duckdb/parser/parsed_data/create_property_graph_info.hpp"
+#include "duckdb/parser/statement/create_statement.hpp"
+#include "duckpgq/core/utils/duckpgq_utils.hpp"
 
 namespace duckdb {
 
 BoundStatement duckpgq_bind(ClientContext &context, Binder &binder, OperatorExtensionInfo *info,
                             SQLStatement &statement) {
+	// Handle CREATE PROPERTY GRAPH parsed by the standard DuckDB parser (no '-' prefix).
+	// CreatePropertyGraphInfo reuses CatalogType::VIEW_ENTRY and crashes Binder::Bind(CreateStatement&).
+	// We detect it here and emit a helpful message directing users to add the '-' prefix.
+	if (statement.type == StatementType::CREATE_STATEMENT) {
+		auto &create_stmt = statement.Cast<CreateStatement>();
+		if (dynamic_cast<CreatePropertyGraphInfo *>(create_stmt.info.get())) {
+			throw BinderException("CREATE PROPERTY GRAPH must use the DuckPGQ parser. "
+			                      "Prefix the statement with '-': -CREATE PROPERTY GRAPH ...");
+		}
+	}
+
 	auto duckpgq_state = context.registered_state->Get<DuckPGQState>("duckpgq");
 	if (!duckpgq_state) {
 		throw; // Throw the original error that got us here if DuckPGQ is not loaded

@@ -96,6 +96,7 @@ Binder Error: Property o is never registered!
 
 
 # https://github.com/cwida/duckpgq-extension/issues/68
+# element_id() now exists; 'a' is not a bound variable in this MATCH, so it gives a binder error
 statement error
 -FROM GRAPH_TABLE (snb
     MATCH o = ANY SHORTEST (p:Person)-[w:knows]->(p2:Person)-[w2:knows]->(p3:Person)
@@ -103,8 +104,7 @@ statement error
     ) tmp
     limit 10;
 ----
-Catalog Error: Scalar Function with name element_id does not exist!
-Did you mean "element_at"?
+Binder Error: Referenced table "a" not found!
 
 query III
 -FROM GRAPH_TABLE (snb

@@ -68,6 +68,11 @@ unique_ptr<CommonTableExpressionInfo> CreateUndirectedCSRCTE(const shared_ptr<Pr
 unique_ptr<CommonTableExpressionInfo> CreateDirectedCSRCTE(const shared_ptr<PropertyGraphTable> &edge_table,
                                                            const string &prev_binding, const string &edge_binding,
                                                            const string &next_binding);
+unique_ptr<CommonTableExpressionInfo> CreateWeightedDirectedCSRCTE(const shared_ptr<PropertyGraphTable> &edge_table,
+                                                                   const string &prev_binding,
+                                                                   const string &edge_binding,
+                                                                   const string &next_binding,
+                                                                   unique_ptr<ParsedExpression> weight_expr);
 
 // Helper functions
 unique_ptr<CommonTableExpressionInfo> MakeEdgesCTE(const shared_ptr<PropertyGraphTable> &edge_table);

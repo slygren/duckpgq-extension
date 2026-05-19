@@ -1,0 +1,59 @@
+# name: test/sql/pattern_matching/all_different.test
+# description: ALL_DIFFERENT predicate ensuring element variables bind to distinct graph elements
+# group: [pattern_matching]
+
+require duckpgq
+
+statement ok
+CREATE TABLE Person(id BIGINT, name VARCHAR);
+
+statement ok
+CREATE TABLE knows(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO Person VALUES (0, 'Alice'), (1, 'Bob'), (2, 'Carol');
+
+statement ok
+INSERT INTO knows VALUES (0, 1), (1, 2), (0, 2);
+
+statement ok
+-CREATE PROPERTY GRAPH pg
+VERTEX TABLES (
+    Person PROPERTIES (id, name) LABEL Person
+)
+EDGE TABLES (
+    knows SOURCE KEY (src) REFERENCES Person (id)
+          DESTINATION KEY (dst) REFERENCES Person (id)
+          LABEL Knows
+);
+
+# Without ALL_DIFFERENT: two-hop paths include paths that reuse an edge
+# Alice->Bob->Carol uses edges (0,1) and (1,2) — distinct
+# Alice->Carol->? — Carol has no outgoing edges, so only one result anyway
+query III
+-FROM GRAPH_TABLE (pg
+    MATCH (a:Person)-[e1:Knows]->(b:Person)-[e2:Knows]->(c:Person)
+    COLUMNS (a.name AS a, b.name AS b, c.name AS c)
+) t ORDER BY a, b, c;
+----
+Alice	Bob	Carol
+
+# ALL_DIFFERENT(e1, e2): same result here since edges are already distinct in this graph
+query III
+-FROM GRAPH_TABLE (pg
+    MATCH (a:Person)-[e1:Knows]->(b:Person)-[e2:Knows]->(c:Person)
+    WHERE ALL_DIFFERENT(e1, e2)
+    COLUMNS (a.name AS a, b.name AS b, c.name AS c)
+) t ORDER BY a, b, c;
+----
+Alice	Bob	Carol
+
+# ALL_DIFFERENT with three elements
+query III
+-FROM GRAPH_TABLE (pg
+    MATCH (a:Person)-[e1:Knows]->(b:Person)-[e2:Knows]->(c:Person)
+    WHERE ALL_DIFFERENT(e1, e2) AND a.name <> c.name
+    COLUMNS (a.name AS a, b.name AS b, c.name AS c)
+) t ORDER BY a, b, c;
+----
+Alice	Bob	Carol

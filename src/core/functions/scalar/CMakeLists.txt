@@ -1,5 +1,6 @@
 set(EXTENSION_SOURCES
     ${EXTENSION_SOURCES}
+    ${CMAKE_CURRENT_SOURCE_DIR}/all_shortest_paths.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cheapest_path_length.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/csr_creation.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/csr_deletion.cpp

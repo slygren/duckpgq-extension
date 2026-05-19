@@ -1,0 +1,78 @@
+# name: test/sql/path_finding/one_row_per.test
+# description: ONE ROW PER VERTEX / EDGE / STEP syntax
+# group: [path_finding]
+
+require duckpgq
+
+statement ok
+LOAD '__BUILD_DIRECTORY__/duckpgq.duckdb_extension';
+
+statement ok
+CREATE TABLE Person (id BIGINT, name VARCHAR);
+
+statement ok
+CREATE TABLE Knows (src BIGINT, dst BIGINT, since INT);
+
+statement ok
+INSERT INTO Person VALUES (0,'Alice'),(1,'Bob'),(2,'Carol'),(3,'Dave');
+
+statement ok
+INSERT INTO Knows VALUES (0,1,2020),(1,2,2021),(2,3,2022),(0,3,2019);
+
+statement ok
+-CREATE PROPERTY GRAPH net
+VERTEX TABLES (Person PROPERTIES (id, name) LABEL Person)
+EDGE TABLES (
+    Knows SOURCE KEY (src) REFERENCES Person (id)
+          DESTINATION KEY (dst) REFERENCES Person (id)
+          PROPERTIES (src, dst, since) LABEL Knows
+);
+
+# ONE ROW PER STEP: returns one row per hop along the shortest path
+# Alice→Bob→Carol is a 2-hop shortest path; should give 2 rows
+query III rowsort
+-FROM GRAPH_TABLE (net
+    MATCH (a:Person)-[e:Knows]->{1,3}(b:Person)
+    ONE ROW PER STEP (v1, edge1, v2)
+    WHERE a.name = 'Alice' AND b.name = 'Carol'
+    COLUMNS (v1.name AS src, edge1.since AS weight, v2.name AS dst)
+) r;
+----
+Alice	2020	Bob
+Bob	2021	Carol
+
+# ONE ROW PER VERTEX: returns one row per vertex visited (including src and dst)
+# Path Alice→Bob→Carol visits 3 vertices
+query I rowsort
+-FROM GRAPH_TABLE (net
+    MATCH (a:Person)-[e:Knows]->{1,3}(b:Person)
+    ONE ROW PER VERTEX (v)
+    WHERE a.name = 'Alice' AND b.name = 'Carol'
+    COLUMNS (v.name AS vname)
+) r;
+----
+Alice
+Bob
+Carol
+
+# ONE ROW PER EDGE: returns one row per edge traversed
+# Alice→Bob→Carol traverses 2 edges (since=2020 and since=2021)
+query I rowsort
+-FROM GRAPH_TABLE (net
+    MATCH (a:Person)-[e:Knows]->{1,3}(b:Person)
+    ONE ROW PER EDGE (edge1)
+    WHERE a.name = 'Alice' AND b.name = 'Carol'
+    COLUMNS (edge1.since AS weight)
+) r;
+----
+2020
+2021
+
+statement ok
+-DROP PROPERTY GRAPH net;
+
+statement ok
+DROP TABLE Knows;
+
+statement ok
+DROP TABLE Person;

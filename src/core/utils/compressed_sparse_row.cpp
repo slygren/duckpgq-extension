@@ -226,7 +226,7 @@ unique_ptr<SubqueryExpression> CreateDirectedCSRVertexSubquery(const shared_ptr<
 
 	auto dense_id_colref = make_uniq<ColumnRefExpression>("dense_id");
 	inner_select_node->groups.group_expressions.push_back(std::move(dense_id_colref));
-	GroupingSet grouping_set = {0};
+	GroupingSet grouping_set = {ProjectionIndex(0)};
 	inner_select_node->groups.grouping_sets.push_back(grouping_set);
 
 	inner_select_statement->node = std::move(inner_select_node);
@@ -288,7 +288,7 @@ unique_ptr<SubqueryExpression> CreateUndirectedCSRVertexSubquery(const shared_pt
 
 	auto dense_id_colref = make_uniq<ColumnRefExpression>("dense_id");
 	inner_select_node->groups.group_expressions.push_back(std::move(dense_id_colref));
-	GroupingSet grouping_set = {0};
+	GroupingSet grouping_set = {ProjectionIndex(0)};
 	inner_select_node->groups.grouping_sets.push_back(grouping_set);
 
 	unique_ptr<SelectNode> unique_edges_select_node, unique_edges_select_node_reverse;
@@ -338,7 +338,7 @@ unique_ptr<SelectNode> CreateOuterSelectEdgesNode() {
 
 	outer_select_edges_node->groups.group_expressions.push_back(make_uniq<ColumnRefExpression>("src"));
 	outer_select_edges_node->groups.group_expressions.push_back(make_uniq<ColumnRefExpression>("dst"));
-	GroupingSet outer_grouping_set = {0, 1};
+	GroupingSet outer_grouping_set = {ProjectionIndex(0), ProjectionIndex(1)};
 	outer_select_edges_node->groups.grouping_sets.push_back(outer_grouping_set);
 
 	return outer_select_edges_node;
@@ -568,6 +568,43 @@ unique_ptr<CommonTableExpressionInfo> CreateDirectedCSRCTE(const shared_ptr<Prop
 	auto create_csr_edge_function = make_uniq<FunctionExpression>("create_csr_edge", std::move(csr_edge_children));
 	auto outer_select_node = CreateOuterSelectNode(std::move(create_csr_edge_function));
 
+	outer_select_node->from_table = GetJoinRef(edge_table, edge_binding, prev_binding, next_binding);
+
+	auto outer_select_statement = make_uniq<SelectStatement>();
+	outer_select_statement->node = std::move(outer_select_node);
+
+	auto info = make_uniq<CommonTableExpressionInfo>();
+	info->query = std::move(outer_select_statement);
+	return info;
+}
+
+unique_ptr<CommonTableExpressionInfo> CreateWeightedDirectedCSRCTE(const shared_ptr<PropertyGraphTable> &edge_table,
+                                                                   const string &prev_binding,
+                                                                   const string &edge_binding,
+                                                                   const string &next_binding,
+                                                                   unique_ptr<ParsedExpression> weight_expr) {
+	auto csr_edge_id_constant = make_uniq<ConstantExpression>(Value::INTEGER(0));
+	auto count_create_edge_select = GetCountTable(edge_table->source_pg_table, prev_binding, edge_table->source_pk[0]);
+	auto cast_subquery_expr = CreateDirectedCSRVertexSubquery(edge_table, prev_binding);
+	auto count_edge_table = GetCountEdgeTable(edge_table);
+
+	auto src_rowid_colref = make_uniq<ColumnRefExpression>("rowid", prev_binding);
+	auto dst_rowid_colref = make_uniq<ColumnRefExpression>("rowid", next_binding);
+	auto edge_rowid_colref = make_uniq<ColumnRefExpression>("rowid", edge_binding);
+	auto cast_expression = make_uniq<CastExpression>(LogicalType::BIGINT, std::move(cast_subquery_expr));
+
+	vector<unique_ptr<ParsedExpression>> csr_edge_children;
+	csr_edge_children.push_back(std::move(csr_edge_id_constant));
+	csr_edge_children.push_back(std::move(count_create_edge_select));
+	csr_edge_children.push_back(std::move(cast_expression));
+	csr_edge_children.push_back(std::move(count_edge_table));
+	csr_edge_children.push_back(std::move(src_rowid_colref));
+	csr_edge_children.push_back(std::move(dst_rowid_colref));
+	csr_edge_children.push_back(std::move(edge_rowid_colref));
+	csr_edge_children.push_back(std::move(weight_expr));
+
+	auto create_csr_edge_function = make_uniq<FunctionExpression>("create_csr_edge", std::move(csr_edge_children));
+	auto outer_select_node = CreateOuterSelectNode(std::move(create_csr_edge_function));
 	outer_select_node->from_table = GetJoinRef(edge_table, edge_binding, prev_binding, next_binding);
 
 	auto outer_select_statement = make_uniq<SelectStatement>();

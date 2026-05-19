@@ -9,6 +9,7 @@
 #include <duckdb/parser/statement/copy_statement.hpp>
 #include <duckdb/parser/statement/create_statement.hpp>
 #include <duckdb/parser/statement/insert_statement.hpp>
+#include "duckdb/parser/query_node/insert_query_node.hpp"
 #include <duckpgq/core/functions/table/create_property_graph.hpp>
 #include <duckpgq_state.hpp>
 
@@ -170,7 +171,9 @@ ParserExtensionPlanResult duckpgq_handle_statement(SQLStatement *statement, Duck
 	}
 	if (statement->type == StatementType::INSERT_STATEMENT) {
 		const auto &insert_statement = statement->Cast<InsertStatement>();
-		duckpgq_handle_statement(insert_statement.select_statement.get(), duckpgq_state);
+		if (insert_statement.node) {
+			duckpgq_handle_statement(insert_statement.node->select_statement.get(), duckpgq_state);
+		}
 	}
 
 	throw Exception(ExceptionType::NOT_IMPLEMENTED,

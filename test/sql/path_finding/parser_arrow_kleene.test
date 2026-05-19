@@ -45,21 +45,21 @@ statement error
 ----
 Parser Error: syntax error at or near "/->"
 
-# Not yet supported
+# Anonymous edge in shortest path — generated variable _anon_0 is unresolvable
 statement error
 -FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)-> *(n2:N));
 ----
-Constraint Error: All patterns must bind to a label
+Binder Error: Referenced table "_anon_0" not found!
 
 statement error
 -FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)-[]-> *(n2:N));
 ----
-Constraint Error: All patterns must bind to a label
+Binder Error: Referenced table "_anon_0" not found!
 
 statement error
 -FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)-[]- > *(n2:N));
 ----
-Constraint Error: All patterns must bind to a label
+Binder Error: Referenced table "_anon_0" not found!
 
 statement error
 -FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)-[e2:E] > *(n2:N));
@@ -82,32 +82,30 @@ Parser Error: syntax error at or near "<"
 statement error
 -FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)<-> *(n2:N));
 ----
-Constraint Error: All patterns must bind to a label
+Not implemented Error: Cannot do shortest path for edge type MATCH_EDGE_LEFT_RIGHT
 
 statement error
 -FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)< - > *(n2:N));
 ----
-Constraint Error: All patterns must bind to a label
+Not implemented Error: Cannot do shortest path for edge type MATCH_EDGE_LEFT_RIGHT
 
 statement error
 -FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)<- *(n2:N));
 ----
-Constraint Error: All patterns must bind to a label
+Not implemented Error: Cannot do shortest path for edge type MATCH_EDGE_LEFT
 
 statement error
 -FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)< - *(n2:N));
 ----
-Constraint Error: All patterns must bind to a label
+Not implemented Error: Cannot do shortest path for edge type MATCH_EDGE_LEFT
 
 statement error
 -FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)< -*(n2:N));
 ----
-Constraint Error: All patterns must bind to a label
+Not implemented Error: Cannot do shortest path for edge type MATCH_EDGE_LEFT
 
-statement error
+statement ok
 -FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)< -?(n2:N));
-----
-Constraint Error: All patterns must bind to a label
 
 statement ok
 -FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)<-[e1:E]-?(n2:N));
