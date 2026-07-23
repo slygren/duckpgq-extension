@@ -193,7 +193,7 @@ public:
 	                           const string &prev_binding, const string &edge_binding, const string &next_binding,
 	                           const shared_ptr<PropertyGraphTable> &edge_table, CreatePropertyGraphInfo &pg_table,
 	                           SubPath *subpath, PGQMatchType edge_type,
-	                           unique_ptr<ParsedExpression> anchor_filter = nullptr);
+	                           unique_ptr<ParsedExpression> anchor_filter = nullptr, bool any_shortest = false);
 
 	static void AddPathModeFilter(PGQPathMode mode, const string &path_cte,
 	                              vector<unique_ptr<ParsedExpression>> &conditions);
@@ -210,7 +210,8 @@ public:
 	                            vector<unique_ptr<ParsedExpression>> &conditions, unique_ptr<SelectNode> &select_node,
 	                            case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map,
 	                            CreatePropertyGraphInfo &pg_table, int32_t &extra_alias_counter,
-	                            MatchExpression &original_ref, bool all_shortest = false);
+	                            MatchExpression &original_ref, bool all_shortest = false,
+	                            bool any_shortest = false);
 
 	// Process one OPTIONAL MATCH group: adds LEFT JOINs for each edge+vertex pair directly
 	// to select_node->from_table. Populates opt_alias_map with the new aliases.

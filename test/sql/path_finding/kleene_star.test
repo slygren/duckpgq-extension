@@ -47,7 +47,10 @@ query IIIII
 );
 ----
 
-query IIIII
+# rowsort: the query has no ORDER BY, so row order is not defined. ANY SHORTEST
+# over a bounded quantifier groups by endpoint pair, and the hash aggregate does
+# not preserve the incidental order this previously happened to produce.
+query IIIII rowsort
 -FROM GRAPH_TABLE(testgraph
       MATCH p = ANY SHORTEST (n1:N)-[e:E]->{0,3}(n2:N)
       COLUMNS (n1.id, n2.id, element_id(p), edges(p) AS path_edges, path_length(p))
@@ -57,7 +60,7 @@ query IIIII
 2	2	[1]	[]	0
 3	3	[2]	[]	0
 
-query IIIII
+query IIIII rowsort
 -FROM GRAPH_TABLE(testgraph
       MATCH p = ANY SHORTEST (n1:N)-[e:E]->{,3}(n2:N)
       COLUMNS (n1.id, n2.id, element_id(p), edges(p) AS path_edges, path_length(p))

@@ -2466,7 +2466,8 @@ static void AddBoundedORPRecursiveCTE(unique_ptr<SelectNode> &select_node, const
 static void AddBoundedVLPathFinding(unique_ptr<SelectNode> &select_node,
                                     vector<unique_ptr<ParsedExpression>> &conditions, const string &prev_binding,
                                     const string &next_binding, const shared_ptr<PropertyGraphTable> &edge_table,
-                                    idx_t lower, idx_t upper, unique_ptr<ParsedExpression> anchor_filter) {
+                                    idx_t lower, idx_t upper, unique_ptr<ParsedExpression> anchor_filter,
+                                    bool any_shortest) {
 	const string &src_pk = edge_table->source_pk[0];
 	const string &dst_pk = edge_table->destination_pk[0];
 	const string &src_fk = edge_table->source_fk[0];
@@ -2610,9 +2611,58 @@ static void AddBoundedVLPathFinding(unique_ptr<SelectNode> &select_node,
 	cte_info->query = std::move(cte_stmt);
 	select_node->cte_map.map[cte_name] = std::move(cte_info);
 
+	// ── ANY SHORTEST: collapse to one row per endpoint pair ──────────────────────
+	// The recursive CTE emits one row per distinct path, because `visited` differs
+	// between them. ANY SHORTEST asks for a single shortest path per (src, dst)
+	// binding, so group to the minimum depth per pair. Without this, a bounded
+	// quantifier returns every path in range and the shortest prefix is silently
+	// ignored.
+	//
+	// The depth range is folded in here, so the outer BETWEEN is skipped below.
+	//
+	// ALL SHORTEST over a bounded quantifier is not handled here -- it needs every
+	// path *at* the minimum depth, not one of them.
+	string scan_name = cte_name;
+	if (any_shortest) {
+		scan_name = cte_name + "_sp";
+
+		auto sp = make_uniq<SelectNode>();
+		auto sp_from = make_uniq<BaseTableRef>();
+		sp_from->table_name = cte_name;
+		sp->from_table = std::move(sp_from);
+
+		sp->select_list.push_back(make_uniq<ColumnRefExpression>("src_rowid"));
+		sp->select_list.push_back(make_uniq<ColumnRefExpression>("dst_rowid"));
+		{
+			vector<unique_ptr<ParsedExpression>> min_args;
+			min_args.push_back(make_uniq<ColumnRefExpression>("depth"));
+			auto min_fn = make_uniq<FunctionExpression>("min", std::move(min_args));
+			min_fn->alias = "depth";
+			sp->select_list.push_back(std::move(min_fn));
+		}
+
+		sp->where_clause = make_uniq<BetweenExpression>(
+		    make_uniq<ColumnRefExpression>("depth"),
+		    make_uniq<ConstantExpression>(Value::INTEGER(static_cast<int32_t>(lower))),
+		    make_uniq<ConstantExpression>(Value::INTEGER(static_cast<int32_t>(upper))));
+
+		sp->groups.group_expressions.push_back(make_uniq<ColumnRefExpression>("src_rowid"));
+		sp->groups.group_expressions.push_back(make_uniq<ColumnRefExpression>("dst_rowid"));
+		GroupingSet sp_grouping_set;
+		sp_grouping_set.insert(ProjectionIndex(0));
+		sp_grouping_set.insert(ProjectionIndex(1));
+		sp->groups.grouping_sets.push_back(std::move(sp_grouping_set));
+
+		auto sp_stmt = make_uniq<SelectStatement>();
+		sp_stmt->node = std::move(sp);
+		auto sp_info = make_uniq<CommonTableExpressionInfo>();
+		sp_info->query = std::move(sp_stmt);
+		select_node->cte_map.map[scan_name] = std::move(sp_info);
+	}
+
 	// ── Add CTE to FROM (cross join) ─────────────────────────────────────────────
 	auto cte_scan = make_uniq<BaseTableRef>();
-	cte_scan->table_name = cte_name;
+	cte_scan->table_name = scan_name;
 	cte_scan->alias = cte_alias;
 	if (select_node->from_table) {
 		auto cross = make_uniq<JoinRef>(JoinRefType::CROSS);
@@ -2630,10 +2680,13 @@ static void AddBoundedVLPathFinding(unique_ptr<SelectNode> &select_node,
 	conditions.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
 	    make_uniq<ColumnRefExpression>("rowid", next_binding),
 	    make_uniq<ColumnRefExpression>("dst_rowid", cte_alias)));
-	conditions.push_back(make_uniq<BetweenExpression>(
-	    make_uniq<ColumnRefExpression>("depth", cte_alias),
-	    make_uniq<ConstantExpression>(Value::INTEGER(static_cast<int32_t>(lower))),
-	    make_uniq<ConstantExpression>(Value::INTEGER(static_cast<int32_t>(upper)))));
+	if (!any_shortest) {
+		// For ANY SHORTEST this is already applied inside the grouping CTE above.
+		conditions.push_back(make_uniq<BetweenExpression>(
+		    make_uniq<ColumnRefExpression>("depth", cte_alias),
+		    make_uniq<ConstantExpression>(Value::INTEGER(static_cast<int32_t>(lower))),
+		    make_uniq<ConstantExpression>(Value::INTEGER(static_cast<int32_t>(upper)))));
+	}
 }
 
 void PGQMatchFunction::AddPathFinding(unique_ptr<SelectNode> &select_node,
@@ -2641,13 +2694,13 @@ void PGQMatchFunction::AddPathFinding(unique_ptr<SelectNode> &select_node,
                                       const string &edge_binding, const string &next_binding,
                                       const shared_ptr<PropertyGraphTable> &edge_table,
                                       CreatePropertyGraphInfo &pg_table, SubPath *subpath, PGQMatchType edge_type,
-                                      unique_ptr<ParsedExpression> anchor_filter) {
+                                      unique_ptr<ParsedExpression> anchor_filter, bool any_shortest) {
 	// For finite bounded directed edges, use a recursive CTE instead of CSR+iterativelength.
 	// This reads only the reachable subgraph rather than the full edge/vertex tables,
 	// which is critical for large remote (httpfs) graphs in browser or constrained environments.
 	if (edge_type == PGQMatchType::MATCH_EDGE_RIGHT && subpath->upper < static_cast<idx_t>(1 << 30)) {
 		AddBoundedVLPathFinding(select_node, conditions, prev_binding, next_binding, edge_table, subpath->lower,
-		                        subpath->upper, std::move(anchor_filter));
+		                        subpath->upper, std::move(anchor_filter), any_shortest);
 		return;
 	}
 
@@ -2971,7 +3024,7 @@ void PGQMatchFunction::ProcessPathList(vector<unique_ptr<PathReference>> &path_l
                                        unique_ptr<SelectNode> &final_select_node,
                                        case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map,
                                        CreatePropertyGraphInfo &pg_table, int32_t &extra_alias_counter,
-                                       MatchExpression &original_ref, bool all_shortest) {
+                                       MatchExpression &original_ref, bool all_shortest, bool any_shortest) {
 	PathElement *previous_vertex_element = GetPathElement(path_list[0]);
 	if (!previous_vertex_element) {
 		const auto previous_vertex_subpath = reinterpret_cast<SubPath *>(path_list[0].get());
@@ -2987,7 +3040,7 @@ void PGQMatchFunction::ProcessPathList(vector<unique_ptr<PathReference>> &path_l
 		} else {
 			// Add the shortest path if the name is found in the column_list
 			ProcessPathList(previous_vertex_subpath->path_list, conditions, final_select_node, alias_map, pg_table,
-			                extra_alias_counter, original_ref, all_shortest);
+			                extra_alias_counter, original_ref, all_shortest, any_shortest);
 			return;
 		}
 	}
@@ -3122,7 +3175,7 @@ void PGQMatchFunction::ProcessPathList(vector<unique_ptr<PathReference>> &path_l
 					AddPathFinding(final_select_node, conditions, previous_vertex_element->variable_binding,
 					               edge_element->variable_binding, next_vertex_element->variable_binding,
 					               edge_table, pg_table, edge_subpath, edge_element->match_type,
-					               std::move(anchor_filter));
+					               std::move(anchor_filter), any_shortest);
 					// AddPathModeFilter references the shortest_path_cte produced by the CSR path.
 					// The recursive-CTE path (finite bounded directed) already prevents vertex revisits
 					// via list_contains cycle detection, so skip the filter there.
@@ -5021,6 +5074,9 @@ static unique_ptr<ParsedExpression> BuildExistsSubquery(
 
 	for (auto &path_pattern : inner_match.path_patterns) {
 		bool all_shortest = path_pattern->all && path_pattern->shortest;
+		// ANY SHORTEST: a shortest-path prefix without ALL. Needed separately so a
+		// bounded quantifier can collapse to one path per endpoint pair.
+		bool any_shortest = path_pattern->shortest && !path_pattern->all;
 		if (!TryPathTableRewrite(context, pg_table, path_pattern->path_elements, inner_match, conditions,
 		                         inner_select, inner_alias_map, extra_alias_counter,
 		                         path_table_cache, referenced_bindings,
@@ -5031,7 +5087,7 @@ static unique_ptr<ParsedExpression> BuildExistsSubquery(
 				ThrowABIPathRequired();
 			}
 			PGQMatchFunction::ProcessPathList(path_pattern->path_elements, conditions, inner_select, inner_alias_map,
-			                                  pg_table, extra_alias_counter, inner_match, all_shortest);
+			                                  pg_table, extra_alias_counter, inner_match, all_shortest, any_shortest);
 		}
 	}
 
@@ -6633,6 +6689,9 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 		// Check if the element is PathElement or a Subpath with potentially many
 		// items
 		bool all_shortest = path_pattern->all && path_pattern->shortest;
+		// ANY SHORTEST: a shortest-path prefix without ALL. Needed separately so a
+		// bounded quantifier can collapse to one path per endpoint pair.
+		bool any_shortest = path_pattern->shortest && !path_pattern->all;
 		// Tier 1: if a pre-computed path table covers this entire pattern, use it.
 		// Falls through to Tier 2/3 (ProcessPathList) when not applicable.
 		// Pass the MATCH WHERE clause for predicate pushdown (v0/v1 = constant).
@@ -6653,7 +6712,7 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 				ThrowABIPathRequired();
 			}
 			ProcessPathList(path_pattern->path_elements, conditions, final_select_node, alias_map, *pg_table,
-			                extra_alias_counter, *ref, all_shortest);
+			                extra_alias_counter, *ref, all_shortest, any_shortest);
 		}
 	}
 
@@ -6797,6 +6856,7 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 
 		for (auto &path_pattern : branch.path_patterns) {
 			bool all_shortest = path_pattern->all && path_pattern->shortest;
+			bool any_shortest = path_pattern->shortest && !path_pattern->all;
 			if (!TryPathTableRewrite(context, *pg_table, path_pattern->path_elements, branch, branch_conditions,
 			                         branch_select, branch_alias_map, branch_counter,
 			                         path_table_cache, branch_referenced_bindings,
@@ -6814,7 +6874,7 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 					ThrowABIPathRequired();
 				}
 				ProcessPathList(path_pattern->path_elements, branch_conditions, branch_select,
-				                branch_alias_map, *pg_table, branch_counter, branch, all_shortest);
+				                branch_alias_map, *pg_table, branch_counter, branch, all_shortest, any_shortest);
 			}
 		}
 
