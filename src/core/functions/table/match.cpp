@@ -3497,10 +3497,18 @@ void PGQMatchFunction::CheckColumnBinding(
 			continue;
 		}
 		if (column_ref->column_names.size() == 1) {
-			// Single-alias (e.g. `r`, `e`): let DuckDB's own binder validate.
-			// Tier 1 path table patterns expose variables as columns (e1 AS e, v1 AS r)
-			// so DuckDB can resolve them; we skip here to avoid false "never registered" errors.
-			continue;
+			// A bare *graph variable* (e.g. `r`, `e`) is legitimate: path table
+			// patterns expose those as columns (e1 AS e, v1 AS r) for DuckDB to
+			// resolve, so skip them here to avoid false "never registered" errors.
+			//
+			// Only skip names that really are bound variables, though. Skipping
+			// every single-name reference also swallows genuine typos, and the
+			// user gets DuckDB's generic "Referenced column not found in FROM
+			// clause" instead of the graph-aware message.
+			if (alias_to_vertex_and_edge_tables.find(column_ref->column_names[0]) !=
+			    alias_to_vertex_and_edge_tables.end()) {
+				continue;
+			}
 		}
 		const auto cur_fq_col_name = StringUtil::Join(column_ref->column_names, /*separator=*/".");
 		if (all_fq_col_names.find(cur_fq_col_name) == all_fq_col_names.end()) {
