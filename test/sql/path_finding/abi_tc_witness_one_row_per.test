@@ -1,0 +1,193 @@
+# name: test/sql/path_finding/abi_tc_witness_one_row_per.test
+# description: ONE ROW PER can unroll DBT ABI tc_witness path_vertices without recursive traversal
+# group: [path_finding]
+
+require duckpgq
+
+statement ok
+CREATE TABLE tag(id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO tag VALUES (10, 'A'), (20, 'B'), (30, 'C');
+
+statement ok
+CREATE TABLE parent(src INTEGER, dst INTEGER, since INTEGER);
+
+statement ok
+INSERT INTO parent VALUES (10, 30, 2019), (10, 20, 2020), (20, 30, 2021);
+
+statement ok
+CREATE SCHEMA graph;
+
+statement ok
+CREATE TABLE graph.__pg_test_graph__custom_tc_witness(
+    v0 INTEGER,
+    v1 INTEGER,
+    depth INTEGER,
+    path_vertices INTEGER[]
+);
+
+statement ok
+INSERT INTO graph.__pg_test_graph__custom_tc_witness VALUES
+    (10, 20, 1, [10, 20]),
+    (10, 30, 2, [10, 20, 30]);
+
+statement ok
+CREATE TABLE graph.__pg_test_graph__custom_tc_chain(
+    v0 INTEGER,
+    v1 INTEGER,
+    depth INTEGER,
+    path_vertices INTEGER[]
+);
+
+statement ok
+INSERT INTO graph.__pg_test_graph__custom_tc_chain VALUES
+    (10, 30, 2, [10, 20, 30]);
+
+statement ok
+CREATE TABLE graph.__pgq_path_catalog AS
+SELECT
+    'test_graph' AS graph_name,
+    '__pg_test_graph__custom_tc_witness' AS path_table_name,
+    'tc_witness' AS path_kind,
+    NULL AS hop_count,
+    'Tag' AS src_label,
+    'Tag' AS dst_label,
+    'Tag,Tag' AS vertex_label_sequence,
+    'HasParent' AS edge_label_sequence,
+    true AS supports_one_row_per_step,
+    true AS is_deduplicated,
+    (SELECT count(*) FROM graph.__pg_test_graph__custom_tc_witness) AS estimated_rows,
+    current_timestamp AS last_refreshed_at,
+    true AS is_sorted_by_v0,
+    (SELECT min(depth) FROM graph.__pg_test_graph__custom_tc_witness) AS min_depth,
+    (SELECT max(depth) FROM graph.__pg_test_graph__custom_tc_witness) AS max_depth,
+    'parent' AS bridge_table_names
+UNION ALL
+SELECT
+    'test_graph' AS graph_name,
+    '__pg_test_graph__custom_tc_chain' AS path_table_name,
+    'tc_chain' AS path_kind,
+    NULL AS hop_count,
+    'Tag' AS src_label,
+    'Tag' AS dst_label,
+    'Tag,Tag' AS vertex_label_sequence,
+    'HasParent' AS edge_label_sequence,
+    true AS supports_one_row_per_step,
+    true AS is_deduplicated,
+    (SELECT count(*) FROM graph.__pg_test_graph__custom_tc_chain) AS estimated_rows,
+    current_timestamp AS last_refreshed_at,
+    true AS is_sorted_by_v0,
+    (SELECT min(depth) FROM graph.__pg_test_graph__custom_tc_chain) AS min_depth,
+    (SELECT max(depth) FROM graph.__pg_test_graph__custom_tc_chain) AS max_depth,
+    'parent' AS bridge_table_names;
+
+statement ok
+CREATE TABLE selected_tag(id INTEGER);
+
+statement ok
+INSERT INTO selected_tag VALUES (10);
+
+statement ok
+-CREATE PROPERTY GRAPH test_graph
+VERTEX TABLES (
+    tag PROPERTIES (id, name) LABEL Tag
+)
+EDGE TABLES (
+    parent SOURCE KEY (src) REFERENCES tag(id)
+           DESTINATION KEY (dst) REFERENCES tag(id)
+           PROPERTIES (src, dst, since)
+           LABEL HasParent
+);
+
+query III rowsort
+-FROM GRAPH_TABLE (
+    test_graph
+    MATCH (a:Tag)-[e:HasParent]->{1,3}(b:Tag)
+    ONE ROW PER STEP (v1, step_e, v2)
+    WHERE a.name = 'A' AND b.name = 'C'
+    COLUMNS (v1.name AS src, step_e.since AS since, v2.name AS dst)
+);
+----
+A	2020	B
+B	2021	C
+
+# Named recursive chain paths should use the ABI chain table directly for
+# path functions instead of falling back to recursive SQL.
+query II
+-FROM GRAPH_TABLE (
+    test_graph
+    MATCH p = (a:Tag)-[e:HasParent]->{1,3}(b:Tag)
+    WHERE a.id = 10
+    COLUMNS (path_length(p) AS depth, vertices(p) AS vertex_ids)
+);
+----
+2	[10, 20, 30]
+
+# If the destination endpoint is constrained, use tc_witness so the path is
+# reconstructed to that specific endpoint rather than the deepest chain target.
+query II
+-FROM GRAPH_TABLE (
+    test_graph
+    MATCH p = (a:Tag)-[e:HasParent]->{1,3}(b:Tag)
+    WHERE a.id = 10 AND b.id = 20
+    COLUMNS (path_length(p) AS depth, vertices(p) AS vertex_ids)
+);
+----
+1	[10, 20]
+
+# With no destination endpoint filter, tc_chain emits the selected hierarchy chain once,
+# rather than ONE ROW PER STEP over every prefix endpoint path.
+query II rowsort
+-FROM GRAPH_TABLE (
+    test_graph
+    MATCH (a:Tag)-[e:HasParent]->{1,3}(b:Tag)
+    ONE ROW PER STEP (v1, step_e, v2)
+    WHERE a.id = 10
+    COLUMNS (v1.name AS src, v2.name AS dst)
+);
+----
+A	B
+B	C
+
+# Key-only chain projections can be answered directly from tc_chain without
+# reconstructing vertex/edge rowids.
+query II rowsort
+-FROM GRAPH_TABLE (
+    test_graph
+    MATCH (a:Tag)-[e:HasParent]->{1,3}(b:Tag)
+    ONE ROW PER STEP (v1, step_e, v2)
+    WHERE a.id = 10
+    COLUMNS (v1.id AS src, v2.id AS dst)
+);
+----
+10	20
+20	30
+
+# Scalar subqueries on key columns should still qualify for the key-only chain
+# fast path.
+query II rowsort
+-FROM GRAPH_TABLE (
+    test_graph
+    MATCH (a:Tag)-[e:HasParent]->{1,3}(b:Tag)
+    ONE ROW PER STEP (v1, step_e, v2)
+    WHERE a.id = (SELECT id FROM selected_tag)
+    COLUMNS (v1.id AS src, v2.id AS dst)
+);
+----
+10	20
+20	30
+
+# Endpoint key predicates should be pushed into the tc_witness CTE before
+# path_vertices is unnested.
+query III rowsort
+-FROM GRAPH_TABLE (
+    test_graph
+    MATCH (a:Tag)-[e:HasParent]->{1,3}(b:Tag)
+    ONE ROW PER STEP (v1, step_e, v2)
+    WHERE a.id = 10 AND b.id = 30
+    COLUMNS (v1.name AS src, step_e.since AS since, v2.name AS dst)
+);
+----
+A	2020	B
+B	2021	C

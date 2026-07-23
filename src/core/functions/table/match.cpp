@@ -7,6 +7,7 @@
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
 
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
@@ -17,6 +18,7 @@
 #include "duckdb/parser/expression/operator_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
 
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/query_node/recursive_cte_node.hpp"
@@ -31,8 +33,20 @@
 #include <duckdb/common/enums/set_operation_type.hpp>
 #include <duckpgq/core/functions/table.hpp>
 #include <duckpgq/core/utils/duckpgq_utils.hpp>
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/main/database_manager.hpp"
+#include "duckdb/main/materialized_query_result.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/parser/parser.hpp"
+
+#include <algorithm>
 
 namespace duckdb {
+
+ParsedExpression *DuckPGQGetParserOverrideExpression(int32_t match_index);
 
 namespace {
 
@@ -119,6 +133,652 @@ GetColRefExprFromPg(const case_insensitive_map_t<shared_ptr<PropertyGraphTable>>
 	return registered_col_names;
 }
 
+static string QualifiedPathTableName(const string &catalog_name, const string &schema_name, const string &table_name) {
+	return KeywordHelper::WriteOptionallyQuoted(catalog_name) + "." +
+	       KeywordHelper::WriteOptionallyQuoted(schema_name) + "." +
+	       KeywordHelper::WriteOptionallyQuoted(table_name);
+}
+
+static string QualifiedTableName(const string &catalog_name, const string &schema_name, const string &table_name) {
+	string result;
+	if (!catalog_name.empty()) {
+		result += KeywordHelper::WriteOptionallyQuoted(catalog_name) + ".";
+	}
+	if (!schema_name.empty()) {
+		result += KeywordHelper::WriteOptionallyQuoted(schema_name) + ".";
+	}
+	result += KeywordHelper::WriteOptionallyQuoted(table_name);
+	return result;
+}
+
+static unique_ptr<SelectStatement> ParseSelectStatement(const string &query) {
+	Parser parser;
+	parser.ParseQuery(query);
+	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+		throw InternalException("Expected generated DuckPGQ helper query to parse as a single SELECT statement");
+	}
+	return unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
+}
+
+static string GetOptionalString(MaterializedQueryResult &result, idx_t column, idx_t row) {
+	auto value = result.GetValue(column, row);
+	return value.IsNull() ? string() : value.GetValue<string>();
+}
+
+static int64_t GetOptionalInt64(MaterializedQueryResult &result, idx_t column, idx_t row) {
+	auto value = result.GetValue(column, row);
+	return value.IsNull() ? -1 : value.GetValue<int64_t>();
+}
+
+static bool GetOptionalBool(MaterializedQueryResult &result, idx_t column, idx_t row) {
+	auto value = result.GetValue(column, row);
+	return !value.IsNull() && value.GetValue<bool>();
+}
+
+static case_insensitive_set_t LoadCatalogTableColumns(Connection &connection, const string &catalog_name,
+                                                      const string &schema_name, const string &table_name) {
+	case_insensitive_set_t columns;
+	const string query = StringUtil::Format(
+	    "SELECT column_name FROM information_schema.columns "
+	    "WHERE lower(table_catalog) = lower(%s) "
+	    "  AND lower(table_schema) = lower(%s) "
+	    "  AND lower(table_name) = lower(%s)",
+	    KeywordHelper::WriteQuoted(catalog_name, '\''), KeywordHelper::WriteQuoted(schema_name, '\''),
+	    KeywordHelper::WriteQuoted(table_name, '\''));
+	auto query_result = connection.Query(query);
+	if (!query_result || query_result->HasError()) {
+		return columns;
+	}
+	auto &materialized_result = query_result->Cast<MaterializedQueryResult>();
+	for (idx_t row_idx = 0; row_idx < materialized_result.RowCount(); row_idx++) {
+		columns.insert(GetOptionalString(materialized_result, 0, row_idx));
+	}
+	return columns;
+}
+
+static case_insensitive_set_t LatestPathCatalogColumns() {
+	case_insensitive_set_t columns;
+	columns.insert("semantic_grain");
+	columns.insert("temporal_mode");
+	columns.insert("multiplicity_mode");
+	columns.insert("property_support");
+	columns.insert("freshness_policy");
+	columns.insert("covered_target_properties");
+	return columns;
+}
+
+static string OptionalStringCatalogColumn(const case_insensitive_set_t &columns, const string &column_name,
+                                          const string &default_value) {
+	if (columns.find(column_name) != columns.end()) {
+		return column_name;
+	}
+	return KeywordHelper::WriteQuoted(default_value, '\'') + " AS " + column_name;
+}
+
+static void AddPathTableInfo(PGQPathTableCatalog &path_table_catalog, PGQPathTableInfo info) {
+	if (info.table_name.empty()) {
+		return;
+	}
+	auto existing = path_table_catalog.find(info.table_name);
+	if (existing == path_table_catalog.end() || (!existing->second.from_metadata && info.from_metadata)) {
+		path_table_catalog[info.table_name] = std::move(info);
+	}
+}
+
+static vector<string> SplitQualifiedTableName(const string &qualified_name) {
+	vector<string> parts = StringUtil::Split(qualified_name, '.');
+	for (auto &part : parts) {
+		StringUtil::Trim(part);
+	}
+	if (parts.size() > 3 || parts.empty()) {
+		return {};
+	}
+	return parts;
+}
+
+static void PopulateQualifiedTableRef(const string &qualified_name, string &catalog_name, string &schema_name,
+                                      string &table_name) {
+	const auto parts = SplitQualifiedTableName(qualified_name);
+	if (parts.empty()) {
+		table_name = qualified_name;
+		return;
+	}
+	if (parts.size() == 3) {
+		catalog_name = parts[0];
+		schema_name = parts[1];
+		table_name = parts[2];
+		return;
+	}
+	if (parts.size() == 2) {
+		schema_name = parts[0];
+		table_name = parts[1];
+		return;
+	}
+	table_name = parts[0];
+}
+
+static string DirectLinkLookupName(const string &name) {
+	string result = StringUtil::Lower(name);
+	StringUtil::Trim(result);
+	return result;
+}
+
+static string DirectLinkIndexKey(const string &src_label, const string &direct_name) {
+	return DirectLinkLookupName(src_label) + "|" + DirectLinkLookupName(direct_name);
+}
+
+static void AddDirectLinkIndexEntry(PGQPathTableCache &cache, const string &src_label, const string &direct_name,
+                                    idx_t direct_link_idx) {
+	if (direct_name.empty()) {
+		return;
+	}
+	auto &entries = cache.direct_link_index[DirectLinkIndexKey(src_label, direct_name)];
+	if (std::find(entries.begin(), entries.end(), direct_link_idx) == entries.end()) {
+		entries.push_back(direct_link_idx);
+	}
+	string normalized = DirectLinkLookupName(direct_name);
+	if (StringUtil::StartsWith(normalized, "has_") && normalized.size() > 4) {
+		auto &has_entries = cache.direct_link_index[DirectLinkIndexKey(src_label, normalized.substr(4))];
+		if (std::find(has_entries.begin(), has_entries.end(), direct_link_idx) == has_entries.end()) {
+			has_entries.push_back(direct_link_idx);
+		}
+	}
+	if (StringUtil::StartsWith(normalized, "in_") && normalized.size() > 3) {
+		auto &in_entries = cache.direct_link_index[DirectLinkIndexKey(src_label, normalized.substr(3))];
+		if (std::find(in_entries.begin(), in_entries.end(), direct_link_idx) == in_entries.end()) {
+			in_entries.push_back(direct_link_idx);
+		}
+	}
+}
+
+static void LoadDirectLinkCatalogMetadata(Connection &connection, const string &catalog_name, const string &schema_name,
+                                          const string &graph_name, PGQPathTableCache &cache) {
+	const string catalog_table = QualifiedPathTableName(catalog_name, schema_name, "__pgq_direct_link_catalog");
+	const string query = StringUtil::Format(
+	    "SELECT graph_name, link_name, src_label, dst_label, relationship_label, cardinality, mode, "
+	    "       link_table, src_col, dst_col, src_vertex_table, src_vertex_key, dst_vertex_table, dst_vertex_key, "
+	    "       CAST(estimated_rows AS BIGINT) AS estimated_rows "
+	    "FROM %s WHERE lower(graph_name) = lower(%s)",
+	    catalog_table, KeywordHelper::WriteQuoted(graph_name, '\''));
+
+	auto query_result = connection.Query(query);
+	if (!query_result || query_result->HasError()) {
+		return;
+	}
+
+	auto &materialized_result = query_result->Cast<MaterializedQueryResult>();
+	for (idx_t row_idx = 0; row_idx < materialized_result.RowCount(); row_idx++) {
+		PGQDirectLinkInfo info;
+		info.graph_name = GetOptionalString(materialized_result, 0, row_idx);
+		info.link_name = GetOptionalString(materialized_result, 1, row_idx);
+		info.src_label = GetOptionalString(materialized_result, 2, row_idx);
+		info.dst_label = GetOptionalString(materialized_result, 3, row_idx);
+		info.relationship_label = GetOptionalString(materialized_result, 4, row_idx);
+		info.cardinality = GetOptionalString(materialized_result, 5, row_idx);
+		info.mode = GetOptionalString(materialized_result, 6, row_idx);
+		PopulateQualifiedTableRef(GetOptionalString(materialized_result, 7, row_idx), info.link_catalog_name,
+		                          info.link_schema_name, info.link_table_name);
+		info.src_col = GetOptionalString(materialized_result, 8, row_idx);
+		info.dst_col = GetOptionalString(materialized_result, 9, row_idx);
+		PopulateQualifiedTableRef(GetOptionalString(materialized_result, 10, row_idx), info.src_vertex_catalog_name,
+		                          info.src_vertex_schema_name, info.src_vertex_table_name);
+		info.src_vertex_key = GetOptionalString(materialized_result, 11, row_idx);
+		PopulateQualifiedTableRef(GetOptionalString(materialized_result, 12, row_idx), info.dst_vertex_catalog_name,
+		                          info.dst_vertex_schema_name, info.dst_vertex_table_name);
+		info.dst_vertex_key = GetOptionalString(materialized_result, 13, row_idx);
+		info.estimated_rows = GetOptionalInt64(materialized_result, 14, row_idx);
+		if (info.link_table_name.empty() || info.src_col.empty() || info.dst_col.empty() ||
+		    info.src_vertex_key.empty() || info.dst_vertex_key.empty()) {
+			continue;
+		}
+		const idx_t direct_link_idx = cache.direct_links.size();
+		cache.direct_links.push_back(std::move(info));
+		const auto &stored = cache.direct_links.back();
+		AddDirectLinkIndexEntry(cache, stored.src_label, stored.link_name, direct_link_idx);
+		AddDirectLinkIndexEntry(cache, stored.src_label, stored.relationship_label, direct_link_idx);
+		AddDirectLinkIndexEntry(cache, stored.src_label, stored.dst_label, direct_link_idx);
+	}
+}
+
+static void LoadDirectLinkCatalogs(ClientContext &context, Connection &connection, const string &graph_name,
+                                   PGQPathTableCache &cache) {
+	case_insensitive_set_t loaded_catalogs;
+	auto load_once = [&](const string &catalog_name, const string &schema_name) {
+		const string key = catalog_name + "." + schema_name;
+		if (loaded_catalogs.find(key) != loaded_catalogs.end()) {
+			return;
+		}
+		loaded_catalogs.insert(key);
+		LoadDirectLinkCatalogMetadata(connection, catalog_name, schema_name, graph_name, cache);
+	};
+
+	const string query =
+	    "SELECT table_catalog, table_schema "
+	    "FROM information_schema.tables "
+	    "WHERE lower(table_name) = '__pgq_direct_link_catalog'";
+	auto result = connection.Query(query);
+	if (result && !result->HasError()) {
+		auto &materialized_result = result->Cast<MaterializedQueryResult>();
+		for (idx_t row_idx = 0; row_idx < materialized_result.RowCount(); row_idx++) {
+			load_once(GetOptionalString(materialized_result, 0, row_idx),
+			          GetOptionalString(materialized_result, 1, row_idx));
+		}
+	}
+
+	auto &db_manager = DatabaseManager::Get(context);
+	for (auto &db : db_manager.GetDatabases(context)) {
+		const string &db_name = db->GetName();
+		auto schema = Catalog::GetSchema(context, db_name, "graph", OnEntryNotFound::RETURN_NULL);
+		if (!schema) {
+			continue;
+		}
+		bool has_direct_link_catalog = false;
+		schema->Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
+			if (StringUtil::CIEquals(entry.name, "__pgq_direct_link_catalog")) {
+				has_direct_link_catalog = true;
+			}
+		});
+		if (has_direct_link_catalog) {
+			load_once(db_name, "graph");
+		}
+	}
+}
+
+static void LoadPathTableCatalogMetadata(Connection &connection, const string &catalog_name, const string &schema_name,
+                                         const string &graph_name, PGQPathTableCatalog &path_table_catalog,
+                                         bool assume_latest_columns = false) {
+	const string catalog_table = QualifiedPathTableName(catalog_name, schema_name, "__pgq_path_catalog");
+	const auto columns = assume_latest_columns ? LatestPathCatalogColumns()
+	                                           : LoadCatalogTableColumns(connection, catalog_name, schema_name,
+	                                                                     "__pgq_path_catalog");
+	const string query = StringUtil::Format(
+	    "SELECT path_table_name, path_kind, "
+	    "       CAST(hop_count AS BIGINT) AS hop_count, "
+	    "       src_label, dst_label, vertex_label_sequence, edge_label_sequence, "
+	    "       supports_one_row_per_step, is_deduplicated, "
+	    "       CAST(estimated_rows AS BIGINT) AS estimated_rows, "
+	    "       is_sorted_by_v0, "
+	    "       CAST(min_depth AS BIGINT) AS min_depth, "
+	    "       CAST(max_depth AS BIGINT) AS max_depth, "
+	    "       bridge_table_names, "
+	    "       %s, %s, %s, %s, %s, %s "
+	    "FROM %s WHERE lower(graph_name) = lower(%s)",
+	    OptionalStringCatalogColumn(columns, "semantic_grain", "identity"),
+	    OptionalStringCatalogColumn(columns, "temporal_mode", "snapshot"),
+	    OptionalStringCatalogColumn(columns, "multiplicity_mode", "unknown"),
+	    OptionalStringCatalogColumn(columns, "property_support", "unknown"),
+	    OptionalStringCatalogColumn(columns, "freshness_policy", "unknown"),
+	    OptionalStringCatalogColumn(columns, "covered_target_properties", ""),
+	    catalog_table, KeywordHelper::WriteQuoted(graph_name, '\''));
+
+	auto query_result = connection.Query(query);
+	if (!query_result || query_result->HasError()) {
+		return;
+	}
+
+	auto &materialized_result = query_result->Cast<MaterializedQueryResult>();
+	for (idx_t row_idx = 0; row_idx < materialized_result.RowCount(); row_idx++) {
+		PGQPathTableInfo info;
+		info.catalog_name = catalog_name;
+		info.schema_name = schema_name;
+		info.table_name = GetOptionalString(materialized_result, 0, row_idx);
+		info.path_kind = GetOptionalString(materialized_result, 1, row_idx);
+		info.hop_count = GetOptionalInt64(materialized_result, 2, row_idx);
+		info.src_label = GetOptionalString(materialized_result, 3, row_idx);
+		info.dst_label = GetOptionalString(materialized_result, 4, row_idx);
+		info.vertex_label_sequence = GetOptionalString(materialized_result, 5, row_idx);
+		info.edge_label_sequence = GetOptionalString(materialized_result, 6, row_idx);
+		info.supports_one_row_per_step = GetOptionalBool(materialized_result, 7, row_idx);
+		info.is_deduplicated = GetOptionalBool(materialized_result, 8, row_idx);
+		info.estimated_rows = GetOptionalInt64(materialized_result, 9, row_idx);
+		info.is_sorted_by_v0 = GetOptionalBool(materialized_result, 10, row_idx);
+		info.min_depth = GetOptionalInt64(materialized_result, 11, row_idx);
+		info.max_depth = GetOptionalInt64(materialized_result, 12, row_idx);
+		info.bridge_table_names = GetOptionalString(materialized_result, 13, row_idx);
+		info.semantic_grain = GetOptionalString(materialized_result, 14, row_idx);
+		info.temporal_mode = GetOptionalString(materialized_result, 15, row_idx);
+		info.multiplicity_mode = GetOptionalString(materialized_result, 16, row_idx);
+		info.property_support = GetOptionalString(materialized_result, 17, row_idx);
+		info.freshness_policy = GetOptionalString(materialized_result, 18, row_idx);
+		info.covered_target_properties = GetOptionalString(materialized_result, 19, row_idx);
+		info.from_metadata = true;
+		AddPathTableInfo(path_table_catalog, std::move(info));
+	}
+}
+
+static void ScanSchemaPathTables(ClientContext &context, const string &catalog_name, const string &schema_name,
+                                 const string &pt_prefix, vector<pair<string, string>> &metadata_catalogs,
+                                 vector<PGQPathTableInfo> &fallback_tables) {
+	auto schema = Catalog::GetSchema(context, catalog_name, schema_name, OnEntryNotFound::RETURN_NULL);
+	if (!schema) {
+		return;
+	}
+
+	bool has_metadata_catalog = false;
+	schema->Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
+		if (StringUtil::CIEquals(entry.name, "__pgq_path_catalog")) {
+			has_metadata_catalog = true;
+			return;
+		}
+		if (StringUtil::StartsWith(StringUtil::Lower(entry.name), StringUtil::Lower(pt_prefix))) {
+			PGQPathTableInfo info;
+			info.catalog_name = catalog_name;
+			info.schema_name = schema_name;
+			info.table_name = entry.name;
+			info.from_metadata = false;
+			fallback_tables.push_back(std::move(info));
+		}
+	});
+
+	if (has_metadata_catalog) {
+		metadata_catalogs.emplace_back(catalog_name, schema_name);
+	}
+}
+
+static void AddGraphArtifactCatalog(case_insensitive_set_t &seen, vector<pair<string, string>> &catalogs,
+                                    const string &catalog_name, const string &schema_name) {
+	if (catalog_name.empty() || schema_name.empty()) {
+		return;
+	}
+	const string key = StringUtil::Lower(catalog_name) + "." + StringUtil::Lower(schema_name);
+	if (seen.find(key) != seen.end()) {
+		return;
+	}
+	seen.insert(key);
+	catalogs.emplace_back(catalog_name, schema_name);
+}
+
+static vector<pair<string, string>> CandidateGraphArtifactCatalogs(const CreatePropertyGraphInfo &pg_table) {
+	case_insensitive_set_t seen;
+	vector<pair<string, string>> catalogs;
+	auto add_for_table = [&](const shared_ptr<PropertyGraphTable> &table) {
+		if (!table || table->catalog_name.empty()) {
+			return;
+		}
+		AddGraphArtifactCatalog(seen, catalogs, table->catalog_name, "graph");
+		AddGraphArtifactCatalog(seen, catalogs, table->catalog_name, "abi");
+	};
+	for (const auto &table : pg_table.vertex_tables) {
+		add_for_table(table);
+	}
+	for (const auto &table : pg_table.edge_tables) {
+		add_for_table(table);
+	}
+	return catalogs;
+}
+
+static void LoadDirectLinkCatalogsFromGraphTables(Connection &connection, const string &graph_name,
+                                                  const CreatePropertyGraphInfo &pg_table,
+                                                  PGQPathTableCache &cache) {
+	for (const auto &entry : CandidateGraphArtifactCatalogs(pg_table)) {
+		LoadDirectLinkCatalogMetadata(connection, entry.first, entry.second, graph_name, cache);
+	}
+}
+
+static PGQPathTableCatalog BuildPathTableCatalogFromGraphTables(ClientContext &context, const string &graph_name,
+                                                                const CreatePropertyGraphInfo &pg_table) {
+	PGQPathTableCatalog path_table_catalog;
+	const string pt_prefix = "__pg_" + graph_name + "__";
+	auto metadata_connection = make_shared_ptr<Connection>(*context.db);
+	vector<PGQPathTableInfo> fallback_tables;
+	const auto candidate_catalogs = CandidateGraphArtifactCatalogs(pg_table);
+
+	for (const auto &entry : candidate_catalogs) {
+		LoadPathTableCatalogMetadata(*metadata_connection, entry.first, entry.second, graph_name,
+		                             path_table_catalog, true);
+	}
+	if (!path_table_catalog.empty()) {
+		return path_table_catalog;
+	}
+
+	for (const auto &entry : candidate_catalogs) {
+		vector<pair<string, string>> schema_metadata_catalogs;
+		ScanSchemaPathTables(context, entry.first, entry.second, pt_prefix, schema_metadata_catalogs, fallback_tables);
+	}
+
+	for (auto &info : fallback_tables) {
+		AddPathTableInfo(path_table_catalog, std::move(info));
+	}
+	return path_table_catalog;
+}
+
+static PGQPathTableCatalog BuildPathTableCatalog(ClientContext &context, const string &graph_name) {
+	PGQPathTableCatalog path_table_catalog;
+	const string pt_prefix = "__pg_" + graph_name + "__";
+	auto metadata_connection = make_shared_ptr<Connection>(*context.db);
+	vector<pair<string, string>> metadata_catalogs;
+	vector<PGQPathTableInfo> fallback_tables;
+
+	const string metadata_query =
+	    "SELECT table_catalog, table_schema "
+	    "FROM information_schema.tables "
+	    "WHERE lower(table_name) = '__pgq_path_catalog'";
+	auto metadata_result = metadata_connection->Query(metadata_query);
+	if (metadata_result && !metadata_result->HasError()) {
+		auto &materialized_result = metadata_result->Cast<MaterializedQueryResult>();
+		for (idx_t row_idx = 0; row_idx < materialized_result.RowCount(); row_idx++) {
+			metadata_catalogs.emplace_back(GetOptionalString(materialized_result, 0, row_idx),
+			                               GetOptionalString(materialized_result, 1, row_idx));
+		}
+	}
+
+	const string fallback_query = StringUtil::Format(
+	    "SELECT table_catalog, table_schema, table_name "
+	    "FROM information_schema.tables "
+	    "WHERE lower(substr(table_name, 1, %d)) = lower(%s)",
+	    static_cast<int>(pt_prefix.size()), KeywordHelper::WriteQuoted(pt_prefix, '\''));
+	auto fallback_result = metadata_connection->Query(fallback_query);
+	if (fallback_result && !fallback_result->HasError()) {
+		auto &materialized_result = fallback_result->Cast<MaterializedQueryResult>();
+		for (idx_t row_idx = 0; row_idx < materialized_result.RowCount(); row_idx++) {
+			PGQPathTableInfo info;
+			info.catalog_name = GetOptionalString(materialized_result, 0, row_idx);
+			info.schema_name = GetOptionalString(materialized_result, 1, row_idx);
+			info.table_name = GetOptionalString(materialized_result, 2, row_idx);
+			info.from_metadata = false;
+			fallback_tables.push_back(std::move(info));
+		}
+	}
+
+	auto &db_manager = DatabaseManager::Get(context);
+	for (auto &db : db_manager.GetDatabases(context)) {
+		const string &db_name = db->GetName();
+		ScanSchemaPathTables(context, db_name, "graph", pt_prefix, metadata_catalogs, fallback_tables);
+		ScanSchemaPathTables(context, db_name, "abi", pt_prefix, metadata_catalogs, fallback_tables);
+	}
+
+	for (const auto &entry : metadata_catalogs) {
+		LoadPathTableCatalogMetadata(*metadata_connection, entry.first, entry.second, graph_name, path_table_catalog);
+	}
+	for (auto &info : fallback_tables) {
+		AddPathTableInfo(path_table_catalog, std::move(info));
+	}
+
+	return path_table_catalog;
+}
+
+static vector<string> SplitCatalogSequence(const string &sequence) {
+	vector<string> result = StringUtil::Split(sequence, ',');
+	for (auto &part : result) {
+		StringUtil::Trim(part);
+	}
+	return result;
+}
+
+static string PathSemanticKey(const string &path_kind, const vector<string> &vertex_label_sequence,
+                              const vector<string> &edge_label_sequence) {
+	string result = StringUtil::Lower(path_kind) + "|v:";
+	for (idx_t idx = 0; idx < vertex_label_sequence.size(); idx++) {
+		if (idx > 0) {
+			result += ",";
+		}
+		result += StringUtil::Lower(vertex_label_sequence[idx]);
+	}
+	result += "|e:";
+	for (idx_t idx = 0; idx < edge_label_sequence.size(); idx++) {
+		if (idx > 0) {
+			result += ",";
+		}
+		result += StringUtil::Lower(edge_label_sequence[idx]);
+	}
+	return result;
+}
+
+static string BranchSummaryKey(const string &src_label, const string &edge_label, const string &dst_label) {
+	return StringUtil::Lower(src_label) + "|" + StringUtil::Lower(edge_label) + "|" + StringUtil::Lower(dst_label);
+}
+
+static shared_ptr<PGQPathTableCache> BuildPathTableCache(ClientContext &context, const string &graph_name,
+                                                         const CreatePropertyGraphInfo *pg_table = nullptr) {
+	auto cache = make_shared_ptr<PGQPathTableCache>();
+	if (pg_table) {
+		cache->catalog = BuildPathTableCatalogFromGraphTables(context, graph_name, *pg_table);
+	}
+	if (cache->catalog.empty()) {
+		cache->catalog = BuildPathTableCatalog(context, graph_name);
+	}
+
+	for (const auto &entry : cache->catalog) {
+		const auto &info = entry.second;
+		if (!info.from_metadata) {
+			continue;
+		}
+		const auto vertex_parts = SplitCatalogSequence(info.vertex_label_sequence);
+		const auto edge_parts = SplitCatalogSequence(info.edge_label_sequence);
+		if (!vertex_parts.empty() || !edge_parts.empty()) {
+			cache->semantic_index[PathSemanticKey(info.path_kind, vertex_parts, edge_parts)] = info.table_name;
+		}
+		if (!StringUtil::CIEquals(info.path_kind, "branch_summary")) {
+			continue;
+		}
+		if (vertex_parts.size() != edge_parts.size() + 1 || vertex_parts.empty()) {
+			continue;
+		}
+		for (idx_t idx = 0; idx < edge_parts.size(); idx++) {
+			PGQBranchSummaryLookup lookup;
+			lookup.table_name = info.table_name;
+			lookup.branch_edge_label = edge_parts[idx];
+			cache->branch_summary_index[BranchSummaryKey(vertex_parts[0], edge_parts[idx], vertex_parts[idx + 1])] =
+			    lookup;
+			cache->branch_summary_index[BranchSummaryKey(vertex_parts[0], edge_parts[idx], "")] = lookup;
+		}
+	}
+
+	return cache;
+}
+
+static shared_ptr<PGQPathTableCache> GetPathTableCache(ClientContext &context, DuckPGQState &duckpgq_state,
+                                                       const string &graph_name,
+                                                       const CreatePropertyGraphInfo *pg_table = nullptr) {
+	lock_guard<mutex> guard(duckpgq_state.path_table_cache_lock);
+	auto entry = duckpgq_state.path_table_caches.find(graph_name);
+	if (entry != duckpgq_state.path_table_caches.end()) {
+		return entry->second;
+	}
+	auto cache = BuildPathTableCache(context, graph_name, pg_table);
+	duckpgq_state.path_table_caches[graph_name] = cache;
+	return cache;
+}
+
+static bool ExpressionMayContainDirectLinkReference(const ParsedExpression *expr) {
+	if (!expr) {
+		return false;
+	}
+	bool found = false;
+	ParsedExpressionIterator::VisitExpression<ColumnRefExpression>(
+	    *expr, [&](const ColumnRefExpression &col_ref) {
+		    if (col_ref.column_names.size() >= 3) {
+			    found = true;
+		    }
+	    });
+	return found;
+}
+
+static bool MatchMayContainDirectLinkReference(const MatchExpression &ref) {
+	for (const auto &expr : ref.column_list) {
+		if (ExpressionMayContainDirectLinkReference(expr.get())) {
+			return true;
+		}
+	}
+	if (ExpressionMayContainDirectLinkReference(ref.where_clause.get())) {
+		return true;
+	}
+	for (const auto &branch : ref.union_matches) {
+		if (branch && MatchMayContainDirectLinkReference(*branch)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void EnsureDirectLinkCatalogs(ClientContext &context, DuckPGQState &duckpgq_state, const string &graph_name,
+                                     const CreatePropertyGraphInfo &pg_table, PGQPathTableCache &cache) {
+	lock_guard<mutex> guard(duckpgq_state.path_table_cache_lock);
+	if (!cache.direct_links.empty()) {
+		return;
+	}
+	auto metadata_connection = make_shared_ptr<Connection>(*context.db);
+	LoadDirectLinkCatalogsFromGraphTables(*metadata_connection, graph_name, pg_table, cache);
+	if (cache.direct_links.empty()) {
+		LoadDirectLinkCatalogs(context, *metadata_connection, graph_name, cache);
+	}
+}
+
+static bool SequenceMatches(const string &metadata_sequence, const vector<string> &query_sequence) {
+	auto metadata_parts = SplitCatalogSequence(metadata_sequence);
+	if (metadata_parts.size() != query_sequence.size()) {
+		return false;
+	}
+	for (idx_t idx = 0; idx < metadata_parts.size(); idx++) {
+		if (!StringUtil::CIEquals(metadata_parts[idx], query_sequence[idx])) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool PathKindMatches(const string &metadata_kind, const string &expected_kind) {
+	return expected_kind.empty() || metadata_kind.empty() || StringUtil::CIEquals(metadata_kind, expected_kind);
+}
+
+static const PGQPathTableInfo *FindPathTableInfo(const PGQPathTableCache &path_table_cache, const string &table_name,
+                                                 const string &path_kind,
+                                                 const vector<string> &vertex_label_sequence,
+                                                 const vector<string> &edge_label_sequence) {
+	const auto &path_table_catalog = path_table_cache.catalog;
+	auto table_entry = path_table_catalog.find(table_name);
+	if (table_entry != path_table_catalog.end()) {
+		return &table_entry->second;
+	}
+
+	auto index_entry = path_table_cache.semantic_index.find(PathSemanticKey(path_kind, vertex_label_sequence,
+	                                                                       edge_label_sequence));
+	if (index_entry != path_table_cache.semantic_index.end()) {
+		auto indexed_table = path_table_catalog.find(index_entry->second);
+		if (indexed_table != path_table_catalog.end()) {
+			return &indexed_table->second;
+		}
+	}
+	return nullptr;
+}
+
+static const PGQPathTableInfo *FindBranchSummaryInfo(const PGQPathTableCache &path_table_cache,
+                                                     const string &src_label, const string &edge_label,
+                                                     const string &dst_label, string &branch_edge_label) {
+	auto lookup_entry = path_table_cache.branch_summary_index.find(BranchSummaryKey(src_label, edge_label, dst_label));
+	if (lookup_entry == path_table_cache.branch_summary_index.end() && !dst_label.empty()) {
+		lookup_entry = path_table_cache.branch_summary_index.find(BranchSummaryKey(src_label, edge_label, ""));
+	}
+	if (lookup_entry != path_table_cache.branch_summary_index.end()) {
+		auto table_entry = path_table_cache.catalog.find(lookup_entry->second.table_name);
+		if (table_entry != path_table_cache.catalog.end()) {
+			branch_edge_label = lookup_entry->second.branch_edge_label;
+			return &table_entry->second;
+		}
+	}
+	return nullptr;
+}
+
 } // namespace
 
 shared_ptr<PropertyGraphTable> PGQMatchFunction::FindGraphTable(const string &label,
@@ -180,6 +840,36 @@ static string StripParens(const string &s) {
 		return s.substr(1, s.size() - 2);
 	}
 	return s;
+}
+
+static bool LabelExpressionAllows(const string &raw_expr, const string &label) {
+	string expr = StripParens(raw_expr);
+	StringUtil::Trim(expr);
+	if (expr.empty()) {
+		return true;
+	}
+	if (!expr.empty() && expr[0] == '!') {
+		return !LabelExpressionAllows(expr.substr(1), label);
+	}
+	auto or_parts = SplitTopLevel(expr, '|');
+	if (or_parts.size() > 1) {
+		for (const auto &part : or_parts) {
+			if (LabelExpressionAllows(part, label)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	auto and_parts = SplitTopLevel(expr, '&');
+	if (and_parts.size() > 1) {
+		for (const auto &part : and_parts) {
+			if (!LabelExpressionAllows(part, label)) {
+				return false;
+			}
+		}
+		return true;
+	}
+	return StringUtil::CIEquals(expr, label);
 }
 
 // Collect all edge PropertyGraphTables for a '|'-separated compound label.
@@ -514,6 +1204,390 @@ static unique_ptr<ParsedExpression> RewriteAllDifferent(unique_ptr<ParsedExpress
 	}
 
 	return expr;
+}
+
+// Return true if expr contains a pgq_exists() call (EXISTS / NOT EXISTS predicate).
+// Used to exclude un-rewritable PGQ subqueries from CTE pushdown.
+static bool ContainsPGQExists(const ParsedExpression &expr) {
+	auto *func = dynamic_cast<const FunctionExpression *>(&expr);
+	if (func && func->function_name == "pgq_exists") {
+		return true;
+	}
+	// Recurse through all child lists that exist on common expression types.
+	auto *op = dynamic_cast<const OperatorExpression *>(&expr);
+	if (op) {
+		for (auto &c : op->children) {
+			if (ContainsPGQExists(*c)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	auto *conj = dynamic_cast<const ConjunctionExpression *>(&expr);
+	if (conj) {
+		for (auto &c : conj->children) {
+			if (ContainsPGQExists(*c)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	if (func) {
+		for (auto &c : func->children) {
+			if (ContainsPGQExists(*c)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+// Walk expr and return a copy of the AND-conjuncts that contain no pgq_exists() call.
+// Returns nullptr when nothing is safe to push down.
+static unique_ptr<ParsedExpression> ExtractSafeCTEConjuncts(const ParsedExpression &expr) {
+	auto *conj = dynamic_cast<const ConjunctionExpression *>(&expr);
+	if (conj && conj->type == ExpressionType::CONJUNCTION_AND) {
+		vector<unique_ptr<ParsedExpression>> safe;
+		for (auto &child : conj->children) {
+			auto part = ExtractSafeCTEConjuncts(*child);
+			if (part) {
+				safe.push_back(std::move(part));
+			}
+		}
+		if (safe.empty()) {
+			return nullptr;
+		}
+		auto result = std::move(safe[0]);
+		for (idx_t i = 1; i < safe.size(); i++) {
+			result = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(result),
+			                                          std::move(safe[i]));
+		}
+		return result;
+	}
+	// Leaf conjunct: safe iff it has no pgq_exists inside.
+	if (!ContainsPGQExists(expr)) {
+		return expr.Copy();
+	}
+	return nullptr;
+}
+
+// Return true if expr references ONLY the given binding (as qualified table.column) and constants.
+// Unqualified column refs and subqueries are rejected; returning false means "do not push."
+static bool ExprOnlyReferencesSingleBinding(const ParsedExpression &expr, const string &binding) {
+	auto *col = dynamic_cast<const ColumnRefExpression *>(&expr);
+	if (col) {
+		return col->column_names.size() >= 2 && col->column_names[0] == binding;
+	}
+	if (dynamic_cast<const ConstantExpression *>(&expr)) return true;
+	auto *comp = dynamic_cast<const ComparisonExpression *>(&expr);
+	if (comp) {
+		return ExprOnlyReferencesSingleBinding(*comp->left, binding) &&
+		       ExprOnlyReferencesSingleBinding(*comp->right, binding);
+	}
+	auto *conj = dynamic_cast<const ConjunctionExpression *>(&expr);
+	if (conj) {
+		for (auto &c : conj->children)
+			if (!ExprOnlyReferencesSingleBinding(*c, binding)) return false;
+		return true;
+	}
+	auto *op = dynamic_cast<const OperatorExpression *>(&expr);
+	if (op) {
+		for (auto &c : op->children)
+			if (!ExprOnlyReferencesSingleBinding(*c, binding)) return false;
+		return true;
+	}
+	auto *func = dynamic_cast<const FunctionExpression *>(&expr);
+	if (func) {
+		if (func->function_name == "pgq_exists") return false;
+		for (auto &c : func->children)
+			if (!ExprOnlyReferencesSingleBinding(*c, binding)) return false;
+		return true;
+	}
+	return false;
+}
+
+// Extract AND-conjuncts from expr that exclusively reference the given binding.
+// Returns nullptr when nothing is safe to push into the recursive CTE anchor.
+static unique_ptr<ParsedExpression> ExtractSrcFilter(const ParsedExpression &expr, const string &binding) {
+	if (ContainsPGQExists(expr)) return nullptr;
+	auto *conj = dynamic_cast<const ConjunctionExpression *>(&expr);
+	if (conj && conj->type == ExpressionType::CONJUNCTION_AND) {
+		vector<unique_ptr<ParsedExpression>> safe;
+		for (auto &child : conj->children) {
+			auto part = ExtractSrcFilter(*child, binding);
+			if (part) safe.push_back(std::move(part));
+		}
+		if (safe.empty()) return nullptr;
+		auto result = std::move(safe[0]);
+		for (idx_t i = 1; i < safe.size(); i++) {
+			result = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND,
+			                                          std::move(result), std::move(safe[i]));
+		}
+		return result;
+	}
+	if (ExprOnlyReferencesSingleBinding(expr, binding)) return expr.Copy();
+	return nullptr;
+}
+
+static bool ExpressionOnlyUsesKeyColumns(const ParsedExpression *expr,
+                                         const case_insensitive_map_t<string> &allowed_key_columns) {
+	if (!expr) {
+		return true;
+	}
+	if (dynamic_cast<const SubqueryExpression *>(expr)) {
+		return true;
+	}
+	if (auto col_ref = dynamic_cast<const ColumnRefExpression *>(expr)) {
+		if (col_ref->column_names.size() != 2) {
+			return false;
+		}
+		auto entry = allowed_key_columns.find(col_ref->column_names[0]);
+		return entry != allowed_key_columns.end() &&
+		       StringUtil::CIEquals(entry->second, col_ref->column_names[1]);
+	}
+
+	bool ok = true;
+	ParsedExpressionIterator::EnumerateChildren(*expr, [&](const ParsedExpression &child) {
+		if (ok && !ExpressionOnlyUsesKeyColumns(&child, allowed_key_columns)) {
+			ok = false;
+		}
+	});
+	return ok;
+}
+
+struct CoveredPathColumn {
+	string table_alias;
+	string column_name;
+};
+
+using CoveredPropertyMap = case_insensitive_map_t<CoveredPathColumn>;
+using CoveredBindingMap = case_insensitive_map_t<CoveredPropertyMap>;
+
+static case_insensitive_map_t<vector<string>> ParseCoveredTargetProperties(const string &value) {
+	case_insensitive_map_t<vector<string>> result;
+	if (value.empty()) {
+		return result;
+	}
+	for (auto group : StringUtil::Split(value, ";")) {
+		StringUtil::Trim(group);
+		if (group.empty()) {
+			continue;
+		}
+		auto parts = StringUtil::Split(group, ":");
+		if (parts.size() != 2) {
+			continue;
+		}
+		auto vertex_col = parts[0];
+		StringUtil::Trim(vertex_col);
+		vector<string> properties;
+		for (auto prop : StringUtil::Split(parts[1], "|")) {
+			StringUtil::Trim(prop);
+			if (!prop.empty()) {
+				properties.push_back(prop);
+			}
+		}
+		if (!vertex_col.empty() && !properties.empty()) {
+			result[vertex_col] = std::move(properties);
+		}
+	}
+	return result;
+}
+
+static unique_ptr<ParsedExpression> RewriteCoveredPathColumns(unique_ptr<ParsedExpression> expr,
+                                                              const CoveredBindingMap &covered_columns) {
+	if (!expr) {
+		return expr;
+	}
+	if (auto col_ref = dynamic_cast<ColumnRefExpression *>(expr.get())) {
+		if (col_ref->column_names.size() == 2) {
+			auto binding_entry = covered_columns.find(col_ref->column_names[0]);
+			if (binding_entry != covered_columns.end()) {
+				auto prop_entry = binding_entry->second.find(col_ref->column_names[1]);
+				if (prop_entry != binding_entry->second.end()) {
+					auto replacement = make_uniq<ColumnRefExpression>(prop_entry->second.column_name,
+					                                                   prop_entry->second.table_alias);
+					replacement->alias = col_ref->alias;
+					return replacement;
+				}
+			}
+		}
+		return expr;
+	}
+	ParsedExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<ParsedExpression> &child) {
+		child = RewriteCoveredPathColumns(std::move(child), covered_columns);
+	});
+	return expr;
+}
+
+static void RewriteCoveredPathColumns(vector<unique_ptr<ParsedExpression>> &expressions,
+                                      const CoveredBindingMap &covered_columns) {
+	for (auto &expr : expressions) {
+		expr = RewriteCoveredPathColumns(std::move(expr), covered_columns);
+	}
+}
+
+static bool BindingReferencesOnlyCovered(const MatchExpression &ref, const string &binding,
+                                         const CoveredPropertyMap &covered_properties) {
+	if (binding.empty()) {
+		return true;
+	}
+	bool referenced = false;
+	bool unsupported = false;
+	auto inspect_expr = [&](const ParsedExpression *expr) {
+		if (!expr || unsupported) {
+			return;
+		}
+		ParsedExpressionIterator::VisitExpression<ColumnRefExpression>(
+		    *expr, [&](const ColumnRefExpression &col_ref) {
+			    if (unsupported || col_ref.column_names.empty() ||
+			        !StringUtil::CIEquals(col_ref.column_names[0], binding)) {
+				    return;
+			    }
+			    referenced = true;
+			    if (col_ref.column_names.size() != 2 ||
+			        covered_properties.find(col_ref.column_names[1]) == covered_properties.end()) {
+				    unsupported = true;
+			    }
+		    });
+		ParsedExpressionIterator::VisitExpression<StarExpression>(
+		    *expr, [&](const StarExpression &star_ref) {
+			    if (!star_ref.relation_name.empty() && StringUtil::CIEquals(star_ref.relation_name, binding)) {
+				    referenced = true;
+				    unsupported = true;
+			    }
+		    });
+		ParsedExpressionIterator::VisitExpression<FunctionExpression>(
+		    *expr, [&](const FunctionExpression &func_ref) {
+			    if (unsupported) {
+				    return;
+			    }
+			    for (const auto &child : func_ref.children) {
+				    auto *col_ref = dynamic_cast<ColumnRefExpression *>(child.get());
+				    if (col_ref && col_ref->column_names.size() == 1 &&
+				        StringUtil::CIEquals(col_ref->column_names[0], binding)) {
+					    referenced = true;
+					    unsupported = true;
+				    }
+			    }
+		    });
+	};
+	for (const auto &expr : ref.column_list) {
+		inspect_expr(expr.get());
+	}
+	inspect_expr(ref.where_clause.get());
+	return referenced && !unsupported;
+}
+
+static bool MatchOnlyUsesKeyColumns(const MatchExpression &ref,
+                                    const case_insensitive_map_t<string> &allowed_key_columns) {
+	for (const auto &expr : ref.column_list) {
+		if (!ExpressionOnlyUsesKeyColumns(expr.get(), allowed_key_columns)) {
+			return false;
+		}
+	}
+	return ExpressionOnlyUsesKeyColumns(ref.where_clause.get(), allowed_key_columns);
+}
+
+static bool ContainsUnsupportedChainBatchExpression(const ParsedExpression *expr) {
+	if (!expr) {
+		return false;
+	}
+	bool unsupported = false;
+	ParsedExpressionIterator::VisitExpression<ColumnRefExpression>(
+	    *expr, [&](const ColumnRefExpression &col_ref) {
+		    if (!col_ref.column_names.empty() && StringUtil::CIEquals(col_ref.column_names.back(), "rowid")) {
+			    unsupported = true;
+		    }
+	    });
+	ParsedExpressionIterator::VisitExpression<FunctionExpression>(
+	    *expr, [&](const FunctionExpression &func) {
+		    if (StringUtil::CIEquals(func.function_name, "element_id")) {
+			    unsupported = true;
+		    }
+	    });
+	return unsupported;
+}
+
+static bool MatchContainsUnsupportedChainBatchExpression(const MatchExpression &ref) {
+	for (const auto &expr : ref.column_list) {
+		if (ContainsUnsupportedChainBatchExpression(expr.get())) {
+			return true;
+		}
+	}
+	return ContainsUnsupportedChainBatchExpression(ref.where_clause.get());
+}
+
+static bool RequireABIPaths(ClientContext &context) {
+	Value value;
+	auto result = context.TryGetCurrentSetting("pgq_require_abi_paths", value);
+	return result && !value.IsNull() && value.GetValue<bool>();
+}
+
+static void ThrowABIPathRequired() {
+	throw BinderException(
+	    "DuckPGQ ABI path required by pgq_require_abi_paths, but no matching ABI path table rewrite was available. "
+	    "Generate the required ABI path metadata/table or SET pgq_require_abi_paths=false to allow fallback traversal.");
+}
+
+static string OneRowPerModeToString(OneRowPerMode mode) {
+	switch (mode) {
+	case OneRowPerMode::VERTEX:
+		return "vertex";
+	case OneRowPerMode::EDGE:
+		return "edge";
+	case OneRowPerMode::STEP:
+		return "step";
+	case OneRowPerMode::NONE:
+	default:
+		return "none";
+	}
+}
+
+static string JoinLabelSequence(const vector<string> &labels) {
+	return StringUtil::Join(labels, ",");
+}
+
+static PGQRewriteDiagnostic MakeArtifactDiagnostic(const string &graph_name, const string &rewrite_type,
+                                                   const string &reason, const PGQPathTableInfo &info,
+                                                   const vector<string> &vertex_sequence,
+                                                   const vector<string> &edge_sequence,
+                                                   const string &table_alias,
+                                                   OneRowPerMode one_row_per_mode) {
+	PGQRewriteDiagnostic diagnostic;
+	diagnostic.graph_name = graph_name;
+	diagnostic.rewrite_type = rewrite_type;
+	diagnostic.status = "selected";
+	diagnostic.reason = reason;
+	diagnostic.catalog_name = info.catalog_name;
+	diagnostic.schema_name = info.schema_name;
+	diagnostic.path_table_name = info.table_name;
+	diagnostic.path_kind = info.path_kind;
+	diagnostic.vertex_label_sequence = vertex_sequence.empty() ? info.vertex_label_sequence : JoinLabelSequence(vertex_sequence);
+	diagnostic.edge_label_sequence = edge_sequence.empty() ? info.edge_label_sequence : JoinLabelSequence(edge_sequence);
+	diagnostic.table_alias = table_alias;
+	diagnostic.one_row_per_mode = OneRowPerModeToString(one_row_per_mode);
+	diagnostic.estimated_rows = info.estimated_rows;
+	diagnostic.min_depth = info.min_depth;
+	diagnostic.max_depth = info.max_depth;
+	diagnostic.semantic_grain = info.semantic_grain;
+	diagnostic.temporal_mode = info.temporal_mode;
+	diagnostic.multiplicity_mode = info.multiplicity_mode;
+	diagnostic.property_support = info.property_support;
+	diagnostic.freshness_policy = info.freshness_policy;
+	diagnostic.supports_one_row_per_step = info.supports_one_row_per_step;
+	diagnostic.is_deduplicated = info.is_deduplicated;
+	diagnostic.is_sorted_by_v0 = info.is_sorted_by_v0;
+	return diagnostic;
+}
+
+static void RecordRewriteDiagnostic(ClientContext &context, PGQRewriteDiagnostic diagnostic) {
+	auto duckpgq_state = GetDuckPGQState(context);
+	diagnostic.sequence_id = duckpgq_state->rewrite_diagnostic_sequence++;
+	duckpgq_state->rewrite_diagnostics.push_back(std::move(diagnostic));
+}
+
+static bool PathPatternRequiresABIPath(const vector<unique_ptr<PathReference>> &path_elements) {
+	return path_elements.size() >= 3;
 }
 
 // Rewrite element_id(x) → x.rowid and label(x) → constant string in WHERE clause expressions.
@@ -969,6 +2043,9 @@ PGQMatchFunction::GenerateShortestPathCTE(CreatePropertyGraphInfo &pg_table, Sub
 
 	select_statement->node = std::move(select_node);
 	cte_info->query = std::move(select_statement);
+	// Materialise so downstream CTEs (e.g. __orp_steps) receive the exact path result rather than
+	// re-evaluating the shortestpath() aggregate per outer-query row.
+	cte_info->materialized = CTEMaterialize::CTE_MATERIALIZE_ALWAYS;
 	return cte_info;
 }
 
@@ -1175,13 +2252,406 @@ PGQMatchFunction::AddPathQuantifierCondition(const string &prev_binding, const s
 	return std::move(between_expression);
 }
 
+// Generate a WITH RECURSIVE CTE for ONE ROW PER [STEP|VERTEX|EDGE] on bounded directed paths.
+// Replaces the CSR + shortestpath() approach so only reachable rows are read.
+//
+// Builds two CTEs:
+//   1. "__rvl_orp_N" — recursive, tracks (src_rowid, cur_rowid, depth, visited, path)
+//      where path is an interleaved BIGINT[] list: [v0, e1, v1, e2, v2, ..., eK, vK]
+//   2. "shortest_path_cte" — thin wrapper that renames cur_rowid → dst_rowid and
+//      filters depth BETWEEN lower AND upper.  ApplyOneRowPer and BuildORPStepsCTE
+//      consume "shortest_path_cte" unchanged.
+static void AddBoundedORPRecursiveCTE(unique_ptr<SelectNode> &select_node, const string &prev_binding,
+                                      const string &next_binding,
+                                      const shared_ptr<PropertyGraphTable> &edge_table, idx_t lower, idx_t upper,
+                                      unique_ptr<ParsedExpression> anchor_filter) {
+	const string &src_pk = edge_table->source_pk[0];
+	const string &dst_pk = edge_table->destination_pk[0];
+	const string &src_fk = edge_table->source_fk[0];
+	const string &dst_fk = edge_table->destination_fk[0];
+
+	const auto cte_idx = select_node->cte_map.map.size();
+	const string cte_name = "__rvl_orp_" + std::to_string(cte_idx);
+	const string mid_alias = "_orp_mid_" + std::to_string(cte_idx);
+	const string e_alias = "_orp_e_" + std::to_string(cte_idx);
+	const string b_alias = "_orp_b_" + std::to_string(cte_idx);
+	const string rec_alias = "_orp_r_" + std::to_string(cte_idx);
+
+	// ── ANCHOR ──────────────────────────────────────────────────────────────────
+	// SELECT v.rowid AS src_rowid, v.rowid AS cur_rowid, 0 AS depth,
+	//        list_value(v.rowid) AS visited, list_value(v.rowid)::BIGINT[] AS path
+	auto anchor = make_uniq<SelectNode>();
+	anchor->from_table = edge_table->source_pg_table->CreateBaseTableRef(prev_binding);
+
+	auto a_src = make_uniq<ColumnRefExpression>("rowid", prev_binding);
+	a_src->alias = "src_rowid";
+	anchor->select_list.push_back(std::move(a_src));
+
+	auto a_cur = make_uniq<ColumnRefExpression>("rowid", prev_binding);
+	a_cur->alias = "cur_rowid";
+	anchor->select_list.push_back(std::move(a_cur));
+
+	auto a_depth = make_uniq<ConstantExpression>(Value::INTEGER(0));
+	a_depth->alias = "depth";
+	anchor->select_list.push_back(std::move(a_depth));
+
+	{
+		vector<unique_ptr<ParsedExpression>> lv;
+		lv.push_back(make_uniq<ColumnRefExpression>("rowid", prev_binding));
+		auto a_vis = make_uniq<FunctionExpression>("list_value", std::move(lv));
+		a_vis->alias = "visited";
+		anchor->select_list.push_back(std::move(a_vis));
+	}
+	{
+		vector<unique_ptr<ParsedExpression>> lv;
+		lv.push_back(make_uniq<ColumnRefExpression>("rowid", prev_binding));
+		auto a_path = make_uniq<FunctionExpression>("list_value", std::move(lv));
+		a_path->alias = "path";
+		anchor->select_list.push_back(std::move(a_path));
+	}
+	if (anchor_filter) {
+		anchor->where_clause = std::move(anchor_filter);
+	}
+
+	// ── RECURSIVE STEP ──────────────────────────────────────────────────────────
+	// SELECT r.src_rowid, b.rowid AS cur_rowid, r.depth+1,
+	//        list_append(r.visited, b.rowid),
+	//        list_append(list_append(r.path, e.rowid), b.rowid)
+	// FROM cte_name r
+	//   JOIN src_table mid ON mid.rowid = r.cur_rowid
+	//   JOIN edge_table e  ON e.src_fk  = mid.src_pk
+	//   JOIN dst_table b   ON b.dst_pk  = e.dst_fk
+	// WHERE r.depth < upper AND NOT list_contains(r.visited, b.rowid)
+	auto recursive = make_uniq<SelectNode>();
+
+	auto cte_ref = make_uniq<BaseTableRef>();
+	cte_ref->table_name = cte_name;
+	cte_ref->alias = rec_alias;
+
+	auto mid_ref = edge_table->source_pg_table->CreateBaseTableRef(mid_alias);
+	auto join_mid = make_uniq<JoinRef>(JoinRefType::REGULAR);
+	join_mid->type = JoinType::INNER;
+	join_mid->left = std::move(cte_ref);
+	join_mid->right = std::move(mid_ref);
+	join_mid->condition = make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+	                                                      make_uniq<ColumnRefExpression>("rowid", mid_alias),
+	                                                      make_uniq<ColumnRefExpression>("cur_rowid", rec_alias));
+
+	auto e_ref = edge_table->CreateBaseTableRef(e_alias);
+	auto join_e = make_uniq<JoinRef>(JoinRefType::REGULAR);
+	join_e->type = JoinType::INNER;
+	join_e->left = std::move(join_mid);
+	join_e->right = std::move(e_ref);
+	join_e->condition = make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+	                                                    make_uniq<ColumnRefExpression>(src_fk, e_alias),
+	                                                    make_uniq<ColumnRefExpression>(src_pk, mid_alias));
+
+	auto b_ref = edge_table->destination_pg_table->CreateBaseTableRef(b_alias);
+	auto join_b = make_uniq<JoinRef>(JoinRefType::REGULAR);
+	join_b->type = JoinType::INNER;
+	join_b->left = std::move(join_e);
+	join_b->right = std::move(b_ref);
+	join_b->condition = make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+	                                                    make_uniq<ColumnRefExpression>(dst_pk, b_alias),
+	                                                    make_uniq<ColumnRefExpression>(dst_fk, e_alias));
+	recursive->from_table = std::move(join_b);
+
+	auto r_src = make_uniq<ColumnRefExpression>("src_rowid", rec_alias);
+	r_src->alias = "src_rowid";
+	recursive->select_list.push_back(std::move(r_src));
+
+	auto r_cur = make_uniq<ColumnRefExpression>("rowid", b_alias);
+	r_cur->alias = "cur_rowid";
+	recursive->select_list.push_back(std::move(r_cur));
+
+	{
+		vector<unique_ptr<ParsedExpression>> add_args;
+		add_args.push_back(make_uniq<ColumnRefExpression>("depth", rec_alias));
+		add_args.push_back(make_uniq<ConstantExpression>(Value::INTEGER(1)));
+		auto r_depth = make_uniq<FunctionExpression>("add", std::move(add_args));
+		r_depth->alias = "depth";
+		recursive->select_list.push_back(std::move(r_depth));
+	}
+	{
+		vector<unique_ptr<ParsedExpression>> app_args;
+		app_args.push_back(make_uniq<ColumnRefExpression>("visited", rec_alias));
+		app_args.push_back(make_uniq<ColumnRefExpression>("rowid", b_alias));
+		auto r_vis = make_uniq<FunctionExpression>("list_append", std::move(app_args));
+		r_vis->alias = "visited";
+		recursive->select_list.push_back(std::move(r_vis));
+	}
+	{
+		// path = list_append(list_append(r.path, e.rowid), b.rowid)
+		vector<unique_ptr<ParsedExpression>> inner_args;
+		inner_args.push_back(make_uniq<ColumnRefExpression>("path", rec_alias));
+		inner_args.push_back(make_uniq<ColumnRefExpression>("rowid", e_alias));
+		auto inner = make_uniq<FunctionExpression>("list_append", std::move(inner_args));
+		vector<unique_ptr<ParsedExpression>> outer_args;
+		outer_args.push_back(std::move(inner));
+		outer_args.push_back(make_uniq<ColumnRefExpression>("rowid", b_alias));
+		auto r_path = make_uniq<FunctionExpression>("list_append", std::move(outer_args));
+		r_path->alias = "path";
+		recursive->select_list.push_back(std::move(r_path));
+	}
+	{
+		vector<unique_ptr<ParsedExpression>> rec_where;
+		rec_where.push_back(make_uniq<ComparisonExpression>(
+		    ExpressionType::COMPARE_LESSTHAN, make_uniq<ColumnRefExpression>("depth", rec_alias),
+		    make_uniq<ConstantExpression>(Value::INTEGER(static_cast<int32_t>(upper)))));
+		vector<unique_ptr<ParsedExpression>> lc_args;
+		lc_args.push_back(make_uniq<ColumnRefExpression>("visited", rec_alias));
+		lc_args.push_back(make_uniq<ColumnRefExpression>("rowid", b_alias));
+		auto lc = make_uniq<FunctionExpression>("list_contains", std::move(lc_args));
+		rec_where.push_back(make_uniq<OperatorExpression>(ExpressionType::OPERATOR_NOT, std::move(lc)));
+		recursive->where_clause = PGQMatchFunction::CreateWhereClause(rec_where);
+	}
+
+	// ── RecursiveCTENode ────────────────────────────────────────────────────────
+	auto rec_cte = make_uniq<RecursiveCTENode>();
+	rec_cte->ctename = cte_name;
+	rec_cte->union_all = true;
+	rec_cte->left = std::move(anchor);
+	rec_cte->right = std::move(recursive);
+	rec_cte->aliases = {"src_rowid", "cur_rowid", "depth", "visited", "path"};
+
+	auto cte_stmt = make_uniq<SelectStatement>();
+	cte_stmt->node = std::move(rec_cte);
+	auto cte_info = make_uniq<CommonTableExpressionInfo>();
+	cte_info->query = std::move(cte_stmt);
+	select_node->cte_map.map[cte_name] = std::move(cte_info);
+
+	// ── "shortest_path_cte" wrapper ─────────────────────────────────────────────
+	// ApplyOneRowPer / BuildORPStepsCTE expect a CTE named "shortest_path_cte"
+	// with columns (path, src_rowid, dst_rowid).  We produce that here by wrapping
+	// the recursive CTE and renaming cur_rowid → dst_rowid, filtering depth range.
+	auto wrapper = make_uniq<SelectNode>();
+
+	auto w_path = make_uniq<ColumnRefExpression>("path", cte_name);
+	wrapper->select_list.push_back(std::move(w_path));
+
+	auto w_src = make_uniq<ColumnRefExpression>("src_rowid", cte_name);
+	w_src->alias = "src_rowid";
+	wrapper->select_list.push_back(std::move(w_src));
+
+	auto w_dst = make_uniq<ColumnRefExpression>("cur_rowid", cte_name);
+	w_dst->alias = "dst_rowid";
+	wrapper->select_list.push_back(std::move(w_dst));
+
+	auto wrapper_from = make_uniq<BaseTableRef>();
+	wrapper_from->table_name = cte_name;
+	wrapper->from_table = std::move(wrapper_from);
+
+	wrapper->where_clause = make_uniq<BetweenExpression>(
+	    make_uniq<ColumnRefExpression>("depth", cte_name),
+	    make_uniq<ConstantExpression>(Value::INTEGER(static_cast<int32_t>(lower))),
+	    make_uniq<ConstantExpression>(Value::INTEGER(static_cast<int32_t>(upper))));
+
+	auto wrapper_stmt = make_uniq<SelectStatement>();
+	wrapper_stmt->node = std::move(wrapper);
+	auto wrapper_info = make_uniq<CommonTableExpressionInfo>();
+	wrapper_info->query = std::move(wrapper_stmt);
+	wrapper_info->materialized = CTEMaterialize::CTE_MATERIALIZE_ALWAYS;
+	select_node->cte_map.map["shortest_path_cte"] = std::move(wrapper_info);
+}
+
+// Generate a WITH RECURSIVE CTE for single-label bounded directed VL path finding.
+// Avoids building a full CSR; instead, BFS expands only from the (optionally filtered)
+// source vertices.  anchor_filter is a copy of any outer WHERE conjuncts that reference
+// only prev_binding — pushing them in limits the anchor to matched source rows.
+//
+// Produces columns: (src_rowid, dst_rowid, depth, visited).
+// Outer conditions added: prev_binding.rowid = cte.src_rowid,
+//                         next_binding.rowid = cte.dst_rowid,
+//                         depth BETWEEN lower AND upper.
+static void AddBoundedVLPathFinding(unique_ptr<SelectNode> &select_node,
+                                    vector<unique_ptr<ParsedExpression>> &conditions, const string &prev_binding,
+                                    const string &next_binding, const shared_ptr<PropertyGraphTable> &edge_table,
+                                    idx_t lower, idx_t upper, unique_ptr<ParsedExpression> anchor_filter) {
+	const string &src_pk = edge_table->source_pk[0];
+	const string &dst_pk = edge_table->destination_pk[0];
+	const string &src_fk = edge_table->source_fk[0];
+	const string &dst_fk = edge_table->destination_fk[0];
+
+	const auto cte_idx = select_node->cte_map.map.size();
+	const string cte_name = "__rvl_" + std::to_string(cte_idx);
+	const string cte_alias = "__rvl_a_" + std::to_string(cte_idx);
+	// Internal aliases used only inside the recursive step — must not clash with outer bindings.
+	const string mid_alias = "_rvl_mid_" + std::to_string(cte_idx);
+	const string e_alias = "_rvl_e_" + std::to_string(cte_idx);
+	const string b_alias = "_rvl_b_" + std::to_string(cte_idx);
+	const string rec_alias = "_rvl_r_" + std::to_string(cte_idx);
+
+	// ── ANCHOR ──────────────────────────────────────────────────────────────────
+	// SELECT prev.rowid AS src_rowid, prev.rowid AS dst_rowid, 0 AS depth,
+	//        list_value(prev.rowid) AS visited
+	// FROM src_table AS prev_binding
+	// [WHERE anchor_filter]
+	auto anchor = make_uniq<SelectNode>();
+	anchor->from_table = edge_table->source_pg_table->CreateBaseTableRef(prev_binding);
+
+	auto a_src = make_uniq<ColumnRefExpression>("rowid", prev_binding);
+	a_src->alias = "src_rowid";
+	anchor->select_list.push_back(std::move(a_src));
+
+	auto a_dst = make_uniq<ColumnRefExpression>("rowid", prev_binding);
+	a_dst->alias = "dst_rowid";
+	anchor->select_list.push_back(std::move(a_dst));
+
+	auto a_depth = make_uniq<ConstantExpression>(Value::INTEGER(0));
+	a_depth->alias = "depth";
+	anchor->select_list.push_back(std::move(a_depth));
+
+	{
+		vector<unique_ptr<ParsedExpression>> lv;
+		lv.push_back(make_uniq<ColumnRefExpression>("rowid", prev_binding));
+		auto a_visited = make_uniq<FunctionExpression>("list_value", std::move(lv));
+		a_visited->alias = "visited";
+		anchor->select_list.push_back(std::move(a_visited));
+	}
+
+	if (anchor_filter) {
+		anchor->where_clause = std::move(anchor_filter);
+	}
+
+	// ── RECURSIVE STEP ──────────────────────────────────────────────────────────
+	// SELECT r.src_rowid, b.rowid AS dst_rowid, r.depth + 1,
+	//        list_append(r.visited, b.rowid)
+	// FROM <cte_name> AS r
+	// INNER JOIN src_table AS mid ON mid.rowid = r.dst_rowid
+	// INNER JOIN edge_table AS e  ON e.src_fk  = mid.src_pk
+	// INNER JOIN dst_table AS b   ON b.dst_pk  = e.dst_fk
+	// WHERE r.depth < upper AND NOT list_contains(r.visited, b.rowid)
+	auto recursive = make_uniq<SelectNode>();
+
+	auto cte_ref = make_uniq<BaseTableRef>();
+	cte_ref->table_name = cte_name;
+	cte_ref->alias = rec_alias;
+
+	// JOIN src_table AS mid ON mid.rowid = r.dst_rowid
+	auto mid_ref = edge_table->source_pg_table->CreateBaseTableRef(mid_alias);
+	auto join_mid = make_uniq<JoinRef>(JoinRefType::REGULAR);
+	join_mid->type = JoinType::INNER;
+	join_mid->left = std::move(cte_ref);
+	join_mid->right = std::move(mid_ref);
+	join_mid->condition = make_uniq<ComparisonExpression>(
+	    ExpressionType::COMPARE_EQUAL, make_uniq<ColumnRefExpression>("rowid", mid_alias),
+	    make_uniq<ColumnRefExpression>("dst_rowid", rec_alias));
+
+	// JOIN edge_table AS e ON e.src_fk = mid.src_pk
+	auto e_ref = edge_table->CreateBaseTableRef(e_alias);
+	auto join_e = make_uniq<JoinRef>(JoinRefType::REGULAR);
+	join_e->type = JoinType::INNER;
+	join_e->left = std::move(join_mid);
+	join_e->right = std::move(e_ref);
+	join_e->condition = make_uniq<ComparisonExpression>(
+	    ExpressionType::COMPARE_EQUAL, make_uniq<ColumnRefExpression>(src_fk, e_alias),
+	    make_uniq<ColumnRefExpression>(src_pk, mid_alias));
+
+	// JOIN dst_table AS b ON b.dst_pk = e.dst_fk
+	auto b_ref = edge_table->destination_pg_table->CreateBaseTableRef(b_alias);
+	auto join_b = make_uniq<JoinRef>(JoinRefType::REGULAR);
+	join_b->type = JoinType::INNER;
+	join_b->left = std::move(join_e);
+	join_b->right = std::move(b_ref);
+	join_b->condition = make_uniq<ComparisonExpression>(
+	    ExpressionType::COMPARE_EQUAL, make_uniq<ColumnRefExpression>(dst_pk, b_alias),
+	    make_uniq<ColumnRefExpression>(dst_fk, e_alias));
+	recursive->from_table = std::move(join_b);
+
+	auto r_src = make_uniq<ColumnRefExpression>("src_rowid", rec_alias);
+	r_src->alias = "src_rowid";
+	recursive->select_list.push_back(std::move(r_src));
+
+	auto r_dst = make_uniq<ColumnRefExpression>("rowid", b_alias);
+	r_dst->alias = "dst_rowid";
+	recursive->select_list.push_back(std::move(r_dst));
+
+	{
+		vector<unique_ptr<ParsedExpression>> add_args;
+		add_args.push_back(make_uniq<ColumnRefExpression>("depth", rec_alias));
+		add_args.push_back(make_uniq<ConstantExpression>(Value::INTEGER(1)));
+		auto r_depth = make_uniq<FunctionExpression>("add", std::move(add_args));
+		r_depth->alias = "depth";
+		recursive->select_list.push_back(std::move(r_depth));
+	}
+	{
+		vector<unique_ptr<ParsedExpression>> app_args;
+		app_args.push_back(make_uniq<ColumnRefExpression>("visited", rec_alias));
+		app_args.push_back(make_uniq<ColumnRefExpression>("rowid", b_alias));
+		auto r_visited = make_uniq<FunctionExpression>("list_append", std::move(app_args));
+		r_visited->alias = "visited";
+		recursive->select_list.push_back(std::move(r_visited));
+	}
+
+	{
+		vector<unique_ptr<ParsedExpression>> rec_where;
+		rec_where.push_back(make_uniq<ComparisonExpression>(
+		    ExpressionType::COMPARE_LESSTHAN, make_uniq<ColumnRefExpression>("depth", rec_alias),
+		    make_uniq<ConstantExpression>(Value::INTEGER(static_cast<int32_t>(upper)))));
+		vector<unique_ptr<ParsedExpression>> lc_args;
+		lc_args.push_back(make_uniq<ColumnRefExpression>("visited", rec_alias));
+		lc_args.push_back(make_uniq<ColumnRefExpression>("rowid", b_alias));
+		auto lc_fn = make_uniq<FunctionExpression>("list_contains", std::move(lc_args));
+		rec_where.push_back(make_uniq<OperatorExpression>(ExpressionType::OPERATOR_NOT, std::move(lc_fn)));
+		recursive->where_clause = PGQMatchFunction::CreateWhereClause(rec_where);
+	}
+
+	// ── Build RecursiveCTENode ───────────────────────────────────────────────────
+	auto rec_cte = make_uniq<RecursiveCTENode>();
+	rec_cte->ctename = cte_name;
+	rec_cte->union_all = true;
+	rec_cte->left = std::move(anchor);
+	rec_cte->right = std::move(recursive);
+	rec_cte->aliases = {"src_rowid", "dst_rowid", "depth", "visited"};
+
+	auto cte_stmt = make_uniq<SelectStatement>();
+	cte_stmt->node = std::move(rec_cte);
+	auto cte_info = make_uniq<CommonTableExpressionInfo>();
+	cte_info->query = std::move(cte_stmt);
+	select_node->cte_map.map[cte_name] = std::move(cte_info);
+
+	// ── Add CTE to FROM (cross join) ─────────────────────────────────────────────
+	auto cte_scan = make_uniq<BaseTableRef>();
+	cte_scan->table_name = cte_name;
+	cte_scan->alias = cte_alias;
+	if (select_node->from_table) {
+		auto cross = make_uniq<JoinRef>(JoinRefType::CROSS);
+		cross->left = std::move(select_node->from_table);
+		cross->right = std::move(cte_scan);
+		select_node->from_table = std::move(cross);
+	} else {
+		select_node->from_table = std::move(cte_scan);
+	}
+
+	// ── Outer WHERE conditions ────────────────────────────────────────────────────
+	conditions.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+	    make_uniq<ColumnRefExpression>("rowid", prev_binding),
+	    make_uniq<ColumnRefExpression>("src_rowid", cte_alias)));
+	conditions.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+	    make_uniq<ColumnRefExpression>("rowid", next_binding),
+	    make_uniq<ColumnRefExpression>("dst_rowid", cte_alias)));
+	conditions.push_back(make_uniq<BetweenExpression>(
+	    make_uniq<ColumnRefExpression>("depth", cte_alias),
+	    make_uniq<ConstantExpression>(Value::INTEGER(static_cast<int32_t>(lower))),
+	    make_uniq<ConstantExpression>(Value::INTEGER(static_cast<int32_t>(upper)))));
+}
+
 void PGQMatchFunction::AddPathFinding(unique_ptr<SelectNode> &select_node,
                                       vector<unique_ptr<ParsedExpression>> &conditions, const string &prev_binding,
                                       const string &edge_binding, const string &next_binding,
                                       const shared_ptr<PropertyGraphTable> &edge_table,
-                                      CreatePropertyGraphInfo &pg_table, SubPath *subpath, PGQMatchType edge_type) {
-	//! START
-	//! FROM (SELECT count(cte1.temp) * 0 as temp from cte1) __x
+                                      CreatePropertyGraphInfo &pg_table, SubPath *subpath, PGQMatchType edge_type,
+                                      unique_ptr<ParsedExpression> anchor_filter) {
+	// For finite bounded directed edges, use a recursive CTE instead of CSR+iterativelength.
+	// This reads only the reachable subgraph rather than the full edge/vertex tables,
+	// which is critical for large remote (httpfs) graphs in browser or constrained environments.
+	if (edge_type == PGQMatchType::MATCH_EDGE_RIGHT && subpath->upper < static_cast<idx_t>(1 << 30)) {
+		AddBoundedVLPathFinding(select_node, conditions, prev_binding, next_binding, edge_table, subpath->lower,
+		                        subpath->upper, std::move(anchor_filter));
+		return;
+	}
+
+	// Fallback: CSR+iterativelength for unbounded paths or non-directed edges.
 	if (select_node->cte_map.map.find("cte1") == select_node->cte_map.map.end()) {
 		if (edge_type == PGQMatchType::MATCH_EDGE_RIGHT) {
 			select_node->cte_map.map["cte1"] =
@@ -1199,8 +2669,6 @@ void PGQMatchFunction::AddPathFinding(unique_ptr<SelectNode> &select_node,
 	}
 	auto temp_cte_select_subquery = CreateCountCTESubquery();
 	if (select_node->from_table) {
-		// create a cross join since there is already something in the
-		// from clause
 		auto from_join = make_uniq<JoinRef>(JoinRefType::CROSS);
 		from_join->left = std::move(select_node->from_table);
 		from_join->right = std::move(temp_cte_select_subquery);
@@ -1208,16 +2676,7 @@ void PGQMatchFunction::AddPathFinding(unique_ptr<SelectNode> &select_node,
 	} else {
 		select_node->from_table = std::move(temp_cte_select_subquery);
 	}
-	//! END
-	//! FROM (SELECT count(cte1.temp) * 0 as temp from cte1) __x
-
-	//! START
-	//! WHERE __x.temp + iterativelength(<csr_id>, (SELECT count(c.id)
-	//!       from dst c, a.rowid, b.rowid) between lower and upper
 	conditions.push_back(AddPathQuantifierCondition(prev_binding, next_binding, edge_table, subpath));
-	//! END
-	//! WHERE __x.temp + iterativelength(<csr_id>, (SELECT count(s.id)
-	//! from src s, a.rowid, b.rowid) between lower and upper
 }
 
 void PGQMatchFunction::AddPathModeFilter(PGQPathMode mode, const string &path_cte,
@@ -1532,7 +2991,17 @@ void PGQMatchFunction::ProcessPathList(vector<unique_ptr<PathReference>> &path_l
 			return;
 		}
 	}
-	auto previous_vertex_table = ResolveTable(previous_vertex_element->label, previous_vertex_element->match_type, pg_table);
+	auto resolve_vertex_table = [&](PathElement *element) {
+		if (element->label.empty()) {
+			auto existing = alias_map.find(element->variable_binding);
+			if (existing != alias_map.end()) {
+				return existing->second;
+			}
+		}
+		return ResolveTable(element->label, element->match_type, pg_table);
+	};
+
+	auto previous_vertex_table = resolve_vertex_table(previous_vertex_element);
 	if (!previous_vertex_element->label.empty()) {
 		CheckInheritance(previous_vertex_table, previous_vertex_element, conditions);
 	}
@@ -1554,7 +3023,7 @@ void PGQMatchFunction::ProcessPathList(vector<unique_ptr<PathReference>> &path_l
 		    previous_vertex_element->match_type != PGQMatchType::MATCH_VERTEX) {
 			throw BinderException("Vertex and edge patterns must be alternated.");
 		}
-		auto next_vertex_table = ResolveTable(next_vertex_element->label, next_vertex_element->match_type, pg_table);
+		auto next_vertex_table = resolve_vertex_table(next_vertex_element);
 		if (!next_vertex_element->label.empty()) {
 			CheckInheritance(next_vertex_table, next_vertex_element, conditions);
 		}
@@ -1599,33 +3068,68 @@ void PGQMatchFunction::ProcessPathList(vector<unique_ptr<PathReference>> &path_l
 				                        edge_subpath->upper);
 			} else if (edge_subpath->upper > 1) {
 				if (original_ref.one_row_per != OneRowPerMode::NONE) {
-					// ONE ROW PER: use shortestpath() so we can unnest per-step data.
-					// Produce cte1 (CSR) + shortest_path_cte; ApplyOneRowPer handles FROM/WHERE.
-					if (final_select_node->cte_map.map.find("cte1") == final_select_node->cte_map.map.end()) {
-						if (edge_element->match_type == PGQMatchType::MATCH_EDGE_RIGHT) {
-							final_select_node->cte_map.map["cte1"] = CreateDirectedCSRCTE(
-							    edge_table, previous_vertex_element->variable_binding,
-							    edge_element->variable_binding, next_vertex_element->variable_binding);
-						} else if (edge_element->match_type == PGQMatchType::MATCH_EDGE_ANY) {
-							final_select_node->cte_map.map["cte1"] =
-							    CreateUndirectedCSRCTE(edge_table, final_select_node);
-						} else {
-							throw NotImplementedException("ONE ROW PER path finding is not supported for "
-							                              "left-directed or bidirectional edges");
-						}
-					}
+					// ONE ROW PER: produce path lists for per-step unnesting.
+					// For finite bounded directed edges use a recursive CTE (avoids full CSR read).
+					// Unbounded or undirected edges fall back to CSR + shortestpath().
 					static const string kPathCTE = "shortest_path_cte";
 					if (final_select_node->cte_map.map.find(kPathCTE) == final_select_node->cte_map.map.end()) {
-						vector<unique_ptr<ParsedExpression>> pfc;
-						final_select_node->cte_map.map[kPathCTE] = GenerateShortestPathCTE(
-						    pg_table, edge_subpath, previous_vertex_element, next_vertex_element, pfc, all_shortest);
+						if (edge_element->match_type == PGQMatchType::MATCH_EDGE_RIGHT &&
+						    edge_subpath->upper < static_cast<idx_t>(1 << 30)) {
+							// Recursive CTE path: reads only reachable rows.
+							unique_ptr<ParsedExpression> anchor_filter;
+							if (original_ref.where_clause) {
+								anchor_filter = ExtractSrcFilter(*original_ref.where_clause,
+								                                 previous_vertex_element->variable_binding);
+							}
+							AddBoundedORPRecursiveCTE(final_select_node,
+							                          previous_vertex_element->variable_binding,
+							                          next_vertex_element->variable_binding, edge_table,
+							                          edge_subpath->lower, edge_subpath->upper,
+							                          std::move(anchor_filter));
+						} else {
+							// CSR fallback for unbounded or undirected ONE ROW PER.
+							if (final_select_node->cte_map.map.find("cte1") ==
+							    final_select_node->cte_map.map.end()) {
+								if (edge_element->match_type == PGQMatchType::MATCH_EDGE_RIGHT) {
+									final_select_node->cte_map.map["cte1"] = CreateDirectedCSRCTE(
+									    edge_table, previous_vertex_element->variable_binding,
+									    edge_element->variable_binding,
+									    next_vertex_element->variable_binding);
+								} else if (edge_element->match_type == PGQMatchType::MATCH_EDGE_ANY) {
+									final_select_node->cte_map.map["cte1"] =
+									    CreateUndirectedCSRCTE(edge_table, final_select_node);
+								} else {
+									throw NotImplementedException(
+									    "ONE ROW PER path finding is not supported for "
+									    "left-directed or bidirectional edges");
+								}
+							}
+							vector<unique_ptr<ParsedExpression>> pfc;
+							final_select_node->cte_map.map[kPathCTE] = GenerateShortestPathCTE(
+							    pg_table, edge_subpath, previous_vertex_element, next_vertex_element, pfc,
+							    all_shortest);
+						}
 					}
 				} else {
-					// Normal case: use iterativelength() — just checks hop-bound, no path materialised.
+					// Normal case: bounded directed → recursive CTE; otherwise CSR+iterativelength.
+					// Extract any WHERE conjuncts that reference only the source binding so they can
+					// be pushed into the recursive CTE anchor (limits BFS to matched source rows).
+					unique_ptr<ParsedExpression> anchor_filter;
+					if (original_ref.where_clause) {
+						anchor_filter = ExtractSrcFilter(*original_ref.where_clause,
+						                                 previous_vertex_element->variable_binding);
+					}
 					AddPathFinding(final_select_node, conditions, previous_vertex_element->variable_binding,
 					               edge_element->variable_binding, next_vertex_element->variable_binding,
-					               edge_table, pg_table, edge_subpath, edge_element->match_type);
-					if (edge_subpath->path_mode != PGQPathMode::NONE &&
+					               edge_table, pg_table, edge_subpath, edge_element->match_type,
+					               std::move(anchor_filter));
+					// AddPathModeFilter references the shortest_path_cte produced by the CSR path.
+					// The recursive-CTE path (finite bounded directed) already prevents vertex revisits
+					// via list_contains cycle detection, so skip the filter there.
+					const bool used_recursive_cte =
+					    (edge_element->match_type == PGQMatchType::MATCH_EDGE_RIGHT &&
+					     edge_subpath->upper < static_cast<idx_t>(1 << 30));
+					if (!used_recursive_cte && edge_subpath->path_mode != PGQPathMode::NONE &&
 					    edge_subpath->path_mode != PGQPathMode::WALK) {
 						AddPathModeFilter(edge_subpath->path_mode, "shortest_path_cte", conditions);
 					}
@@ -1667,7 +3171,11 @@ void PGQMatchFunction::ProcessOptionalPathList(
     const vector<unique_ptr<PathPattern>> &opt_patterns, unique_ptr<SelectNode> &select_node,
     case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &opt_alias_map, CreatePropertyGraphInfo &pg_table,
     int32_t &extra_alias_counter,
-    const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &mandatory_alias_map) {
+    const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &mandatory_alias_map,
+    const PGQPathTableCache &path_table_cache,
+    bool require_abi_paths) {
+	const string &graph_name = pg_table.property_graph_name;
+
 	for (auto &path_pattern : opt_patterns) {
 		auto &path_elements = path_pattern->path_elements;
 		if (path_elements.empty()) {
@@ -1722,63 +3230,154 @@ void PGQMatchFunction::ProcessOptionalPathList(
 			const string &edge_binding = edge_elem->variable_binding;
 			const string &next_binding = next_elem->variable_binding;
 
-			// Build the ON conditions for the edge LEFT JOIN and the vertex LEFT JOIN.
-			// For MATCH_EDGE_RIGHT (a)-[e]->(b): e.src_fk=a.src_pk, b.dst_pk=e.dst_fk
-			// For MATCH_EDGE_LEFT  (a)<-[e]-(b): e.dst_fk=a.dst_pk, b.src_pk=e.src_fk
-			unique_ptr<ParsedExpression> edge_on_cond;
-			unique_ptr<ParsedExpression> vertex_on_cond;
+			// For 1-hop patterns (right-directed or left-directed), prefer a pre-computed
+			// path table over a bridge edge table scan. LEFT JOIN semantics are preserved:
+			// if no path table match, pt columns are NULL → next vertex LEFT JOIN is also NULL.
+			//
+			// Left-directed: (prev)<-[edge]-(next) → semantic source is next, semantic dest is prev.
+			// The path table `__pg_{graph}__{next_label}__{edge}__{prev_label}` covers this with
+			// pt.v0 = next's pk, pt.v1 = prev's pk. We join prev_binding.dst_pk = pt.v1 and
+			// next_binding.src_pk = pt.v0.
+			bool used_path_table = false;
+			const bool pt_left_dir = (edge_elem->match_type == PGQMatchType::MATCH_EDGE_LEFT);
+			if ((edge_elem->match_type == PGQMatchType::MATCH_EDGE_RIGHT || pt_left_dir) &&
+			    !edge_table->source_pk.empty() && !edge_table->destination_pk.empty()) {
+				// For right-directed: table is prev_label__edge__next_label, v0=prev pk, v1=next pk.
+				// For left-directed:  table is next_label__edge__prev_label, v0=next pk, v1=prev pk.
+				const string pt_tname = pt_left_dir
+				    ? "__pg_" + graph_name + "__" + next_vertex_table->main_label + "__" +
+				      edge_table->main_label + "__" + prev_vertex_table->main_label
+				    : "__pg_" + graph_name + "__" + prev_vertex_table->main_label + "__" +
+				      edge_table->main_label + "__" + next_vertex_table->main_label;
+				vector<string> vertex_sequence = pt_left_dir
+				    ? vector<string> {next_vertex_table->main_label, prev_vertex_table->main_label}
+				    : vector<string> {prev_vertex_table->main_label, next_vertex_table->main_label};
+				auto path_info = FindPathTableInfo(path_table_cache, pt_tname, "edge", vertex_sequence,
+				                                   {edge_table->main_label});
+				if (path_info) {
+					const string pt_alias = "_pgq_pt_" + std::to_string(extra_alias_counter++);
+					// v0_binding: for right-directed = prev, for left-directed = next
+					// v1_binding: for right-directed = next, for left-directed = prev
+					const string &v0_binding = pt_left_dir ? next_binding : prev_binding;
+					const string &v1_binding = pt_left_dir ? prev_binding : next_binding;
+					const string &v0_pk = edge_table->source_pk[0];
+					const string &v1_pk = edge_table->destination_pk[0];
 
-			if (edge_elem->match_type == PGQMatchType::MATCH_EDGE_RIGHT) {
-				CheckEdgeTableConstraints(prev_vertex_table->table_name, next_vertex_table->table_name, edge_table);
-				edge_on_cond =
-				    CreateMatchJoinExpression(edge_table->source_pk, edge_table->source_fk, prev_binding, edge_binding);
-				vertex_on_cond = CreateMatchJoinExpression(edge_table->destination_pk, edge_table->destination_fk,
-				                                           next_binding, edge_binding);
-			} else {
-				// MATCH_EDGE_LEFT: (prev)<-[edge]-(next), so edge flows next→prev
-				CheckEdgeTableConstraints(next_vertex_table->table_name, prev_vertex_table->table_name, edge_table);
-				edge_on_cond = CreateMatchJoinExpression(edge_table->destination_pk, edge_table->destination_fk,
-				                                         prev_binding, edge_binding);
-				vertex_on_cond =
-				    CreateMatchJoinExpression(edge_table->source_pk, edge_table->source_fk, next_binding, edge_binding);
-			}
+					// LEFT JOIN path_table pt ON (v0_binding.src_pk = pt.v0)
+					{
+						auto bt          = make_uniq<BaseTableRef>();
+						bt->catalog_name = path_info->catalog_name;
+						bt->schema_name  = path_info->schema_name;
+						bt->table_name   = path_info->table_name;
+						bt->alias        = pt_alias;
+						auto on_cond = make_uniq<ComparisonExpression>(
+						    ExpressionType::COMPARE_EQUAL,
+						    make_uniq<ColumnRefExpression>(v0_pk, v0_binding),
+						    make_uniq<ColumnRefExpression>("v0", pt_alias));
+						auto left_join       = make_uniq<JoinRef>(JoinRefType::REGULAR);
+						left_join->type      = JoinType::LEFT;
+						left_join->left      = std::move(select_node->from_table);
+						left_join->right     = std::move(bt);
+						left_join->condition = std::move(on_cond);
+						select_node->from_table = std::move(left_join);
+					}
 
-			// If the next vertex has a sub-label condition, fold it into the vertex ON clause.
-			if (!next_elem->label.empty()) {
-				vector<unique_ptr<ParsedExpression>> label_conds;
-				CheckInheritance(next_vertex_table, next_elem, label_conds);
-				if (!label_conds.empty()) {
-					auto label_cond = CreateWhereClause(label_conds);
-					vertex_on_cond = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND,
-					                                                   std::move(vertex_on_cond),
-					                                                   std::move(label_cond));
+					// LEFT JOIN the v1 vertex (semantic destination) ON (v1_binding.dst_pk = pt.v1)
+					// For right-directed: v1_binding = next_binding, vertex table = next_vertex_table
+					// For left-directed:  v1_binding = prev_binding, vertex table = prev_vertex_table
+					{
+						// v1 is the semantic destination vertex
+						const shared_ptr<PropertyGraphTable> &v1_vtable = pt_left_dir ? prev_vertex_table : next_vertex_table;
+						PathElement *v1_elem = pt_left_dir ? prev_elem : next_elem;
+						unique_ptr<ParsedExpression> vertex_on_cond = make_uniq<ComparisonExpression>(
+						    ExpressionType::COMPARE_EQUAL,
+						    make_uniq<ColumnRefExpression>(v1_pk, v1_binding),
+						    make_uniq<ColumnRefExpression>("v1", pt_alias));
+						if (!v1_elem->label.empty()) {
+							vector<unique_ptr<ParsedExpression>> label_conds;
+							CheckInheritance(v1_vtable, v1_elem, label_conds);
+							if (!label_conds.empty()) {
+								vertex_on_cond = make_uniq<ConjunctionExpression>(
+								    ExpressionType::CONJUNCTION_AND,
+								    std::move(vertex_on_cond), CreateWhereClause(label_conds));
+							}
+						}
+						auto vertex_ref      = v1_vtable->CreateBaseTableRef(v1_binding);
+						auto left_join       = make_uniq<JoinRef>(JoinRefType::REGULAR);
+						left_join->type      = JoinType::LEFT;
+						left_join->left      = std::move(select_node->from_table);
+						left_join->right     = std::move(vertex_ref);
+						left_join->condition = std::move(vertex_on_cond);
+						select_node->from_table = std::move(left_join);
+					}
+
+					opt_alias_map[next_binding] = next_vertex_table;
+					used_path_table = true;
 				}
 			}
 
-			// LEFT JOIN edge table ON edge_on_cond
-			{
-				auto edge_ref = edge_table->CreateBaseTableRef(edge_binding);
-				auto left_join = make_uniq<JoinRef>(JoinRefType::REGULAR);
-				left_join->type = JoinType::LEFT;
-				left_join->left = std::move(select_node->from_table);
-				left_join->right = std::move(edge_ref);
-				left_join->condition = std::move(edge_on_cond);
-				select_node->from_table = std::move(left_join);
-			}
+			if (!used_path_table) {
+				if (require_abi_paths) {
+					ThrowABIPathRequired();
+				}
+				// Build the ON conditions for the edge LEFT JOIN and the vertex LEFT JOIN.
+				// For MATCH_EDGE_RIGHT (a)-[e]->(b): e.src_fk=a.src_pk, b.dst_pk=e.dst_fk
+				// For MATCH_EDGE_LEFT  (a)<-[e]-(b): e.dst_fk=a.dst_pk, b.src_pk=e.src_fk
+				unique_ptr<ParsedExpression> edge_on_cond;
+				unique_ptr<ParsedExpression> vertex_on_cond;
 
-			// LEFT JOIN next vertex table ON vertex_on_cond
-			{
-				auto vertex_ref = next_vertex_table->CreateBaseTableRef(next_binding);
-				auto left_join = make_uniq<JoinRef>(JoinRefType::REGULAR);
-				left_join->type = JoinType::LEFT;
-				left_join->left = std::move(select_node->from_table);
-				left_join->right = std::move(vertex_ref);
-				left_join->condition = std::move(vertex_on_cond);
-				select_node->from_table = std::move(left_join);
-			}
+				if (edge_elem->match_type == PGQMatchType::MATCH_EDGE_RIGHT) {
+					CheckEdgeTableConstraints(prev_vertex_table->table_name, next_vertex_table->table_name, edge_table);
+					edge_on_cond =
+					    CreateMatchJoinExpression(edge_table->source_pk, edge_table->source_fk, prev_binding, edge_binding);
+					vertex_on_cond = CreateMatchJoinExpression(edge_table->destination_pk, edge_table->destination_fk,
+					                                           next_binding, edge_binding);
+				} else {
+					// MATCH_EDGE_LEFT: (prev)<-[edge]-(next), so edge flows next→prev
+					CheckEdgeTableConstraints(next_vertex_table->table_name, prev_vertex_table->table_name, edge_table);
+					edge_on_cond = CreateMatchJoinExpression(edge_table->destination_pk, edge_table->destination_fk,
+					                                         prev_binding, edge_binding);
+					vertex_on_cond =
+					    CreateMatchJoinExpression(edge_table->source_pk, edge_table->source_fk, next_binding, edge_binding);
+				}
 
-			opt_alias_map[edge_binding] = edge_table;
-			opt_alias_map[next_binding] = next_vertex_table;
+				// If the next vertex has a sub-label condition, fold it into the vertex ON clause.
+				if (!next_elem->label.empty()) {
+					vector<unique_ptr<ParsedExpression>> label_conds;
+					CheckInheritance(next_vertex_table, next_elem, label_conds);
+					if (!label_conds.empty()) {
+						auto label_cond = CreateWhereClause(label_conds);
+						vertex_on_cond = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND,
+						                                                   std::move(vertex_on_cond),
+						                                                   std::move(label_cond));
+					}
+				}
+
+				// LEFT JOIN edge table ON edge_on_cond
+				{
+					auto edge_ref = edge_table->CreateBaseTableRef(edge_binding);
+					auto left_join = make_uniq<JoinRef>(JoinRefType::REGULAR);
+					left_join->type = JoinType::LEFT;
+					left_join->left = std::move(select_node->from_table);
+					left_join->right = std::move(edge_ref);
+					left_join->condition = std::move(edge_on_cond);
+					select_node->from_table = std::move(left_join);
+				}
+
+				// LEFT JOIN next vertex table ON vertex_on_cond
+				{
+					auto vertex_ref = next_vertex_table->CreateBaseTableRef(next_binding);
+					auto left_join = make_uniq<JoinRef>(JoinRefType::REGULAR);
+					left_join->type = JoinType::LEFT;
+					left_join->left = std::move(select_node->from_table);
+					left_join->right = std::move(vertex_ref);
+					left_join->condition = std::move(vertex_on_cond);
+					select_node->from_table = std::move(left_join);
+				}
+
+				opt_alias_map[edge_binding] = edge_table;
+				opt_alias_map[next_binding] = next_vertex_table;
+			}
 
 			prev_elem = next_elem;
 			prev_vertex_table = next_vertex_table;
@@ -1797,13 +3396,24 @@ void PGQMatchFunction::PopulateGraphTableAliasMap(
 			shared_ptr<PropertyGraphTable> tbl;
 			if (IsCompoundLabel(path_elem->label)) {
 				// For compound expressions (A|B, !A, A&B), attempt to resolve to a single table.
-				// Cross-table compound labels (e.g. multi-label traversal edges) are handled by a
-				// recursive CTE — the variable has no single backing table, so skip registration.
+				// Cross-table compound labels are handled by TryPathTableRewrite (Tier 1).
+				// Register the first resolvable component as a stub so CheckColumnBinding can
+				// validate qualified column references (alias.property) against it.
 				auto &pg_mut = const_cast<CreatePropertyGraphInfo &>(pg_table);
 				try {
 					tbl = ResolveLabelExprTable(path_elem->label, path_elem->match_type, pg_mut);
 				} catch (const Exception &) {
-					return; // Cross-table compound: variable not bindable to a single table.
+					if (!path_elem->variable_binding.empty()) {
+						auto parts = SplitTopLevel(path_elem->label, '|');
+						for (auto &part : parts) {
+							auto it = pg_table.label_map.find(StripParens(part));
+							if (it != pg_table.label_map.end()) {
+								alias_to_vertex_and_edge_tables[path_elem->variable_binding] = it->second;
+								break;
+							}
+						}
+					}
+					return;
 				}
 			} else {
 				auto iter = pg_table.label_map.find(path_elem->label);
@@ -1815,14 +3425,21 @@ void PGQMatchFunction::PopulateGraphTableAliasMap(
 			}
 			alias_to_vertex_and_edge_tables[path_elem->variable_binding] = tbl;
 		} else {
+			if (!path_elem->variable_binding.empty() &&
+			    alias_to_vertex_and_edge_tables.find(path_elem->variable_binding) !=
+			        alias_to_vertex_and_edge_tables.end()) {
+				return;
+			}
 			bool is_vertex = (path_elem->match_type == PGQMatchType::MATCH_VERTEX);
 			const auto &tables = is_vertex ? pg_table.vertex_tables : pg_table.edge_tables;
 			if (tables.size() == 1) {
 				alias_to_vertex_and_edge_tables[path_elem->variable_binding] = tables[0];
-			} else {
-				throw BinderException("Unlabeled %s pattern is ambiguous in property graph %s",
-				                      is_vertex ? "vertex" : "edge", pg_table.property_graph_name);
+			} else if (!path_elem->variable_binding.empty() && !tables.empty()) {
+				// Named unlabeled: TryPathTableRewrite handles enumeration.
+				// Register first table as stub so column validation works.
+				alias_to_vertex_and_edge_tables[path_elem->variable_binding] = tables[0];
 			}
+			// Anonymous unlabeled (no variable_binding): nothing to register.
 		}
 		return;
 	}
@@ -1869,21 +3486,21 @@ void PGQMatchFunction::CheckColumnBinding(
 		if (column_ref->column_names[0] == "shortest_path_cte") {
 			continue;
 		}
+		// Named ABI path rewrites expose synthetic columns on an internal subquery.
+		if (column_ref->column_names[0].find("__pgq_named_path_") == 0 ||
+		    column_ref->column_names[0].find("__pgq_context_path_") == 0 ||
+		    column_ref->column_names[0].find("_pgq_pt_") == 0) {
+			continue;
+		}
 		// 'rowid' is a column duckdb binds automatically.
 		if (column_ref->column_names.back() == "rowid") {
 			continue;
 		}
 		if (column_ref->column_names.size() == 1) {
-			bool single_alias = false;
-			for (const auto &alias : alias_to_vertex_and_edge_tables) {
-				if (alias.first == column_ref->column_names[0]) {
-					single_alias = true;
-					break;
-				}
-			}
-			if (single_alias) {
-				continue;
-			}
+			// Single-alias (e.g. `r`, `e`): let DuckDB's own binder validate.
+			// Tier 1 path table patterns expose variables as columns (e1 AS e, v1 AS r)
+			// so DuckDB can resolve them; we skip here to avoid false "never registered" errors.
+			continue;
 		}
 		const auto cur_fq_col_name = StringUtil::Join(column_ref->column_names, /*separator=*/".");
 		if (all_fq_col_names.find(cur_fq_col_name) == all_fq_col_names.end()) {
@@ -1954,7 +3571,450 @@ static unique_ptr<CommonTableExpressionInfo> BuildORPStepsCTE(OneRowPerMode mode
 	stmt->node = std::move(sel);
 	auto cte_info = make_uniq<CommonTableExpressionInfo>();
 	cte_info->query = std::move(stmt);
+	// Force materialisation so the outer joins see the actual small row count (~path_length rows)
+	// rather than an inflated estimate from the UNNEST chain. Without this, DuckDB may build hash
+	// tables on the large vertex/edge base tables instead of on this tiny CTE.
+	cte_info->materialized = CTEMaterialize::CTE_MATERIALIZE_ALWAYS;
 	return cte_info;
+}
+
+static void AddTCWitnessORPCTE(unique_ptr<SelectNode> &select_node, const PGQPathTableInfo &witness_info,
+                               const shared_ptr<PropertyGraphTable> &vertex_table,
+                               const shared_ptr<PropertyGraphTable> &edge_table,
+                               idx_t lower, idx_t upper,
+                               const vector<string> &endpoint_filters) {
+	static const string kPathCTE = "shortest_path_cte";
+	const auto cte_idx = select_node->cte_map.map.size();
+	const string witness_cte_name = "__tcw_orp_" + std::to_string(cte_idx);
+
+	const string witness_table = QualifiedTableName(witness_info.catalog_name, witness_info.schema_name,
+	                                                witness_info.table_name);
+	const string vertex_table_name = QualifiedTableName(vertex_table->catalog_name, vertex_table->schema_name,
+	                                                    vertex_table->table_name);
+	const string edge_table_name = QualifiedTableName(edge_table->catalog_name, edge_table->schema_name,
+	                                                  edge_table->table_name);
+	const string vertex_pk = KeywordHelper::WriteOptionallyQuoted(edge_table->source_pk[0]);
+	const string edge_src_fk = KeywordHelper::WriteOptionallyQuoted(edge_table->source_fk[0]);
+	const string edge_dst_fk = KeywordHelper::WriteOptionallyQuoted(edge_table->destination_fk[0]);
+
+	string depth_filter = "w.depth >= " + std::to_string(static_cast<int64_t>(lower));
+	if (upper < static_cast<idx_t>(1 << 30)) {
+		depth_filter += " AND w.depth <= " + std::to_string(static_cast<int64_t>(upper));
+	}
+	for (const auto &filter : endpoint_filters) {
+		depth_filter += " AND " + filter;
+	}
+
+	const string query = StringUtil::Format(
+	    "SELECT v0, v1, list(path_rowid ORDER BY pos) AS path, "
+	    "       any_value(src_rowid) AS src_rowid, any_value(dst_rowid) AS dst_rowid "
+	    "FROM ("
+	    "  SELECT w.v0, w.v1, 2 * u.ord - 1 AS pos, v.rowid AS path_rowid, "
+	    "         sv.rowid AS src_rowid, dv.rowid AS dst_rowid "
+	    "  FROM %s w "
+	    "  JOIN %s sv ON sv.%s = w.v0 "
+	    "  JOIN %s dv ON dv.%s = w.v1 "
+	    "  CROSS JOIN unnest(w.path_vertices) WITH ORDINALITY AS u(vertex_key, ord) "
+	    "  JOIN %s v ON v.%s = u.vertex_key "
+	    "  WHERE %s "
+	    "  UNION ALL "
+	    "  SELECT w.v0, w.v1, 2 * u.ord AS pos, e.rowid AS path_rowid, "
+	    "         sv.rowid AS src_rowid, dv.rowid AS dst_rowid "
+	    "  FROM %s w "
+	    "  JOIN %s sv ON sv.%s = w.v0 "
+	    "  JOIN %s dv ON dv.%s = w.v1 "
+	    "  CROSS JOIN unnest(w.path_vertices) WITH ORDINALITY AS u(vertex_key, ord) "
+	    "  JOIN %s e ON e.%s = u.vertex_key "
+	    "            AND e.%s = list_extract(w.path_vertices, u.ord + 1) "
+	    "  WHERE %s AND u.ord < list_count(w.path_vertices)"
+	    ") path_rows "
+	    "GROUP BY v0, v1",
+	    witness_table, vertex_table_name, vertex_pk, vertex_table_name, vertex_pk,
+	    vertex_table_name, vertex_pk, depth_filter,
+	    witness_table, vertex_table_name, vertex_pk, vertex_table_name, vertex_pk,
+	    edge_table_name, edge_src_fk, edge_dst_fk, depth_filter);
+
+	auto witness_cte_info = make_uniq<CommonTableExpressionInfo>();
+	witness_cte_info->query = ParseSelectStatement(query);
+	witness_cte_info->materialized = CTEMaterialize::CTE_MATERIALIZE_ALWAYS;
+	select_node->cte_map.map[witness_cte_name] = std::move(witness_cte_info);
+
+	auto wrapper = make_uniq<SelectNode>();
+	wrapper->select_list.push_back(make_uniq<ColumnRefExpression>("path", witness_cte_name));
+	auto src_col = make_uniq<ColumnRefExpression>("src_rowid", witness_cte_name);
+	src_col->alias = "src_rowid";
+	wrapper->select_list.push_back(std::move(src_col));
+	auto dst_col = make_uniq<ColumnRefExpression>("dst_rowid", witness_cte_name);
+	dst_col->alias = "dst_rowid";
+	wrapper->select_list.push_back(std::move(dst_col));
+	auto wrapper_from = make_uniq<BaseTableRef>();
+	wrapper_from->table_name = witness_cte_name;
+	wrapper->from_table = std::move(wrapper_from);
+
+	auto wrapper_stmt = make_uniq<SelectStatement>();
+	wrapper_stmt->node = std::move(wrapper);
+	auto wrapper_info = make_uniq<CommonTableExpressionInfo>();
+	wrapper_info->query = std::move(wrapper_stmt);
+	wrapper_info->materialized = CTEMaterialize::CTE_MATERIALIZE_ALWAYS;
+	select_node->cte_map.map[kPathCTE] = std::move(wrapper_info);
+}
+
+struct MaterializedSQLFilter {
+	string column_name;
+	string value_sql;
+};
+
+static void AddTCChainORPCTE(unique_ptr<SelectNode> &select_node, const PGQPathTableInfo &chain_info,
+                             const shared_ptr<PropertyGraphTable> &vertex_table,
+                             const shared_ptr<PropertyGraphTable> &edge_table,
+                             idx_t lower, idx_t upper,
+                             const vector<string> &endpoint_filters,
+                             const vector<MaterializedSQLFilter> &materialized_endpoint_filters,
+                             bool build_full_path_cte) {
+	static const string kPathCTE = "shortest_path_cte";
+	static const string kKeyStepsCTE = "__orp_key_steps";
+	const auto cte_idx = select_node->cte_map.map.size();
+	const string chain_cte_name = "__tcc_orp_" + std::to_string(cte_idx);
+
+	const string chain_table = QualifiedTableName(chain_info.catalog_name, chain_info.schema_name,
+	                                              chain_info.table_name);
+	const string vertex_table_name = QualifiedTableName(vertex_table->catalog_name, vertex_table->schema_name,
+	                                                    vertex_table->table_name);
+	const string edge_table_name = QualifiedTableName(edge_table->catalog_name, edge_table->schema_name,
+	                                                  edge_table->table_name);
+	const string vertex_pk = KeywordHelper::WriteOptionallyQuoted(edge_table->source_pk[0]);
+	const string edge_src_fk = KeywordHelper::WriteOptionallyQuoted(edge_table->source_fk[0]);
+	const string edge_dst_fk = KeywordHelper::WriteOptionallyQuoted(edge_table->destination_fk[0]);
+
+	const idx_t step_lower = std::max<idx_t>(1, lower);
+	string base_filter = "c.depth >= " + std::to_string(static_cast<int64_t>(step_lower));
+	for (const auto &filter : endpoint_filters) {
+		base_filter += " AND " + filter;
+	}
+
+	string chain_from = chain_table + " c";
+	string local_with_prefix;
+	if (!materialized_endpoint_filters.empty()) {
+		const string filter_cte_name = "__tcc_filter_" + std::to_string(cte_idx);
+		const string filtered_chain_cte_name = "__tcc_chain_rows_" + std::to_string(cte_idx);
+		vector<string> select_parts;
+		vector<string> join_parts;
+		for (const auto &filter : materialized_endpoint_filters) {
+			const string quoted_col = KeywordHelper::WriteOptionallyQuoted(filter.column_name);
+			select_parts.push_back(filter.value_sql + " AS " + quoted_col);
+			join_parts.push_back("c." + quoted_col + " = f." + quoted_col);
+		}
+		const string filter_query = "SELECT " + StringUtil::Join(select_parts, ", ");
+
+		const string filtered_chain_query =
+		    "SELECT c.* FROM " + filter_cte_name + " f JOIN " + chain_table + " c ON " +
+		    StringUtil::Join(join_parts, " AND ") + " WHERE " + base_filter;
+
+		local_with_prefix = "WITH " + filter_cte_name + " AS MATERIALIZED (" + filter_query + "), " +
+		                    filtered_chain_cte_name + " AS MATERIALIZED (" + filtered_chain_query + ") ";
+		chain_from = filtered_chain_cte_name + " c";
+	}
+
+	string edge_upper_expr = "c.depth";
+	string vertex_upper_expr = "c.depth + 1";
+	if (upper < static_cast<idx_t>(1 << 30)) {
+		edge_upper_expr = "LEAST(c.depth, " + std::to_string(static_cast<int64_t>(upper)) + ")";
+		vertex_upper_expr = "LEAST(c.depth + 1, " + std::to_string(static_cast<int64_t>(upper + 1)) + ")";
+	}
+	const string dst_key_expr = "list_extract(c.path_vertices, " + vertex_upper_expr + ")";
+	const string step_lower_str = std::to_string(static_cast<int64_t>(step_lower));
+
+	const string key_steps_query = local_with_prefix + StringUtil::Format(
+	    "SELECT row_number() OVER () AS __orp_step_id, * "
+	    "FROM ("
+	    "  SELECT c.v0 AS __orp_src_key, %s AS __orp_dst_key, "
+	    "         u.vertex_key AS __orp_v1_key, "
+	    "         list_extract(c.path_vertices, u.ord + 1) AS __orp_v2_key "
+	    "  FROM %s "
+	    "  CROSS JOIN unnest(c.path_vertices) WITH ORDINALITY AS u(vertex_key, ord) "
+	    "  WHERE %s AND u.ord >= %s AND u.ord <= %s"
+	    ") key_steps",
+	    dst_key_expr, chain_from, base_filter, step_lower_str, edge_upper_expr);
+	auto key_steps_info = make_uniq<CommonTableExpressionInfo>();
+	key_steps_info->query = ParseSelectStatement(key_steps_query);
+	key_steps_info->materialized = CTEMaterialize::CTE_MATERIALIZE_ALWAYS;
+	select_node->cte_map.map[kKeyStepsCTE] = std::move(key_steps_info);
+
+	if (!build_full_path_cte) {
+		return;
+	}
+
+	const string query = local_with_prefix + StringUtil::Format(
+	    "SELECT v0, v1, list(path_rowid ORDER BY pos) AS path, "
+	    "       any_value(src_rowid) AS src_rowid, any_value(dst_rowid) AS dst_rowid "
+	    "FROM ("
+	    "  SELECT c.v0, %s AS v1, 2 * (u.ord - %s) + 1 AS pos, v.rowid AS path_rowid, "
+	    "         sv.rowid AS src_rowid, dv.rowid AS dst_rowid "
+	    "  FROM %s "
+	    "  JOIN %s sv ON sv.%s = c.v0 "
+	    "  JOIN %s dv ON dv.%s = %s "
+	    "  CROSS JOIN unnest(c.path_vertices) WITH ORDINALITY AS u(vertex_key, ord) "
+	    "  JOIN %s v ON v.%s = u.vertex_key "
+	    "  WHERE %s AND u.ord >= %s AND u.ord <= %s "
+	    "  UNION ALL "
+	    "  SELECT c.v0, %s AS v1, 2 * (u.ord - %s + 1) AS pos, e.rowid AS path_rowid, "
+	    "         sv.rowid AS src_rowid, dv.rowid AS dst_rowid "
+	    "  FROM %s "
+	    "  JOIN %s sv ON sv.%s = c.v0 "
+	    "  JOIN %s dv ON dv.%s = %s "
+	    "  CROSS JOIN unnest(c.path_vertices) WITH ORDINALITY AS u(vertex_key, ord) "
+	    "  JOIN %s e ON e.%s = u.vertex_key "
+	    "            AND e.%s = list_extract(c.path_vertices, u.ord + 1) "
+	    "  WHERE %s AND u.ord >= %s AND u.ord <= %s"
+	    ") path_rows "
+	    "GROUP BY v0, v1",
+	    dst_key_expr, step_lower_str,
+	    chain_from, vertex_table_name, vertex_pk, vertex_table_name, vertex_pk, dst_key_expr,
+	    vertex_table_name, vertex_pk, base_filter, step_lower_str, vertex_upper_expr,
+	    dst_key_expr, step_lower_str,
+	    chain_from, vertex_table_name, vertex_pk, vertex_table_name, vertex_pk, dst_key_expr,
+	    edge_table_name, edge_src_fk, edge_dst_fk, base_filter, step_lower_str, edge_upper_expr);
+
+	auto chain_cte_info = make_uniq<CommonTableExpressionInfo>();
+	chain_cte_info->query = ParseSelectStatement(query);
+	chain_cte_info->materialized = CTEMaterialize::CTE_MATERIALIZE_ALWAYS;
+	select_node->cte_map.map[chain_cte_name] = std::move(chain_cte_info);
+
+	auto wrapper = make_uniq<SelectNode>();
+	wrapper->select_list.push_back(make_uniq<ColumnRefExpression>("path", chain_cte_name));
+	auto src_col = make_uniq<ColumnRefExpression>("src_rowid", chain_cte_name);
+	src_col->alias = "src_rowid";
+	wrapper->select_list.push_back(std::move(src_col));
+	auto dst_col = make_uniq<ColumnRefExpression>("dst_rowid", chain_cte_name);
+	dst_col->alias = "dst_rowid";
+	wrapper->select_list.push_back(std::move(dst_col));
+	auto wrapper_from = make_uniq<BaseTableRef>();
+	wrapper_from->table_name = chain_cte_name;
+	wrapper->from_table = std::move(wrapper_from);
+
+	auto wrapper_stmt = make_uniq<SelectStatement>();
+	wrapper_stmt->node = std::move(wrapper);
+	auto wrapper_info = make_uniq<CommonTableExpressionInfo>();
+	wrapper_info->query = std::move(wrapper_stmt);
+	wrapper_info->materialized = CTEMaterialize::CTE_MATERIALIZE_ALWAYS;
+	select_node->cte_map.map[kPathCTE] = std::move(wrapper_info);
+}
+
+static string BuildSQLFilter(const string &base_filter, const vector<string> &endpoint_filters) {
+	string filter = base_filter;
+	for (const auto &endpoint_filter : endpoint_filters) {
+		filter += " AND " + endpoint_filter;
+	}
+	return filter;
+}
+
+static unique_ptr<TableRef> BuildTCChainNamedPathRef(const PGQPathTableInfo &chain_info, const string &path_alias,
+                                                     idx_t lower, idx_t upper,
+                                                     const vector<string> &endpoint_filters) {
+	const string chain_table = QualifiedTableName(chain_info.catalog_name, chain_info.schema_name,
+	                                              chain_info.table_name);
+	const idx_t step_lower = std::max<idx_t>(1, lower);
+	const string base_filter = BuildSQLFilter("c.depth >= " + std::to_string(static_cast<int64_t>(step_lower)),
+	                                          endpoint_filters);
+
+	string selected_depth_expr = "c.depth";
+	if (upper < static_cast<idx_t>(1 << 30)) {
+		selected_depth_expr = "LEAST(c.depth, " + std::to_string(static_cast<int64_t>(upper)) + ")";
+	}
+	const string vertex_upper_expr = "(" + selected_depth_expr + " + 1)";
+	const string query = StringUtil::Format(
+	    "SELECT c.v0, list_extract(c.path_vertices, %s) AS v1, "
+	    "       %s AS __pgq_path_length, "
+	    "       list_slice(c.path_vertices, 1, %s) AS __pgq_path_vertices "
+	    "FROM %s c "
+	    "WHERE %s",
+	    vertex_upper_expr, selected_depth_expr, vertex_upper_expr, chain_table, base_filter);
+
+	return make_uniq<SubqueryRef>(ParseSelectStatement(query), path_alias);
+}
+
+static unique_ptr<TableRef> BuildTCWitnessNamedPathRef(const PGQPathTableInfo &witness_info, const string &path_alias,
+                                                       idx_t lower, idx_t upper,
+                                                       const vector<string> &endpoint_filters) {
+	const string witness_table = QualifiedTableName(witness_info.catalog_name, witness_info.schema_name,
+	                                                witness_info.table_name);
+	string base_filter = "w.depth >= " + std::to_string(static_cast<int64_t>(std::max<idx_t>(1, lower)));
+	if (upper < static_cast<idx_t>(1 << 30)) {
+		base_filter += " AND w.depth <= " + std::to_string(static_cast<int64_t>(upper));
+	}
+	const string filter = BuildSQLFilter(base_filter, endpoint_filters);
+	const string query = StringUtil::Format(
+	    "SELECT w.v0, w.v1, w.depth AS __pgq_path_length, "
+	    "       w.path_vertices AS __pgq_path_vertices "
+	    "FROM %s w "
+	    "WHERE %s",
+	    witness_table, filter);
+
+	return make_uniq<SubqueryRef>(ParseSelectStatement(query), path_alias);
+}
+
+static bool HasTopLevelNamedPathFunction(const MatchExpression &ref, const string &path_variable) {
+	if (path_variable.empty()) {
+		return false;
+	}
+	for (const auto &expression : ref.column_list) {
+		auto *function_ref = dynamic_cast<FunctionExpression *>(expression.get());
+		if (!function_ref || function_ref->children.size() != 1) {
+			continue;
+		}
+		if (!StringUtil::CIEquals(function_ref->function_name, "path_length") &&
+		    !StringUtil::CIEquals(function_ref->function_name, "vertices") &&
+		    !StringUtil::CIEquals(function_ref->function_name, "vertex_labels") &&
+		    !StringUtil::CIEquals(function_ref->function_name, "edge_labels") &&
+		    !StringUtil::CIEquals(function_ref->function_name, "vertex_properties")) {
+			continue;
+		}
+		auto *column_ref = dynamic_cast<ColumnRefExpression *>(function_ref->children[0].get());
+		if (column_ref && column_ref->column_names.size() == 1 &&
+		    StringUtil::CIEquals(column_ref->column_names[0], path_variable)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool HasTopLevelNamedPathFunction(const MatchExpression &ref, const string &path_variable,
+                                         const string &function_name) {
+	if (path_variable.empty()) {
+		return false;
+	}
+	for (const auto &expression : ref.column_list) {
+		auto *function_ref = dynamic_cast<FunctionExpression *>(expression.get());
+		if (!function_ref || function_ref->children.size() != 1 ||
+		    !StringUtil::CIEquals(function_ref->function_name, function_name)) {
+			continue;
+		}
+		auto *column_ref = dynamic_cast<ColumnRefExpression *>(function_ref->children[0].get());
+		if (column_ref && column_ref->column_names.size() == 1 &&
+		    StringUtil::CIEquals(column_ref->column_names[0], path_variable)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void RewriteTopLevelNamedPathFunctions(MatchExpression &ref, const string &path_variable,
+                                              const string &path_alias) {
+	for (auto &expression : ref.column_list) {
+		auto *function_ref = dynamic_cast<FunctionExpression *>(expression.get());
+		if (!function_ref || function_ref->children.size() != 1) {
+			continue;
+		}
+		auto *column_ref = dynamic_cast<ColumnRefExpression *>(function_ref->children[0].get());
+		if (!column_ref || column_ref->column_names.size() != 1 ||
+		    !StringUtil::CIEquals(column_ref->column_names[0], path_variable)) {
+			continue;
+		}
+
+		string target_column;
+		string default_alias;
+		if (StringUtil::CIEquals(function_ref->function_name, "path_length")) {
+			target_column = "__pgq_path_length";
+			default_alias = "path_length(" + path_variable + ")";
+		} else if (StringUtil::CIEquals(function_ref->function_name, "vertices")) {
+			target_column = "__pgq_path_vertices";
+			default_alias = "vertices(" + path_variable + ")";
+		} else if (StringUtil::CIEquals(function_ref->function_name, "vertex_labels")) {
+			target_column = "__pgq_vertex_labels";
+			default_alias = "vertex_labels(" + path_variable + ")";
+		} else if (StringUtil::CIEquals(function_ref->function_name, "edge_labels")) {
+			target_column = "__pgq_edge_labels";
+			default_alias = "edge_labels(" + path_variable + ")";
+		} else if (StringUtil::CIEquals(function_ref->function_name, "vertex_properties")) {
+			target_column = "__pgq_vertex_properties";
+			default_alias = "vertex_properties(" + path_variable + ")";
+		} else {
+			continue;
+		}
+
+		auto replacement = make_uniq<ColumnRefExpression>(target_column, path_alias);
+		replacement->alias = function_ref->alias.empty() ? default_alias : function_ref->alias;
+		expression = std::move(replacement);
+	}
+}
+
+static bool HasTopLevelEndpointFunction(const MatchExpression &ref, const string &binding) {
+	if (binding.empty()) {
+		return false;
+	}
+	for (const auto &expression : ref.column_list) {
+		auto *function_ref = dynamic_cast<FunctionExpression *>(expression.get());
+		if (!function_ref || function_ref->children.size() != 1) {
+			continue;
+		}
+		if (!StringUtil::CIEquals(function_ref->function_name, "label")) {
+			continue;
+		}
+		auto *column_ref = dynamic_cast<ColumnRefExpression *>(function_ref->children[0].get());
+		if (column_ref && column_ref->column_names.size() == 1 &&
+		    StringUtil::CIEquals(column_ref->column_names[0], binding)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void RewriteTopLevelEndpointFunctions(MatchExpression &ref, const string &binding,
+                                             const string &path_alias) {
+	if (binding.empty()) {
+		return;
+	}
+	for (auto &expression : ref.column_list) {
+		auto *function_ref = dynamic_cast<FunctionExpression *>(expression.get());
+		if (!function_ref || function_ref->children.size() != 1) {
+			continue;
+		}
+		auto *column_ref = dynamic_cast<ColumnRefExpression *>(function_ref->children[0].get());
+		if (!column_ref || column_ref->column_names.size() != 1 ||
+		    !StringUtil::CIEquals(column_ref->column_names[0], binding)) {
+			continue;
+		}
+
+		string target_column;
+		string default_alias;
+		if (!StringUtil::CIEquals(function_ref->function_name, "label")) {
+			continue;
+		}
+		target_column = "__pgq_dst_label";
+		default_alias = "label(" + binding + ")";
+
+		auto replacement = make_uniq<ColumnRefExpression>(target_column, path_alias);
+		replacement->alias = function_ref->alias.empty() ? default_alias : function_ref->alias;
+		expression = std::move(replacement);
+	}
+}
+
+static vector<unique_ptr<PathReference>> *GetRewritePathElements(vector<unique_ptr<PathReference>> &path_elements,
+                                                                 string &path_variable) {
+	path_variable.clear();
+	if (path_elements.size() == 1 &&
+	    path_elements[0]->path_reference_type == PGQPathReferenceType::SUBPATH) {
+		auto *outer_subpath = reinterpret_cast<SubPath *>(path_elements[0].get());
+		if (!outer_subpath->path_variable.empty() && outer_subpath->path_list.size() > 1) {
+			path_variable = outer_subpath->path_variable;
+			return &outer_subpath->path_list;
+		}
+	}
+	return &path_elements;
+}
+
+static const vector<unique_ptr<PathReference>> *
+GetRewritePathElements(const vector<unique_ptr<PathReference>> &path_elements, string &path_variable) {
+	path_variable.clear();
+	if (path_elements.size() == 1 &&
+	    path_elements[0]->path_reference_type == PGQPathReferenceType::SUBPATH) {
+		auto *outer_subpath = reinterpret_cast<const SubPath *>(path_elements[0].get());
+		if (!outer_subpath->path_variable.empty() && outer_subpath->path_list.size() > 1) {
+			path_variable = outer_subpath->path_variable;
+			return &outer_subpath->path_list;
+		}
+	}
+	return &path_elements;
 }
 
 // File-local helper: cast a PathReference to PathElement (returns nullptr for SubPath).
@@ -1967,11 +4027,16 @@ static PathElement *AsPathElement(const unique_ptr<PathReference> &ref) {
 // Returns false if no quantified subpath is found.
 static bool FindQuantifiedPathElements(const vector<unique_ptr<PathReference>> &path_elements,
                                        PathElement *&out_src, PathElement *&out_edge, PathElement *&out_dst) {
-	for (idx_t i = 1; i + 1 < path_elements.size(); i += 2) {
-		auto *sp = dynamic_cast<SubPath *>(path_elements[i].get());
-		if (sp && sp->upper > 1) {
-			out_src = AsPathElement(path_elements[i - 1]);
-			out_dst = AsPathElement(path_elements[i + 1]);
+	string ignored_path_variable;
+	auto *effective_path_elements = GetRewritePathElements(path_elements, ignored_path_variable);
+	for (idx_t i = 1; i + 1 < effective_path_elements->size(); i += 2) {
+		if ((*effective_path_elements)[i]->path_reference_type != PGQPathReferenceType::SUBPATH) {
+			continue;
+		}
+		auto *sp = reinterpret_cast<SubPath *>((*effective_path_elements)[i].get());
+		if (sp->upper > 1) {
+			out_src = AsPathElement((*effective_path_elements)[i - 1]);
+			out_dst = AsPathElement((*effective_path_elements)[i + 1]);
 			out_edge = sp->path_list.empty() ? nullptr : AsPathElement(sp->path_list[0]);
 			return out_src != nullptr && out_dst != nullptr && out_edge != nullptr;
 		}
@@ -1987,8 +4052,12 @@ static void ApplyOneRowPer(MatchExpression &ref, CreatePropertyGraphInfo &pg_tab
                            case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_to_vertex_and_edge_tables) {
 	static const string kPathCTE = "shortest_path_cte";
 	static const string kORPCTE = "__orp_steps";
+	static const string kKeyStepsCTE = "__orp_key_steps";
 
-	if (final_select_node->cte_map.map.find(kPathCTE) == final_select_node->cte_map.map.end()) {
+	const bool has_path_cte = final_select_node->cte_map.map.find(kPathCTE) != final_select_node->cte_map.map.end();
+	const bool has_key_steps_cte =
+	    final_select_node->cte_map.map.find(kKeyStepsCTE) != final_select_node->cte_map.map.end();
+	if (!has_path_cte && !has_key_steps_cte) {
 		throw NotImplementedException(
 		    "ONE ROW PER requires a quantified path pattern (e.g., ->{1,3}). "
 		    "No shortest-path CTE was generated for this query.");
@@ -2004,6 +4073,182 @@ static void ApplyOneRowPer(MatchExpression &ref, CreatePropertyGraphInfo &pg_tab
 	auto src_table = ResolveTable(src_elem->label, src_elem->match_type, pg_table);
 	auto dst_table = ResolveTable(dst_elem->label, dst_elem->match_type, pg_table);
 	auto edge_table = ResolveTable(edge_elem->label, edge_elem->match_type, pg_table);
+
+	const auto &vars = ref.one_row_per_vars;
+	if (ref.one_row_per == OneRowPerMode::STEP && vars.size() == 3 &&
+	    has_key_steps_cte && !edge_table->source_pk.empty() && !edge_table->destination_pk.empty() &&
+	    edge_table->source_pk[0] == edge_table->destination_pk[0]) {
+		const string key_name = edge_table->source_pk[0];
+		case_insensitive_map_t<string> allowed_key_columns;
+		allowed_key_columns[src_elem->variable_binding] = key_name;
+		allowed_key_columns[dst_elem->variable_binding] = key_name;
+		allowed_key_columns[vars[0]] = key_name;
+		allowed_key_columns[vars[2]] = key_name;
+		if (MatchOnlyUsesKeyColumns(ref, allowed_key_columns)) {
+			auto key_ref = make_uniq<BaseTableRef>();
+			key_ref->table_name = kKeyStepsCTE;
+			final_select_node->from_table = std::move(key_ref);
+			conditions.clear();
+
+			case_insensitive_set_t added_aliases;
+			auto add_key_alias_join = [&](const string &var, const string &key_col,
+			                              const shared_ptr<PropertyGraphTable> &pg_tbl) {
+				if (var.empty() || added_aliases.find(var) != added_aliases.end()) {
+					return;
+				}
+				added_aliases.insert(var);
+
+				auto alias_select = make_uniq<SelectNode>();
+				auto step_id = make_uniq<ColumnRefExpression>("__orp_step_id", kKeyStepsCTE);
+				step_id->alias = "__orp_step_id";
+				alias_select->select_list.push_back(std::move(step_id));
+				auto key = make_uniq<ColumnRefExpression>(key_col, kKeyStepsCTE);
+				key->alias = key_name;
+				alias_select->select_list.push_back(std::move(key));
+				auto alias_from = make_uniq<BaseTableRef>();
+				alias_from->table_name = kKeyStepsCTE;
+				alias_select->from_table = std::move(alias_from);
+
+				auto alias_stmt = make_uniq<SelectStatement>();
+				alias_stmt->node = std::move(alias_select);
+				unique_ptr<TableRef> alias_ref = make_uniq<SubqueryRef>(std::move(alias_stmt), var);
+
+				auto join = make_uniq<JoinRef>(JoinRefType::CROSS);
+				join->left = std::move(final_select_node->from_table);
+				join->right = std::move(alias_ref);
+				final_select_node->from_table = std::move(join);
+				conditions.push_back(make_uniq<ComparisonExpression>(
+				    ExpressionType::COMPARE_EQUAL,
+				    make_uniq<ColumnRefExpression>("__orp_step_id", var),
+				    make_uniq<ColumnRefExpression>("__orp_step_id", kKeyStepsCTE)));
+				alias_to_vertex_and_edge_tables[var] = pg_tbl;
+			};
+
+			add_key_alias_join(src_elem->variable_binding, "__orp_src_key", src_table);
+			add_key_alias_join(dst_elem->variable_binding, "__orp_dst_key", dst_table);
+			add_key_alias_join(vars[0], "__orp_v1_key", src_table);
+			add_key_alias_join(vars[2], "__orp_v2_key", dst_table);
+			return;
+		}
+		if (!MatchContainsUnsupportedChainBatchExpression(ref)) {
+			case_insensitive_set_t referenced_bindings;
+			for (const auto &expr : ref.column_list) {
+				auto *star = dynamic_cast<StarExpression *>(expr.get());
+				if (star && !star->relation_name.empty()) {
+					referenced_bindings.insert(star->relation_name);
+				}
+				ParsedExpressionIterator::VisitExpression<ColumnRefExpression>(
+				    *expr, [&](const ColumnRefExpression &col_ref) {
+					    if (!col_ref.column_names.empty()) {
+						    referenced_bindings.insert(col_ref.column_names[0]);
+					    }
+				    });
+			}
+			if (ref.where_clause) {
+				ParsedExpressionIterator::VisitExpression<ColumnRefExpression>(
+				    *ref.where_clause, [&](const ColumnRefExpression &col_ref) {
+					    if (!col_ref.column_names.empty()) {
+						    referenced_bindings.insert(col_ref.column_names[0]);
+					    }
+				    });
+			}
+
+			const string vertex_props_cte = "__orp_vertex_props";
+			const string edge_props_cte = "__orp_edge_props";
+			const string vertex_table_name = QualifiedTableName(src_table->catalog_name, src_table->schema_name,
+			                                                    src_table->table_name);
+			const string edge_table_name = QualifiedTableName(edge_table->catalog_name, edge_table->schema_name,
+			                                                  edge_table->table_name);
+			const string quoted_key = KeywordHelper::WriteOptionallyQuoted(key_name);
+			const string quoted_edge_src = KeywordHelper::WriteOptionallyQuoted(edge_table->source_fk[0]);
+			const string quoted_edge_dst = KeywordHelper::WriteOptionallyQuoted(edge_table->destination_fk[0]);
+
+			const string vertex_props_query = StringUtil::Format(
+			    "SELECT * FROM %s "
+			    "WHERE %s IN ("
+			    "  SELECT __orp_src_key FROM %s "
+			    "  UNION SELECT __orp_dst_key FROM %s "
+			    "  UNION SELECT __orp_v1_key FROM %s "
+			    "  UNION SELECT __orp_v2_key FROM %s"
+			    ")",
+			    vertex_table_name, quoted_key, kKeyStepsCTE, kKeyStepsCTE, kKeyStepsCTE, kKeyStepsCTE);
+			auto vertex_props_info = make_uniq<CommonTableExpressionInfo>();
+			vertex_props_info->query = ParseSelectStatement(vertex_props_query);
+			vertex_props_info->materialized = CTEMaterialize::CTE_MATERIALIZE_ALWAYS;
+			final_select_node->cte_map.map[vertex_props_cte] = std::move(vertex_props_info);
+
+			const bool edge_required = referenced_bindings.find(vars[1]) != referenced_bindings.end();
+			if (edge_required) {
+				const string edge_props_query = StringUtil::Format(
+				    "SELECT e.* FROM %s e "
+				    "JOIN ("
+				    "  SELECT DISTINCT __orp_v1_key AS from_key, __orp_v2_key AS to_key FROM %s"
+				    ") p ON e.%s = p.from_key AND e.%s = p.to_key",
+				    edge_table_name, kKeyStepsCTE, quoted_edge_src, quoted_edge_dst);
+				auto edge_props_info = make_uniq<CommonTableExpressionInfo>();
+				edge_props_info->query = ParseSelectStatement(edge_props_query);
+				edge_props_info->materialized = CTEMaterialize::CTE_MATERIALIZE_ALWAYS;
+				final_select_node->cte_map.map[edge_props_cte] = std::move(edge_props_info);
+			}
+
+			auto key_ref = make_uniq<BaseTableRef>();
+			key_ref->table_name = kKeyStepsCTE;
+			final_select_node->from_table = std::move(key_ref);
+			conditions.clear();
+
+			case_insensitive_set_t added_aliases;
+			auto add_vertex_alias_join = [&](const string &var, const string &key_col,
+			                                 const shared_ptr<PropertyGraphTable> &pg_tbl) {
+				if (var.empty() || added_aliases.find(var) != added_aliases.end()) {
+					return;
+				}
+				added_aliases.insert(var);
+				auto tbl_ref = make_uniq<BaseTableRef>();
+				tbl_ref->table_name = vertex_props_cte;
+				tbl_ref->alias = var;
+				auto join = make_uniq<JoinRef>(JoinRefType::CROSS);
+				join->left = std::move(final_select_node->from_table);
+				join->right = std::move(tbl_ref);
+				final_select_node->from_table = std::move(join);
+				conditions.push_back(make_uniq<ComparisonExpression>(
+				    ExpressionType::COMPARE_EQUAL,
+				    make_uniq<ColumnRefExpression>(key_name, var),
+				    make_uniq<ColumnRefExpression>(key_col, kKeyStepsCTE)));
+				alias_to_vertex_and_edge_tables[var] = pg_tbl;
+			};
+
+			add_vertex_alias_join(src_elem->variable_binding, "__orp_src_key", src_table);
+			add_vertex_alias_join(dst_elem->variable_binding, "__orp_dst_key", dst_table);
+			add_vertex_alias_join(vars[0], "__orp_v1_key", src_table);
+			add_vertex_alias_join(vars[2], "__orp_v2_key", dst_table);
+
+			if (edge_required) {
+				auto edge_ref = make_uniq<BaseTableRef>();
+				edge_ref->table_name = edge_props_cte;
+				edge_ref->alias = vars[1];
+				auto join = make_uniq<JoinRef>(JoinRefType::CROSS);
+				join->left = std::move(final_select_node->from_table);
+				join->right = std::move(edge_ref);
+				final_select_node->from_table = std::move(join);
+				conditions.push_back(make_uniq<ComparisonExpression>(
+				    ExpressionType::COMPARE_EQUAL,
+				    make_uniq<ColumnRefExpression>(edge_table->source_fk[0], vars[1]),
+				    make_uniq<ColumnRefExpression>("__orp_v1_key", kKeyStepsCTE)));
+				conditions.push_back(make_uniq<ComparisonExpression>(
+				    ExpressionType::COMPARE_EQUAL,
+				    make_uniq<ColumnRefExpression>(edge_table->destination_fk[0], vars[1]),
+				    make_uniq<ColumnRefExpression>("__orp_v2_key", kKeyStepsCTE)));
+				alias_to_vertex_and_edge_tables[vars[1]] = edge_table;
+			}
+			return;
+		}
+	}
+
+	if (!has_path_cte) {
+		throw NotImplementedException(
+		    "ONE ROW PER STEP over tc_chain requires expressions that can be answered from key steps "
+		    "or batched property lookups");
+	}
 
 	// Add __orp_steps CTE
 	final_select_node->cte_map.map[kORPCTE] = BuildORPStepsCTE(ref.one_row_per, kPathCTE);
@@ -2038,7 +4283,6 @@ static void ApplyOneRowPer(MatchExpression &ref, CreatePropertyGraphInfo &pg_tab
 		add_step_join(dst_elem->variable_binding, "__orp_dst_rowid", dst_table);
 	}
 
-	const auto &vars = ref.one_row_per_vars;
 	switch (ref.one_row_per) {
 	case OneRowPerMode::VERTEX:
 		add_step_join(vars[0], "__orp_v_rowid", src_table);
@@ -2056,13 +4300,704 @@ static void ApplyOneRowPer(MatchExpression &ref, CreatePropertyGraphInfo &pg_tab
 	}
 }
 
+// WHERE-clause equality constraints extracted for predicate pushdown.
+// Maps binding_name → (column_name → copied constant expression).
+using WhereConstraints = case_insensitive_map_t<case_insensitive_map_t<unique_ptr<ParsedExpression>>>;
+using ReferencedBindings = case_insensitive_set_t;
+
+static bool IsPathPushdownValue(const ParsedExpression *expr) {
+	return expr && (expr->type == ExpressionType::VALUE_CONSTANT || expr->type == ExpressionType::SUBQUERY);
+}
+
+// Walk top-level AND conjuncts of `expr` collecting simple equalities of the
+// form `binding.column = constant_or_scalar_subquery`.  Only ColumnRef (2-part)
+// equality pairs are captured; anything more complex is skipped without error.
+static WhereConstraints ExtractEqualityConstraints(const ParsedExpression *expr) {
+	WhereConstraints result;
+	if (!expr) {
+		return result;
+	}
+	if (expr->type == ExpressionType::CONJUNCTION_AND) {
+		const auto &conj = expr->Cast<ConjunctionExpression>();
+		for (const auto &child : conj.children) {
+			auto child_constraints = ExtractEqualityConstraints(child.get());
+			for (auto &binding_entry : child_constraints) {
+				for (auto &col_entry : binding_entry.second) {
+					result[binding_entry.first].emplace(col_entry.first, std::move(col_entry.second));
+				}
+			}
+		}
+		return result;
+	}
+	if (expr->type != ExpressionType::COMPARE_EQUAL) {
+		return result;
+	}
+	const auto &cmp = expr->Cast<ComparisonExpression>();
+	const ParsedExpression *lhs = cmp.left.get();
+	const ParsedExpression *rhs = cmp.right.get();
+	// Canonicalize: ColumnRef on left, pushdown-safe value on right.
+	if (lhs->type != ExpressionType::COLUMN_REF && rhs->type == ExpressionType::COLUMN_REF) {
+		std::swap(lhs, rhs);
+	}
+	if (lhs->type != ExpressionType::COLUMN_REF || !IsPathPushdownValue(rhs)) {
+		return result;
+	}
+	const auto &col_ref = lhs->Cast<ColumnRefExpression>();
+	if (col_ref.column_names.size() != 2) {
+		return result;
+	}
+	result[col_ref.column_names[0]].emplace(col_ref.column_names[1], rhs->Copy());
+	return result;
+}
+
+static bool IsEndpointEqualityConjunct(const ParsedExpression &expr, const string &binding, const string &pk) {
+	if (expr.type != ExpressionType::COMPARE_EQUAL) {
+		return false;
+	}
+	const auto &cmp = expr.Cast<ComparisonExpression>();
+	const ParsedExpression *lhs = cmp.left.get();
+	const ParsedExpression *rhs = cmp.right.get();
+	if (lhs->type != ExpressionType::COLUMN_REF && rhs->type == ExpressionType::COLUMN_REF) {
+		std::swap(lhs, rhs);
+	}
+	if (lhs->type != ExpressionType::COLUMN_REF || rhs->type == ExpressionType::COLUMN_REF) {
+		return false;
+	}
+	const auto &col_ref = lhs->Cast<ColumnRefExpression>();
+	return col_ref.column_names.size() == 2 &&
+	       StringUtil::CIEquals(col_ref.column_names[0], binding) &&
+	       StringUtil::CIEquals(col_ref.column_names[1], pk);
+}
+
+static unique_ptr<ParsedExpression>
+RemoveEndpointEqualityConjuncts(unique_ptr<ParsedExpression> expr,
+                                const vector<pair<string, string>> &endpoint_keys) {
+	if (!expr) {
+		return nullptr;
+	}
+	auto *conj = dynamic_cast<ConjunctionExpression *>(expr.get());
+	if (conj && conj->type == ExpressionType::CONJUNCTION_AND) {
+		vector<unique_ptr<ParsedExpression>> remaining;
+		for (auto &child : conj->children) {
+			auto rewritten = RemoveEndpointEqualityConjuncts(std::move(child), endpoint_keys);
+			if (rewritten) {
+				remaining.push_back(std::move(rewritten));
+			}
+		}
+		if (remaining.empty()) {
+			return nullptr;
+		}
+		auto result = std::move(remaining[0]);
+		for (idx_t i = 1; i < remaining.size(); i++) {
+			result = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(result),
+			                                          std::move(remaining[i]));
+		}
+		return result;
+	}
+	for (const auto &endpoint_key : endpoint_keys) {
+		if (IsEndpointEqualityConjunct(*expr, endpoint_key.first, endpoint_key.second)) {
+			return nullptr;
+		}
+	}
+	return expr;
+}
+
+// Emit pt.pt_col = constant when WHERE clause constrains binding.pk to a literal.
+static void PushConstraintToPathTable(const WhereConstraints &wc,
+                                      const string &binding, const string &pk,
+                                      const string &pt_col, const string &pt_alias,
+                                      vector<unique_ptr<ParsedExpression>> &conditions) {
+	if (binding.empty()) {
+		return;
+	}
+	auto it_b = wc.find(binding);
+	if (it_b == wc.end()) {
+		return;
+	}
+	auto it_c = it_b->second.find(pk);
+	if (it_c == it_b->second.end()) {
+		return;
+	}
+	conditions.push_back(make_uniq<ComparisonExpression>(
+	    ExpressionType::COMPARE_EQUAL,
+	    make_uniq<ColumnRefExpression>(pt_col, pt_alias),
+	    it_c->second->Copy()));
+}
+
+static void PushConstraintToSQLFilter(const WhereConstraints &wc, const string &binding, const string &pk,
+                                      const string &sql_col, vector<string> &filters) {
+	if (binding.empty()) {
+		return;
+	}
+	auto it_b = wc.find(binding);
+	if (it_b == wc.end()) {
+		return;
+	}
+	auto it_c = it_b->second.find(pk);
+	if (it_c == it_b->second.end()) {
+		return;
+	}
+	filters.push_back(sql_col + " = " + it_c->second->ToString());
+}
+
+static void PushConstraintToTCChainFilter(const WhereConstraints &wc, const string &binding, const string &pk,
+                                          const string &chain_col, vector<string> &direct_filters,
+                                          vector<MaterializedSQLFilter> &materialized_filters) {
+	if (binding.empty()) {
+		return;
+	}
+	auto it_b = wc.find(binding);
+	if (it_b == wc.end()) {
+		return;
+	}
+	auto it_c = it_b->second.find(pk);
+	if (it_c == it_b->second.end()) {
+		return;
+	}
+	const string value_sql = it_c->second->ToString();
+	materialized_filters.push_back({chain_col, value_sql});
+}
+
+static bool HasEqualityConstraint(const WhereConstraints &wc, const string &binding, const string &pk) {
+	if (binding.empty()) {
+		return false;
+	}
+	auto it_b = wc.find(binding);
+	if (it_b == wc.end()) {
+		return false;
+	}
+	return it_b->second.find(pk) != it_b->second.end();
+}
+
+static idx_t CountEndpointFilters(const WhereConstraints &where_constraints,
+                                  const vector<pair<string, string>> &binding_keys) {
+	idx_t count = 0;
+	for (const auto &binding_key : binding_keys) {
+		if (HasEqualityConstraint(where_constraints, binding_key.first, binding_key.second)) {
+			count++;
+		}
+	}
+	return count;
+}
+
+static string JoinSQLUnionAll(const vector<string> &selects) {
+	string result;
+	for (idx_t idx = 0; idx < selects.size(); idx++) {
+		if (idx > 0) {
+			result += " UNION ALL ";
+		}
+		result += selects[idx];
+	}
+	return result;
+}
+
+static bool SamePropertyGraphTable(const shared_ptr<PropertyGraphTable> &left,
+                                   const shared_ptr<PropertyGraphTable> &right) {
+	if (!left || !right) {
+		return false;
+	}
+	if (left.get() == right.get()) {
+		return true;
+	}
+	return StringUtil::CIEquals(left->catalog_name, right->catalog_name) &&
+	       StringUtil::CIEquals(left->schema_name, right->schema_name) &&
+	       StringUtil::CIEquals(left->table_name, right->table_name);
+}
+
+static string InferVertexKeyColumn(CreatePropertyGraphInfo &pg_table,
+                                   const shared_ptr<PropertyGraphTable> &vertex_table) {
+	for (const auto &edge_table : pg_table.edge_tables) {
+		if (SamePropertyGraphTable(edge_table->source_pg_table, vertex_table) && !edge_table->source_pk.empty()) {
+			return edge_table->source_pk[0];
+		}
+		if (SamePropertyGraphTable(edge_table->destination_pg_table, vertex_table) && !edge_table->destination_pk.empty()) {
+			return edge_table->destination_pk[0];
+		}
+	}
+	return string();
+}
+
+static string JsonEscapeSQLPropertyName(const string &input) {
+	string result;
+	for (const auto c : input) {
+		if (c == '"' || c == '\\') {
+			result += '\\';
+		}
+		result += c;
+	}
+	return result;
+}
+
+static string BuildJsonScalarSQL(const string &value_expr) {
+	return "CASE WHEN " + value_expr + " IS NULL THEN 'null' ELSE '\"' || " +
+	       "replace(replace(CAST(" + value_expr + " AS VARCHAR), '\\\\', '\\\\\\\\'), '\"', '\\\\\"') || '\"' END";
+}
+
+static string BuildJsonObjectExpression(const shared_ptr<PropertyGraphTable> &vertex_table, const string &table_alias) {
+	vector<string> entries;
+	for (idx_t idx = 0; idx < vertex_table->column_names.size(); idx++) {
+		const string &column_name = vertex_table->column_names[idx];
+		const string property_name = idx < vertex_table->column_aliases.size() && !vertex_table->column_aliases[idx].empty()
+		                                 ? vertex_table->column_aliases[idx]
+		                                 : column_name;
+		const string column_expr = table_alias + "." + KeywordHelper::WriteOptionallyQuoted(column_name);
+		entries.push_back(KeywordHelper::WriteQuoted("\"" + JsonEscapeSQLPropertyName(property_name) + "\":", '\'') +
+		                  " || " + BuildJsonScalarSQL(column_expr));
+	}
+	if (entries.empty()) {
+		return KeywordHelper::WriteQuoted("{}", '\'');
+	}
+	return KeywordHelper::WriteQuoted("{", '\'') + " || " + StringUtil::Join(entries, " || ',' || ") + " || " +
+	       KeywordHelper::WriteQuoted("}", '\'');
+}
+
+static string BuildVertexPropertiesUnionSQL(CreatePropertyGraphInfo &pg_table) {
+	vector<string> selects;
+	for (const auto &vertex_table : pg_table.vertex_tables) {
+		const string key_column = InferVertexKeyColumn(pg_table, vertex_table);
+		if (key_column.empty()) {
+			continue;
+		}
+		const string table_alias = "__pgq_v";
+		const string qualified_table = QualifiedTableName(vertex_table->catalog_name, vertex_table->schema_name,
+		                                                  vertex_table->table_name);
+		vector<string> labels;
+		labels.push_back(vertex_table->main_label);
+		for (const auto &sub_label : vertex_table->sub_labels) {
+			labels.push_back(sub_label);
+		}
+		for (const auto &label : labels) {
+			selects.push_back(StringUtil::Format(
+			    "SELECT %s::VARCHAR AS __pgq_label, "
+			    "       CAST(%s.%s AS VARCHAR) AS __pgq_key, "
+			    "       %s AS __pgq_properties "
+			    "FROM %s %s",
+			    KeywordHelper::WriteQuoted(label, '\''), table_alias,
+			    KeywordHelper::WriteOptionallyQuoted(key_column),
+			    BuildJsonObjectExpression(vertex_table, table_alias), qualified_table, table_alias));
+		}
+	}
+	return JoinSQLUnionAll(selects);
+}
+
+static string BuildVertexPropertiesListSQL(const string &vertices_expr, const string &labels_expr,
+                                           const string &properties_relation) {
+	if (properties_relation.empty()) {
+		return StringUtil::Format(
+		    "(SELECT list(%s ORDER BY u.ordinality) "
+		    " FROM unnest(%s) WITH ORDINALITY AS u(__pgq_vertex_key, ordinality))",
+		    KeywordHelper::WriteQuoted("{}", '\''), vertices_expr);
+	}
+	return StringUtil::Format(
+	    "(SELECT list(COALESCE(( "
+	    "          SELECT p.__pgq_properties "
+	    "          FROM %s p "
+	    "          WHERE lower(p.__pgq_label) = lower(list_extract(%s, u.ordinality)) "
+	    "            AND p.__pgq_key = CAST(u.__pgq_vertex_key AS VARCHAR) "
+	    "          LIMIT 1), %s) ORDER BY u.ordinality) "
+	    " FROM unnest(%s) WITH ORDINALITY AS u(__pgq_vertex_key, ordinality))",
+	    properties_relation, labels_expr, KeywordHelper::WriteQuoted("{}", '\''), vertices_expr);
+}
+
+static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache &path_table_cache,
+                                                        CreatePropertyGraphInfo &pg_table,
+                                                        const string &path_alias,
+                                                        const string &src_label,
+                                                        const string &src_binding,
+                                                        const string &edge_label_expr,
+                                                        const string &dst_label_expr,
+                                                        idx_t lower, idx_t upper,
+                                                        const WhereConstraints &where_constraints,
+                                                        string &src_pk_out,
+                                                        bool include_vertex_properties) {
+	if (upper >= static_cast<idx_t>(1 << 30)) {
+		return nullptr;
+	}
+
+	struct ContextEdgeTable {
+		string src_label;
+		string dst_label;
+		string edge_label;
+		string table_name;
+		string catalog_name;
+		string schema_name;
+		string src_pk;
+	};
+
+	vector<ContextEdgeTable> edge_tables;
+	edge_tables.reserve(path_table_cache.catalog.size());
+	for (const auto &entry : path_table_cache.catalog) {
+		const auto &info = entry.second;
+		if (!info.from_metadata || !StringUtil::CIEquals(info.path_kind, "edge")) {
+			continue;
+		}
+		const auto vertex_parts = SplitCatalogSequence(info.vertex_label_sequence);
+		const auto edge_parts = SplitCatalogSequence(info.edge_label_sequence);
+		if (vertex_parts.size() != 2 || edge_parts.size() != 1) {
+			continue;
+		}
+		if (!LabelExpressionAllows(edge_label_expr, edge_parts[0])) {
+			continue;
+		}
+		shared_ptr<PropertyGraphTable> edge_table;
+		try {
+			edge_table = ResolveTable(edge_parts[0], PGQMatchType::MATCH_EDGE_RIGHT, pg_table);
+		} catch (...) {
+			continue;
+		}
+		if (!edge_table || edge_table->source_pk.empty()) {
+			continue;
+		}
+		edge_tables.push_back({vertex_parts[0], vertex_parts[1], edge_parts[0], info.table_name,
+		                       info.catalog_name, info.schema_name, edge_table->source_pk[0]});
+	}
+	if (edge_tables.empty()) {
+		return nullptr;
+	}
+
+	string canonical_src_label;
+	for (const auto &edge_table : edge_tables) {
+		if (StringUtil::CIEquals(edge_table.src_label, src_label)) {
+			src_pk_out = edge_table.src_pk;
+			canonical_src_label = edge_table.src_label;
+			break;
+		}
+	}
+	if (src_pk_out.empty()) {
+		return nullptr;
+	}
+
+	shared_ptr<PropertyGraphTable> src_table;
+	try {
+		src_table = ResolveTable(src_label, PGQMatchType::MATCH_VERTEX, pg_table);
+	} catch (...) {
+		return nullptr;
+	}
+
+	vector<string> edge_selects;
+	edge_selects.reserve(edge_tables.size());
+	for (const auto &edge_table : edge_tables) {
+		const string qualified_table = QualifiedTableName(edge_table.catalog_name, edge_table.schema_name,
+		                                                  edge_table.table_name);
+		edge_selects.push_back(StringUtil::Format(
+		    "SELECT %s::VARCHAR AS src_label, %s::VARCHAR AS dst_label, %s::VARCHAR AS edge_label, v0, v1 "
+		    "FROM %s",
+		    KeywordHelper::WriteQuoted(edge_table.src_label, '\''),
+		    KeywordHelper::WriteQuoted(edge_table.dst_label, '\''),
+		    KeywordHelper::WriteQuoted(edge_table.edge_label, '\''),
+		    qualified_table));
+	}
+
+	vector<string> seed_filters;
+	PushConstraintToSQLFilter(where_constraints, src_binding, src_pk_out,
+	                          "s." + KeywordHelper::WriteOptionallyQuoted(src_pk_out), seed_filters);
+	string seed_where;
+	if (!seed_filters.empty()) {
+		seed_where = " WHERE ";
+		for (idx_t idx = 0; idx < seed_filters.size(); idx++) {
+			if (idx > 0) {
+				seed_where += " AND ";
+			}
+			seed_where += seed_filters[idx];
+		}
+	}
+
+	vector<string> dst_label_filters;
+	for (const auto &vertex_table : pg_table.vertex_tables) {
+		if (LabelExpressionAllows(dst_label_expr, vertex_table->main_label)) {
+			dst_label_filters.push_back("lower(c.dst_label) = lower(" +
+			                            KeywordHelper::WriteQuoted(vertex_table->main_label, '\'') + ")");
+		}
+	}
+	string final_filter = "c.depth >= " + std::to_string(static_cast<int64_t>(lower));
+	if (!dst_label_expr.empty()) {
+		if (dst_label_filters.empty()) {
+			return nullptr;
+		}
+		final_filter += " AND (";
+		for (idx_t idx = 0; idx < dst_label_filters.size(); idx++) {
+			if (idx > 0) {
+				final_filter += " OR ";
+			}
+			final_filter += dst_label_filters[idx];
+		}
+		final_filter += ")";
+	}
+
+	const string src_table_name = QualifiedTableName(src_table->catalog_name, src_table->schema_name,
+	                                                 src_table->table_name);
+	const string src_pk = KeywordHelper::WriteOptionallyQuoted(src_pk_out);
+	const string src_label_sql = KeywordHelper::WriteQuoted(canonical_src_label, '\'');
+	const string vertex_properties_union = include_vertex_properties ? BuildVertexPropertiesUnionSQL(pg_table) : "";
+	const string vertex_properties_cte =
+	    vertex_properties_union.empty() ? "" : ", __pgq_vertex_props AS (" + vertex_properties_union + ") ";
+	const string vertex_properties_expr =
+	    BuildVertexPropertiesListSQL("c.path_vertices", "c.path_vertex_labels",
+	                                 vertex_properties_union.empty() ? "" : "__pgq_vertex_props");
+	const string vertex_properties_select =
+	    include_vertex_properties ? ", " + vertex_properties_expr + " AS __pgq_vertex_properties " : "";
+	const string query = StringUtil::Format(
+	    "WITH RECURSIVE __pgq_ctx(dst_label, dst_id, depth, path_vertices, path_vertex_labels, "
+	    "path_edge_labels, path_participants) AS ("
+	    "  SELECT %s::VARCHAR AS dst_label, s.%s AS dst_id, 0 AS depth, "
+	    "         list_value(s.%s) AS path_vertices, "
+	    "         list_value(%s::VARCHAR) AS path_vertex_labels, "
+	    "         []::VARCHAR[] AS path_edge_labels, "
+	    "         list_value(%s::VARCHAR || ':' || CAST(s.%s AS VARCHAR)) AS path_participants "
+	    "  FROM %s s%s "
+	    "  UNION ALL "
+	    "  SELECT e.dst_label, e.v1 AS dst_id, c.depth + 1 AS depth, "
+	    "         list_append(c.path_vertices, e.v1) AS path_vertices, "
+	    "         list_append(c.path_vertex_labels, e.dst_label) AS path_vertex_labels, "
+	    "         list_append(c.path_edge_labels, e.edge_label) AS path_edge_labels, "
+	    "         list_append(c.path_participants, e.dst_label || ':' || CAST(e.v1 AS VARCHAR)) AS path_participants "
+	    "  FROM __pgq_ctx c "
+	    "  JOIN (%s) e ON lower(e.src_label) = lower(c.dst_label) AND e.v0 = c.dst_id "
+	    "  WHERE c.depth < %s "
+	    "    AND NOT list_contains(c.path_participants, e.dst_label || ':' || CAST(e.v1 AS VARCHAR))"
+	    ") %s "
+	    "SELECT list_extract(c.path_vertices, 1) AS v0, c.dst_id AS v1, "
+	    "       c.dst_label AS __pgq_dst_label, "
+	    "       c.depth AS __pgq_path_length, "
+	    "       c.path_vertices AS __pgq_path_vertices, "
+	    "       c.path_vertex_labels AS __pgq_vertex_labels, "
+	    "       c.path_edge_labels AS __pgq_edge_labels%s "
+	    "FROM __pgq_ctx c "
+	    "WHERE %s",
+	    src_label_sql, src_pk, src_pk, src_label_sql, src_label_sql, src_pk,
+	    src_table_name, seed_where, JoinSQLUnionAll(edge_selects),
+	    std::to_string(static_cast<int64_t>(upper)), vertex_properties_cte, vertex_properties_select, final_filter);
+
+	return make_uniq<SubqueryRef>(ParseSelectStatement(query), path_alias);
+}
+
+static bool ExpressionReferencesNonKeyColumn(const ParsedExpression *expr, const string &binding, const string &key) {
+	if (!expr || binding.empty() || key.empty()) {
+		return false;
+	}
+	bool references_non_key = false;
+	ParsedExpressionIterator::VisitExpression<ColumnRefExpression>(
+	    *expr, [&](const ColumnRefExpression &col_ref) {
+		    if (references_non_key || col_ref.column_names.size() != 2) {
+			    return;
+		    }
+		    if (StringUtil::CIEquals(col_ref.column_names[0], binding) &&
+		        !StringUtil::CIEquals(col_ref.column_names[1], key)) {
+			    references_non_key = true;
+		    }
+	    });
+	return references_non_key;
+}
+
+static void PushBindingFilterToPathTable(const ParsedExpression *where_hint,
+                                         const string &binding, const shared_ptr<PropertyGraphTable> &table,
+                                         const string &key, const string &pt_col, const string &pt_alias,
+                                         vector<unique_ptr<ParsedExpression>> &conditions) {
+	if (!where_hint || binding.empty() || !table || key.empty()) {
+		return;
+	}
+	auto filter = ExtractSrcFilter(*where_hint, binding);
+	if (!filter || !ExpressionReferencesNonKeyColumn(filter.get(), binding, key)) {
+		return;
+	}
+
+	auto subquery_expr = make_uniq<SubqueryExpression>();
+	auto select_statement = make_uniq<SelectStatement>();
+	auto select_node = make_uniq<SelectNode>();
+	select_node->select_list.push_back(make_uniq<ColumnRefExpression>(key, binding));
+	auto table_ref = table->CreateBaseTableRef();
+	table_ref->alias = binding;
+	select_node->from_table = std::move(table_ref);
+	select_node->where_clause = std::move(filter);
+	select_statement->node = std::move(select_node);
+	subquery_expr->subquery = std::move(select_statement);
+	subquery_expr->subquery_type = SubqueryType::ANY;
+	subquery_expr->comparison_type = ExpressionType::COMPARE_EQUAL;
+	subquery_expr->child = make_uniq<ColumnRefExpression>(pt_col, pt_alias);
+	conditions.push_back(std::move(subquery_expr));
+}
+
+static void PushEdgeFilterToPathTable(const ParsedExpression *where_hint,
+                                      const string &binding, const shared_ptr<PropertyGraphTable> &edge_table,
+                                      const string &src_fk, const string &dst_fk,
+                                      const string &src_pt_col, const string &dst_pt_col,
+                                      const string &pt_alias,
+                                      vector<unique_ptr<ParsedExpression>> &conditions) {
+	if (!where_hint || binding.empty() || !edge_table || src_fk.empty() || dst_fk.empty()) {
+		return;
+	}
+	auto filter = ExtractSrcFilter(*where_hint, binding);
+	if (!filter) {
+		return;
+	}
+	const bool has_property_filter =
+	    ExpressionReferencesNonKeyColumn(filter.get(), binding, src_fk) &&
+	    ExpressionReferencesNonKeyColumn(filter.get(), binding, dst_fk);
+	if (!has_property_filter) {
+		return;
+	}
+
+	auto exists_expr = make_uniq<SubqueryExpression>();
+	auto select_statement = make_uniq<SelectStatement>();
+	auto select_node = make_uniq<SelectNode>();
+	select_node->select_list.push_back(make_uniq<ConstantExpression>(Value::INTEGER(1)));
+	auto table_ref = edge_table->CreateBaseTableRef();
+	table_ref->alias = binding;
+	select_node->from_table = std::move(table_ref);
+
+	vector<unique_ptr<ParsedExpression>> edge_conditions;
+	edge_conditions.push_back(make_uniq<ComparisonExpression>(
+	    ExpressionType::COMPARE_EQUAL,
+	    make_uniq<ColumnRefExpression>(src_fk, binding),
+	    make_uniq<ColumnRefExpression>(src_pt_col, pt_alias)));
+	edge_conditions.push_back(make_uniq<ComparisonExpression>(
+	    ExpressionType::COMPARE_EQUAL,
+	    make_uniq<ColumnRefExpression>(dst_fk, binding),
+	    make_uniq<ColumnRefExpression>(dst_pt_col, pt_alias)));
+	edge_conditions.push_back(std::move(filter));
+	select_node->where_clause = PGQMatchFunction::CreateWhereClause(edge_conditions);
+	select_statement->node = std::move(select_node);
+	exists_expr->subquery = std::move(select_statement);
+	exists_expr->subquery_type = SubqueryType::EXISTS;
+	conditions.push_back(std::move(exists_expr));
+}
+
+static void CollectReferencedBindings(const ParsedExpression *expr, ReferencedBindings &bindings) {
+	if (!expr) {
+		return;
+	}
+	ParsedExpressionIterator::VisitExpression<ColumnRefExpression>(
+	    *expr, [&](const ColumnRefExpression &col_ref) {
+		    if (col_ref.column_names.empty()) {
+			    return;
+		    }
+		    bindings.insert(col_ref.column_names[0]);
+	    });
+}
+
+static ReferencedBindings CollectReferencedBindings(const MatchExpression &match_expr) {
+	ReferencedBindings bindings;
+	for (const auto &expr : match_expr.column_list) {
+		CollectReferencedBindings(expr.get(), bindings);
+	}
+	CollectReferencedBindings(match_expr.where_clause.get(), bindings);
+	return bindings;
+}
+
+// Forward declaration: TryPathTableRewrite is defined later in this file but is called
+// by BuildExistsSubquery and the UNION branch loop, both of which precede it.
+static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo &pg_table,
+                                 vector<unique_ptr<PathReference>> &path_elements,
+                                 MatchExpression &match_ref,
+                                 vector<unique_ptr<ParsedExpression>> &conditions,
+                                 unique_ptr<SelectNode> &select_node,
+                                 case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map,
+                                 int32_t &extra_alias_counter,
+                                 const PGQPathTableCache &path_table_cache,
+                                 const ReferencedBindings &referenced_bindings,
+                                 CoveredBindingMap &covered_columns,
+                                 OneRowPerMode one_row_per_mode,
+                                 const ParsedExpression *where_hint = nullptr);
+
+static unique_ptr<ParsedExpression> TryBuildBranchSummaryExistsSubquery(
+    MatchExpression &inner_match, CreatePropertyGraphInfo &pg_table,
+    const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &outer_alias_map,
+    const PGQPathTableCache &path_table_cache, SubqueryType sub_type) {
+	if (inner_match.path_patterns.size() != 1 || inner_match.where_clause ||
+	    !inner_match.optional_match_patterns.empty() || !inner_match.union_matches.empty() ||
+	    inner_match.one_row_per != OneRowPerMode::NONE) {
+		return nullptr;
+	}
+
+	auto &path_elements = inner_match.path_patterns[0]->path_elements;
+	if (path_elements.size() != 3) {
+		return nullptr;
+	}
+	auto *src = PGQMatchFunction::GetPathElement(path_elements[0]);
+	auto *edge = PGQMatchFunction::GetPathElement(path_elements[1]);
+	auto *dst = PGQMatchFunction::GetPathElement(path_elements[2]);
+	if (!src || !edge || !dst || src->variable_binding.empty() || edge->label.empty() ||
+	    IsCompoundLabel(edge->label) || edge->match_type != PGQMatchType::MATCH_EDGE_RIGHT) {
+		return nullptr;
+	}
+	auto outer_entry = outer_alias_map.find(src->variable_binding);
+	if (outer_entry == outer_alias_map.end()) {
+		return nullptr;
+	}
+
+	shared_ptr<PropertyGraphTable> edge_table;
+	try {
+		edge_table = ResolveTable(edge->label, PGQMatchType::MATCH_EDGE_RIGHT, pg_table);
+	} catch (...) {
+		return nullptr;
+	}
+	if (!edge_table || edge_table->source_pk.empty()) {
+		return nullptr;
+	}
+
+	const auto &outer_src_table = outer_entry->second;
+	string src_label = src->label.empty() ? outer_src_table->main_label : src->label;
+	if (!StringUtil::CIEquals(src_label, outer_src_table->main_label)) {
+		return nullptr;
+	}
+	string dst_label = dst->label;
+	if (dst_label.empty() && edge_table->destination_pg_table) {
+		dst_label = edge_table->destination_pg_table->main_label;
+	}
+
+	string branch_edge_label;
+	const auto *branch_info = FindBranchSummaryInfo(path_table_cache, src_label, edge->label, dst_label,
+	                                                branch_edge_label);
+	if (!branch_info) {
+		return nullptr;
+	}
+
+	const string branch_alias = "_pgq_branch_exists";
+	auto inner_select = make_uniq<SelectNode>();
+	inner_select->select_list.push_back(make_uniq<ConstantExpression>(Value::INTEGER(1)));
+	auto branch_ref = make_uniq<BaseTableRef>();
+	branch_ref->catalog_name = branch_info->catalog_name;
+	branch_ref->schema_name = branch_info->schema_name;
+	branch_ref->table_name = branch_info->table_name;
+	branch_ref->alias = branch_alias;
+	inner_select->from_table = std::move(branch_ref);
+
+	vector<unique_ptr<ParsedExpression>> conditions;
+	conditions.push_back(make_uniq<ComparisonExpression>(
+	    ExpressionType::COMPARE_EQUAL,
+	    make_uniq<ColumnRefExpression>("v0", branch_alias),
+	    make_uniq<ColumnRefExpression>(edge_table->source_pk[0], src->variable_binding)));
+	conditions.push_back(make_uniq<ComparisonExpression>(
+	    ExpressionType::COMPARE_EQUAL,
+	    make_uniq<ColumnRefExpression>(StringUtil::Lower(branch_edge_label) + "_exists", branch_alias),
+	    make_uniq<ConstantExpression>(Value::BOOLEAN(true))));
+	inner_select->where_clause = PGQMatchFunction::CreateWhereClause(conditions);
+
+	auto stmt = make_uniq<SelectStatement>();
+	stmt->node = std::move(inner_select);
+	auto subq = make_uniq<SubqueryExpression>();
+	subq->subquery = std::move(stmt);
+	subq->subquery_type = SubqueryType::EXISTS;
+	if (sub_type == SubqueryType::NOT_EXISTS) {
+		return make_uniq<OperatorExpression>(ExpressionType::OPERATOR_NOT, std::move(subq));
+	}
+	return subq;
+}
+
 // Build an EXISTS (or NOT EXISTS) subquery from a PGQ path pattern.
 // Variables already in outer_alias_map are correlated references — they are NOT
 // added to the inner FROM clause.
 static unique_ptr<ParsedExpression> BuildExistsSubquery(
-    MatchExpression &inner_match, CreatePropertyGraphInfo &pg_table,
+    ClientContext &context, MatchExpression &inner_match, CreatePropertyGraphInfo &pg_table,
     const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &outer_alias_map,
-    SubqueryType sub_type) {
+    SubqueryType sub_type,
+    const PGQPathTableCache &path_table_cache) {
+
+	auto branch_summary_subquery =
+	    TryBuildBranchSummaryExistsSubquery(inner_match, pg_table, outer_alias_map, path_table_cache, sub_type);
+	if (branch_summary_subquery) {
+		return branch_summary_subquery;
+	}
 
 	auto inner_select = make_uniq<SelectNode>();
 	inner_select->select_list.push_back(make_uniq<ConstantExpression>(Value::INTEGER(1)));
@@ -2072,12 +5007,28 @@ static unique_ptr<ParsedExpression> BuildExistsSubquery(
 
 	vector<unique_ptr<ParsedExpression>> conditions;
 	int32_t extra_alias_counter = 0;
+	const ReferencedBindings referenced_bindings = CollectReferencedBindings(inner_match);
+	const bool require_abi_paths = RequireABIPaths(context);
+	CoveredBindingMap covered_columns;
 
 	for (auto &path_pattern : inner_match.path_patterns) {
 		bool all_shortest = path_pattern->all && path_pattern->shortest;
-		PGQMatchFunction::ProcessPathList(path_pattern->path_elements, conditions, inner_select, inner_alias_map,
-		                                  pg_table, extra_alias_counter, inner_match, all_shortest);
+		if (!TryPathTableRewrite(context, pg_table, path_pattern->path_elements, inner_match, conditions,
+		                         inner_select, inner_alias_map, extra_alias_counter,
+		                         path_table_cache, referenced_bindings,
+		                         covered_columns,
+		                         inner_match.one_row_per,
+		                         inner_match.where_clause.get())) {
+			if (require_abi_paths && PathPatternRequiresABIPath(path_pattern->path_elements)) {
+				ThrowABIPathRequired();
+			}
+			PGQMatchFunction::ProcessPathList(path_pattern->path_elements, conditions, inner_select, inner_alias_map,
+			                                  pg_table, extra_alias_counter, inner_match, all_shortest);
+		}
 	}
+
+	RewriteCoveredPathColumns(inner_match.column_list, covered_columns);
+	inner_match.where_clause = RewriteCoveredPathColumns(std::move(inner_match.where_clause), covered_columns);
 
 	// Build FROM only for NEW variables (not in outer scope).
 	for (auto &entry : inner_alias_map) {
@@ -2117,8 +5068,9 @@ static unique_ptr<ParsedExpression> BuildExistsSubquery(
 
 // Walk expr, replacing pgq_exists(MatchExpression) with EXISTS/NOT EXISTS subqueries.
 static unique_ptr<ParsedExpression> RewritePGQExists(
-    unique_ptr<ParsedExpression> expr, CreatePropertyGraphInfo &pg_table,
-    const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &outer_alias_map) {
+    unique_ptr<ParsedExpression> expr, ClientContext &context, CreatePropertyGraphInfo &pg_table,
+    const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &outer_alias_map,
+    const PGQPathTableCache &path_table_cache) {
 
 	if (!expr) {
 		return expr;
@@ -2131,11 +5083,12 @@ static unique_ptr<ParsedExpression> RewritePGQExists(
 		if (inner_func && inner_func->function_name == "pgq_exists" && inner_func->children.size() == 1) {
 			auto *inner_match = dynamic_cast<MatchExpression *>(inner_func->children[0].get());
 			if (inner_match) {
-				return BuildExistsSubquery(*inner_match, pg_table, outer_alias_map, SubqueryType::NOT_EXISTS);
+				return BuildExistsSubquery(context, *inner_match, pg_table, outer_alias_map,
+				                           SubqueryType::NOT_EXISTS, path_table_cache);
 			}
 		}
 		for (auto &child : op->children) {
-			child = RewritePGQExists(std::move(child), pg_table, outer_alias_map);
+			child = RewritePGQExists(std::move(child), context, pg_table, outer_alias_map, path_table_cache);
 		}
 		return expr;
 	}
@@ -2145,7 +5098,8 @@ static unique_ptr<ParsedExpression> RewritePGQExists(
 	if (func && func->function_name == "pgq_exists" && func->children.size() == 1) {
 		auto *inner_match = dynamic_cast<MatchExpression *>(func->children[0].get());
 		if (inner_match) {
-			return BuildExistsSubquery(*inner_match, pg_table, outer_alias_map, SubqueryType::EXISTS);
+			return BuildExistsSubquery(context, *inner_match, pg_table, outer_alias_map,
+			                           SubqueryType::EXISTS, path_table_cache);
 		}
 	}
 
@@ -2153,7 +5107,7 @@ static unique_ptr<ParsedExpression> RewritePGQExists(
 	auto *conj = dynamic_cast<ConjunctionExpression *>(expr.get());
 	if (conj) {
 		for (auto &child : conj->children) {
-			child = RewritePGQExists(std::move(child), pg_table, outer_alias_map);
+			child = RewritePGQExists(std::move(child), context, pg_table, outer_alias_map, path_table_cache);
 		}
 		return expr;
 	}
@@ -2161,20 +5115,310 @@ static unique_ptr<ParsedExpression> RewritePGQExists(
 	// Recurse into comparison children
 	auto *comp = dynamic_cast<ComparisonExpression *>(expr.get());
 	if (comp) {
-		comp->left = RewritePGQExists(std::move(comp->left), pg_table, outer_alias_map);
-		comp->right = RewritePGQExists(std::move(comp->right), pg_table, outer_alias_map);
+		comp->left  = RewritePGQExists(std::move(comp->left),  context, pg_table, outer_alias_map, path_table_cache);
+		comp->right = RewritePGQExists(std::move(comp->right), context, pg_table, outer_alias_map, path_table_cache);
 		return expr;
 	}
 
 	// Recurse into other function children
 	if (func) {
 		for (auto &child : func->children) {
-			child = RewritePGQExists(std::move(child), pg_table, outer_alias_map);
+			child = RewritePGQExists(std::move(child), context, pg_table, outer_alias_map, path_table_cache);
 		}
 		return expr;
 	}
 
 	return expr;
+}
+
+struct DirectLinkRewriteState {
+	case_insensitive_map_t<string> target_alias_by_source_and_link;
+	idx_t next_alias_id = 0;
+	idx_t join_rewrite_count = 0;
+	idx_t filter_rewrite_count = 0;
+};
+
+static const PGQDirectLinkInfo *FindDirectLinkInfo(const PGQPathTableCache &path_table_cache, const string &src_label,
+                                                   const string &direct_name) {
+	auto entry = path_table_cache.direct_link_index.find(DirectLinkIndexKey(src_label, direct_name));
+	if (entry == path_table_cache.direct_link_index.end() || entry->second.empty()) {
+		return nullptr;
+	}
+	if (entry->second.size() > 1) {
+		throw BinderException("Direct link %s from label %s is ambiguous; use the generated link name instead.",
+		                      direct_name, src_label);
+	}
+	const idx_t direct_link_idx = entry->second[0];
+	if (direct_link_idx >= path_table_cache.direct_links.size()) {
+		return nullptr;
+	}
+	return &path_table_cache.direct_links[direct_link_idx];
+}
+
+static unique_ptr<BaseTableRef> CreateDirectLinkBaseTableRef(const PGQDirectLinkInfo &info, const string &alias) {
+	auto ref = make_uniq<BaseTableRef>();
+	ref->catalog_name = info.link_catalog_name;
+	ref->schema_name = info.link_schema_name;
+	ref->table_name = info.link_table_name;
+	ref->alias = alias;
+	return ref;
+}
+
+static string EnsureDirectLinkJoin(CreatePropertyGraphInfo &pg_table, unique_ptr<SelectNode> &select_node,
+                                   case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map,
+                                   const string &source_alias, const string &direct_name,
+                                   const PGQPathTableCache &path_table_cache,
+                                   DirectLinkRewriteState &state, JoinType join_type) {
+	auto src_entry = alias_map.find(source_alias);
+	if (src_entry == alias_map.end()) {
+		return string();
+	}
+	const auto &src_table = src_entry->second;
+	const auto *direct_link = FindDirectLinkInfo(path_table_cache, src_table->main_label, direct_name);
+	if (!direct_link) {
+		return string();
+	}
+
+	const string join_state_key = DirectLinkIndexKey(source_alias, direct_name);
+	auto existing = state.target_alias_by_source_and_link.find(join_state_key);
+	if (existing != state.target_alias_by_source_and_link.end()) {
+		return existing->second;
+	}
+
+	auto dst_entry = pg_table.label_map.find(direct_link->dst_label);
+	if (dst_entry == pg_table.label_map.end()) {
+		throw BinderException("Direct link %s references destination label %s, which is not registered in property graph %s.",
+		                      direct_link->link_name, direct_link->dst_label, pg_table.property_graph_name);
+	}
+
+	const string link_alias = "__pgq_dl_" + std::to_string(state.next_alias_id++);
+	const string dst_alias = link_alias + "_dst";
+
+	auto link_ref = CreateDirectLinkBaseTableRef(*direct_link, link_alias);
+	auto source_on_cond = make_uniq<ComparisonExpression>(
+	    ExpressionType::COMPARE_EQUAL,
+	    make_uniq<ColumnRefExpression>(direct_link->src_vertex_key, source_alias),
+	    make_uniq<ColumnRefExpression>(direct_link->src_col, link_alias));
+	auto source_join = make_uniq<JoinRef>(JoinRefType::REGULAR);
+	source_join->type = join_type;
+	source_join->left = std::move(select_node->from_table);
+	source_join->right = std::move(link_ref);
+	source_join->condition = std::move(source_on_cond);
+	select_node->from_table = std::move(source_join);
+
+	auto dst_ref = dst_entry->second->CreateBaseTableRef(dst_alias);
+	auto destination_on_cond = make_uniq<ComparisonExpression>(
+	    ExpressionType::COMPARE_EQUAL,
+	    make_uniq<ColumnRefExpression>(direct_link->dst_vertex_key, dst_alias),
+	    make_uniq<ColumnRefExpression>(direct_link->dst_col, link_alias));
+	auto destination_join = make_uniq<JoinRef>(JoinRefType::REGULAR);
+	destination_join->type = join_type;
+	destination_join->left = std::move(select_node->from_table);
+	destination_join->right = std::move(dst_ref);
+	destination_join->condition = std::move(destination_on_cond);
+	select_node->from_table = std::move(destination_join);
+
+	alias_map[dst_alias] = dst_entry->second;
+	state.target_alias_by_source_and_link[join_state_key] = dst_alias;
+	state.join_rewrite_count++;
+	return dst_alias;
+}
+
+static bool IsDirectLinkColumnRef(const ParsedExpression *expr, string &source_alias, string &direct_name,
+                                  string &column_name) {
+	auto *column_ref = dynamic_cast<const ColumnRefExpression *>(expr);
+	if (!column_ref || column_ref->column_names.size() != 3) {
+		return false;
+	}
+	source_alias = column_ref->column_names[0];
+	direct_name = column_ref->column_names[1];
+	column_name = column_ref->column_names[2];
+	return true;
+}
+
+static unique_ptr<ParsedExpression> RewriteDirectLinkExpression(
+    unique_ptr<ParsedExpression> expr, CreatePropertyGraphInfo &pg_table, unique_ptr<SelectNode> &select_node,
+    case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map, const PGQPathTableCache &path_table_cache,
+    DirectLinkRewriteState &state, JoinType join_type);
+
+static bool ContainsSubqueryExpression(ParsedExpression *expr) {
+	if (!expr) {
+		return false;
+	}
+	if (dynamic_cast<SubqueryExpression *>(expr)) {
+		return true;
+	}
+	bool contains_subquery = false;
+	ParsedExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<ParsedExpression> &child) {
+		if (!contains_subquery && ContainsSubqueryExpression(child.get())) {
+			contains_subquery = true;
+		}
+	});
+	return contains_subquery;
+}
+
+static unique_ptr<SubqueryExpression> BuildDirectLinkFilterSubquery(
+    CreatePropertyGraphInfo &pg_table, const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map,
+    const PGQPathTableCache &path_table_cache, const string &source_alias, const string &direct_name,
+    const string &column_name, ExpressionType comparison_type, unique_ptr<ParsedExpression> other_side,
+    bool direct_ref_is_left, DirectLinkRewriteState &state) {
+	auto src_entry = alias_map.find(source_alias);
+	if (src_entry == alias_map.end()) {
+		return nullptr;
+	}
+	const auto *direct_link = FindDirectLinkInfo(path_table_cache, src_entry->second->main_label, direct_name);
+	if (!direct_link) {
+		return nullptr;
+	}
+	auto dst_entry = pg_table.label_map.find(direct_link->dst_label);
+	if (dst_entry == pg_table.label_map.end()) {
+		throw BinderException("Direct link %s references destination label %s, which is not registered in property graph %s.",
+		                      direct_link->link_name, direct_link->dst_label, pg_table.property_graph_name);
+	}
+
+	const string link_alias = "__pgq_dlf_" + std::to_string(state.next_alias_id++) + "_link";
+	const string dst_alias = "__pgq_dlf_" + std::to_string(state.next_alias_id++) + "_dst";
+	auto link_ref = CreateDirectLinkBaseTableRef(*direct_link, link_alias);
+	auto dst_ref = dst_entry->second->CreateBaseTableRef(dst_alias);
+	auto join_cond = make_uniq<ComparisonExpression>(
+	    ExpressionType::COMPARE_EQUAL,
+	    make_uniq<ColumnRefExpression>(direct_link->dst_col, link_alias),
+	    make_uniq<ColumnRefExpression>(direct_link->dst_vertex_key, dst_alias));
+	auto join = make_uniq<JoinRef>(JoinRefType::REGULAR);
+	join->type = JoinType::INNER;
+	join->left = std::move(link_ref);
+	join->right = std::move(dst_ref);
+	join->condition = std::move(join_cond);
+
+	unique_ptr<ParsedExpression> predicate;
+	if (direct_ref_is_left) {
+		predicate = make_uniq<ComparisonExpression>(
+		    comparison_type, make_uniq<ColumnRefExpression>(column_name, dst_alias), std::move(other_side));
+	} else {
+		predicate = make_uniq<ComparisonExpression>(
+		    comparison_type, std::move(other_side), make_uniq<ColumnRefExpression>(column_name, dst_alias));
+	}
+
+	auto select_node = make_uniq<SelectNode>();
+	select_node->select_list.push_back(make_uniq<ColumnRefExpression>(direct_link->src_col, link_alias));
+	select_node->from_table = std::move(join);
+	select_node->where_clause = std::move(predicate);
+	auto select_statement = make_uniq<SelectStatement>();
+	select_statement->node = std::move(select_node);
+
+	auto subquery_expr = make_uniq<SubqueryExpression>();
+	subquery_expr->subquery = std::move(select_statement);
+	subquery_expr->subquery_type = SubqueryType::ANY;
+	subquery_expr->child = make_uniq<ColumnRefExpression>(direct_link->src_vertex_key, source_alias);
+	subquery_expr->comparison_type = ExpressionType::COMPARE_EQUAL;
+	state.filter_rewrite_count++;
+	return subquery_expr;
+}
+
+static unique_ptr<ParsedExpression> RewriteDirectLinkFilterExpression(
+    unique_ptr<ParsedExpression> expr, CreatePropertyGraphInfo &pg_table, unique_ptr<SelectNode> &select_node,
+    case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map, const PGQPathTableCache &path_table_cache,
+    DirectLinkRewriteState &state) {
+	if (!expr) {
+		return nullptr;
+	}
+
+	if (auto *comp = dynamic_cast<ComparisonExpression *>(expr.get())) {
+		string source_alias;
+		string direct_name;
+		string column_name;
+		if (IsDirectLinkColumnRef(comp->left.get(), source_alias, direct_name, column_name)) {
+			if (ContainsSubqueryExpression(comp->right.get())) {
+				comp->left = RewriteDirectLinkExpression(std::move(comp->left), pg_table, select_node, alias_map,
+				                                         path_table_cache, state, JoinType::INNER);
+				return expr;
+			}
+			auto subquery = BuildDirectLinkFilterSubquery(pg_table, alias_map, path_table_cache, source_alias, direct_name,
+			                                              column_name, comp->type, std::move(comp->right), true, state);
+			if (subquery) {
+				return std::move(subquery);
+			}
+		}
+		if (IsDirectLinkColumnRef(comp->right.get(), source_alias, direct_name, column_name)) {
+			if (ContainsSubqueryExpression(comp->left.get())) {
+				comp->right = RewriteDirectLinkExpression(std::move(comp->right), pg_table, select_node, alias_map,
+				                                          path_table_cache, state, JoinType::INNER);
+				return expr;
+			}
+			auto subquery = BuildDirectLinkFilterSubquery(pg_table, alias_map, path_table_cache, source_alias, direct_name,
+			                                              column_name, comp->type, std::move(comp->left), false, state);
+			if (subquery) {
+				return std::move(subquery);
+			}
+		}
+		comp->left = RewriteDirectLinkFilterExpression(std::move(comp->left), pg_table, select_node, alias_map,
+		                                               path_table_cache, state);
+		comp->right = RewriteDirectLinkFilterExpression(std::move(comp->right), pg_table, select_node, alias_map,
+		                                                path_table_cache, state);
+		return expr;
+	}
+
+	if (auto *conj = dynamic_cast<ConjunctionExpression *>(expr.get())) {
+		for (auto &child : conj->children) {
+			child = RewriteDirectLinkFilterExpression(std::move(child), pg_table, select_node, alias_map,
+			                                          path_table_cache, state);
+		}
+		return expr;
+	}
+
+	return RewriteDirectLinkExpression(std::move(expr), pg_table, select_node, alias_map, path_table_cache, state,
+	                                   JoinType::INNER);
+}
+
+static unique_ptr<ParsedExpression> RewriteDirectLinkExpression(
+    unique_ptr<ParsedExpression> expr, CreatePropertyGraphInfo &pg_table, unique_ptr<SelectNode> &select_node,
+    case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map, const PGQPathTableCache &path_table_cache,
+    DirectLinkRewriteState &state, JoinType join_type) {
+	if (!expr) {
+		return nullptr;
+	}
+
+	if (auto *column_ref = dynamic_cast<ColumnRefExpression *>(expr.get())) {
+		if (column_ref->column_names.size() == 3) {
+			const string source_alias = column_ref->column_names[0];
+			const string direct_name = column_ref->column_names[1];
+			const string column_name = column_ref->column_names[2];
+			const string target_alias = EnsureDirectLinkJoin(pg_table, select_node, alias_map, source_alias, direct_name,
+			                                                 path_table_cache, state, join_type);
+			if (!target_alias.empty()) {
+				auto rewritten = make_uniq<ColumnRefExpression>(column_name, target_alias);
+				rewritten->alias = column_ref->alias;
+				return std::move(rewritten);
+			}
+		}
+		return expr;
+	}
+
+	ParsedExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<ParsedExpression> &child) {
+		child = RewriteDirectLinkExpression(std::move(child), pg_table, select_node, alias_map, path_table_cache, state,
+		                                    join_type);
+	});
+	return expr;
+}
+
+static idx_t RewriteDirectLinkReferences(CreatePropertyGraphInfo &pg_table, unique_ptr<SelectNode> &select_node,
+                                        vector<unique_ptr<ParsedExpression>> &column_list,
+                                        unique_ptr<ParsedExpression> &where_clause,
+                                        case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map,
+                                        const PGQPathTableCache &path_table_cache) {
+	if (path_table_cache.direct_links.empty()) {
+		return 0;
+	}
+	DirectLinkRewriteState state;
+	if (where_clause) {
+		where_clause = RewriteDirectLinkFilterExpression(std::move(where_clause), pg_table, select_node, alias_map,
+		                                                 path_table_cache, state);
+	}
+	for (auto &expression : column_list) {
+		expression = RewriteDirectLinkExpression(std::move(expression), pg_table, select_node, alias_map,
+		                                         path_table_cache, state, JoinType::LEFT);
+	}
+	return state.join_rewrite_count + state.filter_rewrite_count;
 }
 
 static vector<unique_ptr<ParsedExpression>>
@@ -2273,11 +5517,1092 @@ BuildFinalColumnList(vector<unique_ptr<ParsedExpression>> col_list,
 	return final_column_list;
 }
 
+// Tier 1 path table rewrite — catalog-driven.
+//
+// Checks whether one or more pre-computed path tables in any attached catalog's
+// `graph` schema cover the full label sequence of a path pattern.  When they do,
+// the bridge/edge table scans are replaced with the path table(s), and vertex
+// tables are joined on the path table key columns.
+//
+// Returns true  → pattern has been rewritten; skip ProcessPathList.
+// Returns false → fall through to Tier 2 (ProcessPathList) only for patterns
+//                 that are genuinely incompatible: SubPath / variable-length
+//                 elements, left-directed edges, named edge variables.
+//
+// Supported label forms for edge and dst vertex (1-hop only for disjunctions):
+//   - Single explicit label          → exact path table lookup
+//   - '|'-disjunction of labels      → enumerate all matching path tables, UNION ALL
+//   - Empty (unlabeled)              → enumerate ALL edge/vertex tables, UNION ALL
+//
+// For multi-hop (2-3 hops), all labels must still be single and explicit.
+// path_table_cache: session-local ABI metadata and semantic lookup cache.
+static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo &pg_table,
+                                 vector<unique_ptr<PathReference>> &path_elements,
+                                 MatchExpression &match_ref,
+                                 vector<unique_ptr<ParsedExpression>> &conditions,
+                                 unique_ptr<SelectNode> &select_node,
+                                 case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map,
+                                 int32_t &extra_alias_counter,
+                                 const PGQPathTableCache &path_table_cache,
+                                 const ReferencedBindings &referenced_bindings,
+                                 CoveredBindingMap &covered_columns,
+                                 OneRowPerMode one_row_per_mode,
+                                 const ParsedExpression *where_hint) {
+	// Pre-compute WHERE equality constraints once; used to push pt.v0/pt.v1 filters.
+	const WhereConstraints where_constraints = ExtractEqualityConstraints(where_hint);
+	auto binding_is_referenced = [&](const string &binding) {
+		return !binding.empty() && referenced_bindings.find(binding) != referenced_bindings.end();
+	};
+
+	auto get_path_element = [](const unique_ptr<PathReference> &ref) -> PathElement * {
+		if (ref->path_reference_type == PGQPathReferenceType::PATH_ELEMENT) {
+			return reinterpret_cast<PathElement *>(ref.get());
+		}
+		return nullptr;
+	};
+
+	string named_path_variable;
+	auto *rewrite_path_elements = GetRewritePathElements(path_elements, named_path_variable);
+
+	const size_t n = rewrite_path_elements->size();
+	if (n < 3 || n % 2 == 0) {
+		return false;
+	}
+	const size_t n_hops = (n - 1) / 2;
+	if (n_hops > 3) {
+		return false;
+	}
+
+	const string &graph_name = pg_table.property_graph_name;
+
+	auto find_path_table = [&](const string &tname, const string &path_kind, const vector<string> &vertex_sequence,
+	                           const vector<string> &edge_sequence) -> const PGQPathTableInfo * {
+		return FindPathTableInfo(path_table_cache, tname, path_kind, vertex_sequence, edge_sequence);
+	};
+
+	// -----------------------------------------------------------------------
+	// TC case: single-hop pattern with a quantified SubPath edge.
+	// Routes to pre-computed transitive-closure table __pg_{graph}__tc__{V}__{E}.
+	// Must run before the ElemSpec loop, which rejects all SubPath elements.
+	// TC tables have schema (v0, v1, depth); only exist for self-referential edges.
+	// -----------------------------------------------------------------------
+	if (n == 3) {
+		PathElement *tc_src = get_path_element((*rewrite_path_elements)[0]);
+		PathElement *tc_dst = get_path_element((*rewrite_path_elements)[2]);
+		SubPath     *tc_sp  = nullptr;
+		if ((*rewrite_path_elements)[1]->path_reference_type == PGQPathReferenceType::SUBPATH) {
+			tc_sp = reinterpret_cast<SubPath *>((*rewrite_path_elements)[1].get());
+		}
+		if (tc_src && tc_dst && tc_sp &&
+		    !tc_src->variable_binding.empty() && !tc_dst->variable_binding.empty() &&
+		    !tc_src->label.empty() && !IsCompoundLabel(tc_src->label) &&
+		    !tc_dst->label.empty() && !IsCompoundLabel(tc_dst->label) &&
+		    tc_src->label == tc_dst->label &&
+		    tc_sp->path_list.size() == 1) {
+			PathElement *tc_edge = get_path_element(tc_sp->path_list[0]);
+			if (tc_edge && !tc_edge->label.empty() && !IsCompoundLabel(tc_edge->label) &&
+			    tc_edge->match_type == PGQMatchType::MATCH_EDGE_RIGHT) {
+				if (binding_is_referenced(tc_edge->variable_binding)) {
+					return false;
+				}
+				if (one_row_per_mode != OneRowPerMode::NONE) {
+					const string tc_witness_tname = "__pg_" + graph_name + "__tc_witness__" +
+					                                tc_src->label + "__" + tc_edge->label;
+					const PGQPathTableInfo *tc_witness_info =
+					    find_path_table(tc_witness_tname, "tc_witness", {tc_src->label, tc_dst->label},
+					                    {tc_edge->label});
+					if (!tc_witness_info) {
+						return false;
+					}
+					shared_ptr<PropertyGraphTable> vtable, etbl;
+					try {
+						vtable = ResolveTable(tc_src->label, PGQMatchType::MATCH_VERTEX, pg_table);
+						etbl = ResolveTable(tc_edge->label, PGQMatchType::MATCH_EDGE_RIGHT, pg_table);
+					} catch (...) {
+						return false;
+					}
+					if (etbl->source_pk.empty() || etbl->destination_pk.empty() ||
+					    etbl->source_fk.empty() || etbl->destination_fk.empty() ||
+					    etbl->source_pk[0] != etbl->destination_pk[0]) {
+						return false;
+					}
+					if (one_row_per_mode == OneRowPerMode::STEP &&
+					    !HasEqualityConstraint(where_constraints, tc_dst->variable_binding, etbl->destination_pk[0])) {
+						const string tc_chain_tname = "__pg_" + graph_name + "__tc_chain__" +
+						                              tc_src->label + "__" + tc_edge->label;
+						const PGQPathTableInfo *tc_chain_info =
+						    find_path_table(tc_chain_tname, "tc_chain", {tc_src->label, tc_dst->label},
+						                    {tc_edge->label});
+						if (tc_chain_info) {
+							vector<string> endpoint_filters;
+							vector<MaterializedSQLFilter> materialized_endpoint_filters;
+							PushConstraintToTCChainFilter(where_constraints, tc_src->variable_binding,
+							                              etbl->source_pk[0], "v0", endpoint_filters,
+							                              materialized_endpoint_filters);
+							if ((!endpoint_filters.empty() || !materialized_endpoint_filters.empty()) &&
+							    match_ref.where_clause) {
+								match_ref.where_clause = RemoveEndpointEqualityConjuncts(
+								    std::move(match_ref.where_clause),
+								    {{tc_src->variable_binding, etbl->source_pk[0]}});
+							}
+							case_insensitive_map_t<string> allowed_key_columns;
+							allowed_key_columns[tc_src->variable_binding] = etbl->source_pk[0];
+							allowed_key_columns[tc_dst->variable_binding] = etbl->destination_pk[0];
+							if (match_ref.one_row_per_vars.size() >= 3) {
+								allowed_key_columns[match_ref.one_row_per_vars[0]] = etbl->source_pk[0];
+								allowed_key_columns[match_ref.one_row_per_vars[2]] = etbl->destination_pk[0];
+							}
+							const bool key_only_chain =
+							    MatchOnlyUsesKeyColumns(match_ref, allowed_key_columns);
+							const bool batchable_chain =
+							    key_only_chain || !MatchContainsUnsupportedChainBatchExpression(match_ref);
+							AddTCChainORPCTE(select_node, *tc_chain_info, vtable, etbl, tc_sp->lower, tc_sp->upper,
+							                 endpoint_filters, materialized_endpoint_filters, !batchable_chain);
+							alias_map[tc_src->variable_binding] = vtable;
+							alias_map[tc_dst->variable_binding] = vtable;
+							auto diagnostic = MakeArtifactDiagnostic(
+							    graph_name, "tc_chain_one_row_per", "selected tc_chain artifact for ONE ROW PER STEP",
+							    *tc_chain_info, {tc_src->label, tc_dst->label}, {tc_edge->label}, "__tcc_orp",
+							    one_row_per_mode);
+							diagnostic.endpoint_filter_count =
+							    endpoint_filters.size() + materialized_endpoint_filters.size();
+							RecordRewriteDiagnostic(context, std::move(diagnostic));
+							return true;
+						}
+					}
+					vector<string> endpoint_filters;
+					PushConstraintToSQLFilter(where_constraints, tc_src->variable_binding, etbl->source_pk[0],
+					                          "w.v0", endpoint_filters);
+					PushConstraintToSQLFilter(where_constraints, tc_dst->variable_binding, etbl->destination_pk[0],
+					                          "w.v1", endpoint_filters);
+					AddTCWitnessORPCTE(select_node, *tc_witness_info, vtable, etbl, tc_sp->lower, tc_sp->upper,
+					                   endpoint_filters);
+					alias_map[tc_src->variable_binding] = vtable;
+					alias_map[tc_dst->variable_binding] = vtable;
+					auto diagnostic = MakeArtifactDiagnostic(
+					    graph_name, "tc_witness_one_row_per", "selected tc_witness artifact for ONE ROW PER",
+					    *tc_witness_info, {tc_src->label, tc_dst->label}, {tc_edge->label}, "__tcw_orp",
+					    one_row_per_mode);
+					diagnostic.endpoint_filter_count = endpoint_filters.size();
+					RecordRewriteDiagnostic(context, std::move(diagnostic));
+					return true;
+				}
+
+				if (one_row_per_mode == OneRowPerMode::NONE &&
+				    HasTopLevelNamedPathFunction(match_ref, named_path_variable)) {
+					const string tc_witness_tname = "__pg_" + graph_name + "__tc_witness__" +
+					                                tc_src->label + "__" + tc_edge->label;
+					const PGQPathTableInfo *tc_witness_info =
+					    find_path_table(tc_witness_tname, "tc_witness", {tc_src->label, tc_dst->label},
+					                    {tc_edge->label});
+					const string tc_chain_tname = "__pg_" + graph_name + "__tc_chain__" +
+					                              tc_src->label + "__" + tc_edge->label;
+					const PGQPathTableInfo *tc_chain_info =
+					    find_path_table(tc_chain_tname, "tc_chain", {tc_src->label, tc_dst->label},
+					                    {tc_edge->label});
+					shared_ptr<PropertyGraphTable> vtable, etbl;
+					try {
+						vtable = ResolveTable(tc_src->label, PGQMatchType::MATCH_VERTEX, pg_table);
+						etbl = ResolveTable(tc_edge->label, PGQMatchType::MATCH_EDGE_RIGHT, pg_table);
+					} catch (...) {
+						return false;
+					}
+					if (etbl->source_pk.empty() || etbl->destination_pk.empty() ||
+					    etbl->source_fk.empty() || etbl->destination_fk.empty() ||
+					    etbl->source_pk[0] != etbl->destination_pk[0]) {
+						return false;
+					}
+
+					const bool dst_key_constrained =
+					    HasEqualityConstraint(where_constraints, tc_dst->variable_binding, etbl->destination_pk[0]);
+					ReferencedBindings where_referenced_bindings;
+					CollectReferencedBindings(where_hint, where_referenced_bindings);
+					const bool dst_where_referenced =
+					    !tc_dst->variable_binding.empty() &&
+					    where_referenced_bindings.find(tc_dst->variable_binding) != where_referenced_bindings.end();
+					const bool use_witness = dst_key_constrained || dst_where_referenced || !tc_chain_info;
+					if (use_witness && !tc_witness_info) {
+						return false;
+					}
+					if (!use_witness && !tc_chain_info) {
+						return false;
+					}
+
+					const string path_alias = "__pgq_named_path_" + to_string(extra_alias_counter++);
+					vector<string> endpoint_filters;
+					const string table_prefix = use_witness ? "w." : "c.";
+					PushConstraintToSQLFilter(where_constraints, tc_src->variable_binding, etbl->source_pk[0],
+					                          table_prefix + "v0", endpoint_filters);
+					if (use_witness) {
+						PushConstraintToSQLFilter(where_constraints, tc_dst->variable_binding, etbl->destination_pk[0],
+						                          "w.v1", endpoint_filters);
+					}
+
+					unique_ptr<TableRef> path_ref;
+					if (use_witness) {
+						path_ref = BuildTCWitnessNamedPathRef(*tc_witness_info, path_alias, tc_sp->lower, tc_sp->upper,
+						                                      endpoint_filters);
+					} else {
+						path_ref = BuildTCChainNamedPathRef(*tc_chain_info, path_alias, tc_sp->lower, tc_sp->upper,
+						                                    endpoint_filters);
+					}
+
+					if (select_node->from_table) {
+						auto cross = make_uniq<JoinRef>(JoinRefType::CROSS);
+						cross->left = std::move(select_node->from_table);
+						cross->right = std::move(path_ref);
+						select_node->from_table = std::move(cross);
+					} else {
+						select_node->from_table = std::move(path_ref);
+					}
+
+					const string &src_binding = tc_src->variable_binding;
+					const string &dst_binding = tc_dst->variable_binding;
+					alias_map[src_binding] = vtable;
+					alias_map[dst_binding] = vtable;
+					conditions.push_back(make_uniq<ComparisonExpression>(
+					    ExpressionType::COMPARE_EQUAL,
+					    make_uniq<ColumnRefExpression>(etbl->source_pk[0], src_binding),
+					    make_uniq<ColumnRefExpression>("v0", path_alias)));
+					conditions.push_back(make_uniq<ComparisonExpression>(
+					    ExpressionType::COMPARE_EQUAL,
+					    make_uniq<ColumnRefExpression>(etbl->destination_pk[0], dst_binding),
+					    make_uniq<ColumnRefExpression>("v1", path_alias)));
+					RewriteTopLevelNamedPathFunctions(match_ref, named_path_variable, path_alias);
+					auto diagnostic = MakeArtifactDiagnostic(
+					    graph_name, use_witness ? "tc_witness_named_path" : "tc_chain_named_path",
+					    use_witness ? "selected tc_witness artifact for named path functions"
+					                : "selected tc_chain artifact for named path functions",
+					    use_witness ? *tc_witness_info : *tc_chain_info,
+					    {tc_src->label, tc_dst->label}, {tc_edge->label}, path_alias, one_row_per_mode);
+					diagnostic.endpoint_filter_count = endpoint_filters.size();
+					RecordRewriteDiagnostic(context, std::move(diagnostic));
+					return true;
+				}
+
+				const string tc_tname = "__pg_" + graph_name + "__tc__" +
+				                        tc_src->label + "__" + tc_edge->label;
+				const PGQPathTableInfo *tc_info =
+				    find_path_table(tc_tname, "transitive_closure", {tc_src->label, tc_dst->label}, {tc_edge->label});
+				if (tc_info) {
+					shared_ptr<PropertyGraphTable> vtable, etbl;
+					try {
+						vtable = ResolveTable(tc_src->label,  PGQMatchType::MATCH_VERTEX,     pg_table);
+						etbl   = ResolveTable(tc_edge->label, PGQMatchType::MATCH_EDGE_RIGHT, pg_table);
+					} catch (...) {
+						return false;
+					}
+					if (etbl->source_pk.empty() || etbl->destination_pk.empty()) {
+						return false;
+					}
+
+					const string pt_alias = "_pgq_pt_" + to_string(extra_alias_counter++);
+					{
+						auto bt          = make_uniq<BaseTableRef>();
+						bt->catalog_name = tc_info->catalog_name;
+						bt->schema_name  = tc_info->schema_name;
+						bt->table_name   = tc_info->table_name;
+						bt->alias        = pt_alias;
+						unique_ptr<TableRef> pt_ref = std::move(bt);
+						if (select_node->from_table) {
+							auto cross   = make_uniq<JoinRef>(JoinRefType::CROSS);
+							cross->left  = std::move(select_node->from_table);
+							cross->right = std::move(pt_ref);
+							select_node->from_table = std::move(cross);
+						} else {
+							select_node->from_table = std::move(pt_ref);
+						}
+					}
+
+					const string &src_binding = tc_src->variable_binding;
+					const string &dst_binding = tc_dst->variable_binding;
+					alias_map[src_binding] = vtable;
+					alias_map[dst_binding] = vtable;
+					{
+						auto lhs = make_uniq<ColumnRefExpression>(etbl->source_pk[0], src_binding);
+						auto rhs = make_uniq<ColumnRefExpression>("v0", pt_alias);
+						conditions.push_back(make_uniq<ComparisonExpression>(
+						    ExpressionType::COMPARE_EQUAL, std::move(lhs), std::move(rhs)));
+					}
+					{
+						auto lhs = make_uniq<ColumnRefExpression>(etbl->destination_pk[0], dst_binding);
+						auto rhs = make_uniq<ColumnRefExpression>("v1", pt_alias);
+						conditions.push_back(make_uniq<ComparisonExpression>(
+						    ExpressionType::COMPARE_EQUAL, std::move(lhs), std::move(rhs)));
+					}
+
+					// Depth filter: add bounds when the quantifier is not fully open.
+					// Unbounded upper is represented as 1 << 30 in the parser.
+					const int64_t lo = tc_sp->lower;
+					const int64_t hi = tc_sp->upper;
+					if (lo > 1) {
+						auto lhs = make_uniq<ColumnRefExpression>("depth", pt_alias);
+						auto rhs = make_uniq<ConstantExpression>(Value::BIGINT(lo));
+						conditions.push_back(make_uniq<ComparisonExpression>(
+						    ExpressionType::COMPARE_GREATERTHANOREQUALTO, std::move(lhs), std::move(rhs)));
+					}
+					if (hi < (1 << 30)) {
+						auto lhs = make_uniq<ColumnRefExpression>("depth", pt_alias);
+						auto rhs = make_uniq<ConstantExpression>(Value::BIGINT(hi));
+						conditions.push_back(make_uniq<ComparisonExpression>(
+						    ExpressionType::COMPARE_LESSTHANOREQUALTO, std::move(lhs), std::move(rhs)));
+					}
+					// Predicate pushdown: WHERE src.pk = const → pt.v0 = const
+					//                     WHERE dst.pk = const → pt.v1 = const
+					// Enables S3 Parquet row-group pruning on the sorted path table.
+					PushConstraintToPathTable(where_constraints, src_binding,
+					                         etbl->source_pk[0], "v0", pt_alias, conditions);
+					PushConstraintToPathTable(where_constraints, dst_binding,
+					                         etbl->destination_pk[0], "v1", pt_alias, conditions);
+					PushBindingFilterToPathTable(where_hint, src_binding, vtable, etbl->source_pk[0],
+					                             "v0", pt_alias, conditions);
+					PushBindingFilterToPathTable(where_hint, dst_binding, vtable, etbl->destination_pk[0],
+					                             "v1", pt_alias, conditions);
+					auto diagnostic = MakeArtifactDiagnostic(
+					    graph_name, "transitive_closure", "selected transitive_closure artifact",
+					    *tc_info, {tc_src->label, tc_dst->label}, {tc_edge->label}, pt_alias,
+					    one_row_per_mode);
+					diagnostic.endpoint_filter_count = CountEndpointFilters(
+					    where_constraints, {{src_binding, etbl->source_pk[0]}, {dst_binding, etbl->destination_pk[0]}});
+					RecordRewriteDiagnostic(context, std::move(diagnostic));
+					return true;
+				}
+			}
+		}
+	}
+
+	// ABI context expansion: a bounded variable-length right-directed pattern over
+	// metadata-backed edge path tables, e.g.
+	//   MATCH p = (t:Tag)-[:!HasParent]->{1,3}(x)
+	// The rewrite expands from the current frontier label, so once a TAG reaches a
+	// WORK_ORDER, WORK_ORDER-starting ABI tables are included in the next step.
+	if (n == 3 && one_row_per_mode == OneRowPerMode::NONE) {
+		PathElement *ctx_src = get_path_element((*rewrite_path_elements)[0]);
+		PathElement *ctx_dst = get_path_element((*rewrite_path_elements)[2]);
+		SubPath *ctx_sp = nullptr;
+		if ((*rewrite_path_elements)[1]->path_reference_type == PGQPathReferenceType::SUBPATH) {
+			ctx_sp = reinterpret_cast<SubPath *>((*rewrite_path_elements)[1].get());
+		}
+		if (ctx_src && ctx_dst && ctx_sp && ctx_sp->path_list.size() == 1 &&
+		    !ctx_src->variable_binding.empty() && !ctx_src->label.empty() &&
+		    !IsCompoundLabel(ctx_src->label)) {
+			PathElement *ctx_edge = get_path_element(ctx_sp->path_list[0]);
+			const bool named_path_projection = HasTopLevelNamedPathFunction(match_ref, named_path_variable);
+			const bool vertex_properties_projection =
+			    HasTopLevelNamedPathFunction(match_ref, named_path_variable, "vertex_properties");
+			const bool dst_endpoint_projection = HasTopLevelEndpointFunction(match_ref, ctx_dst->variable_binding);
+			if (ctx_edge && ctx_edge->match_type == PGQMatchType::MATCH_EDGE_RIGHT &&
+			    !binding_is_referenced(ctx_edge->variable_binding) &&
+			    (named_path_projection || dst_endpoint_projection)) {
+				if (!ctx_dst->variable_binding.empty() && binding_is_referenced(ctx_dst->variable_binding) &&
+				    !dst_endpoint_projection) {
+					return false;
+				}
+
+				shared_ptr<PropertyGraphTable> src_vtable;
+				try {
+					src_vtable = ResolveTable(ctx_src->label, PGQMatchType::MATCH_VERTEX, pg_table);
+				} catch (...) {
+					return false;
+				}
+
+				const string path_alias = "__pgq_context_path_" + to_string(extra_alias_counter++);
+				string src_pk;
+				auto path_ref = BuildABIContextNamedPathRef(path_table_cache, pg_table, path_alias,
+				                                            src_vtable->main_label, ctx_src->variable_binding,
+				                                            ctx_edge->label, ctx_dst->label,
+				                                            ctx_sp->lower, ctx_sp->upper,
+				                                            where_constraints, src_pk,
+				                                            vertex_properties_projection);
+				if (!path_ref || src_pk.empty()) {
+					return false;
+				}
+
+				if (select_node->from_table) {
+					auto cross = make_uniq<JoinRef>(JoinRefType::CROSS);
+					cross->left = std::move(select_node->from_table);
+					cross->right = std::move(path_ref);
+					select_node->from_table = std::move(cross);
+				} else {
+					select_node->from_table = std::move(path_ref);
+				}
+
+				alias_map[ctx_src->variable_binding] = src_vtable;
+				conditions.push_back(make_uniq<ComparisonExpression>(
+				    ExpressionType::COMPARE_EQUAL,
+				    make_uniq<ColumnRefExpression>(src_pk, ctx_src->variable_binding),
+				    make_uniq<ColumnRefExpression>("v0", path_alias)));
+				RewriteTopLevelNamedPathFunctions(match_ref, named_path_variable, path_alias);
+				RewriteTopLevelEndpointFunctions(match_ref, ctx_dst->variable_binding, path_alias);
+				PGQRewriteDiagnostic diagnostic;
+				diagnostic.graph_name = graph_name;
+				diagnostic.rewrite_type = "abi_context_expansion";
+				diagnostic.status = "selected";
+				diagnostic.reason = "selected metadata-backed bounded context expansion";
+				diagnostic.path_kind = "context_expansion";
+				diagnostic.vertex_label_sequence = ctx_dst->label.empty() ? ctx_src->label + ",*" : ctx_src->label + "," + ctx_dst->label;
+				diagnostic.edge_label_sequence = ctx_edge->label.empty() ? "*" : ctx_edge->label;
+				diagnostic.table_alias = path_alias;
+				diagnostic.one_row_per_mode = OneRowPerModeToString(one_row_per_mode);
+				diagnostic.min_depth = static_cast<int64_t>(ctx_sp->lower);
+				diagnostic.max_depth = static_cast<int64_t>(ctx_sp->upper);
+				diagnostic.endpoint_filter_count =
+				    CountEndpointFilters(where_constraints, {{ctx_src->variable_binding, src_pk}});
+				diagnostic.property_filter_count = vertex_properties_projection ? 1 : 0;
+				RecordRewriteDiagnostic(context, std::move(diagnostic));
+				return true;
+			}
+		}
+	}
+
+	// Unpack into flat (src, edge, dst) triples.
+	// Left-directed edges are accepted and normalized below.
+	// Undirected (MATCH_EDGE_ANY) and bidirectional (MATCH_EDGE_LEFT_RIGHT) are handled
+	// by a dedicated 1-hop block below; multi-hop undirected falls through to Tier 2.
+	struct ElemSpec {
+		PathElement *src;
+		PathElement *edge;
+		PathElement *dst;
+		bool reversed;   // true when edge is MATCH_EDGE_LEFT
+		bool undirected; // true when edge is MATCH_EDGE_ANY or MATCH_EDGE_LEFT_RIGHT
+	};
+	vector<ElemSpec> specs;
+	specs.reserve(n_hops);
+	for (size_t i = 0; i < n_hops; i++) {
+		PathElement *src  = get_path_element((*rewrite_path_elements)[i * 2]);
+		PathElement *edge = get_path_element((*rewrite_path_elements)[i * 2 + 1]);
+		PathElement *dst  = get_path_element((*rewrite_path_elements)[i * 2 + 2]);
+		if (!src || !edge || !dst) {
+			return false; // non-TC SubPath or other unsupported element
+		}
+		if (src->variable_binding.empty() || dst->variable_binding.empty()) {
+			return false; // anonymous vertex: no join possible
+		}
+		const bool rev  = (edge->match_type == PGQMatchType::MATCH_EDGE_LEFT);
+		const bool undir = (edge->match_type == PGQMatchType::MATCH_EDGE_ANY ||
+		                    edge->match_type == PGQMatchType::MATCH_EDGE_LEFT_RIGHT);
+		specs.push_back({src, edge, dst, rev, undir});
+	}
+
+	// -----------------------------------------------------------------------
+	// Undirected 1-hop: (a)-[:E]-(b)  or  (a)-[]-(b)
+	// Only supported when all edges are undirected and the pattern is 1-hop.
+	// Emits a UNION ALL subquery (forward ∪ self-reverse) against the forward
+	// path table when it exists.  Both vertex labels must be the same type OR
+	// both unlabeled (heterogeneous undirected falls through to Tier 2).
+	// -----------------------------------------------------------------------
+	{
+		bool any_undirected = false, all_undirected = true;
+		for (const auto &s : specs) {
+			if (s.undirected) { any_undirected = true; }
+			else              { all_undirected = false; }
+		}
+		if (any_undirected) {
+			if (n_hops != 1 || !all_undirected) {
+				return false; // multi-hop or mixed-direction undirected
+			}
+			const auto &s = specs[0];
+			// Require explicit, single edge label and same-type (or unlabeled) vertices.
+			if (s.edge->label.empty() || IsCompoundLabel(s.edge->label)) {
+				return false; // undirected enumeration is future work — use Case A path
+			}
+			const string &src_label_u = s.src->label;
+			const string &dst_label_u = s.dst->label;
+			if (!src_label_u.empty() && !dst_label_u.empty() && src_label_u != dst_label_u) {
+				return false; // heterogeneous typed undirected — fall through to Tier 2
+			}
+			// Look up the (directed) path table for this edge.
+			// For homogeneous (same type both ends), SRC==DST so forward==reverse table.
+			const string vtx_label  = src_label_u.empty() ? dst_label_u : src_label_u;
+			const string fwd_tname  = "__pg_" + graph_name + "__" + vtx_label +
+			                          "__" + s.edge->label + "__" + vtx_label;
+			const PGQPathTableInfo *fwd_info =
+			    find_path_table(fwd_tname, "edge", {vtx_label, vtx_label}, {s.edge->label});
+			if (!fwd_info) {
+				return false;
+			}
+			shared_ptr<PropertyGraphTable> vtable, etbl;
+			try {
+				vtable = ResolveTable(vtx_label, PGQMatchType::MATCH_VERTEX, pg_table);
+				etbl   = ResolveTable(s.edge->label, PGQMatchType::MATCH_EDGE_RIGHT, pg_table);
+			} catch (...) {
+				return false;
+			}
+			if (etbl->source_pk.empty() || etbl->destination_pk.empty()) {
+				return false;
+			}
+
+			// Build UNION ALL of forward + self-reverse:
+			//   SELECT v0, e1, v1 FROM pt   (a→b direction)
+			//   UNION ALL
+			//   SELECT v1, e1, v0 FROM pt   (b→a direction, swapping v0/v1)
+			auto make_sel = [&](bool reverse) -> unique_ptr<SelectNode> {
+				auto sel = make_uniq<SelectNode>();
+				auto bt  = make_uniq<BaseTableRef>();
+				bt->catalog_name = fwd_info->catalog_name;
+				bt->schema_name  = fwd_info->schema_name;
+				bt->table_name   = fwd_info->table_name;
+				sel->from_table  = std::move(bt);
+				if (!reverse) {
+					sel->select_list.push_back(make_uniq<StarExpression>());
+				} else {
+					sel->select_list.push_back(make_uniq<ColumnRefExpression>("v1"));
+					sel->select_list.back()->alias = "v0";
+					sel->select_list.push_back(make_uniq<ColumnRefExpression>("e1"));
+					sel->select_list.push_back(make_uniq<ColumnRefExpression>("v0"));
+					sel->select_list.back()->alias = "v1";
+				}
+				return sel;
+			};
+			auto sop        = make_uniq<SetOperationNode>();
+			sop->setop_type = SetOperationType::UNION;
+			sop->setop_all  = true;
+			sop->children.push_back(make_sel(false));
+			sop->children.push_back(make_sel(true));
+			auto stmt  = make_uniq<SelectStatement>();
+			stmt->node = std::move(sop);
+
+			const string pt_alias_u = "_pgq_pt_" + std::to_string(extra_alias_counter++);
+			auto pt_ref_u = make_uniq<SubqueryRef>(std::move(stmt), pt_alias_u);
+
+			if (select_node->from_table) {
+				auto cross   = make_uniq<JoinRef>(JoinRefType::CROSS);
+				cross->left  = std::move(select_node->from_table);
+				cross->right = std::move(pt_ref_u);
+				select_node->from_table = std::move(cross);
+			} else {
+				select_node->from_table = std::move(pt_ref_u);
+			}
+
+			const string &src_binding_u = s.src->variable_binding;
+			const string &dst_binding_u = s.dst->variable_binding;
+			alias_map[src_binding_u] = vtable;
+			alias_map[dst_binding_u] = vtable;
+			{
+				auto lhs = make_uniq<ColumnRefExpression>(etbl->source_pk[0], src_binding_u);
+				auto rhs = make_uniq<ColumnRefExpression>("v0", pt_alias_u);
+				conditions.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+				                                                     std::move(lhs), std::move(rhs)));
+			}
+			{
+				auto lhs = make_uniq<ColumnRefExpression>(etbl->destination_pk[0], dst_binding_u);
+				auto rhs = make_uniq<ColumnRefExpression>("v1", pt_alias_u);
+				conditions.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+				                                                     std::move(lhs), std::move(rhs)));
+			}
+			// Predicate pushdown on the UNION ALL alias (filters on pt.v0/pt.v1 are pushed
+			// to the subquery alias — DuckDB will push them inside).
+			PushConstraintToPathTable(where_constraints, src_binding_u,
+			                         etbl->source_pk[0], "v0", pt_alias_u, conditions);
+			PushConstraintToPathTable(where_constraints, dst_binding_u,
+			                         etbl->destination_pk[0], "v1", pt_alias_u, conditions);
+			PushBindingFilterToPathTable(where_hint, src_binding_u, vtable, etbl->source_pk[0],
+			                             "v0", pt_alias_u, conditions);
+			PushBindingFilterToPathTable(where_hint, dst_binding_u, vtable, etbl->destination_pk[0],
+			                             "v1", pt_alias_u, conditions);
+			auto diagnostic = MakeArtifactDiagnostic(
+			    graph_name, "undirected_edge", "selected edge artifact with forward/reverse UNION ALL",
+			    *fwd_info, {vtx_label, vtx_label}, {s.edge->label}, pt_alias_u, one_row_per_mode);
+			diagnostic.endpoint_filter_count = CountEndpointFilters(
+			    where_constraints, {{src_binding_u, etbl->source_pk[0]}, {dst_binding_u, etbl->destination_pk[0]}});
+			RecordRewriteDiagnostic(context, std::move(diagnostic));
+			return true;
+		}
+	}
+
+	// Direction normalization: for a fully left-directed path pattern
+	// (e.g. (c)<-[E2]-(b)<-[E1]-(a)), reverse the spec order and swap src/dst so the
+	// path is right-directed (a)-[E1]->(b)-[E2]->(c).  The existing Case A/B logic then
+	// produces the correct table name and join conditions unchanged.
+	// Mixed-direction patterns (some left, some right) fall through to bridge table scans.
+	// Undirected specs (handled above) never reach this point.
+	{
+		bool all_right = true, all_left = true;
+		for (const auto &s : specs) {
+			if (s.reversed)  { all_right = false; }
+			else             { all_left  = false; }
+		}
+		if (!all_right && !all_left) {
+			return false; // mixed directions — no precomputed table covers this
+		}
+		if (all_left) {
+			std::reverse(specs.begin(), specs.end());
+			for (auto &s : specs) {
+				std::swap(s.src, s.dst);
+				s.reversed = false;
+			}
+		}
+	}
+
+	// Helper: split a '|' expression into leaf labels.
+	// If expr is empty (unlabeled) return the main_label of every table of the given type.
+	auto collect_labels = [&](const string &expr, bool is_vertex) -> vector<string> {
+		if (expr.empty()) {
+			const auto &tables = is_vertex ? pg_table.vertex_tables : pg_table.edge_tables;
+			vector<string> result;
+			result.reserve(tables.size());
+			for (const auto &tbl : tables) {
+				result.push_back(tbl->main_label);
+			}
+			return result;
+		}
+		auto parts = SplitTopLevel(expr, '|');
+		vector<string> result;
+		result.reserve(parts.size());
+		for (auto &p : parts) {
+			result.push_back(StripParens(p));
+		}
+		return result;
+	};
+
+	// -----------------------------------------------------------------------
+	// Case A: 1-hop with any compound or empty src/edge/dst label.
+	//   Enumerate all (src_label, edge_label, dst_label) combinations; keep
+	//   those whose path table exists in the catalog.  Build UNION ALL if >1 hit.
+	// -----------------------------------------------------------------------
+	const bool needs_enumeration =
+	    (n_hops == 1) &&
+	    (specs[0].src->label.empty()  || IsCompoundLabel(specs[0].src->label) ||
+	     specs[0].edge->label.empty() || IsCompoundLabel(specs[0].edge->label) ||
+	     specs[0].dst->label.empty()  || IsCompoundLabel(specs[0].dst->label));
+
+	if (needs_enumeration) {
+		auto src_candidates  = collect_labels(specs[0].src->label,  /*is_vertex=*/true);
+		auto edge_candidates = collect_labels(specs[0].edge->label, /*is_vertex=*/false);
+		auto dst_candidates  = collect_labels(specs[0].dst->label,  /*is_vertex=*/true);
+
+		struct Hit {
+			string catalog;
+			string schema;
+			string tname;
+			string src_pk;
+			string dst_pk;
+			string src_label;
+			string edge_label;
+			string dst_label;
+			shared_ptr<PropertyGraphTable> edge_table;
+			shared_ptr<PropertyGraphTable> src_vtable;
+			shared_ptr<PropertyGraphTable> dst_vtable;
+		};
+		vector<Hit> hits;
+
+		for (const auto &sl : src_candidates) {
+			for (const auto &el : edge_candidates) {
+				shared_ptr<PropertyGraphTable> etbl;
+				try {
+					etbl = ResolveTable(el, PGQMatchType::MATCH_EDGE_RIGHT, pg_table);
+				} catch (...) {
+					continue;
+				}
+				if (etbl->source_pk.empty() || etbl->destination_pk.empty() ||
+				    etbl->source_fk.empty() || etbl->destination_fk.empty()) {
+					continue;
+				}
+				for (const auto &dl : dst_candidates) {
+					const string tname = "__pg_" + graph_name + "__" + sl + "__" + el + "__" + dl;
+					const PGQPathTableInfo *path_info = find_path_table(tname, "edge", {sl, dl}, {el});
+					if (!path_info) {
+						continue;
+					}
+					shared_ptr<PropertyGraphTable> src_vtable, dst_vtable;
+					try {
+						src_vtable = ResolveTable(sl, PGQMatchType::MATCH_VERTEX, pg_table);
+					} catch (...) {}
+					try {
+						dst_vtable = ResolveTable(dl, PGQMatchType::MATCH_VERTEX, pg_table);
+					} catch (...) {}
+					hits.push_back({path_info->catalog_name, path_info->schema_name, path_info->table_name, etbl->source_pk[0],
+					                etbl->destination_pk[0], sl, el, dl, etbl, src_vtable, dst_vtable});
+				}
+			}
+		}
+
+		if (hits.empty()) {
+			return false;
+		}
+
+		// Pre-compute whether src/dst types are uniform across all hits.
+		const string &src_binding = specs[0].src->variable_binding;
+		const string &dst_binding = specs[0].dst->variable_binding;
+		bool uniform_src = true;
+		for (const auto &h : hits) {
+			if (h.src_label != hits[0].src_label) { uniform_src = false; break; }
+		}
+		bool uniform_dst = true;
+		for (const auto &h : hits) {
+			if (h.dst_label != hits[0].dst_label) { uniform_dst = false; break; }
+		}
+		const string &edge_binding = specs[0].edge->variable_binding;
+		const bool edge_required = binding_is_referenced(edge_binding);
+		bool uniform_edge = true;
+		for (const auto &h : hits) {
+			if (h.edge_table.get() != hits[0].edge_table.get()) { uniform_edge = false; break; }
+		}
+		if (edge_required && !uniform_edge) {
+			return false;
+		}
+
+		// Build the FROM reference.
+		// Single hit → plain BaseTableRef; multiple hits → SubqueryRef wrapping UNION ALL.
+		const string pt_alias = "_pgq_pt_" + to_string(extra_alias_counter++);
+		unique_ptr<TableRef> pt_ref;
+
+		if (hits.size() == 1) {
+			auto bt          = make_uniq<BaseTableRef>();
+			bt->catalog_name = hits[0].catalog;
+			bt->schema_name  = hits[0].schema;
+			bt->table_name   = hits[0].tname;
+			bt->alias        = pt_alias;
+			pt_ref           = std::move(bt);
+		} else {
+			// Build one SELECT * per hit, UNION ALL.
+			auto make_hit_sel = [&](const Hit &h) -> unique_ptr<SelectNode> {
+				auto sel = make_uniq<SelectNode>();
+				sel->select_list.push_back(make_uniq<StarExpression>());
+				auto bt          = make_uniq<BaseTableRef>();
+				bt->catalog_name = h.catalog;
+				bt->schema_name  = h.schema;
+				bt->table_name   = h.tname;
+				sel->from_table  = std::move(bt);
+				return sel;
+			};
+			unique_ptr<QueryNode> union_node;
+			for (const auto &h : hits) {
+				auto sel = make_hit_sel(h);
+				if (!union_node) {
+					union_node = std::move(sel);
+				} else {
+					auto sop        = make_uniq<SetOperationNode>();
+					sop->setop_type = SetOperationType::UNION;
+					sop->setop_all  = true;
+					sop->children.push_back(std::move(union_node));
+					sop->children.push_back(std::move(sel));
+					union_node = std::move(sop);
+				}
+			}
+			auto stmt  = make_uniq<SelectStatement>();
+			stmt->node = std::move(union_node);
+			pt_ref     = make_uniq<SubqueryRef>(std::move(stmt), pt_alias);
+		}
+
+		if (select_node->from_table) {
+			auto cross   = make_uniq<JoinRef>(JoinRefType::CROSS);
+			cross->left  = std::move(select_node->from_table);
+			cross->right = std::move(pt_ref);
+			select_node->from_table = std::move(cross);
+		} else {
+			select_node->from_table = std::move(pt_ref);
+		}
+
+		// Src vertex: binding.src_pk = pt.v0
+		// Skip when src is anonymous (no binding) or type is non-uniform across hits.
+		if (!src_binding.empty() && uniform_src && hits[0].src_vtable) {
+			alias_map[src_binding] = hits[0].src_vtable;
+			auto lhs = make_uniq<ColumnRefExpression>(hits[0].src_pk, src_binding);
+			auto rhs = make_uniq<ColumnRefExpression>("v0", pt_alias);
+			conditions.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+			                                                     std::move(lhs), std::move(rhs)));
+		}
+
+		// Dst vertex: join condition only when dst has a binding, all hits share the same dst
+		// type, and dst_vtable is known. For polymorphic or anonymous dst, v1 is only
+		// accessible via the path table alias.
+		if (!dst_binding.empty() && uniform_dst && hits[0].dst_vtable) {
+			alias_map[dst_binding] = hits[0].dst_vtable;
+			auto lhs = make_uniq<ColumnRefExpression>(hits[0].dst_pk, dst_binding);
+			auto rhs = make_uniq<ColumnRefExpression>("v1", pt_alias);
+			conditions.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+			                                                     std::move(lhs), std::move(rhs)));
+		}
+		if (edge_required && hits[0].edge_table) {
+			alias_map[edge_binding] = hits[0].edge_table;
+			conditions.push_back(make_uniq<ComparisonExpression>(
+			    ExpressionType::COMPARE_EQUAL,
+			    make_uniq<ColumnRefExpression>(hits[0].edge_table->source_fk[0], edge_binding),
+			    make_uniq<ColumnRefExpression>("v0", pt_alias)));
+			conditions.push_back(make_uniq<ComparisonExpression>(
+			    ExpressionType::COMPARE_EQUAL,
+			    make_uniq<ColumnRefExpression>(hits[0].edge_table->destination_fk[0], edge_binding),
+			    make_uniq<ColumnRefExpression>("v1", pt_alias)));
+		}
+
+		// Predicate pushdown: pt.v0 = const / pt.v1 = const for S3 row-group pruning.
+		PushConstraintToPathTable(where_constraints, src_binding, hits[0].src_pk,
+		                         "v0", pt_alias, conditions);
+		PushConstraintToPathTable(where_constraints, dst_binding, hits[0].dst_pk,
+		                         "v1", pt_alias, conditions);
+		if (!src_binding.empty() && uniform_src && hits[0].src_vtable) {
+			PushBindingFilterToPathTable(where_hint, src_binding, hits[0].src_vtable, hits[0].src_pk,
+			                             "v0", pt_alias, conditions);
+		}
+		if (!dst_binding.empty() && uniform_dst && hits[0].dst_vtable) {
+			PushBindingFilterToPathTable(where_hint, dst_binding, hits[0].dst_vtable, hits[0].dst_pk,
+			                             "v1", pt_alias, conditions);
+		}
+		if (edge_required && hits[0].edge_table) {
+			PushEdgeFilterToPathTable(where_hint, edge_binding, hits[0].edge_table,
+			                          hits[0].edge_table->source_fk[0], hits[0].edge_table->destination_fk[0],
+			                          "v0", "v1", pt_alias, conditions);
+		}
+
+		PGQRewriteDiagnostic diagnostic;
+		if (hits.size() == 1) {
+			diagnostic = MakeArtifactDiagnostic(
+			    graph_name, "enumerated_edge", "selected enumerated edge artifact", path_table_cache.catalog.find(hits[0].tname)->second,
+			    {hits[0].src_label, hits[0].dst_label}, {hits[0].edge_label}, pt_alias, one_row_per_mode);
+		} else {
+			diagnostic.graph_name = graph_name;
+			diagnostic.rewrite_type = "enumerated_edge_union";
+			diagnostic.status = "selected";
+			diagnostic.reason = "selected multiple edge artifacts through UNION ALL";
+			diagnostic.path_kind = "edge";
+			diagnostic.vertex_label_sequence = "*";
+			diagnostic.edge_label_sequence = specs[0].edge->label.empty() ? "*" : specs[0].edge->label;
+			diagnostic.table_alias = pt_alias;
+			diagnostic.one_row_per_mode = OneRowPerModeToString(one_row_per_mode);
+			diagnostic.estimated_rows = 0;
+			diagnostic.semantic_grain = "identity";
+			diagnostic.temporal_mode = "snapshot";
+			diagnostic.multiplicity_mode = "union_of_distinct_edges";
+			diagnostic.property_support = "late_vertex_property_fetch";
+			diagnostic.freshness_policy = "mixed";
+			for (const auto &hit : hits) {
+				auto hit_info = path_table_cache.catalog.find(hit.tname);
+				if (hit_info != path_table_cache.catalog.end() && hit_info->second.estimated_rows > 0) {
+					diagnostic.estimated_rows += hit_info->second.estimated_rows;
+				}
+			}
+		}
+		diagnostic.endpoint_filter_count = CountEndpointFilters(
+		    where_constraints, {{src_binding, hits[0].src_pk}, {dst_binding, hits[0].dst_pk}});
+		RecordRewriteDiagnostic(context, std::move(diagnostic));
+		return true;
+	}
+
+	// -----------------------------------------------------------------------
+	// Case B: All labels explicit and single (original multi-hop behavior).
+	// -----------------------------------------------------------------------
+	for (const auto &s : specs) {
+		if (s.edge->label.empty() || IsCompoundLabel(s.edge->label)) {
+			return false;
+		}
+		if (s.dst->label.empty() || IsCompoundLabel(s.dst->label)) {
+			return false;
+		}
+	}
+
+	struct HopInfo {
+		string src_label, edge_label, dst_label;
+		string src_binding, edge_binding, dst_binding;
+		string src_pk, dst_pk, edge_src_fk, edge_dst_fk;
+		shared_ptr<PropertyGraphTable> edge_table;
+		shared_ptr<PropertyGraphTable> src_vtable, dst_vtable;
+	};
+	vector<HopInfo> hops;
+	hops.reserve(n_hops);
+
+	for (size_t i = 0; i < n_hops; i++) {
+		shared_ptr<PropertyGraphTable> edge_tbl;
+		try {
+			edge_tbl = ResolveTable(specs[i].edge->label, PGQMatchType::MATCH_EDGE_RIGHT, pg_table);
+		} catch (...) {
+			return false;
+		}
+		if (edge_tbl->source_pk.empty() || edge_tbl->destination_pk.empty() ||
+		    edge_tbl->source_fk.empty() || edge_tbl->destination_fk.empty()) {
+			return false;
+		}
+		shared_ptr<PropertyGraphTable> src_vtable, dst_vtable;
+		try {
+			src_vtable = ResolveTable(specs[i].src->label, PGQMatchType::MATCH_VERTEX, pg_table);
+			dst_vtable = ResolveTable(specs[i].dst->label, PGQMatchType::MATCH_VERTEX, pg_table);
+		} catch (...) {
+			return false;
+		}
+		HopInfo h;
+		h.src_label   = specs[i].src->label;
+		h.edge_label  = specs[i].edge->label;
+		h.dst_label   = specs[i].dst->label;
+		h.src_binding = specs[i].src->variable_binding;
+		h.edge_binding = specs[i].edge->variable_binding;
+		h.dst_binding = specs[i].dst->variable_binding;
+		h.src_pk      = edge_tbl->source_pk[0];
+		h.dst_pk      = edge_tbl->destination_pk[0];
+		h.edge_src_fk = edge_tbl->source_fk[0];
+		h.edge_dst_fk = edge_tbl->destination_fk[0];
+		h.edge_table  = edge_tbl;
+		h.src_vtable  = std::move(src_vtable);
+		h.dst_vtable  = std::move(dst_vtable);
+		hops.push_back(std::move(h));
+	}
+
+	// Build the candidate path table name: __pg_{graph}__{V0}__{E0}__{V1}__...
+	string tname = "__pg_" + graph_name + "__" + hops[0].src_label;
+	vector<string> vertex_sequence;
+	vector<string> edge_sequence;
+	vertex_sequence.push_back(hops[0].src_label);
+	for (const auto &h : hops) {
+		tname += "__" + h.edge_label + "__" + h.dst_label;
+		edge_sequence.push_back(h.edge_label);
+		vertex_sequence.push_back(h.dst_label);
+	}
+
+	const PGQPathTableInfo *path_info =
+	    find_path_table(tname, n_hops == 1 ? "edge" : "fixed_path", vertex_sequence, edge_sequence);
+	if (!path_info) {
+		return false;
+	}
+
+	// Rewrite: path table reference (plain BaseTableRef).
+	const string pt_alias = "_pgq_pt_" + to_string(extra_alias_counter++);
+	const auto covered_target_properties = ParseCoveredTargetProperties(path_info->covered_target_properties);
+	unique_ptr<TableRef> pt_ref;
+	{
+		auto bt          = make_uniq<BaseTableRef>();
+		bt->catalog_name = path_info->catalog_name;
+		bt->schema_name  = path_info->schema_name;
+		bt->table_name   = path_info->table_name;
+		bt->alias        = pt_alias;
+		pt_ref           = std::move(bt);
+	}
+
+	if (select_node->from_table) {
+		auto cross   = make_uniq<JoinRef>(JoinRefType::CROSS);
+		cross->left  = std::move(select_node->from_table);
+		cross->right = std::move(pt_ref);
+		select_node->from_table = std::move(cross);
+	} else {
+		select_node->from_table = std::move(pt_ref);
+	}
+
+	// Src vertex: binding.src_pk = pt.v0. If the query only references covered
+	// columns for this binding, rewrite those references to the path table and
+	// skip the late vertex join entirely.
+	CoveredPropertyMap src_covered_properties;
+	src_covered_properties[hops[0].src_pk] = {pt_alias, "v0"};
+	covered_columns[hops[0].src_binding] = src_covered_properties;
+	const bool src_fully_covered =
+	    BindingReferencesOnlyCovered(match_ref, hops[0].src_binding, src_covered_properties);
+	if (!src_fully_covered) {
+		alias_map[hops[0].src_binding] = hops[0].src_vtable;
+		auto lhs = make_uniq<ColumnRefExpression>(hops[0].src_pk, hops[0].src_binding);
+		auto rhs = make_uniq<ColumnRefExpression>("v0", pt_alias);
+		conditions.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+		                                                     std::move(lhs), std::move(rhs)));
+	}
+
+	// Each hop's dst vertex: binding.dst_pk = pt.v(i+1)
+	for (size_t i = 0; i < hops.size(); i++) {
+		const string vcol = "v" + to_string(i + 1);
+		CoveredPropertyMap dst_covered_properties;
+		dst_covered_properties[hops[i].dst_pk] = {pt_alias, vcol};
+		auto covered_entry = covered_target_properties.find(vcol);
+		if (covered_entry != covered_target_properties.end()) {
+			for (const auto &property_name : covered_entry->second) {
+				dst_covered_properties[property_name] = {pt_alias, vcol + "_" + property_name};
+			}
+		}
+		covered_columns[hops[i].dst_binding] = dst_covered_properties;
+		const bool dst_fully_covered =
+		    BindingReferencesOnlyCovered(match_ref, hops[i].dst_binding, dst_covered_properties);
+		if (!dst_fully_covered) {
+			alias_map[hops[i].dst_binding] = hops[i].dst_vtable;
+			auto lhs = make_uniq<ColumnRefExpression>(hops[i].dst_pk, hops[i].dst_binding);
+			auto rhs = make_uniq<ColumnRefExpression>(vcol, pt_alias);
+			conditions.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+			                                                     std::move(lhs), std::move(rhs)));
+		}
+	}
+
+	// Bind edge variables only when a query actually references them. The ABI path
+	// table remains the driving relation; the edge table is joined back by its
+	// declared source/destination keys so edge properties and element_id(e) bind.
+	for (size_t i = 0; i < hops.size(); i++) {
+		if (!binding_is_referenced(hops[i].edge_binding)) {
+			continue;
+		}
+		alias_map[hops[i].edge_binding] = hops[i].edge_table;
+		const string src_vcol = "v" + to_string(i);
+		const string dst_vcol = "v" + to_string(i + 1);
+		conditions.push_back(make_uniq<ComparisonExpression>(
+		    ExpressionType::COMPARE_EQUAL,
+		    make_uniq<ColumnRefExpression>(hops[i].edge_src_fk, hops[i].edge_binding),
+		    make_uniq<ColumnRefExpression>(src_vcol, pt_alias)));
+		conditions.push_back(make_uniq<ComparisonExpression>(
+		    ExpressionType::COMPARE_EQUAL,
+		    make_uniq<ColumnRefExpression>(hops[i].edge_dst_fk, hops[i].edge_binding),
+		    make_uniq<ColumnRefExpression>(dst_vcol, pt_alias)));
+	}
+
+	// Predicate pushdown: push WHERE constraints on src/intermediate/dst vertices
+	// directly to the corresponding pt.vN column for S3 row-group pruning.
+	PushConstraintToPathTable(where_constraints, hops[0].src_binding, hops[0].src_pk,
+	                         "v0", pt_alias, conditions);
+	PushBindingFilterToPathTable(where_hint, hops[0].src_binding, hops[0].src_vtable, hops[0].src_pk,
+	                             "v0", pt_alias, conditions);
+	for (size_t i = 0; i < hops.size(); i++) {
+		const string vcol = "v" + to_string(i + 1);
+		PushConstraintToPathTable(where_constraints, hops[i].dst_binding, hops[i].dst_pk,
+		                         vcol, pt_alias, conditions);
+		PushBindingFilterToPathTable(where_hint, hops[i].dst_binding, hops[i].dst_vtable, hops[i].dst_pk,
+		                             vcol, pt_alias, conditions);
+		if (binding_is_referenced(hops[i].edge_binding)) {
+			PushEdgeFilterToPathTable(where_hint, hops[i].edge_binding, hops[i].edge_table,
+			                          hops[i].edge_src_fk, hops[i].edge_dst_fk,
+			                          "v" + to_string(i), vcol, pt_alias, conditions);
+		}
+	}
+
+	vector<pair<string, string>> endpoint_filter_keys;
+	endpoint_filter_keys.emplace_back(hops[0].src_binding, hops[0].src_pk);
+	for (size_t i = 0; i < hops.size(); i++) {
+		endpoint_filter_keys.emplace_back(hops[i].dst_binding, hops[i].dst_pk);
+	}
+	auto diagnostic = MakeArtifactDiagnostic(
+	    graph_name, n_hops == 1 ? "edge" : "fixed_path",
+	    n_hops == 1 ? "selected exact edge artifact" : "selected exact fixed_path artifact",
+	    *path_info, vertex_sequence, edge_sequence, pt_alias, one_row_per_mode);
+	diagnostic.endpoint_filter_count = CountEndpointFilters(where_constraints, endpoint_filter_keys);
+	RecordRewriteDiagnostic(context, std::move(diagnostic));
+	return true;
+}
+
 unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, TableFunctionBindInput &bind_input) {
 	auto duckpgq_state = GetDuckPGQState(context);
 
-	auto match_index = bind_input.inputs[0].GetValue<int32_t>();
-	auto *ref = dynamic_cast<MatchExpression *>(duckpgq_state->transform_expression[match_index].get());
+	int32_t match_index = 0;
+	unique_ptr<ParsedExpression> match_copy;
+	ParsedExpression *match_expression = nullptr;
+	auto *function = dynamic_cast<FunctionExpression *>(bind_input.ref.function.get());
+	if (function && !function->children.empty()) {
+		auto *raw_match = dynamic_cast<MatchExpression *>(function->children[0].get());
+		if (raw_match) {
+			match_copy = raw_match->Copy();
+			match_expression = match_copy.get();
+		}
+	}
+	if (!match_expression && !bind_input.inputs.empty()) {
+		match_index = bind_input.inputs[0].GetValue<int32_t>();
+		if (match_index < 0) {
+			auto parser_override_expression = DuckPGQGetParserOverrideExpression(match_index);
+			if (parser_override_expression) {
+				match_copy = parser_override_expression->Copy();
+				match_expression = match_copy.get();
+			}
+		} else {
+			auto match_entry = duckpgq_state->transform_expression.find(match_index);
+			if (match_entry != duckpgq_state->transform_expression.end()) {
+				match_expression = match_entry->second.get();
+			}
+		}
+	}
+	if (!match_expression) {
+		throw InternalException("DuckPGQ match expression index %d was not registered", match_index);
+	}
+	auto *ref = dynamic_cast<MatchExpression *>(match_expression);
+	if (!ref) {
+		throw InternalException("DuckPGQ match expression index %d did not contain a MatchExpression", match_index);
+	}
 	auto *pg_table = duckpgq_state->GetPropertyGraph(ref->pg_name);
 
 	vector<unique_ptr<ParsedExpression>> conditions;
@@ -2285,15 +6610,48 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	auto final_select_node = make_uniq<SelectNode>();
 	case_insensitive_map_t<shared_ptr<PropertyGraphTable>> alias_map;
 
+	// Build/reuse session-local path-table metadata once per graph. Prefer DBT's
+	// __pgq_path_catalog ABI metadata, with a name-scan fallback for older layouts.
+	auto path_table_cache_ptr = GetPathTableCache(context, *duckpgq_state, pg_table->property_graph_name,
+	                                              pg_table);
+	auto &path_table_cache = *path_table_cache_ptr;
+	const ReferencedBindings referenced_bindings = CollectReferencedBindings(*ref);
+	const bool require_abi_paths = RequireABIPaths(context);
+	CoveredBindingMap covered_columns;
+
 	int32_t extra_alias_counter = 0;
 	for (idx_t idx_i = 0; idx_i < ref->path_patterns.size(); idx_i++) {
 		auto &path_pattern = ref->path_patterns[idx_i];
 		// Check if the element is PathElement or a Subpath with potentially many
 		// items
 		bool all_shortest = path_pattern->all && path_pattern->shortest;
-		ProcessPathList(path_pattern->path_elements, conditions, final_select_node, alias_map, *pg_table,
-		                extra_alias_counter, *ref, all_shortest);
+		// Tier 1: if a pre-computed path table covers this entire pattern, use it.
+		// Falls through to Tier 2/3 (ProcessPathList) when not applicable.
+		// Pass the MATCH WHERE clause for predicate pushdown (v0/v1 = constant).
+		if (!TryPathTableRewrite(context, *pg_table, path_pattern->path_elements, *ref, conditions,
+		                          final_select_node, alias_map, extra_alias_counter,
+		                          path_table_cache, referenced_bindings,
+		                          covered_columns,
+		                          ref->one_row_per,
+		                          ref->where_clause.get())) {
+			if (require_abi_paths && PathPatternRequiresABIPath(path_pattern->path_elements)) {
+				PGQRewriteDiagnostic diagnostic;
+				diagnostic.graph_name = pg_table->property_graph_name;
+				diagnostic.rewrite_type = "abi_path";
+				diagnostic.status = "missing";
+				diagnostic.reason = "pgq_require_abi_paths=true and no matching ABI rewrite was available";
+				diagnostic.one_row_per_mode = OneRowPerModeToString(ref->one_row_per);
+				RecordRewriteDiagnostic(context, std::move(diagnostic));
+				ThrowABIPathRequired();
+			}
+			ProcessPathList(path_pattern->path_elements, conditions, final_select_node, alias_map, *pg_table,
+			                extra_alias_counter, *ref, all_shortest);
+		}
 	}
+
+	// Go through all aliases encountered
+	RewriteCoveredPathColumns(ref->column_list, covered_columns);
+	ref->where_clause = RewriteCoveredPathColumns(std::move(ref->where_clause), covered_columns);
 
 	// Go through all aliases encountered
 	for (auto &table_alias_entry : alias_map) {
@@ -2312,7 +6670,8 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	// Process OPTIONAL MATCH groups — each group becomes a chain of LEFT JOINs.
 	case_insensitive_map_t<shared_ptr<PropertyGraphTable>> optional_alias_map;
 	for (auto &opt_group : ref->optional_match_patterns) {
-		ProcessOptionalPathList(opt_group, final_select_node, optional_alias_map, *pg_table, extra_alias_counter, alias_map);
+		ProcessOptionalPathList(opt_group, final_select_node, optional_alias_map, *pg_table, extra_alias_counter, alias_map,
+		                        path_table_cache, require_abi_paths);
 	}
 
 	// Maps from table alias to table, including vertex and edge tables.
@@ -2327,13 +6686,69 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	// but before CheckColumnBinding (which validates the COLUMNS list).
 	if (ref->one_row_per != OneRowPerMode::NONE) {
 		ApplyOneRowPer(*ref, *pg_table, final_select_node, conditions, alias_to_vertex_and_edge_tables);
+
+		// Push safe WHERE conjuncts into shortest_path_cte so DuckDB doesn't enumerate all
+		// N×N src/dst pairs before computing shortestpath().  Conjuncts containing pgq_exists()
+		// are excluded because they reference outer aliases that are not in CTE scope.
+		//
+		// EXCEPTION: when shortest_path_cte wraps a bounded ORP recursive CTE (__rvl_orp_*)
+		// the anchor filter is already applied inside the recursive CTE.  Pushing the conjunct
+		// again into shortest_path_cte would reference vertex aliases (e.g. "t") that are not
+		// in scope there — only __rvl_orp_* columns are visible — causing a binder error.
+		static const string kPathCTE = "shortest_path_cte";
+		if (ref->where_clause && final_select_node->cte_map.map.find(kPathCTE) != final_select_node->cte_map.map.end()) {
+			auto &cte_entry = final_select_node->cte_map.map[kPathCTE];
+			auto *inner_sel = dynamic_cast<SelectNode *>(cte_entry->query->node.get());
+			bool wraps_orp_path_source = false;
+			if (inner_sel && inner_sel->from_table) {
+				auto *from_bt = dynamic_cast<BaseTableRef *>(inner_sel->from_table.get());
+				wraps_orp_path_source = from_bt &&
+				                        (from_bt->table_name.find("__rvl_orp_") == 0 ||
+				                         from_bt->table_name.find("__tcw_orp_") == 0 ||
+				                         from_bt->table_name.find("__tcc_orp_") == 0);
+			}
+			if (!wraps_orp_path_source) {
+				auto cte_filter = ExtractSafeCTEConjuncts(*ref->where_clause);
+				if (cte_filter) {
+					cte_filter = RewriteAllDifferent(std::move(cte_filter));
+					cte_filter = RewriteGraphFunctions(std::move(cte_filter), alias_to_vertex_and_edge_tables);
+					if (inner_sel) {
+						if (inner_sel->where_clause) {
+							inner_sel->where_clause = make_uniq<ConjunctionExpression>(
+							    ExpressionType::CONJUNCTION_AND, std::move(inner_sel->where_clause),
+							    std::move(cte_filter));
+						} else {
+							inner_sel->where_clause = std::move(cte_filter);
+						}
+					}
+				}
+			}
+		}
 	}
 
+	if (MatchMayContainDirectLinkReference(*ref)) {
+		EnsureDirectLinkCatalogs(context, *duckpgq_state, pg_table->property_graph_name, *pg_table, path_table_cache);
+	}
+	const auto direct_link_rewrite_count =
+	    RewriteDirectLinkReferences(*pg_table, final_select_node, ref->column_list, ref->where_clause,
+	                                alias_to_vertex_and_edge_tables, path_table_cache);
+	if (direct_link_rewrite_count > 0) {
+		PGQRewriteDiagnostic diagnostic;
+		diagnostic.graph_name = pg_table->property_graph_name;
+		diagnostic.rewrite_type = "direct_link";
+		diagnostic.status = "selected";
+		diagnostic.reason = "rewrote direct-link dot references to catalog-backed joins/subqueries";
+		diagnostic.path_kind = "direct_link";
+		diagnostic.one_row_per_mode = OneRowPerModeToString(ref->one_row_per);
+		diagnostic.direct_link_rewrite_count = direct_link_rewrite_count;
+		RecordRewriteDiagnostic(context, std::move(diagnostic));
+	}
 	CheckColumnBinding(*pg_table, *ref, alias_to_vertex_and_edge_tables);
 
 	if (ref->where_clause) {
 		// Rewrite PGQ EXISTS/NOT EXISTS predicates first, then standard rewrites.
-		ref->where_clause = RewritePGQExists(std::move(ref->where_clause), *pg_table, alias_map);
+		ref->where_clause = RewritePGQExists(std::move(ref->where_clause), context, *pg_table, alias_map,
+		                                      path_table_cache);
 		auto where = RewriteAllDifferent(std::move(ref->where_clause));
 		where = RewriteGraphFunctions(std::move(where), alias_to_vertex_and_edge_tables);
 		conditions.push_back(std::move(where));
@@ -2369,12 +6784,34 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 		case_insensitive_map_t<shared_ptr<PropertyGraphTable>> branch_alias_map;
 		vector<unique_ptr<ParsedExpression>> branch_conditions;
 		int32_t branch_counter = 0;
+		const ReferencedBindings branch_referenced_bindings = CollectReferencedBindings(branch);
+		CoveredBindingMap branch_covered_columns;
 
 		for (auto &path_pattern : branch.path_patterns) {
 			bool all_shortest = path_pattern->all && path_pattern->shortest;
-			ProcessPathList(path_pattern->path_elements, branch_conditions, branch_select,
-			                branch_alias_map, *pg_table, branch_counter, branch, all_shortest);
+			if (!TryPathTableRewrite(context, *pg_table, path_pattern->path_elements, branch, branch_conditions,
+			                         branch_select, branch_alias_map, branch_counter,
+			                         path_table_cache, branch_referenced_bindings,
+			                         branch_covered_columns,
+			                         branch.one_row_per,
+			                         branch.where_clause.get())) {
+				if (require_abi_paths && PathPatternRequiresABIPath(path_pattern->path_elements)) {
+					PGQRewriteDiagnostic diagnostic;
+					diagnostic.graph_name = pg_table->property_graph_name;
+					diagnostic.rewrite_type = "abi_path";
+					diagnostic.status = "missing";
+					diagnostic.reason = "pgq_require_abi_paths=true and no matching ABI rewrite was available in UNION branch";
+					diagnostic.one_row_per_mode = OneRowPerModeToString(branch.one_row_per);
+					RecordRewriteDiagnostic(context, std::move(diagnostic));
+					ThrowABIPathRequired();
+				}
+				ProcessPathList(path_pattern->path_elements, branch_conditions, branch_select,
+				                branch_alias_map, *pg_table, branch_counter, branch, all_shortest);
+			}
 		}
+
+		RewriteCoveredPathColumns(union_col_copies[ui], branch_covered_columns);
+		branch.where_clause = RewriteCoveredPathColumns(std::move(branch.where_clause), branch_covered_columns);
 
 		for (auto &entry : branch_alias_map) {
 			auto tbl_ref = entry.second->CreateBaseTableRef();
@@ -2392,7 +6829,7 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 		case_insensitive_map_t<shared_ptr<PropertyGraphTable>> branch_opt_alias_map;
 		for (auto &opt_group : branch.optional_match_patterns) {
 			ProcessOptionalPathList(opt_group, branch_select, branch_opt_alias_map, *pg_table, branch_counter,
-			                        branch_alias_map);
+			                        branch_alias_map, path_table_cache, require_abi_paths);
 		}
 
 		auto branch_alias_to_ve = PopulateGraphTableAliasMap(*pg_table, branch);
@@ -2404,8 +6841,24 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 			ApplyOneRowPer(branch, *pg_table, branch_select, branch_conditions, branch_alias_to_ve);
 		}
 
+		const auto branch_direct_link_rewrite_count =
+		    RewriteDirectLinkReferences(*pg_table, branch_select, union_col_copies[ui], branch.where_clause,
+		                                branch_alias_to_ve, path_table_cache);
+		if (branch_direct_link_rewrite_count > 0) {
+			PGQRewriteDiagnostic diagnostic;
+			diagnostic.graph_name = pg_table->property_graph_name;
+			diagnostic.rewrite_type = "direct_link";
+			diagnostic.status = "selected";
+			diagnostic.reason = "rewrote direct-link dot references in UNION branch";
+			diagnostic.path_kind = "direct_link";
+			diagnostic.one_row_per_mode = OneRowPerModeToString(branch.one_row_per);
+			diagnostic.direct_link_rewrite_count = branch_direct_link_rewrite_count;
+			RecordRewriteDiagnostic(context, std::move(diagnostic));
+		}
+
 		if (branch.where_clause) {
-			branch.where_clause = RewritePGQExists(std::move(branch.where_clause), *pg_table, branch_alias_map);
+			branch.where_clause = RewritePGQExists(std::move(branch.where_clause), context, *pg_table,
+			                                       branch_alias_map, path_table_cache);
 			auto where = RewriteAllDifferent(std::move(branch.where_clause));
 			where = RewriteGraphFunctions(std::move(where), branch_alias_to_ve);
 			branch_conditions.push_back(std::move(where));

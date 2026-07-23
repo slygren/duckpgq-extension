@@ -14,6 +14,8 @@ struct CoreTableFunctions {
 		RegisterSummarizePropertyGraphTableFunction(loader);
 		RegisterWeaklyConnectedComponentTableFunction(loader);
 		RegisterPageRankTableFunction(loader);
+		RegisterExplainABIPathTableFunction(loader);
+		RegisterLastRewriteDiagnosticsTableFunction(loader);
 	}
 
 private:
@@ -26,6 +28,8 @@ private:
 	static void RegisterWeaklyConnectedComponentTableFunction(ExtensionLoader &loader);
 	static void RegisterPageRankTableFunction(ExtensionLoader &loader);
 	static void RegisterSummarizePropertyGraphTableFunction(ExtensionLoader &loader);
+	static void RegisterExplainABIPathTableFunction(ExtensionLoader &loader);
+	static void RegisterLastRewriteDiagnosticsTableFunction(ExtensionLoader &loader);
 };
 
 } // namespace duckdb

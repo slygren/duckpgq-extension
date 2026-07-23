@@ -4,10 +4,41 @@
 #include "duckdb/common/case_insensitive_map.hpp"
 
 #include "duckpgq/core/utils/compressed_sparse_row.hpp"
+#include "duckpgq/core/functions/table/match.hpp"
 #include "duckdb/parser/parser_extension.hpp"
 #include "duckdb/parser/parsed_data/create_property_graph_info.hpp"
 
 namespace duckdb {
+
+struct PGQRewriteDiagnostic {
+	int64_t sequence_id = 0;
+	string graph_name;
+	string rewrite_type;
+	string status;
+	string reason;
+	string catalog_name;
+	string schema_name;
+	string path_table_name;
+	string path_kind;
+	string vertex_label_sequence;
+	string edge_label_sequence;
+	string table_alias;
+	string one_row_per_mode;
+	int64_t estimated_rows = -1;
+	int64_t min_depth = -1;
+	int64_t max_depth = -1;
+	string semantic_grain;
+	string temporal_mode;
+	string multiplicity_mode;
+	string property_support;
+	string freshness_policy;
+	bool supports_one_row_per_step = false;
+	bool is_deduplicated = false;
+	bool is_sorted_by_v0 = false;
+	int64_t endpoint_filter_count = 0;
+	int64_t property_filter_count = 0;
+	int64_t direct_link_rewrite_count = 0;
+};
 
 class DuckPGQState : public ClientContextState {
 public:
@@ -31,6 +62,14 @@ public:
 
 	//! Property graphs that are registered
 	case_insensitive_map_t<unique_ptr<CreateInfo>> registered_property_graphs;
+
+	//! Session-local ABI metadata and semantic lookup caches keyed by property graph name.
+	case_insensitive_map_t<shared_ptr<PGQPathTableCache>> path_table_caches;
+	std::mutex path_table_cache_lock;
+
+	//! Last GRAPH_TABLE binder/rewrite diagnostics for the current connection.
+	vector<PGQRewriteDiagnostic> rewrite_diagnostics;
+	int64_t rewrite_diagnostic_sequence = 0;
 
 	//! Used to build the CSR data structures required for path-finding queries
 	std::unordered_map<int32_t, unique_ptr<CSR>> csr_list;

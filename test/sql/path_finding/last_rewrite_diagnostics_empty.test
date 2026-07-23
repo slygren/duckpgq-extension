@@ -1,0 +1,11 @@
+# name: test/sql/path_finding/last_rewrite_diagnostics_empty.test
+# description: pgq_last_rewrite_diagnostics is callable before any graph rewrite
+# group: [path_finding]
+
+require duckpgq
+
+query I
+SELECT count(*)
+FROM pgq_last_rewrite_diagnostics();
+----
+0

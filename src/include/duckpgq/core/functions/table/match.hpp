@@ -26,6 +26,71 @@
 
 namespace duckdb {
 
+struct PGQPathTableInfo {
+	string catalog_name;
+	string schema_name;
+	string table_name;
+	string path_kind;
+	string src_label;
+	string dst_label;
+	string vertex_label_sequence;
+	string edge_label_sequence;
+	string bridge_table_names;
+	int64_t hop_count = -1;
+	int64_t estimated_rows = -1;
+	int64_t min_depth = -1;
+	int64_t max_depth = -1;
+	string semantic_grain;
+	string temporal_mode;
+	string multiplicity_mode;
+	string property_support;
+	string freshness_policy;
+	string covered_target_properties;
+	bool supports_one_row_per_step = false;
+	bool is_deduplicated = false;
+	bool is_sorted_by_v0 = false;
+	bool from_metadata = false;
+};
+
+using PGQPathTableCatalog = case_insensitive_map_t<PGQPathTableInfo>;
+
+struct PGQBranchSummaryLookup {
+	string table_name;
+	string branch_edge_label;
+};
+
+struct PGQDirectLinkInfo {
+	string graph_name;
+	string link_name;
+	string src_label;
+	string dst_label;
+	string relationship_label;
+	string cardinality;
+	string mode;
+	string link_catalog_name;
+	string link_schema_name;
+	string link_table_name;
+	string src_col;
+	string dst_col;
+	string src_vertex_catalog_name;
+	string src_vertex_schema_name;
+	string src_vertex_table_name;
+	string src_vertex_key;
+	string dst_vertex_catalog_name;
+	string dst_vertex_schema_name;
+	string dst_vertex_table_name;
+	string dst_vertex_key;
+	int64_t estimated_rows = -1;
+};
+
+struct PGQPathTableCache {
+	PGQPathTableCatalog catalog;
+	case_insensitive_map_t<string> semantic_index;
+	case_insensitive_map_t<PGQBranchSummaryLookup> branch_summary_index;
+	vector<PGQDirectLinkInfo> direct_links;
+	case_insensitive_map_t<vector<idx_t>> direct_link_index;
+};
+
 struct PGQMatchFunction : public TableFunction {
 public:
 	PGQMatchFunction() {
@@ -127,7 +192,8 @@ public:
 	static void AddPathFinding(unique_ptr<SelectNode> &select_node, vector<unique_ptr<ParsedExpression>> &conditions,
 	                           const string &prev_binding, const string &edge_binding, const string &next_binding,
 	                           const shared_ptr<PropertyGraphTable> &edge_table, CreatePropertyGraphInfo &pg_table,
-	                           SubPath *subpath, PGQMatchType edge_type);
+	                           SubPath *subpath, PGQMatchType edge_type,
+	                           unique_ptr<ParsedExpression> anchor_filter = nullptr);
 
 	static void AddPathModeFilter(PGQPathMode mode, const string &path_cte,
 	                              vector<unique_ptr<ParsedExpression>> &conditions);
@@ -154,7 +220,9 @@ public:
 	                                    case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &opt_alias_map,
 	                                    CreatePropertyGraphInfo &pg_table,
 	                                    int32_t &extra_alias_counter,
-	                                    const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &mandatory_alias_map);
+	                                    const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &mandatory_alias_map,
+	                                    const PGQPathTableCache &path_table_cache,
+	                                    bool require_abi_paths = false);
 
 	static void CheckNamedSubpath(SubPath &subpath, MatchExpression &original_ref, CreatePropertyGraphInfo &pg_table,
 	                              unique_ptr<SelectNode> &final_select_node,

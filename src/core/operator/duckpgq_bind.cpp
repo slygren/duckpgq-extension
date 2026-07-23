@@ -8,34 +8,89 @@
 
 #include "duckdb/planner/operator_extension.hpp"
 #include "duckdb/parser/parsed_data/create_property_graph_info.hpp"
+#include "duckdb/parser/parsed_data/drop_property_graph_info.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
+#include "duckdb/parser/statement/drop_statement.hpp"
+#include "duckdb/parser/statement/explain_statement.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/parser.hpp"
 #include "duckpgq/core/utils/duckpgq_utils.hpp"
 
 namespace duckdb {
 
 BoundStatement duckpgq_bind(ClientContext &context, Binder &binder, OperatorExtensionInfo *info,
                             SQLStatement &statement) {
-	// Handle CREATE PROPERTY GRAPH parsed by the standard DuckDB parser (no '-' prefix).
-	// CreatePropertyGraphInfo reuses CatalogType::VIEW_ENTRY and crashes Binder::Bind(CreateStatement&).
-	// We detect it here and emit a helpful message directing users to add the '-' prefix.
-	if (statement.type == StatementType::CREATE_STATEMENT) {
-		auto &create_stmt = statement.Cast<CreateStatement>();
-		if (dynamic_cast<CreatePropertyGraphInfo *>(create_stmt.info.get())) {
-			throw BinderException("CREATE PROPERTY GRAPH must use the DuckPGQ parser. "
-			                      "Prefix the statement with '-': -CREATE PROPERTY GRAPH ...");
-		}
-	}
-
 	auto duckpgq_state = context.registered_state->Get<DuckPGQState>("duckpgq");
 	if (!duckpgq_state) {
 		throw; // Throw the original error that got us here if DuckPGQ is not loaded
 	}
 
-	auto duckpgq_binder = Binder::CreateBinder(context, &binder);
 	auto duckpgq_parse_data = dynamic_cast<DuckPGQParseData *>(duckpgq_state->parse_data.get());
+
+	// Path 1: came via '-' prefix — duckpgq_plan already processed the statement
+	// (MatchExpressions stashed, parse_data set). Re-bind the processed statement.
 	if (duckpgq_parse_data) {
+		duckpgq_state->rewrite_diagnostics.clear();
+		duckpgq_state->rewrite_diagnostic_sequence = 0;
+		auto duckpgq_binder = Binder::CreateBinder(context, &binder);
 		return duckpgq_binder->Bind(*(duckpgq_parse_data->statement));
 	}
+
+	// Path 2: came via parser_override (no '-' prefix, no parse_data yet).
+	// We handle DDL and SELECT statement types directly here.
+
+	auto duckpgq_binder = Binder::CreateBinder(context, &binder);
+
+	// CREATE PROPERTY GRAPH: store the statement in parse_data so
+	// CreatePropertyGraphBind can access the CreatePropertyGraphInfo, then bind
+	// a synthetic table-function call that drives the creation.
+	if (statement.type == StatementType::CREATE_STATEMENT) {
+		auto &create_stmt = statement.Cast<CreateStatement>();
+		if (dynamic_cast<CreatePropertyGraphInfo *>(create_stmt.info.get())) {
+			duckpgq_state->parse_data = make_uniq<DuckPGQParseData>(statement.Copy());
+			Parser inner_parser;
+			inner_parser.ParseQuery("SELECT * FROM create_property_graph()");
+			return duckpgq_binder->Bind(*inner_parser.statements[0]);
+		}
+	}
+
+	// DROP PROPERTY GRAPH: same pattern — store statement, bind synthetic call.
+	// Guard with dynamic_cast to avoid intercepting plain DROP TABLE/VIEW statements.
+	if (statement.type == StatementType::DROP_STATEMENT) {
+		auto &drop_stmt = statement.Cast<DropStatement>();
+		if (dynamic_cast<DropPropertyGraphInfo *>(drop_stmt.info.get())) {
+			duckpgq_state->parse_data = make_uniq<DuckPGQParseData>(statement.Copy());
+			Parser inner_parser;
+			inner_parser.ParseQuery("SELECT * FROM drop_property_graph()");
+			return duckpgq_binder->Bind(*inner_parser.statements[0]);
+		}
+	}
+
+	// EXPLAIN wrapping a PGQ query: recurse into the inner statement so its
+	// MatchExpressions are stashed, then re-bind the whole EXPLAIN.
+	if (statement.type == StatementType::EXPLAIN_STATEMENT) {
+		auto &explain_stmt = statement.Cast<ExplainStatement>();
+		if (explain_stmt.stmt->type == StatementType::SELECT_STATEMENT) {
+			duckpgq_state->rewrite_diagnostics.clear();
+			duckpgq_state->rewrite_diagnostic_sequence = 0;
+			duckpgq_find_select_statement(explain_stmt.stmt.get(), *duckpgq_state);
+		}
+		return duckpgq_binder->Bind(statement);
+	}
+
+	// SELECT / FROM GRAPH_TABLE: stash MatchExpressions in DuckPGQState
+	// (duckpgq_find_select_statement modifies TableFunctionRefs in-place,
+	// replacing MatchExpression children with integer indices), then re-bind.
+	if (statement.type == StatementType::SELECT_STATEMENT) {
+		duckpgq_state->rewrite_diagnostics.clear();
+		duckpgq_state->rewrite_diagnostic_sequence = 0;
+		auto rebound_statement = statement.Copy();
+		duckpgq_find_select_statement(rebound_statement.get(), *duckpgq_state);
+		duckpgq_state->parse_data = make_uniq<DuckPGQParseData>(std::move(rebound_statement));
+		auto duckpgq_parse_data = dynamic_cast<DuckPGQParseData *>(duckpgq_state->parse_data.get());
+		return duckpgq_binder->Bind(*duckpgq_parse_data->statement);
+	}
+
 	throw;
 }
 

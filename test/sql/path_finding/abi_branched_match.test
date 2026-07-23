@@ -1,0 +1,104 @@
+# name: test/sql/path_finding/abi_branched_match.test
+# description: Comma-separated branch patterns sharing an anchor can use ABI path tables
+# group: [path_finding]
+
+require duckpgq
+
+statement ok
+CREATE TABLE tag(id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO tag VALUES (1, 'Pump A'), (2, 'Pump B');
+
+statement ok
+CREATE TABLE workorder(id INTEGER, title VARCHAR);
+
+statement ok
+INSERT INTO workorder VALUES (10, 'WO-10');
+
+statement ok
+CREATE TABLE notification(id INTEGER, title VARCHAR);
+
+statement ok
+INSERT INTO notification VALUES (20, 'N-20');
+
+statement ok
+CREATE TABLE has_workorder(tag_id INTEGER, wo_id INTEGER);
+
+statement ok
+CREATE TABLE has_notification(tag_id INTEGER, notification_id INTEGER);
+
+statement ok
+CREATE SCHEMA graph;
+
+statement ok
+CREATE TABLE graph.__pg_test_graph__Tag__HasWorkorder__Workorder AS
+SELECT 1 AS v0, hash('wo') AS e1, 10 AS v1;
+
+statement ok
+CREATE TABLE graph.__pg_test_graph__Tag__HasNotification__Notification AS
+SELECT 1 AS v0, hash('notif') AS e1, 20 AS v1;
+
+statement ok
+CREATE TABLE graph.__pgq_path_catalog AS
+SELECT
+    'test_graph' AS graph_name,
+    '__pg_test_graph__Tag__HasWorkorder__Workorder' AS path_table_name,
+    'edge' AS path_kind,
+    1 AS hop_count,
+    'Tag' AS src_label,
+    'Workorder' AS dst_label,
+    'Tag,Workorder' AS vertex_label_sequence,
+    'HasWorkorder' AS edge_label_sequence,
+    true AS supports_one_row_per_step,
+    true AS is_deduplicated,
+    (SELECT count(*) FROM graph.__pg_test_graph__Tag__HasWorkorder__Workorder) AS estimated_rows,
+    current_timestamp AS last_refreshed_at,
+    true AS is_sorted_by_v0,
+    1 AS min_depth,
+    1 AS max_depth,
+    'has_workorder' AS bridge_table_names
+UNION ALL
+SELECT
+    'test_graph' AS graph_name,
+    '__pg_test_graph__Tag__HasNotification__Notification' AS path_table_name,
+    'edge' AS path_kind,
+    1 AS hop_count,
+    'Tag' AS src_label,
+    'Notification' AS dst_label,
+    'Tag,Notification' AS vertex_label_sequence,
+    'HasNotification' AS edge_label_sequence,
+    true AS supports_one_row_per_step,
+    true AS is_deduplicated,
+    (SELECT count(*) FROM graph.__pg_test_graph__Tag__HasNotification__Notification) AS estimated_rows,
+    current_timestamp AS last_refreshed_at,
+    true AS is_sorted_by_v0,
+    1 AS min_depth,
+    1 AS max_depth,
+    'has_notification' AS bridge_table_names;
+
+statement ok
+-CREATE PROPERTY GRAPH test_graph
+VERTEX TABLES (
+    tag PROPERTIES (id, name) LABEL Tag,
+    workorder PROPERTIES (id, title) LABEL Workorder,
+    notification PROPERTIES (id, title) LABEL Notification
+)
+EDGE TABLES (
+    has_workorder SOURCE KEY (tag_id) REFERENCES tag(id)
+                  DESTINATION KEY (wo_id) REFERENCES workorder(id)
+                  LABEL HasWorkorder,
+    has_notification SOURCE KEY (tag_id) REFERENCES tag(id)
+                     DESTINATION KEY (notification_id) REFERENCES notification(id)
+                     LABEL HasNotification
+);
+
+query III
+-FROM GRAPH_TABLE (
+    test_graph
+    MATCH (t:Tag)-[:HasWorkorder]->(w:Workorder),
+          (t)-[:HasNotification]->(n:Notification)
+    COLUMNS (t.name AS tag_name, w.title AS workorder_title, n.title AS notification_title)
+);
+----
+Pump A	WO-10	N-20

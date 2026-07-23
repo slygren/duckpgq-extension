@@ -1,0 +1,149 @@
+# name: test/sql/path_finding/abi_explain_path.test
+# description: pgq_explain_abi_path reports semantic ABI path artifact coverage
+# group: [path_finding]
+
+require duckpgq
+
+statement ok
+CREATE SCHEMA graph;
+
+statement ok
+CREATE TABLE graph.__pgq_path_catalog AS
+SELECT
+    'test_graph' AS graph_name,
+    '__pg_test_graph__Tag__HasWorkorder__Workorder' AS path_table_name,
+    'edge' AS path_kind,
+    1 AS hop_count,
+    'Tag' AS src_label,
+    'Workorder' AS dst_label,
+    'Tag,Workorder' AS vertex_label_sequence,
+    'HasWorkorder' AS edge_label_sequence,
+    true AS supports_one_row_per_step,
+    true AS is_deduplicated,
+    42::BIGINT AS estimated_rows,
+    current_timestamp AS last_refreshed_at,
+    true AS is_sorted_by_v0,
+    1 AS min_depth,
+    1 AS max_depth,
+    'has_workorder' AS bridge_table_names,
+    'identity' AS semantic_grain,
+    'snapshot' AS temporal_mode,
+    'distinct_edges' AS multiplicity_mode,
+    'late_vertex_property_fetch' AS property_support,
+    'dbt_build' AS freshness_policy
+UNION ALL
+SELECT
+    'test_graph',
+    '__pg_test_graph__Tag__HasWorkorder__Workorder__HasOperation__Operation',
+    'fixed_path',
+    2,
+    'Tag',
+    'Operation',
+    'Tag,Workorder,Operation',
+    'HasWorkorder,HasOperation',
+    false,
+    true,
+    7::BIGINT,
+    current_timestamp,
+    true,
+    2,
+    2,
+    'has_workorder,has_operation',
+    'identity',
+    'snapshot',
+    'distinct_identity_paths',
+    'late_vertex_property_fetch',
+    'dbt_build';
+
+query TTTTTTTTTTITTTTTTTIIITTTTTT
+SELECT
+    graph_name,
+    requested_path_kind,
+    requested_vertex_label_sequence,
+    requested_edge_label_sequence,
+    status,
+    reason,
+    catalog_name,
+    schema_name,
+    path_table_name,
+    path_kind,
+    hop_count,
+    src_label,
+    dst_label,
+    vertex_label_sequence,
+    edge_label_sequence,
+    supports_one_row_per_step,
+    is_deduplicated,
+    is_sorted_by_v0,
+    estimated_rows,
+    min_depth,
+    max_depth,
+    bridge_table_names,
+    semantic_grain,
+    temporal_mode,
+    multiplicity_mode,
+    property_support,
+    freshness_policy
+FROM pgq_explain_abi_path(
+    'test_graph',
+    'fixed_path',
+    ['Tag', 'Workorder', 'Operation'],
+    ['HasWorkorder', 'HasOperation']
+);
+----
+test_graph	fixed_path	Tag,Workorder,Operation	HasWorkorder,HasOperation	selected	exact path kind and semantic sequence match	memory	graph	__pg_test_graph__Tag__HasWorkorder__Workorder__HasOperation__Operation	fixed_path	2	Tag	Operation	Tag,Workorder,Operation	HasWorkorder,HasOperation	false	true	true	7	2	2	has_workorder,has_operation	identity	snapshot	distinct_identity_paths	late_vertex_property_fetch	dbt_build
+
+query TTTTTTTTTTITTTTTTTIIITTTTTT
+SELECT
+    graph_name,
+    requested_path_kind,
+    requested_vertex_label_sequence,
+    requested_edge_label_sequence,
+    status,
+    reason,
+    catalog_name,
+    schema_name,
+    path_table_name,
+    path_kind,
+    hop_count,
+    src_label,
+    dst_label,
+    vertex_label_sequence,
+    edge_label_sequence,
+    supports_one_row_per_step,
+    is_deduplicated,
+    is_sorted_by_v0,
+    estimated_rows,
+    min_depth,
+    max_depth,
+    bridge_table_names,
+    semantic_grain,
+    temporal_mode,
+    multiplicity_mode,
+    property_support,
+    freshness_policy
+FROM pgq_explain_abi_path(
+    'test_graph',
+    'auto',
+    ['tag', 'workorder'],
+    ['hasworkorder']
+);
+----
+test_graph	auto	tag,workorder	hasworkorder	selected	exact semantic sequence match	memory	graph	__pg_test_graph__Tag__HasWorkorder__Workorder	edge	1	Tag	Workorder	Tag,Workorder	HasWorkorder	true	true	true	42	1	1	has_workorder	identity	snapshot	distinct_edges	late_vertex_property_fetch	dbt_build
+
+query TTTTTT
+SELECT
+    graph_name,
+    requested_path_kind,
+    requested_vertex_label_sequence,
+    requested_edge_label_sequence,
+    status,
+    reason
+FROM pgq_explain_abi_path(
+    'test_graph',
+    'fixed_path',
+    ['Tag', 'Notification'],
+    ['HasNotification']
+);
+----
+test_graph	fixed_path	Tag,Notification	HasNotification	missing	no ABI path artifact matched the requested semantic sequence

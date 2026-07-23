@@ -132,6 +132,11 @@ void DuckPGQState::ExtractListValues(const Value &list_value, vector<string> &ou
 
 void DuckPGQState::RegisterPropertyGraph(const shared_ptr<PropertyGraphTable> &table, const string &graph_name,
                                          bool is_vertex) {
+	{
+		lock_guard<mutex> guard(path_table_cache_lock);
+		path_table_caches.erase(graph_name);
+	}
+
 	// Ensure the property graph exists in the registry
 	if (registered_property_graphs.find(graph_name) == registered_property_graphs.end()) {
 		registered_property_graphs[graph_name] = make_uniq<CreatePropertyGraphInfo>(graph_name);

@@ -2,6 +2,7 @@
 #include "duckpgq/common.hpp"
 
 #include <duckpgq_state.hpp>
+#include "duckdb/parser/parser_options.hpp"
 
 namespace duckdb {
 
@@ -24,6 +25,11 @@ ParserExtensionParseResult duckpgq_parse(ParserExtensionInfo *info, const std::s
 ParserExtensionPlanResult duckpgq_plan(ParserExtensionInfo *info, ClientContext &,
                                        unique_ptr<ParserExtensionParseData>);
 
+// parser_override: intercepts PGQ queries (GRAPH_TABLE / PROPERTY GRAPH) before DuckDB's
+// standard parser so that a leading '-' prefix is no longer required.
+ParserOverrideResult duckpgq_parser_override(ParserExtensionInfo *info, const string &query,
+                                             ParserOptions &options);
+
 ParserExtensionPlanResult duckpgq_find_select_statement(SQLStatement *statement, DuckPGQState &duckpgq_state);
 
 ParserExtensionPlanResult duckpgq_handle_statement(SQLStatement *statement, DuckPGQState &duckpgq_state);
@@ -32,9 +38,10 @@ void duckpgq_find_match_function(TableRef *table_ref, DuckPGQState &duckpgq_stat
 
 struct DuckPGQParserExtension : ParserExtension {
 	DuckPGQParserExtension() : ParserExtension() {
-		parse_function = duckpgq_parse;
-		plan_function = duckpgq_plan;
-		parser_info = make_shared_ptr<DuckPGQParserExtensionInfo>();
+		parse_function  = duckpgq_parse;
+		plan_function   = duckpgq_plan;
+		parser_override = duckpgq_parser_override;
+		parser_info     = make_shared_ptr<DuckPGQParserExtensionInfo>();
 	}
 };
 

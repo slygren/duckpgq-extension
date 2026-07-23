@@ -1,0 +1,233 @@
+# name: test/sql/path_finding/abi_context_expansion.test
+# description: Bounded variable-length context expansion uses ABI edge metadata across reached labels
+# group: [path_finding]
+
+require duckpgq
+
+statement ok
+CREATE TABLE tag(id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO tag VALUES (1, 'Pump A'), (2, 'Parent');
+
+statement ok
+CREATE TABLE workorder(id INTEGER, title VARCHAR);
+
+statement ok
+INSERT INTO workorder VALUES (10, 'WO-10');
+
+statement ok
+CREATE TABLE notification(id INTEGER, title VARCHAR);
+
+statement ok
+INSERT INTO notification VALUES (20, 'N-20');
+
+statement ok
+CREATE TABLE operation(id INTEGER, title VARCHAR);
+
+statement ok
+INSERT INTO operation VALUES (100, 'Inspect');
+
+statement ok
+CREATE TABLE has_parent(src INTEGER, dst INTEGER);
+
+statement ok
+CREATE TABLE has_workorder(src INTEGER, dst INTEGER);
+
+statement ok
+CREATE TABLE has_notification(src INTEGER, dst INTEGER);
+
+statement ok
+CREATE TABLE has_operation(src INTEGER, dst INTEGER);
+
+statement ok
+CREATE TABLE notified_operation(src INTEGER, dst INTEGER);
+
+statement ok
+CREATE SCHEMA graph;
+
+statement ok
+CREATE TABLE graph.__pg_test_graph__Tag__HasParent__Tag AS
+SELECT 1 AS v0, hash('parent') AS e1, 2 AS v1;
+
+statement ok
+CREATE TABLE graph.__pg_test_graph__Tag__HasWorkorder__Workorder AS
+SELECT 1 AS v0, hash('wo') AS e1, 10 AS v1;
+
+statement ok
+CREATE TABLE graph.__pg_test_graph__Tag__HasNotification__Notification AS
+SELECT 1 AS v0, hash('notif') AS e1, 20 AS v1;
+
+statement ok
+CREATE TABLE graph.__pg_test_graph__Workorder__HasOperation__Operation AS
+SELECT 10 AS v0, hash('wo-op') AS e1, 100 AS v1;
+
+statement ok
+CREATE TABLE graph.__pg_test_graph__Notification__NotifiedOperation__Operation AS
+SELECT 20 AS v0, hash('notif-op') AS e1, 100 AS v1;
+
+statement ok
+CREATE TABLE graph.__pgq_path_catalog AS
+SELECT
+    'test_graph' AS graph_name,
+    '__pg_test_graph__Tag__HasParent__Tag' AS path_table_name,
+    'edge' AS path_kind,
+    1 AS hop_count,
+    'Tag' AS src_label,
+    'Tag' AS dst_label,
+    'Tag,Tag' AS vertex_label_sequence,
+    'HasParent' AS edge_label_sequence,
+    true AS supports_one_row_per_step,
+    true AS is_deduplicated,
+    (SELECT count(*) FROM graph.__pg_test_graph__Tag__HasParent__Tag) AS estimated_rows,
+    current_timestamp AS last_refreshed_at,
+    true AS is_sorted_by_v0,
+    1 AS min_depth,
+    1 AS max_depth,
+    'has_parent' AS bridge_table_names
+UNION ALL
+SELECT 'test_graph', '__pg_test_graph__Tag__HasWorkorder__Workorder', 'edge', 1,
+       'Tag', 'Workorder', 'Tag,Workorder', 'HasWorkorder', true, true,
+       (SELECT count(*) FROM graph.__pg_test_graph__Tag__HasWorkorder__Workorder),
+       current_timestamp, true, 1, 1, 'has_workorder'
+UNION ALL
+SELECT 'test_graph', '__pg_test_graph__Tag__HasNotification__Notification', 'edge', 1,
+       'Tag', 'Notification', 'Tag,Notification', 'HasNotification', true, true,
+       (SELECT count(*) FROM graph.__pg_test_graph__Tag__HasNotification__Notification),
+       current_timestamp, true, 1, 1, 'has_notification'
+UNION ALL
+SELECT 'test_graph', '__pg_test_graph__Workorder__HasOperation__Operation', 'edge', 1,
+       'Workorder', 'Operation', 'Workorder,Operation', 'HasOperation', true, true,
+       (SELECT count(*) FROM graph.__pg_test_graph__Workorder__HasOperation__Operation),
+       current_timestamp, true, 1, 1, 'has_operation'
+UNION ALL
+SELECT 'test_graph', '__pg_test_graph__Notification__NotifiedOperation__Operation', 'edge', 1,
+       'Notification', 'Operation', 'Notification,Operation', 'NotifiedOperation', true, true,
+       (SELECT count(*) FROM graph.__pg_test_graph__Notification__NotifiedOperation__Operation),
+       current_timestamp, true, 1, 1, 'notified_operation';
+
+statement ok
+-CREATE PROPERTY GRAPH test_graph
+VERTEX TABLES (
+    tag PROPERTIES (id, name) LABEL Tag,
+    workorder PROPERTIES (id, title) LABEL Workorder,
+    notification PROPERTIES (id, title) LABEL Notification,
+    operation PROPERTIES (id, title) LABEL Operation
+)
+EDGE TABLES (
+    has_parent SOURCE KEY (src) REFERENCES tag(id)
+               DESTINATION KEY (dst) REFERENCES tag(id)
+               LABEL HasParent,
+    has_workorder SOURCE KEY (src) REFERENCES tag(id)
+                  DESTINATION KEY (dst) REFERENCES workorder(id)
+                  LABEL HasWorkorder,
+    has_notification SOURCE KEY (src) REFERENCES tag(id)
+                     DESTINATION KEY (dst) REFERENCES notification(id)
+                     LABEL HasNotification,
+    has_operation SOURCE KEY (src) REFERENCES workorder(id)
+                  DESTINATION KEY (dst) REFERENCES operation(id)
+                  LABEL HasOperation,
+    notified_operation SOURCE KEY (src) REFERENCES notification(id)
+                       DESTINATION KEY (dst) REFERENCES operation(id)
+                       LABEL NotifiedOperation
+);
+
+statement ok
+SET pgq_require_abi_paths = true;
+
+query ITTTT rowsort
+-FROM GRAPH_TABLE (
+    test_graph
+    MATCH p = (t:Tag)-[:!HasParent]->{1,2}(x)
+    WHERE t.id = 1
+    COLUMNS (
+        path_length(p) AS depth,
+        vertices(p) AS vertex_ids,
+        vertex_labels(p) AS vertex_labels,
+        edge_labels(p) AS edge_labels,
+        label(x) AS dst_label
+    )
+);
+----
+1	[1, 10]	[Tag, Workorder]	[HasWorkorder]	Workorder
+1	[1, 20]	[Tag, Notification]	[HasNotification]	Notification
+2	[1, 10, 100]	[Tag, Workorder, Operation]	[HasWorkorder, HasOperation]	Operation
+2	[1, 20, 100]	[Tag, Notification, Operation]	[HasNotification, NotifiedOperation]	Operation
+
+query ITT rowsort
+-FROM GRAPH_TABLE (
+    test_graph
+    MATCH p = (t:Tag)-[:!HasParent]->{1,2}(x)
+    WHERE t.id = 1
+    COLUMNS (
+        path_length(p) AS depth,
+        vertices(p) AS vertex_ids,
+        vertex_properties(p) AS vertex_properties
+    )
+);
+----
+1	[1, 10]	['{"id":"1","name":"Pump A"}', '{"id":"10","title":"WO-10"}']
+1	[1, 20]	['{"id":"1","name":"Pump A"}', '{"id":"20","title":"N-20"}']
+2	[1, 10, 100]	['{"id":"1","name":"Pump A"}', '{"id":"10","title":"WO-10"}', '{"id":"100","title":"Inspect"}']
+2	[1, 20, 100]	['{"id":"1","name":"Pump A"}', '{"id":"20","title":"N-20"}', '{"id":"100","title":"Inspect"}']
+
+query T
+-WITH graph_paths AS (
+    FROM GRAPH_TABLE (
+        test_graph
+        MATCH p = (t:Tag)-[:!HasParent]->{1,2}(x)
+        WHERE t.id = 1
+        COLUMNS (
+            path_length(p) AS depth,
+            label(x) AS dst_label,
+            vertices(p) AS vertex_ids,
+            vertex_labels(p) AS vertex_labels,
+            edge_labels(p) AS edge_labels,
+            vertex_properties(p) AS vertex_properties
+        )
+    )
+)
+SELECT graph_tree_json(
+    list(vertex_ids ORDER BY depth, dst_label),
+    list(vertex_labels ORDER BY depth, dst_label),
+    list(edge_labels ORDER BY depth, dst_label),
+    list(vertex_properties ORDER BY depth, dst_label)
+)
+FROM graph_paths;
+----
+{"label":"Tag","key":"1","properties":{"id":"1","name":"Pump A"},"relationships":{"HasNotification":[{"label":"Notification","key":"20","properties":{"id":"20","title":"N-20"},"relationships":{"NotifiedOperation":[{"label":"Operation","key":"100","properties":{"id":"100","title":"Inspect"}}]}}],"HasWorkorder":[{"label":"Workorder","key":"10","properties":{"id":"10","title":"WO-10"},"relationships":{"HasOperation":[{"label":"Operation","key":"100","properties":{"id":"100","title":"Inspect"}}]}}]}}
+
+query ITTTT rowsort
+-FROM GRAPH_TABLE (
+    test_graph
+    MATCH p = (t:Tag)-[:!(HasParent|HasNotification)]->{1,2}(x)
+    WHERE t.id = 1
+    COLUMNS (
+        path_length(p) AS depth,
+        vertices(p) AS vertex_ids,
+        vertex_labels(p) AS vertex_labels,
+        edge_labels(p) AS edge_labels,
+        label(x) AS dst_label
+    )
+);
+----
+1	[1, 10]	[Tag, Workorder]	[HasWorkorder]	Workorder
+2	[1, 10, 100]	[Tag, Workorder, Operation]	[HasWorkorder, HasOperation]	Operation
+
+query ITTT rowsort
+-FROM GRAPH_TABLE (
+    test_graph
+    MATCH p = (w:Workorder)-[]->{1,1}(x)
+    WHERE w.id = 10
+    COLUMNS (
+        path_length(p) AS depth,
+        vertices(p) AS vertex_ids,
+        vertex_labels(p) AS vertex_labels,
+        label(x) AS dst_label
+    )
+);
+----
+1	[10, 100]	[Workorder, Operation]	Operation
+
+statement ok
+SET pgq_require_abi_paths = false;

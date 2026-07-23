@@ -96,6 +96,22 @@ query II
 ----
 Bob	Carol
 
+# Grouped edge negation — !(Colleague|Friend) excludes both edge sub-labels
+query II
+-FROM GRAPH_TABLE (pg
+    MATCH (a:Person)-[e:!(Colleague|Friend)]->(b:Person)
+    COLUMNS (a.name AS src, b.name AS dst)
+) t ORDER BY src, dst;
+----
+
+# Grouped vertex negation — !(Admin|User) excludes all vertices with either sub-label
+query I
+-FROM GRAPH_TABLE (pg
+    MATCH (a:!(Admin|User))
+    COLUMNS (a.name AS name)
+) t ORDER BY name;
+----
+
 # Compound vertex filter in WHERE with label disjunction in pattern
 query I
 -FROM GRAPH_TABLE (pg

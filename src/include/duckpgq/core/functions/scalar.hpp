@@ -18,6 +18,7 @@ struct CoreScalarFunctions {
 		RegisterShortestPathScalarFunction(loader);
 		RegisterWeaklyConnectedComponentScalarFunction(loader);
 		RegisterPageRankScalarFunction(loader);
+		RegisterGraphTreeJsonScalarFunction(loader);
 	}
 
 private:
@@ -34,6 +35,7 @@ private:
 	static void RegisterShortestPathScalarFunction(ExtensionLoader &loader);
 	static void RegisterWeaklyConnectedComponentScalarFunction(ExtensionLoader &loader);
 	static void RegisterPageRankScalarFunction(ExtensionLoader &loader);
+	static void RegisterGraphTreeJsonScalarFunction(ExtensionLoader &loader);
 };
 
 } // namespace duckdb
