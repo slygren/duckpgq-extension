@@ -1,10 +1,14 @@
 #
 # This workflow calls the main distribution pipeline from DuckDB to build, test and (optionally) release the extension
 #
+# For day-to-day signal use Tests.yml instead -- it builds one platform and runs
+# the same test suite in a fraction of the time. This matrix is for releases.
+#
 name: Main Extension Distribution Pipeline
 on:
   push:
-  pull_request:
+    branches: [ main ]
+    tags: [ 'v*' ]
   workflow_dispatch:
 
 concurrency:
@@ -12,22 +16,22 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  duckdb-next-build:
-    name: Build extension binaries
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
-    with:
-      duckdb_version: main
-      ci_tools_version: main
-      extension_name: duckpgq
-
+  # NOTE: duckdb_version + override_duckdb_repository together tell the reusable
+  # workflow to clone OUR fork and check out the PGQL grammar branch. Without the
+  # override it clones upstream duckdb/duckdb, which has no OPTIONAL MATCH,
+  # ONE ROW PER, IS LABELED or in-GRAPH_TABLE UNION grammar, and the build cannot
+  # compile this extension. Bump these together with the duckdb submodule pointer.
   duckdb-stable-build:
     name: Build extension binaries
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
     with:
-      duckdb_version: v1.5-variegata
+      duckdb_version: pgq-abi-grammar
       ci_tools_version: v1.5-variegata
       extension_name: duckpgq
+      override_duckdb_repository: https://github.com/slygren/duckdb.git
 
+  # Uses the duckdb submodule pin as-is (no re-checkout), so it already builds
+  # against the fork.
   code-quality-check:
     name: Code Quality Check
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5-variegata
