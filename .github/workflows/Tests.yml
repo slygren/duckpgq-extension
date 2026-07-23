@@ -7,9 +7,20 @@
 #
 name: Tests
 
+# Manual trigger only. This repo is private, and hosted runners were not
+# picking up queued jobs (a run sat 29 min with no runner assigned), so
+# push-triggered runs just accumulate in the queue forever. The local loop is
+# the real signal here:
+#
+#     make release && make test_release
+#
+# To go back to automatic runs -- once minutes are available, or if this repo
+# is made public, where Actions is free and unlimited -- restore:
+#
+#   push:
+#   pull_request:
+#
 on:
-  push:
-  pull_request:
   workflow_dispatch:
 
 concurrency:

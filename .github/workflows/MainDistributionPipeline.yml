@@ -5,10 +5,9 @@
 # the same test suite in a fraction of the time. This matrix is for releases.
 #
 name: Main Extension Distribution Pipeline
+# Manual trigger only -- see the note in Tests.yml. This matrix is expensive
+# (all platforms) and should only run deliberately, for a release.
 on:
-  push:
-    branches: [ main ]
-    tags: [ 'v*' ]
   workflow_dispatch:
 
 concurrency:

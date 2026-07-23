@@ -85,7 +85,21 @@ BoundStatement duckpgq_bind(ClientContext &context, Binder &binder, OperatorExte
 		duckpgq_state->rewrite_diagnostics.clear();
 		duckpgq_state->rewrite_diagnostic_sequence = 0;
 		auto rebound_statement = statement.Copy();
+		const auto stashed_before = duckpgq_state->transform_expression.size();
 		duckpgq_find_select_statement(rebound_statement.get(), *duckpgq_state);
+
+		// Only re-bind when the statement actually carried a graph pattern.
+		// duckpgq_bind is the operator-extension fallback, so it runs for *any*
+		// SELECT that failed to bind -- including ones with no PGQ construct at
+		// all, whose failure we have nothing to do with. Re-binding those
+		// re-enters the binder while the original exception is still unwinding,
+		// which dereferences a null ExtensionActiveLoad and turns a clean
+		// "Binder Error: Property graph X does not exist" into an INTERNAL
+		// Error. Rethrowing preserves the original, useful message.
+		if (duckpgq_state->transform_expression.size() == stashed_before) {
+			throw;
+		}
+
 		duckpgq_state->parse_data = make_uniq<DuckPGQParseData>(std::move(rebound_statement));
 		auto duckpgq_parse_data = dynamic_cast<DuckPGQParseData *>(duckpgq_state->parse_data.get());
 		return duckpgq_binder->Bind(*duckpgq_parse_data->statement);
