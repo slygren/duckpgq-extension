@@ -36,6 +36,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/main/attached_database.hpp"
+#include "duckdb/storage/object_cache.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
@@ -664,19 +665,120 @@ static shared_ptr<PGQPathTableCache> BuildPathTableCache(ClientContext &context,
 		}
 	}
 
+	// Load the direct-link catalog eagerly so the finished cache is fully immutable.
+	// This used to be filled lazily on first direct-link query (EnsureDirectLinkCatalogs),
+	// which is unsafe once the cache is shared across connections via the ObjectCache:
+	// a second connection would mutate a cache another is reading. Building it here means
+	// the cache never changes after BuildPathTableCache returns.
+	{
+		auto direct_link_connection = make_shared_ptr<Connection>(*context.db);
+		if (pg_table) {
+			LoadDirectLinkCatalogsFromGraphTables(*direct_link_connection, graph_name, *pg_table, *cache);
+		}
+		if (cache->direct_links.empty()) {
+			LoadDirectLinkCatalogs(context, *direct_link_connection, graph_name, *cache);
+		}
+	}
+
 	return cache;
+}
+
+// Wraps a shared, immutable PGQPathTableCache in the database-instance ObjectCache so
+// every connection to the same instance reuses a single build. Non-evictable: the
+// metadata is small and we want it to persist for the instance's lifetime. The
+// fingerprint records the ABI-catalog content it was built from, so a regenerated
+// catalog is rebuilt rather than served stale.
+struct PGQPathTableCacheEntry : public ObjectCacheEntry {
+	PGQPathTableCacheEntry(shared_ptr<PGQPathTableCache> cache_p, string fingerprint_p)
+	    : cache(std::move(cache_p)), fingerprint(std::move(fingerprint_p)) {
+	}
+	shared_ptr<PGQPathTableCache> cache;
+	string fingerprint;
+
+	static string ObjectType() {
+		return "duckpgq_path_table_cache";
+	}
+	string GetObjectType() override {
+		return ObjectType();
+	}
+	optional_idx GetEstimatedCacheMemory() const override {
+		return optional_idx(); // invalid -> non-evictable
+	}
+};
+
+// Cheap content fingerprint of a graph's ABI metadata. `sum(hash(row))` over every
+// path/direct-link catalog table (located via information_schema, so it does not depend
+// on the property-graph tables carrying an explicit catalog name) changes whenever those
+// catalogs are regenerated -- any cell change, added or removed row. A shared cache whose
+// fingerprint no longer matches is rebuilt instead of serving a stale rewrite. Returns ""
+// only if the metadata cannot be sampled, in which case the caller skips the shared cache
+// (builds locally, never caches a value it cannot invalidate).
+static string ComputePathCatalogFingerprint(ClientContext &context, const string &graph_name) {
+	auto conn = make_shared_ptr<Connection>(*context.db);
+	// Locate every ABI catalog table across all attached databases/schemas, in a stable
+	// order so the fingerprint is deterministic.
+	auto loc_res = conn->Query(
+	    "SELECT table_catalog, table_schema, table_name FROM information_schema.tables "
+	    "WHERE lower(table_name) IN ('__pgq_path_catalog', '__pgq_direct_link_catalog') "
+	    "ORDER BY table_catalog, table_schema, table_name");
+	if (!loc_res || loc_res->HasError()) {
+		return "";
+	}
+	auto &locs = loc_res->Cast<MaterializedQueryResult>();
+	string fingerprint = "g:" + StringUtil::Lower(graph_name);
+	if (locs.RowCount() == 0) {
+		return fingerprint + "|none"; // no ABI catalog present (yet)
+	}
+	for (idx_t i = 0; i < locs.RowCount(); i++) {
+		const string qualified = QualifiedPathTableName(locs.GetValue(0, i).ToString(),
+		                                                locs.GetValue(1, i).ToString(),
+		                                                locs.GetValue(2, i).ToString());
+		const string q =
+		    StringUtil::Format("SELECT count(*), coalesce(CAST(sum(hash(__pgq_fp)) AS VARCHAR), '0') "
+		                       "FROM %s AS __pgq_fp WHERE lower(graph_name) = lower(%s)",
+		                       qualified, KeywordHelper::WriteQuoted(graph_name, '\''));
+		auto r = conn->Query(q);
+		if (!r || r->HasError() || r->RowCount() == 0) {
+			continue;
+		}
+		auto &m = r->Cast<MaterializedQueryResult>();
+		fingerprint += "|" + qualified + ":" + m.GetValue(0, 0).ToString() + "," + m.GetValue(1, 0).ToString();
+	}
+	return fingerprint;
 }
 
 static shared_ptr<PGQPathTableCache> GetPathTableCache(ClientContext &context, DuckPGQState &duckpgq_state,
                                                        const string &graph_name,
                                                        const CreatePropertyGraphInfo *pg_table = nullptr) {
 	lock_guard<mutex> guard(duckpgq_state.path_table_cache_lock);
+
+	// L1: per-connection cache. Preserves the original per-connection semantics for
+	// repeated queries on the same connection.
 	auto entry = duckpgq_state.path_table_caches.find(graph_name);
 	if (entry != duckpgq_state.path_table_caches.end()) {
 		return entry->second;
 	}
+
+	// L2: database-instance ObjectCache, shared across connections. A fresh connection
+	// (e.g. the stateless semantic-pgql endpoint's connection-per-request) reuses a
+	// prior build instead of paying the full catalog-load + semantic-index build again.
+	// Guarded by the content fingerprint so a regenerated catalog is never served stale.
+	const string fingerprint = ComputePathCatalogFingerprint(context, graph_name);
+	auto &object_cache = ObjectCache::GetObjectCache(context);
+	const string object_key = "duckpgq_ptc:" + graph_name;
+	if (!fingerprint.empty()) {
+		auto shared = object_cache.Get<PGQPathTableCacheEntry>(object_key);
+		if (shared && shared->fingerprint == fingerprint) {
+			duckpgq_state.path_table_caches[graph_name] = shared->cache;
+			return shared->cache;
+		}
+	}
+
 	auto cache = BuildPathTableCache(context, graph_name, pg_table);
 	duckpgq_state.path_table_caches[graph_name] = cache;
+	if (!fingerprint.empty()) {
+		object_cache.Put(object_key, make_shared_ptr<PGQPathTableCacheEntry>(cache, fingerprint));
+	}
 	return cache;
 }
 
@@ -709,19 +811,6 @@ static bool MatchMayContainDirectLinkReference(const MatchExpression &ref) {
 		}
 	}
 	return false;
-}
-
-static void EnsureDirectLinkCatalogs(ClientContext &context, DuckPGQState &duckpgq_state, const string &graph_name,
-                                     const CreatePropertyGraphInfo &pg_table, PGQPathTableCache &cache) {
-	lock_guard<mutex> guard(duckpgq_state.path_table_cache_lock);
-	if (!cache.direct_links.empty()) {
-		return;
-	}
-	auto metadata_connection = make_shared_ptr<Connection>(*context.db);
-	LoadDirectLinkCatalogsFromGraphTables(*metadata_connection, graph_name, pg_table, cache);
-	if (cache.direct_links.empty()) {
-		LoadDirectLinkCatalogs(context, *metadata_connection, graph_name, cache);
-	}
 }
 
 static bool SequenceMatches(const string &metadata_sequence, const vector<string> &query_sequence) {
@@ -7136,9 +7225,8 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 		}
 	}
 
-	if (MatchMayContainDirectLinkReference(*ref)) {
-		EnsureDirectLinkCatalogs(context, *duckpgq_state, pg_table->property_graph_name, *pg_table, path_table_cache);
-	}
+	// Direct-link catalogs are loaded eagerly in BuildPathTableCache, so the cache is
+	// fully populated (and immutable) here -- no lazy fill needed.
 	const auto direct_link_rewrite_count =
 	    RewriteDirectLinkReferences(*pg_table, final_select_node, ref->column_list, ref->where_clause,
 	                                alias_to_vertex_and_edge_tables, path_table_cache);

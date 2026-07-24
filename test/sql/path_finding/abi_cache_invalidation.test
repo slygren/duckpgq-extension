@@ -1,0 +1,67 @@
+# name: test/sql/path_finding/abi_cache_invalidation.test
+# description: the ABI metadata cache is shared across connections (ObjectCache) but invalidated when the path catalog changes, so a regenerated catalog never serves a stale rewrite
+# group: [path_finding]
+
+require duckpgq
+
+statement ok con1
+CREATE TABLE person(id INTEGER, name VARCHAR);
+
+statement ok con1
+INSERT INTO person VALUES (1,'Alice'),(2,'Bob'),(3,'Carol');
+
+statement ok con1
+CREATE TABLE knows(src INTEGER, dst INTEGER);
+
+statement ok con1
+INSERT INTO knows VALUES (1,2),(2,3);
+
+statement ok con1
+CREATE SCHEMA graph;
+
+# Two ABI edge tables with DIFFERENT mappings, so the query result reveals which one
+# the rewrite is pointed at.
+statement ok con1
+CREATE TABLE graph.__pg_g__e_ac AS SELECT 1 AS v0, hash('ac') AS e1, 3 AS v1;
+
+statement ok con1
+CREATE TABLE graph.__pg_g__e_ab AS SELECT 1 AS v0, hash('ab') AS e1, 2 AS v1;
+
+# Catalog initially points the Person-Knows-Person edge family at the A->C table.
+statement ok con1
+CREATE TABLE graph.__pgq_path_catalog AS
+SELECT * FROM (VALUES
+  ('g','__pg_g__e_ac','edge',1,'Person','Person','Person,Person','Knows',true,true,1,now(),true,1,1,'knows')
+) t(graph_name,path_table_name,path_kind,hop_count,src_label,dst_label,vertex_label_sequence,edge_label_sequence,
+    supports_one_row_per_step,is_deduplicated,estimated_rows,last_refreshed_at,is_sorted_by_v0,min_depth,max_depth,bridge_table_names);
+
+statement ok con1
+-CREATE PROPERTY GRAPH g
+VERTEX TABLES (person PROPERTIES (id, name) LABEL Person)
+EDGE TABLES (knows SOURCE KEY (src) REFERENCES person(id) DESTINATION KEY (dst) REFERENCES person(id) LABEL Knows);
+
+# con1 builds and populates the shared cache: rewrite uses the A->C table.
+query II con1
+-FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->(b:Person) COLUMNS (a.id AS aid, b.id AS bid));
+----
+1	3
+
+# con2 is a fresh connection (empty per-connection cache). It reuses the shared build
+# from the ObjectCache rather than rebuilding, and gets the same answer.
+query II con2
+-FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->(b:Person) COLUMNS (a.id AS aid, b.id AS bid));
+----
+1	3
+
+# Regenerate the catalog: repoint the edge family at the A->B table. This changes the
+# catalog content, hence the fingerprint the shared cache is keyed on.
+statement ok con1
+UPDATE graph.__pgq_path_catalog SET path_table_name = '__pg_g__e_ab';
+
+# con3 is a brand-new connection, so its per-connection cache is empty and it must
+# consult the shared cache. The fingerprint no longer matches, so the stale entry is
+# rebuilt and con3 sees the NEW mapping (A->B), not the stale A->C.
+query II con3
+-FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->(b:Person) COLUMNS (a.id AS aid, b.id AS bid));
+----
+1	2
