@@ -1590,6 +1590,25 @@ static bool PathPatternRequiresABIPath(const vector<unique_ptr<PathReference>> &
 	return path_elements.size() >= 3;
 }
 
+// True if any edge subpath in the pattern carries a COST expression. CHEAPEST is
+// defined by that cost; without it the request is ill-defined and we must reject
+// it rather than silently returning shortest-path results.
+static bool PatternHasCostExpr(const vector<unique_ptr<PathReference>> &path_elements) {
+	for (auto &el : path_elements) {
+		auto *sp = dynamic_cast<SubPath *>(el.get());
+		if (!sp) {
+			continue;
+		}
+		if (sp->cost_expr) {
+			return true;
+		}
+		if (PatternHasCostExpr(sp->path_list)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 // Rewrite element_id(x) → x.rowid and label(x) → constant string in WHERE clause expressions.
 static unique_ptr<ParsedExpression>
 RewriteGraphFunctions(unique_ptr<ParsedExpression> expr,
@@ -5077,6 +5096,11 @@ static unique_ptr<ParsedExpression> BuildExistsSubquery(
 		// ANY SHORTEST: a shortest-path prefix without ALL. Needed separately so a
 		// bounded quantifier can collapse to one path per endpoint pair.
 		bool any_shortest = path_pattern->shortest && !path_pattern->all;
+		if (path_pattern->cheapest && !PatternHasCostExpr(path_pattern->path_elements)) {
+			throw BinderException(
+			    "ANY CHEAPEST / ALL CHEAPEST requires a COST expression on the edge pattern "
+			    "(e.g. -[e:Label COST e.weight]->). Without a cost the request is undefined; use SHORTEST.");
+		}
 		if (!TryPathTableRewrite(context, pg_table, path_pattern->path_elements, inner_match, conditions,
 		                         inner_select, inner_alias_map, extra_alias_counter,
 		                         path_table_cache, referenced_bindings,
@@ -6692,6 +6716,11 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 		// ANY SHORTEST: a shortest-path prefix without ALL. Needed separately so a
 		// bounded quantifier can collapse to one path per endpoint pair.
 		bool any_shortest = path_pattern->shortest && !path_pattern->all;
+		if (path_pattern->cheapest && !PatternHasCostExpr(path_pattern->path_elements)) {
+			throw BinderException(
+			    "ANY CHEAPEST / ALL CHEAPEST requires a COST expression on the edge pattern "
+			    "(e.g. -[e:Label COST e.weight]->). Without a cost the request is undefined; use SHORTEST.");
+		}
 		// Tier 1: if a pre-computed path table covers this entire pattern, use it.
 		// Falls through to Tier 2/3 (ProcessPathList) when not applicable.
 		// Pass the MATCH WHERE clause for predicate pushdown (v0/v1 = constant).
@@ -6857,6 +6886,11 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 		for (auto &path_pattern : branch.path_patterns) {
 			bool all_shortest = path_pattern->all && path_pattern->shortest;
 			bool any_shortest = path_pattern->shortest && !path_pattern->all;
+			if (path_pattern->cheapest && !PatternHasCostExpr(path_pattern->path_elements)) {
+				throw BinderException(
+				    "ANY CHEAPEST / ALL CHEAPEST requires a COST expression on the edge pattern "
+				    "(e.g. -[e:Label COST e.weight]->). Without a cost the request is undefined; use SHORTEST.");
+			}
 			if (!TryPathTableRewrite(context, *pg_table, path_pattern->path_elements, branch, branch_conditions,
 			                         branch_select, branch_alias_map, branch_counter,
 			                         path_table_cache, branch_referenced_bindings,

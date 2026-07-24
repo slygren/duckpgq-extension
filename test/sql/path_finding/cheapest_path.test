@@ -71,6 +71,27 @@ query TTI
 ----
 A	C	2
 
+# ANY CHEAPEST without a COST expression is undefined and must fail loudly,
+# not silently fall through to shortest-path results.
+statement error
+-FROM GRAPH_TABLE (wg
+    MATCH p = ANY CHEAPEST (a:Person)-[e:Link]->+(b:Person)
+    WHERE a.name = 'A' AND b.name = 'D'
+    COLUMNS (a.name, b.name)
+) r;
+----
+requires a COST expression
+
+# ALL CHEAPEST without a COST expression must also fail.
+statement error
+-FROM GRAPH_TABLE (wg
+    MATCH p = ALL CHEAPEST (a:Person)-[e:Link]->+(b:Person)
+    WHERE a.name = 'A' AND b.name = 'D'
+    COLUMNS (a.name, b.name)
+) r;
+----
+requires a COST expression
+
 statement ok
 -DROP PROPERTY GRAPH wg;
 
