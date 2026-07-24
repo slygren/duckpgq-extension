@@ -49,6 +49,11 @@ struct PGQPathTableInfo {
 	bool supports_one_row_per_step = false;
 	bool is_deduplicated = false;
 	bool is_sorted_by_v0 = false;
+	//! Reverse-sorted twin: same rows as the forward artifact but physically ordered by
+	//! the destination key, so a destination-anchored lookup prunes row groups instead of
+	//! scanning the whole family. Selected by the binder when only the destination
+	//! endpoint is bound.
+	bool is_sorted_by_v1 = false;
 	bool from_metadata = false;
 };
 
@@ -86,6 +91,9 @@ struct PGQDirectLinkInfo {
 struct PGQPathTableCache {
 	PGQPathTableCatalog catalog;
 	case_insensitive_map_t<string> semantic_index;
+	//! Same keys as semantic_index, but resolving to reverse-sorted twins. Kept separate
+	//! so a twin never displaces the forward artifact for source-anchored lookups.
+	case_insensitive_map_t<string> reverse_semantic_index;
 	case_insensitive_map_t<PGQBranchSummaryLookup> branch_summary_index;
 	vector<PGQDirectLinkInfo> direct_links;
 	case_insensitive_map_t<vector<idx_t>> direct_link_index;

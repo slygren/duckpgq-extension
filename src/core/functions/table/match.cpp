@@ -206,6 +206,7 @@ static case_insensitive_set_t LatestPathCatalogColumns() {
 	columns.insert("property_support");
 	columns.insert("freshness_policy");
 	columns.insert("covered_target_properties");
+	columns.insert("is_sorted_by_v1");
 	return columns;
 }
 
@@ -215,6 +216,16 @@ static string OptionalStringCatalogColumn(const case_insensitive_set_t &columns,
 		return column_name;
 	}
 	return KeywordHelper::WriteQuoted(default_value, '\'') + " AS " + column_name;
+}
+
+// Boolean counterpart of OptionalStringCatalogColumn: substitutes a literal when the
+// catalog predates the column, so older generated catalogs keep loading unchanged.
+static string OptionalBoolCatalogColumn(const case_insensitive_set_t &columns, const string &column_name,
+                                        bool default_value) {
+	if (columns.find(column_name) != columns.end()) {
+		return column_name;
+	}
+	return string(default_value ? "true" : "false") + " AS " + column_name;
 }
 
 static void AddPathTableInfo(PGQPathTableCatalog &path_table_catalog, PGQPathTableInfo info) {
@@ -403,7 +414,7 @@ static void LoadPathTableCatalogMetadata(Connection &connection, const string &c
 	    "       CAST(min_depth AS BIGINT) AS min_depth, "
 	    "       CAST(max_depth AS BIGINT) AS max_depth, "
 	    "       bridge_table_names, "
-	    "       %s, %s, %s, %s, %s, %s "
+	    "       %s, %s, %s, %s, %s, %s, %s "
 	    "FROM %s WHERE lower(graph_name) = lower(%s)",
 	    OptionalStringCatalogColumn(columns, "semantic_grain", "identity"),
 	    OptionalStringCatalogColumn(columns, "temporal_mode", "snapshot"),
@@ -411,6 +422,7 @@ static void LoadPathTableCatalogMetadata(Connection &connection, const string &c
 	    OptionalStringCatalogColumn(columns, "property_support", "unknown"),
 	    OptionalStringCatalogColumn(columns, "freshness_policy", "unknown"),
 	    OptionalStringCatalogColumn(columns, "covered_target_properties", ""),
+	    OptionalBoolCatalogColumn(columns, "is_sorted_by_v1", false),
 	    catalog_table, KeywordHelper::WriteQuoted(graph_name, '\''));
 
 	auto query_result = connection.Query(query);
@@ -443,6 +455,7 @@ static void LoadPathTableCatalogMetadata(Connection &connection, const string &c
 		info.property_support = GetOptionalString(materialized_result, 17, row_idx);
 		info.freshness_policy = GetOptionalString(materialized_result, 18, row_idx);
 		info.covered_target_properties = GetOptionalString(materialized_result, 19, row_idx);
+		info.is_sorted_by_v1 = GetOptionalBool(materialized_result, 20, row_idx);
 		info.from_metadata = true;
 		AddPathTableInfo(path_table_catalog, std::move(info));
 	}
@@ -648,7 +661,11 @@ static shared_ptr<PGQPathTableCache> BuildPathTableCache(ClientContext &context,
 		const auto vertex_parts = SplitCatalogSequence(info.vertex_label_sequence);
 		const auto edge_parts = SplitCatalogSequence(info.edge_label_sequence);
 		if (!vertex_parts.empty() || !edge_parts.empty()) {
-			cache->semantic_index[PathSemanticKey(info.path_kind, vertex_parts, edge_parts)] = info.table_name;
+			// A reverse-sorted twin carries the same rows and the same semantic key as its
+			// forward artifact, so it is indexed separately -- otherwise whichever loaded
+			// last would displace the other for every lookup.
+			auto &index = info.is_sorted_by_v1 ? cache->reverse_semantic_index : cache->semantic_index;
+			index[PathSemanticKey(info.path_kind, vertex_parts, edge_parts)] = info.table_name;
 		}
 		if (!StringUtil::CIEquals(info.path_kind, "branch_summary")) {
 			continue;
@@ -831,11 +848,27 @@ static bool PathKindMatches(const string &metadata_kind, const string &expected_
 	return expected_kind.empty() || metadata_kind.empty() || StringUtil::CIEquals(metadata_kind, expected_kind);
 }
 
+// prefer_reverse asks for the reverse-sorted twin of this family: the same rows ordered by
+// the destination key. Worth taking when only the destination endpoint is bound, because a
+// v1 predicate against a v0-ordered file prunes nothing and scans the whole family. Falls
+// through to the forward artifact when no twin exists, so this only ever changes which
+// physical copy is read -- never the rows returned.
 static const PGQPathTableInfo *FindPathTableInfo(const PGQPathTableCache &path_table_cache, const string &table_name,
                                                  const string &path_kind,
                                                  const vector<string> &vertex_label_sequence,
-                                                 const vector<string> &edge_label_sequence) {
+                                                 const vector<string> &edge_label_sequence,
+                                                 bool prefer_reverse = false) {
 	const auto &path_table_catalog = path_table_cache.catalog;
+	if (prefer_reverse) {
+		auto reverse_entry = path_table_cache.reverse_semantic_index.find(
+		    PathSemanticKey(path_kind, vertex_label_sequence, edge_label_sequence));
+		if (reverse_entry != path_table_cache.reverse_semantic_index.end()) {
+			auto reverse_table = path_table_catalog.find(reverse_entry->second);
+			if (reverse_table != path_table_catalog.end()) {
+				return &reverse_table->second;
+			}
+		}
+	}
 	auto table_entry = path_table_catalog.find(table_name);
 	if (table_entry != path_table_catalog.end()) {
 		return &table_entry->second;
@@ -7146,8 +7179,19 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 		vertex_sequence.push_back(h.dst_label);
 	}
 
-	const PGQPathTableInfo *path_info =
-	    find_path_table(tname, n_hops == 1 ? "edge" : "fixed_path", vertex_sequence, edge_sequence);
+	// Reverse-anchored pick: when the pattern binds only its destination endpoint, the
+	// lookup filters v1 against a v0-ordered artifact and prunes nothing, so read the
+	// reverse-sorted twin instead if the generator produced one. Same rows either way --
+	// only the physical ordering, and therefore the row groups touched, differ.
+	const bool src_endpoint_bound =
+	    HasEqualityConstraint(where_constraints, hops[0].src_binding, hops[0].src_pk);
+	const bool dst_endpoint_bound =
+	    HasEqualityConstraint(where_constraints, hops.back().dst_binding, hops.back().dst_pk);
+	const bool prefer_reverse_sorted = dst_endpoint_bound && !src_endpoint_bound;
+
+	const PGQPathTableInfo *path_info = FindPathTableInfo(path_table_cache, tname,
+	                                                      n_hops == 1 ? "edge" : "fixed_path", vertex_sequence,
+	                                                      edge_sequence, prefer_reverse_sorted);
 	if (!path_info) {
 		return false;
 	}
@@ -7257,10 +7301,12 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 	for (size_t i = 0; i < hops.size(); i++) {
 		endpoint_filter_keys.emplace_back(hops[i].dst_binding, hops[i].dst_pk);
 	}
-	auto diagnostic = MakeArtifactDiagnostic(
-	    graph_name, n_hops == 1 ? "edge" : "fixed_path",
-	    n_hops == 1 ? "selected exact edge artifact" : "selected exact fixed_path artifact",
-	    *path_info, vertex_sequence, edge_sequence, pt_alias, one_row_per_mode);
+	string selection_reason = n_hops == 1 ? "selected exact edge artifact" : "selected exact fixed_path artifact";
+	if (path_info->is_sorted_by_v1) {
+		selection_reason += " (reverse-sorted twin: destination-anchored lookup)";
+	}
+	auto diagnostic = MakeArtifactDiagnostic(graph_name, n_hops == 1 ? "edge" : "fixed_path", selection_reason,
+	                                         *path_info, vertex_sequence, edge_sequence, pt_alias, one_row_per_mode);
 	diagnostic.endpoint_filter_count = CountEndpointFilters(where_constraints, endpoint_filter_keys);
 	RecordRewriteDiagnostic(context, std::move(diagnostic));
 	return true;
