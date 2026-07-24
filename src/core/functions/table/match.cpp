@@ -2482,11 +2482,14 @@ static void AddBoundedORPRecursiveCTE(unique_ptr<SelectNode> &select_node, const
 // Outer conditions added: prev_binding.rowid = cte.src_rowid,
 //                         next_binding.rowid = cte.dst_rowid,
 //                         depth BETWEEN lower AND upper.
-static void AddBoundedVLPathFinding(unique_ptr<SelectNode> &select_node,
-                                    vector<unique_ptr<ParsedExpression>> &conditions, const string &prev_binding,
-                                    const string &next_binding, const shared_ptr<PropertyGraphTable> &edge_table,
-                                    idx_t lower, idx_t upper, unique_ptr<ParsedExpression> anchor_filter,
-                                    bool any_shortest) {
+// Builds a bounded variable-length reachability CTE (columns src_rowid, dst_rowid,
+// depth, visited) rooted at prev_binding's source table, registers it on
+// select_node, and returns the name of the relation to scan. Shared verbatim by
+// the mandatory path (cross join + WHERE) and OPTIONAL MATCH (LEFT JOIN) so both
+// compute reachability identically.
+static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node, const string &prev_binding,
+                                            const shared_ptr<PropertyGraphTable> &edge_table, idx_t lower, idx_t upper,
+                                            unique_ptr<ParsedExpression> anchor_filter, bool any_shortest) {
 	const string &src_pk = edge_table->source_pk[0];
 	const string &dst_pk = edge_table->destination_pk[0];
 	const string &src_fk = edge_table->source_fk[0];
@@ -2494,7 +2497,6 @@ static void AddBoundedVLPathFinding(unique_ptr<SelectNode> &select_node,
 
 	const auto cte_idx = select_node->cte_map.map.size();
 	const string cte_name = "__rvl_" + std::to_string(cte_idx);
-	const string cte_alias = "__rvl_a_" + std::to_string(cte_idx);
 	// Internal aliases used only inside the recursive step — must not clash with outer bindings.
 	const string mid_alias = "_rvl_mid_" + std::to_string(cte_idx);
 	const string e_alias = "_rvl_e_" + std::to_string(cte_idx);
@@ -2679,6 +2681,20 @@ static void AddBoundedVLPathFinding(unique_ptr<SelectNode> &select_node,
 		select_node->cte_map.map[scan_name] = std::move(sp_info);
 	}
 
+	return scan_name;
+}
+
+// Mandatory bounded variable-length: reachability CTE cross-joined into FROM,
+// with the endpoint/depth match pushed into the outer WHERE.
+static void AddBoundedVLPathFinding(unique_ptr<SelectNode> &select_node,
+                                    vector<unique_ptr<ParsedExpression>> &conditions, const string &prev_binding,
+                                    const string &next_binding, const shared_ptr<PropertyGraphTable> &edge_table,
+                                    idx_t lower, idx_t upper, unique_ptr<ParsedExpression> anchor_filter,
+                                    bool any_shortest) {
+	const string scan_name = BuildBoundedVLReachabilityCTE(select_node, prev_binding, edge_table, lower, upper,
+	                                                       std::move(anchor_filter), any_shortest);
+	const string cte_alias = scan_name + "_scan";
+
 	// ── Add CTE to FROM (cross join) ─────────────────────────────────────────────
 	auto cte_scan = make_uniq<BaseTableRef>();
 	cte_scan->table_name = scan_name;
@@ -2706,6 +2722,58 @@ static void AddBoundedVLPathFinding(unique_ptr<SelectNode> &select_node,
 		    make_uniq<ConstantExpression>(Value::INTEGER(static_cast<int32_t>(lower))),
 		    make_uniq<ConstantExpression>(Value::INTEGER(static_cast<int32_t>(upper)))));
 	}
+}
+
+// OPTIONAL MATCH bounded variable-length: same reachability CTE, but LEFT JOINed
+// so a prev row with no reachable dst survives with NULLs. The next vertex is
+// LEFT JOINed off the CTE's dst_rowid.
+static void AddBoundedVLPathFindingOptional(unique_ptr<SelectNode> &select_node, const string &prev_binding,
+                                            const string &next_binding,
+                                            const shared_ptr<PropertyGraphTable> &next_vertex_table,
+                                            PathElement *next_elem, const shared_ptr<PropertyGraphTable> &edge_table,
+                                            idx_t lower, idx_t upper) {
+	const string scan_name = BuildBoundedVLReachabilityCTE(select_node, prev_binding, edge_table, lower, upper,
+	                                                       nullptr, /*any_shortest=*/false);
+	const string cte_alias = scan_name + "_optscan";
+
+	// LEFT JOIN reachability CTE ON prev.rowid = cte.src_rowid AND depth BETWEEN lo AND hi
+	auto cte_scan = make_uniq<BaseTableRef>();
+	cte_scan->table_name = scan_name;
+	cte_scan->alias = cte_alias;
+	unique_ptr<ParsedExpression> cte_on = make_uniq<ComparisonExpression>(
+	    ExpressionType::COMPARE_EQUAL, make_uniq<ColumnRefExpression>("rowid", prev_binding),
+	    make_uniq<ColumnRefExpression>("src_rowid", cte_alias));
+	cte_on = make_uniq<ConjunctionExpression>(
+	    ExpressionType::CONJUNCTION_AND, std::move(cte_on),
+	    make_uniq<BetweenExpression>(make_uniq<ColumnRefExpression>("depth", cte_alias),
+	                                 make_uniq<ConstantExpression>(Value::INTEGER(static_cast<int32_t>(lower))),
+	                                 make_uniq<ConstantExpression>(Value::INTEGER(static_cast<int32_t>(upper)))));
+	auto cte_join = make_uniq<JoinRef>(JoinRefType::REGULAR);
+	cte_join->type = JoinType::LEFT;
+	cte_join->left = std::move(select_node->from_table);
+	cte_join->right = std::move(cte_scan);
+	cte_join->condition = std::move(cte_on);
+	select_node->from_table = std::move(cte_join);
+
+	// LEFT JOIN next vertex ON next.rowid = cte.dst_rowid (+ optional label)
+	unique_ptr<ParsedExpression> vertex_on = make_uniq<ComparisonExpression>(
+	    ExpressionType::COMPARE_EQUAL, make_uniq<ColumnRefExpression>("rowid", next_binding),
+	    make_uniq<ColumnRefExpression>("dst_rowid", cte_alias));
+	if (next_elem && !next_elem->label.empty()) {
+		vector<unique_ptr<ParsedExpression>> label_conds;
+		PGQMatchFunction::CheckInheritance(next_vertex_table, next_elem, label_conds);
+		if (!label_conds.empty()) {
+			vertex_on = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(vertex_on),
+			                                             PGQMatchFunction::CreateWhereClause(label_conds));
+		}
+	}
+	auto vertex_ref = next_vertex_table->CreateBaseTableRef(next_binding);
+	auto vertex_join = make_uniq<JoinRef>(JoinRefType::REGULAR);
+	vertex_join->type = JoinType::LEFT;
+	vertex_join->left = std::move(select_node->from_table);
+	vertex_join->right = std::move(vertex_ref);
+	vertex_join->condition = std::move(vertex_on);
+	select_node->from_table = std::move(vertex_join);
 }
 
 void PGQMatchFunction::AddPathFinding(unique_ptr<SelectNode> &select_node,
@@ -3286,8 +3354,45 @@ void PGQMatchFunction::ProcessOptionalPathList(
 			PathElement *edge_elem = GetPathElement(path_elements[idx_j]);
 			PathElement *next_elem = GetPathElement(path_elements[idx_j + 1]);
 
-			if (!edge_elem || !next_elem) {
-				throw NotImplementedException("Variable-length paths in OPTIONAL MATCH are not yet supported.");
+			// Variable-length quantified edge, e.g. OPTIONAL MATCH (a)-[e]->{1,5}(b):
+			// the edge slot is a SubPath so GetPathElement returns null. Build a
+			// LEFT-JOINed bounded reachability. Only right-directed, bounded VL is
+			// supported (mirrors the mandatory AddBoundedVLPathFinding).
+			if (!edge_elem) {
+				auto *edge_subpath = dynamic_cast<SubPath *>(path_elements[idx_j].get());
+				if (!edge_subpath || edge_subpath->path_list.empty() || !next_elem) {
+					throw NotImplementedException("Unsupported variable-length OPTIONAL MATCH shape.");
+				}
+				PathElement *vl_edge = GetPathElement(edge_subpath->path_list[0]);
+				if (!vl_edge) {
+					throw NotImplementedException("Unsupported variable-length OPTIONAL MATCH shape.");
+				}
+				if (vl_edge->match_type != PGQMatchType::MATCH_EDGE_RIGHT) {
+					throw NotImplementedException(
+					    "Only right-directed (->) variable-length edges are supported in OPTIONAL MATCH.");
+				}
+				if (edge_subpath->upper >= static_cast<idx_t>(1 << 30)) {
+					throw NotImplementedException("Unbounded variable-length OPTIONAL MATCH is not yet supported.");
+				}
+				if (require_abi_paths) {
+					ThrowABIPathRequired();
+				}
+				auto vl_edge_table = ResolveTable(vl_edge->label, vl_edge->match_type, pg_table);
+				auto vl_next_table = ResolveTable(next_elem->label, next_elem->match_type, pg_table);
+				AddBoundedVLPathFindingOptional(select_node, prev_elem->variable_binding, next_elem->variable_binding,
+				                                vl_next_table, next_elem, vl_edge_table,
+				                                static_cast<idx_t>(edge_subpath->lower),
+				                                static_cast<idx_t>(edge_subpath->upper));
+				if (!vl_edge->variable_binding.empty()) {
+					opt_alias_map[vl_edge->variable_binding] = vl_edge_table;
+				}
+				opt_alias_map[next_elem->variable_binding] = vl_next_table;
+				prev_elem = next_elem;
+				prev_vertex_table = vl_next_table;
+				continue;
+			}
+			if (!next_elem) {
+				throw NotImplementedException("Unsupported OPTIONAL MATCH path shape.");
 			}
 			if (edge_elem->match_type == PGQMatchType::MATCH_EDGE_LEFT_RIGHT) {
 				throw NotImplementedException(
