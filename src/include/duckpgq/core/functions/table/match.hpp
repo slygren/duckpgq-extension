@@ -223,7 +223,8 @@ public:
 	                                    int32_t &extra_alias_counter,
 	                                    const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &mandatory_alias_map,
 	                                    const PGQPathTableCache &path_table_cache,
-	                                    bool require_abi_paths = false);
+	                                    bool require_abi_paths = false,
+	                                    const ParsedExpression *where_hint = nullptr);
 
 	static void CheckNamedSubpath(SubPath &subpath, MatchExpression &original_ref, CreatePropertyGraphInfo &pg_table,
 	                              unique_ptr<SelectNode> &final_select_node,

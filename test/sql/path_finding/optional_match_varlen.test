@@ -58,5 +58,30 @@ C	NULL
 D	NULL
 X	NULL
 
+# A WHERE predicate on the mandatory (prev) binding is pushed into the
+# reachability anchor. The result must be identical to filtering after the join:
+# only t=A survives, and A reaches B,C within {1,2}.
+query TT
+-FROM GRAPH_TABLE (vg
+    MATCH (t:Tag)
+    OPTIONAL MATCH (t)-[e:Chain]->{1,2}(o:Tag)
+    WHERE t.name = 'A'
+    COLUMNS (t.name AS t, o.name AS o)
+    ) r ORDER BY 1, 2;
+----
+A	B
+A	C
+
+# A prev with no reachable target still survives the pushed filter (NULL kept).
+query TT
+-FROM GRAPH_TABLE (vg
+    MATCH (t:Tag)
+    OPTIONAL MATCH (t)-[e:Chain]->{1,2}(o:Tag)
+    WHERE t.name = 'X'
+    COLUMNS (t.name AS t, o.name AS o)
+    ) r ORDER BY 1, 2;
+----
+X	NULL
+
 statement ok
 -DROP PROPERTY GRAPH vg;

@@ -2731,9 +2731,12 @@ static void AddBoundedVLPathFindingOptional(unique_ptr<SelectNode> &select_node,
                                             const string &next_binding,
                                             const shared_ptr<PropertyGraphTable> &next_vertex_table,
                                             PathElement *next_elem, const shared_ptr<PropertyGraphTable> &edge_table,
-                                            idx_t lower, idx_t upper) {
+                                            idx_t lower, idx_t upper,
+                                            unique_ptr<ParsedExpression> anchor_filter) {
+	// anchor_filter (a prev-only WHERE predicate) limits the reachability BFS to
+	// the source vertices that survive the outer WHERE, instead of every source.
 	const string scan_name = BuildBoundedVLReachabilityCTE(select_node, prev_binding, edge_table, lower, upper,
-	                                                       nullptr, /*any_shortest=*/false);
+	                                                       std::move(anchor_filter), /*any_shortest=*/false);
 	const string cte_alias = scan_name + "_optscan";
 
 	// LEFT JOIN reachability CTE ON prev.rowid = cte.src_rowid AND depth BETWEEN lo AND hi
@@ -3313,7 +3316,7 @@ void PGQMatchFunction::ProcessOptionalPathList(
     int32_t &extra_alias_counter,
     const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &mandatory_alias_map,
     const PGQPathTableCache &path_table_cache,
-    bool require_abi_paths) {
+    bool require_abi_paths, const ParsedExpression *where_hint) {
 	const string &graph_name = pg_table.property_graph_name;
 
 	for (auto &path_pattern : opt_patterns) {
@@ -3379,10 +3382,16 @@ void PGQMatchFunction::ProcessOptionalPathList(
 				}
 				auto vl_edge_table = ResolveTable(vl_edge->label, vl_edge->match_type, pg_table);
 				auto vl_next_table = ResolveTable(next_elem->label, next_elem->match_type, pg_table);
+				// Push a prev-only WHERE predicate into the reachability anchor so the
+				// BFS starts only from the source vertices that survive the filter.
+				unique_ptr<ParsedExpression> anchor_filter;
+				if (where_hint) {
+					anchor_filter = ExtractSrcFilter(*where_hint, prev_elem->variable_binding);
+				}
 				AddBoundedVLPathFindingOptional(select_node, prev_elem->variable_binding, next_elem->variable_binding,
 				                                vl_next_table, next_elem, vl_edge_table,
 				                                static_cast<idx_t>(edge_subpath->lower),
-				                                static_cast<idx_t>(edge_subpath->upper));
+				                                static_cast<idx_t>(edge_subpath->upper), std::move(anchor_filter));
 				if (!vl_edge->variable_binding.empty()) {
 					opt_alias_map[vl_edge->variable_binding] = vl_edge_table;
 				}
@@ -6936,7 +6945,7 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	case_insensitive_map_t<shared_ptr<PropertyGraphTable>> optional_alias_map;
 	for (auto &opt_group : ref->optional_match_patterns) {
 		ProcessOptionalPathList(opt_group, final_select_node, optional_alias_map, *pg_table, extra_alias_counter, alias_map,
-		                        path_table_cache, require_abi_paths);
+		                        path_table_cache, require_abi_paths, ref->where_clause.get());
 	}
 
 	// Maps from table alias to table, including vertex and edge tables.
@@ -7100,7 +7109,7 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 		case_insensitive_map_t<shared_ptr<PropertyGraphTable>> branch_opt_alias_map;
 		for (auto &opt_group : branch.optional_match_patterns) {
 			ProcessOptionalPathList(opt_group, branch_select, branch_opt_alias_map, *pg_table, branch_counter,
-			                        branch_alias_map, path_table_cache, require_abi_paths);
+			                        branch_alias_map, path_table_cache, require_abi_paths, branch.where_clause.get());
 		}
 
 		auto branch_alias_to_ve = PopulateGraphTableAliasMap(*pg_table, branch);
