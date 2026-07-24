@@ -241,8 +241,8 @@ INSERT INTO schema2.v VALUES (1, 'a');
 statement error
 create table schema1.e (
     id bigint primary key,
-    src BIGINT REFERENCES v(id),
-    dst BIGINT REFERENCES v(id)
+    src BIGINT REFERENCES schema2.v(id),
+    dst BIGINT REFERENCES schema2.v(id)
 );
 ----
 Binder Error: Creating foreign keys across different schemas or catalogs is not supported

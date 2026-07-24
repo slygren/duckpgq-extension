@@ -86,7 +86,7 @@ did:plc:23df55poeztue4terk3s5ain	did:plc:6k63663icgdybm5evgszxjn2
 did:plc:23df55poeztue4terk3s5ain	did:plc:7562tstpez4aexd75ttshl3z
 
 query II con1
--FROM GRAPH_TABLE (bluesky MATCH (a:account where a.did='did:plc:7qqkrwwec4qeujs6hthlgpbe')-[f:follows]->{1,3}(b:account) COLUMNS (a.did as a_id, b.did as b_id)) ORDER BY a_id, b_id LIMIT 10;
+-FROM GRAPH_TABLE (bluesky MATCH p = ANY SHORTEST (a:account where a.did='did:plc:7qqkrwwec4qeujs6hthlgpbe')-[f:follows]->{1,3}(b:account) COLUMNS (a.did as a_id, b.did as b_id)) ORDER BY a_id, b_id LIMIT 10;
 ----
 did:plc:7qqkrwwec4qeujs6hthlgpbe	did:plc:224f4aj5p5vgk7tpcc4lltgx
 did:plc:7qqkrwwec4qeujs6hthlgpbe	did:plc:225ihm6x4pkgdpbmvfpxyicf
