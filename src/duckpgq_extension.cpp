@@ -19,6 +19,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    "Require GRAPH_TABLE MATCH path patterns to use DuckPGQ ABI path tables; fail instead of using fallback scans or recursive traversal.",
 		    LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::SESSION);
 	}
+	if (!config.HasExtensionOption("pgq_disable_abi_rewrite")) {
+		config.AddExtensionOption(
+		    "pgq_disable_abi_rewrite",
+		    "Skip the DuckPGQ ABI path-table rewrite entirely and use the fallback recursive-SQL/bridge-scan traversal. "
+		    "Used by pgq_verify_abi_rewrite() to run a query both ways and compare.",
+		    LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::SESSION);
+	}
 	CoreModule::Register(loader);
 }
 

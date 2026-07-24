@@ -1,0 +1,83 @@
+# name: test/sql/path_finding/verify_abi_rewrite.test
+# description: pgq_verify_abi_rewrite runs a query with and without the ABI rewrite and reports whether they agree
+# group: [path_finding]
+
+require duckpgq
+
+statement ok
+CREATE TABLE person(id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO person VALUES (1,'Alice'),(2,'Bob'),(3,'Carol');
+
+statement ok
+CREATE TABLE knows(src INTEGER, dst INTEGER);
+
+statement ok
+INSERT INTO knows VALUES (1,2),(2,3);
+
+statement ok
+CREATE SCHEMA graph;
+
+# GOOD: ABI edge table faithfully mirrors the bridge (1->2, 2->3).
+statement ok
+CREATE TABLE graph.__pg_good__custom_edge AS
+SELECT src AS v0, hash('e' || src || dst) AS e1, dst AS v1 FROM knows;
+
+# BAD: ABI edge table diverges from the bridge (claims 1->3, which is not a real edge).
+statement ok
+CREATE TABLE graph.__pg_bad__custom_edge AS
+SELECT 1 AS v0, hash('synthetic') AS e1, 3 AS v1;
+
+statement ok
+CREATE TABLE graph.__pgq_path_catalog AS
+SELECT * FROM (VALUES
+  ('good_graph','__pg_good__custom_edge','edge',1,'Person','Person','Person,Person','Knows',true,true,2,now(),true,1,1,'knows'),
+  ('bad_graph', '__pg_bad__custom_edge', 'edge',1,'Person','Person','Person,Person','Knows',true,true,1,now(),true,1,1,'knows')
+) t(graph_name,path_table_name,path_kind,hop_count,src_label,dst_label,vertex_label_sequence,edge_label_sequence,
+    supports_one_row_per_step,is_deduplicated,estimated_rows,last_refreshed_at,is_sorted_by_v0,min_depth,max_depth,bridge_table_names);
+
+statement ok
+-CREATE PROPERTY GRAPH good_graph
+VERTEX TABLES (person PROPERTIES (id, name) LABEL Person)
+EDGE TABLES (knows SOURCE KEY (src) REFERENCES person(id) DESTINATION KEY (dst) REFERENCES person(id) LABEL Knows);
+
+statement ok
+-CREATE PROPERTY GRAPH bad_graph
+VERTEX TABLES (person PROPERTIES (id, name) LABEL Person)
+EDGE TABLES (knows SOURCE KEY (src) REFERENCES person(id) DESTINATION KEY (dst) REFERENCES person(id) LABEL Knows);
+
+# Sanity: the ABI rewrite really is used for good_graph (returns the bridge edges).
+query II rowsort
+-FROM GRAPH_TABLE (good_graph MATCH (a:Person)-[:Knows]->(b:Person) COLUMNS (a.id AS aid, b.id AS bid));
+----
+1	2
+2	3
+
+# The verify function confirms the good ABI table equals the fallback: match, no diffs.
+query TIIII
+SELECT status, abi_rows, fallback_rows, only_in_abi, only_in_fallback
+FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (good_graph MATCH (a:Person)-[:Knows]->(b:Person) COLUMNS (a.id AS aid, b.id AS bid))');
+----
+match	2	2	0	0
+
+# The verify function CATCHES the divergent bad ABI table: MISMATCH.
+# ABI says 1->3 (1 row); fallback bridge says 1->2, 2->3 (2 rows).
+query TIIII
+SELECT status, abi_rows, fallback_rows, only_in_abi, only_in_fallback
+FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (bad_graph MATCH (a:Person)-[:Knows]->(b:Person) COLUMNS (a.id AS aid, b.id AS bid))');
+----
+MISMATCH	1	2	1	2
+
+# A query with no ABI coverage runs the fallback both ways: trivially matches.
+query TIIII
+SELECT status, abi_rows, fallback_rows, only_in_abi, only_in_fallback
+FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (good_graph MATCH (a:Person)-[:Knows]->{1,2}(b:Person) COLUMNS (a.id AS aid, b.id AS bid))');
+----
+match	3	3	0	0
+
+statement ok
+-DROP PROPERTY GRAPH good_graph;
+
+statement ok
+-DROP PROPERTY GRAPH bad_graph;

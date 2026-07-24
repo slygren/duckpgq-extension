@@ -1523,6 +1523,15 @@ static bool RequireABIPaths(ClientContext &context) {
 	return result && !value.IsNull() && value.GetValue<bool>();
 }
 
+// When set, the ABI path-table rewrite is skipped so the query runs the fallback
+// (recursive-SQL / bridge scan) path. pgq_verify_abi_rewrite() toggles this to run
+// a query both ways and confirm the fast path equals the reference traversal.
+static bool DisableABIRewrite(ClientContext &context) {
+	Value value;
+	auto result = context.TryGetCurrentSetting("pgq_disable_abi_rewrite", value);
+	return result && !value.IsNull() && value.GetValue<bool>();
+}
+
 static void ThrowABIPathRequired() {
 	throw BinderException(
 	    "DuckPGQ ABI path required by pgq_require_abi_paths, but no matching ABI path table rewrite was available. "
@@ -5936,6 +5945,11 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
                                  CoveredBindingMap &covered_columns,
                                  OneRowPerMode one_row_per_mode,
                                  const ParsedExpression *where_hint) {
+	// Verification/diagnostic escape hatch: force the fallback traversal so
+	// pgq_verify_abi_rewrite() can compare the two paths.
+	if (DisableABIRewrite(context)) {
+		return false;
+	}
 	// Pre-compute WHERE equality constraints once; used to push pt.v0/pt.v1 filters.
 	const WhereConstraints where_constraints = ExtractEqualityConstraints(where_hint);
 	auto binding_is_referenced = [&](const string &binding) {
