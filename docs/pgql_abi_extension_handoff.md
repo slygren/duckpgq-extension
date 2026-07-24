@@ -962,6 +962,44 @@ The short browser/Wasm smoke script is:
 
 Run it in DuckShellNode after loading a frozen DuckLake and registering `maintenance_graph`. It covers ABI one-hop lookup, direct-link dot projection, graph JSON, SQL-level `UNION ALL`, attributes JSON, and rewrite diagnostics in the runtime users actually touch.
 
+## Scope: SQL/PGQ vs PGQL 2.1
+
+This fork is **SQL/PGQ** — the SQL:2023 `GRAPH_TABLE` table function — not standalone
+PGQL 2.1 (Oracle's `SELECT ... FROM MATCH ...` language). The two overlap heavily on
+pattern-matching semantics, so we track PGQL 2.1 as the reference for *pattern and path*
+features, but the surface is SQL/PGQ. "PGQL 2.1 compliance" in commit history and older
+notes should be read as "PGQL 2.1-*compatible pattern semantics inside `GRAPH_TABLE`",
+not conformance to the standalone PGQL grammar.
+
+The practical consequence: a whole class of PGQL 2.1 "SELECT clause" features is **not
+missing — it comes from the host SQL** wrapping `GRAPH_TABLE`. `GROUP BY`, `HAVING`,
+`SELECT DISTINCT`, `ORDER BY`, `CASE`, the `IN` predicate, and `COUNT/MIN/MAX/AVG/SUM`
+are all written in ordinary DuckDB SQL around the graph table. Do not read their absence
+from the `MATCH` grammar as a gap.
+
+### Feature status against PGQL 2.1
+
+| PGQL 2.1 feature | This fork | Note |
+| --- | --- | --- |
+| `ONE ROW PER MATCH` / `VERTEX` / `STEP` | supported | `MATCH` is the default; we also add a non-standard `ONE ROW PER EDGE`. Some path shapes (left-directed, bidirectional) still throw — see limitations. |
+| `SELECT` clause: `GROUP BY`/`HAVING`/`DISTINCT`/`ORDER BY`/`CASE`/`IN`/aggregates | via host SQL | Not part of the `MATCH` grammar by design; written in DuckDB SQL around `GRAPH_TABLE`. |
+| Path search: `ANY`/`ALL SHORTEST`, `ANY`/`ALL CHEAPEST`, path modes (`WALK`/`TRAIL`/`SIMPLE`/`ACYCLIC`), quantifiers | supported | `ANY CHEAPEST` without a `COST` expression is rejected, not silently degraded. |
+| Mode-less quantifier (e.g. `-[e]->{1,3}` with no prefix) | all walks | SQL/PGQ walk semantics — every matching acyclic path, not one-per-endpoint. Use `ANY SHORTEST` for one-per-endpoint. |
+| `COUNTED SHORTEST` / top-k | parsed, not implemented | Throws `NotImplementedException`. Niche for this workload. |
+| `LATERAL` subqueries (PGQL-native, inside `MATCH`) | not supported | SQL `LATERAL` over two `GRAPH_TABLE`s already works via DuckDB; the in-`MATCH` form does not. |
+| Graph modification (`INSERT`/`UPDATE`/`DELETE` vertices/edges) | not supported | Out of scope by design: the graph is generated from DBT/DuckLake (and, longer term, the ontology), not mutated through queries. |
+| Horizontal aggregation over a group variable (e.g. `SUM(e.weight)` along `->{1,n}`) | not supported | Only `COST(p)` and the path functions (`path_length`, `vertices`, `edges`, …) express path-level values. A genuine gap, but rarely requested. |
+
+### Policy
+
+Implement a PGQL 2.1 feature when a real ontology/agent query needs it — not to chase
+conformance. The differentiated value of this work is the ABI rewrite + (future)
+ontology-driven, verified graph-access layer, not spec coverage. If conformance ever
+matters for credibility, the two honest gaps to close first are the remaining
+`ONE ROW PER` path-shape cases and horizontal aggregation; everything else is either
+already present, provided by host SQL, or a deliberate non-goal for a derived,
+read-only, lake-backed graph.
+
 ## Known Limitations / Next Work
 
 - SQL-level `UNION ALL` over separate `GRAPH_TABLE` subqueries now has native regression coverage for ABI-backed one-hop branches. Keep Wasm/browser coverage in the release checklist, since this area previously reproduced as memory out-of-bounds when parser-extension state or generated glue drifted.
