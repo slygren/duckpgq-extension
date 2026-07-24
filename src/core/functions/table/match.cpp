@@ -851,6 +851,53 @@ static const PGQPathTableInfo *FindPathTableInfo(const PGQPathTableCache &path_t
 	return nullptr;
 }
 
+// Resolve the ABI `edge` artifact that materializes this bridge edge table, so a recursive
+// traversal step can scan it instead of the bridge. The artifact is key-only (v0, e1, v1),
+// deduplicated and sorted by v0, so it is a strictly cheaper scan than a bridge table that
+// may be wide and unordered. This makes ABI coverage *graded*: a pattern with no
+// whole-pattern rewrite still gets ABI-backed traversal steps.
+//
+// Offered only for LEAN (ANY SHORTEST) reachability, which is the multiplicity-insensitive
+// case: the lean CTE UNION-distincts its rows and keeps MIN(depth) per (src, dst) pair, so
+// whether the artifact stores one row per distinct edge or one deduplicated row per
+// (v0, v1) pair cannot change reachability or the shortest depth.
+//
+// Walk enumeration (mode-less {lo,hi}, UNION ALL) is deliberately excluded: there, two
+// parallel edges are two distinct PGQL paths, so a deduplicated artifact would silently
+// drop rows. The catalog's multiplicity contract is generator-declared metadata we cannot
+// verify at bind time, so the bridge scan is kept for that case.
+static PGQABIEdgeScan ResolveABIEdgeScan(const PGQPathTableCache *path_table_cache, const string &graph_name,
+                                          const shared_ptr<PropertyGraphTable> &edge_table, bool any_shortest) {
+	PGQABIEdgeScan scan;
+	if (!path_table_cache || !any_shortest || !edge_table) {
+		return scan;
+	}
+	const auto &src_table = edge_table->source_pg_table;
+	const auto &dst_table = edge_table->destination_pg_table;
+	if (!src_table || !dst_table || edge_table->source_pk.empty() || edge_table->destination_pk.empty()) {
+		return scan;
+	}
+	const string &src_label = src_table->main_label;
+	const string &edge_label = edge_table->main_label;
+	const string &dst_label = dst_table->main_label;
+	if (src_label.empty() || edge_label.empty() || dst_label.empty()) {
+		return scan;
+	}
+	// The artifact is always stored in semantic source->destination orientation, so its
+	// name and lookup are independent of the direction the pattern walks it.
+	const string table_name = "__pg_" + graph_name + "__" + src_label + "__" + edge_label + "__" + dst_label;
+	const auto *info =
+	    FindPathTableInfo(*path_table_cache, table_name, "edge", {src_label, dst_label}, {edge_label});
+	if (!info) {
+		return scan;
+	}
+	scan.catalog_name = info->catalog_name;
+	scan.schema_name = info->schema_name;
+	scan.table_name = info->table_name;
+	scan.valid = true;
+	return scan;
+}
+
 static const PGQPathTableInfo *FindBranchSummaryInfo(const PGQPathTableCache &path_table_cache,
                                                      const string &src_label, const string &edge_label,
                                                      const string &dst_label, string &branch_edge_label) {
@@ -2599,7 +2646,7 @@ static void AddBoundedORPRecursiveCTE(unique_ptr<SelectNode> &select_node, const
 static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node, const string &prev_binding,
                                             const shared_ptr<PropertyGraphTable> &edge_table, idx_t lower, idx_t upper,
                                             unique_ptr<ParsedExpression> anchor_filter, bool any_shortest,
-                                            bool reverse = false) {
+                                            bool reverse = false, const PGQABIEdgeScan *abi_edge = nullptr) {
 	// reverse=true walks edges backwards (for left-directed patterns like
 	// (a)<-[e]-{1,3}(b)): the anchor sits on the edge's *destination* side and each
 	// step follows an edge from its dst to its src. Implemented by swapping the
@@ -2693,17 +2740,38 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 	    ExpressionType::COMPARE_EQUAL, make_uniq<ColumnRefExpression>("rowid", mid_alias),
 	    make_uniq<ColumnRefExpression>("dst_rowid", rec_alias));
 
-	// JOIN edge_table AS e ON e.src_fk = mid.src_pk
-	auto e_ref = edge_table->CreateBaseTableRef(e_alias);
+	// JOIN <edge source> AS e ON e.<step-out column> = mid.src_pk
+	//
+	// The step scans either the bridge edge table (columns src_fk/dst_fk hold the vertex
+	// keys) or, when an ABI edge artifact covers this family, that artifact (columns v0/v1
+	// hold the same vertex keys). Both are key-to-key, so the join skeleton is identical --
+	// only the table ref and the two column names change. The artifact is always stored in
+	// semantic source->destination orientation, so a reverse (left-directed) walk steps out
+	// of v1 and lands on v0.
+	const bool use_abi_edge = abi_edge && abi_edge->valid;
+	const string step_out_col = use_abi_edge ? (reverse ? "v1" : "v0") : src_fk;
+	const string step_in_col = use_abi_edge ? (reverse ? "v0" : "v1") : dst_fk;
+
+	unique_ptr<TableRef> e_ref;
+	if (use_abi_edge) {
+		auto abi_ref = make_uniq<BaseTableRef>();
+		abi_ref->catalog_name = abi_edge->catalog_name;
+		abi_ref->schema_name = abi_edge->schema_name;
+		abi_ref->table_name = abi_edge->table_name;
+		abi_ref->alias = e_alias;
+		e_ref = std::move(abi_ref);
+	} else {
+		e_ref = edge_table->CreateBaseTableRef(e_alias);
+	}
 	auto join_e = make_uniq<JoinRef>(JoinRefType::REGULAR);
 	join_e->type = JoinType::INNER;
 	join_e->left = std::move(join_mid);
 	join_e->right = std::move(e_ref);
 	join_e->condition = make_uniq<ComparisonExpression>(
-	    ExpressionType::COMPARE_EQUAL, make_uniq<ColumnRefExpression>(src_fk, e_alias),
+	    ExpressionType::COMPARE_EQUAL, make_uniq<ColumnRefExpression>(step_out_col, e_alias),
 	    make_uniq<ColumnRefExpression>(src_pk, mid_alias));
 
-	// JOIN dst_table AS b ON b.dst_pk = e.dst_fk
+	// JOIN dst_table AS b ON b.dst_pk = e.<step-in column>
 	auto b_ref = far_side_table->CreateBaseTableRef(b_alias);
 	auto join_b = make_uniq<JoinRef>(JoinRefType::REGULAR);
 	join_b->type = JoinType::INNER;
@@ -2711,7 +2779,7 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 	join_b->right = std::move(b_ref);
 	join_b->condition = make_uniq<ComparisonExpression>(
 	    ExpressionType::COMPARE_EQUAL, make_uniq<ColumnRefExpression>(dst_pk, b_alias),
-	    make_uniq<ColumnRefExpression>(dst_fk, e_alias));
+	    make_uniq<ColumnRefExpression>(step_in_col, e_alias));
 	recursive->from_table = std::move(join_b);
 
 	auto r_src = make_uniq<ColumnRefExpression>("src_rowid", rec_alias);
@@ -2846,9 +2914,10 @@ static void AddBoundedVLPathFinding(unique_ptr<SelectNode> &select_node,
                                     vector<unique_ptr<ParsedExpression>> &conditions, const string &prev_binding,
                                     const string &next_binding, const shared_ptr<PropertyGraphTable> &edge_table,
                                     idx_t lower, idx_t upper, unique_ptr<ParsedExpression> anchor_filter,
-                                    bool any_shortest, bool reverse = false) {
+                                    bool any_shortest, bool reverse = false,
+                                    const PGQABIEdgeScan *abi_edge = nullptr) {
 	const string scan_name = BuildBoundedVLReachabilityCTE(select_node, prev_binding, edge_table, lower, upper,
-	                                                       std::move(anchor_filter), any_shortest, reverse);
+	                                                       std::move(anchor_filter), any_shortest, reverse, abi_edge);
 	const string cte_alias = scan_name + "_scan";
 
 	// ── Add CTE to FROM (cross join) ─────────────────────────────────────────────
@@ -2940,7 +3009,8 @@ void PGQMatchFunction::AddPathFinding(unique_ptr<SelectNode> &select_node,
                                       const string &edge_binding, const string &next_binding,
                                       const shared_ptr<PropertyGraphTable> &edge_table,
                                       CreatePropertyGraphInfo &pg_table, SubPath *subpath, PGQMatchType edge_type,
-                                      unique_ptr<ParsedExpression> anchor_filter, bool any_shortest) {
+                                      unique_ptr<ParsedExpression> anchor_filter, bool any_shortest,
+                                      const PGQABIEdgeScan *abi_edge) {
 	// For finite bounded directed edges, use a recursive CTE instead of CSR+iterativelength.
 	// This reads only the reachable subgraph rather than the full edge/vertex tables,
 	// which is critical for large remote (httpfs) graphs in browser or constrained environments.
@@ -2949,7 +3019,7 @@ void PGQMatchFunction::AddPathFinding(unique_ptr<SelectNode> &select_node,
 		// Left-directed (a)<-[e]-{lo,hi}(b): same recursive CTE walked in reverse.
 		AddBoundedVLPathFinding(select_node, conditions, prev_binding, next_binding, edge_table, subpath->lower,
 		                        subpath->upper, std::move(anchor_filter), any_shortest,
-		                        edge_type == PGQMatchType::MATCH_EDGE_LEFT);
+		                        edge_type == PGQMatchType::MATCH_EDGE_LEFT, abi_edge);
 		return;
 	}
 
@@ -3273,7 +3343,8 @@ void PGQMatchFunction::ProcessPathList(vector<unique_ptr<PathReference>> &path_l
                                        unique_ptr<SelectNode> &final_select_node,
                                        case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map,
                                        CreatePropertyGraphInfo &pg_table, int32_t &extra_alias_counter,
-                                       MatchExpression &original_ref, bool all_shortest, bool any_shortest) {
+                                       MatchExpression &original_ref, bool all_shortest, bool any_shortest,
+                                       const PGQPathTableCache *path_table_cache) {
 	PathElement *previous_vertex_element = GetPathElement(path_list[0]);
 	if (!previous_vertex_element) {
 		const auto previous_vertex_subpath = reinterpret_cast<SubPath *>(path_list[0].get());
@@ -3289,7 +3360,7 @@ void PGQMatchFunction::ProcessPathList(vector<unique_ptr<PathReference>> &path_l
 		} else {
 			// Add the shortest path if the name is found in the column_list
 			ProcessPathList(previous_vertex_subpath->path_list, conditions, final_select_node, alias_map, pg_table,
-			                extra_alias_counter, original_ref, all_shortest, any_shortest);
+			                extra_alias_counter, original_ref, all_shortest, any_shortest, path_table_cache);
 			return;
 		}
 	}
@@ -3424,10 +3495,14 @@ void PGQMatchFunction::ProcessPathList(vector<unique_ptr<PathReference>> &path_l
 						anchor_filter = ExtractSrcFilter(*original_ref.where_clause,
 						                                 previous_vertex_element->variable_binding);
 					}
+					// Graded ABI coverage: even though no whole-pattern rewrite applied, the
+					// recursive step can still scan an ABI edge artifact instead of the bridge.
+					const PGQABIEdgeScan abi_edge = ResolveABIEdgeScan(
+					    path_table_cache, pg_table.property_graph_name, edge_table, any_shortest);
 					AddPathFinding(final_select_node, conditions, previous_vertex_element->variable_binding,
 					               edge_element->variable_binding, next_vertex_element->variable_binding,
 					               edge_table, pg_table, edge_subpath, edge_element->match_type,
-					               std::move(anchor_filter), any_shortest);
+					               std::move(anchor_filter), any_shortest, &abi_edge);
 					// AddPathModeFilter references the shortest_path_cte produced by the CSR path.
 					// The recursive-CTE path (finite bounded directed) already prevents vertex revisits
 					// via list_contains cycle detection, so skip the filter there.
@@ -5508,8 +5583,12 @@ static unique_ptr<ParsedExpression> BuildExistsSubquery(
 			if (require_abi_paths && PathPatternRequiresABIPath(path_pattern->path_elements)) {
 				ThrowABIPathRequired();
 			}
+			// Withholding the cache disables the fallback's ABI edge-artifact scans too, so
+			// pgq_disable_abi_rewrite forces a fully bridge-based traversal -- which is what
+			// makes pgq_verify_abi_rewrite able to verify this rewrite.
 			PGQMatchFunction::ProcessPathList(path_pattern->path_elements, conditions, inner_select, inner_alias_map,
-			                                  pg_table, extra_alias_counter, inner_match, all_shortest, any_shortest);
+			                                  pg_table, extra_alias_counter, inner_match, all_shortest, any_shortest,
+			                                  DisableABIRewrite(context) ? nullptr : &path_table_cache);
 		}
 	}
 
@@ -7144,7 +7223,8 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 				ThrowABIPathRequired();
 			}
 			ProcessPathList(path_pattern->path_elements, conditions, final_select_node, alias_map, *pg_table,
-			                extra_alias_counter, *ref, all_shortest, any_shortest);
+			                extra_alias_counter, *ref, all_shortest, any_shortest,
+			                DisableABIRewrite(context) ? nullptr : &path_table_cache);
 		}
 	}
 
@@ -7310,7 +7390,8 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 					ThrowABIPathRequired();
 				}
 				ProcessPathList(path_pattern->path_elements, branch_conditions, branch_select,
-				                branch_alias_map, *pg_table, branch_counter, branch, all_shortest, any_shortest);
+				                branch_alias_map, *pg_table, branch_counter, branch, all_shortest, any_shortest,
+				                DisableABIRewrite(context) ? nullptr : &path_table_cache);
 			}
 		}
 

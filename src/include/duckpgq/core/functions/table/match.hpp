@@ -91,6 +91,17 @@ struct PGQPathTableCache {
 	case_insensitive_map_t<vector<idx_t>> direct_link_index;
 };
 
+//! A resolved ABI `edge` artifact standing in for a bridge edge-table scan inside a
+//! recursive traversal step. The artifact is keyed by vertex key values in v0/v1, so it
+//! drops into the same join skeleton as the bridge. `valid == false` means "no ABI
+//! coverage for this edge -- scan the bridge".
+struct PGQABIEdgeScan {
+	string catalog_name;
+	string schema_name;
+	string table_name;
+	bool valid = false;
+};
+
 struct PGQMatchFunction : public TableFunction {
 public:
 	PGQMatchFunction() {
@@ -193,7 +204,8 @@ public:
 	                           const string &prev_binding, const string &edge_binding, const string &next_binding,
 	                           const shared_ptr<PropertyGraphTable> &edge_table, CreatePropertyGraphInfo &pg_table,
 	                           SubPath *subpath, PGQMatchType edge_type,
-	                           unique_ptr<ParsedExpression> anchor_filter = nullptr, bool any_shortest = false);
+	                           unique_ptr<ParsedExpression> anchor_filter = nullptr, bool any_shortest = false,
+	                           const PGQABIEdgeScan *abi_edge = nullptr);
 
 	static void AddPathModeFilter(PGQPathMode mode, const string &path_cte,
 	                              vector<unique_ptr<ParsedExpression>> &conditions);
@@ -206,12 +218,16 @@ public:
 	                         case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map,
 	                         int32_t &extra_alias_counter, unique_ptr<TableRef> &from_clause);
 
+	// path_table_cache (optional) lets the recursive-CTE fallback still scan ABI edge
+	// artifacts for its traversal steps when no whole-pattern ABI rewrite applied --
+	// i.e. ABI coverage is graded, not all-or-nothing.
 	static void ProcessPathList(vector<unique_ptr<PathReference>> &path_pattern,
 	                            vector<unique_ptr<ParsedExpression>> &conditions, unique_ptr<SelectNode> &select_node,
 	                            case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map,
 	                            CreatePropertyGraphInfo &pg_table, int32_t &extra_alias_counter,
 	                            MatchExpression &original_ref, bool all_shortest = false,
-	                            bool any_shortest = false);
+	                            bool any_shortest = false,
+	                            const PGQPathTableCache *path_table_cache = nullptr);
 
 	// Process one OPTIONAL MATCH group: adds LEFT JOINs for each edge+vertex pair directly
 	// to select_node->from_table. Populates opt_alias_map with the new aliases.
