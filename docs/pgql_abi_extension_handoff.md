@@ -981,7 +981,7 @@ from the `MATCH` grammar as a gap.
 
 | PGQL 2.1 feature | This fork | Note |
 | --- | --- | --- |
-| `ONE ROW PER MATCH` / `VERTEX` / `STEP` | supported | `MATCH` is the default; we also add a non-standard `ONE ROW PER EDGE`. Some path shapes (left-directed, bidirectional) still throw — see limitations. |
+| `ONE ROW PER MATCH` / `VERTEX` / `STEP` | supported | `MATCH` is the default; we also add a non-standard `ONE ROW PER EDGE`. Works for right-directed, left-directed (reverse-walked recursive CTE, traversal-order steps), and undirected (CSR); only unbounded left-directed and bidirectional variable-length still throw. |
 | `SELECT` clause: `GROUP BY`/`HAVING`/`DISTINCT`/`ORDER BY`/`CASE`/`IN`/aggregates | via host SQL | Not part of the `MATCH` grammar by design; written in DuckDB SQL around `GRAPH_TABLE`. |
 | Path search: `ANY`/`ALL SHORTEST`, `ANY`/`ALL CHEAPEST`, path modes (`WALK`/`TRAIL`/`SIMPLE`/`ACYCLIC`), quantifiers | supported | `ANY CHEAPEST` without a `COST` expression is rejected, not silently degraded. |
 | Mode-less quantifier (e.g. `-[e]->{1,3}` with no prefix) | all walks | SQL/PGQ walk semantics — every matching acyclic path, not one-per-endpoint. Use `ANY SHORTEST` for one-per-endpoint. |

@@ -2283,11 +2283,22 @@ PGQMatchFunction::AddPathQuantifierCondition(const string &prev_binding, const s
 static void AddBoundedORPRecursiveCTE(unique_ptr<SelectNode> &select_node, const string &prev_binding,
                                       const string &next_binding,
                                       const shared_ptr<PropertyGraphTable> &edge_table, idx_t lower, idx_t upper,
-                                      unique_ptr<ParsedExpression> anchor_filter) {
-	const string &src_pk = edge_table->source_pk[0];
-	const string &dst_pk = edge_table->destination_pk[0];
-	const string &src_fk = edge_table->source_fk[0];
-	const string &dst_fk = edge_table->destination_fk[0];
+                                      unique_ptr<ParsedExpression> anchor_filter, bool reverse = false) {
+	// reverse=true walks edges backwards (for left-directed patterns like
+	// (a)<-[e]-{1,3}(b)): the anchor sits on the edge's *destination* side and each
+	// step follows an edge from its dst to its src. Implemented by swapping the
+	// source/destination roles here; the join skeleton below is direction-agnostic.
+	// Path lists stay in traversal order (anchor -> far end), matching the
+	// undirected convention: v1/v2 in ONE ROW PER STEP are traversal order, not
+	// physical edge direction.
+	const string &src_pk = reverse ? edge_table->destination_pk[0] : edge_table->source_pk[0];
+	const string &dst_pk = reverse ? edge_table->source_pk[0] : edge_table->destination_pk[0];
+	const string &src_fk = reverse ? edge_table->destination_fk[0] : edge_table->source_fk[0];
+	const string &dst_fk = reverse ? edge_table->source_fk[0] : edge_table->destination_fk[0];
+	const shared_ptr<PropertyGraphTable> &anchor_side_table =
+	    reverse ? edge_table->destination_pg_table : edge_table->source_pg_table;
+	const shared_ptr<PropertyGraphTable> &far_side_table =
+	    reverse ? edge_table->source_pg_table : edge_table->destination_pg_table;
 
 	const auto cte_idx = select_node->cte_map.map.size();
 	const string cte_name = "__rvl_orp_" + std::to_string(cte_idx);
@@ -2300,7 +2311,7 @@ static void AddBoundedORPRecursiveCTE(unique_ptr<SelectNode> &select_node, const
 	// SELECT v.rowid AS src_rowid, v.rowid AS cur_rowid, 0 AS depth,
 	//        list_value(v.rowid) AS visited, list_value(v.rowid)::BIGINT[] AS path
 	auto anchor = make_uniq<SelectNode>();
-	anchor->from_table = edge_table->source_pg_table->CreateBaseTableRef(prev_binding);
+	anchor->from_table = anchor_side_table->CreateBaseTableRef(prev_binding);
 
 	auto a_src = make_uniq<ColumnRefExpression>("rowid", prev_binding);
 	a_src->alias = "src_rowid";
@@ -2347,7 +2358,7 @@ static void AddBoundedORPRecursiveCTE(unique_ptr<SelectNode> &select_node, const
 	cte_ref->table_name = cte_name;
 	cte_ref->alias = rec_alias;
 
-	auto mid_ref = edge_table->source_pg_table->CreateBaseTableRef(mid_alias);
+	auto mid_ref = anchor_side_table->CreateBaseTableRef(mid_alias);
 	auto join_mid = make_uniq<JoinRef>(JoinRefType::REGULAR);
 	join_mid->type = JoinType::INNER;
 	join_mid->left = std::move(cte_ref);
@@ -2365,7 +2376,7 @@ static void AddBoundedORPRecursiveCTE(unique_ptr<SelectNode> &select_node, const
 	                                                    make_uniq<ColumnRefExpression>(src_fk, e_alias),
 	                                                    make_uniq<ColumnRefExpression>(src_pk, mid_alias));
 
-	auto b_ref = edge_table->destination_pg_table->CreateBaseTableRef(b_alias);
+	auto b_ref = far_side_table->CreateBaseTableRef(b_alias);
 	auto join_b = make_uniq<JoinRef>(JoinRefType::REGULAR);
 	join_b->type = JoinType::INNER;
 	join_b->left = std::move(join_e);
@@ -2489,11 +2500,23 @@ static void AddBoundedORPRecursiveCTE(unique_ptr<SelectNode> &select_node, const
 // compute reachability identically.
 static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node, const string &prev_binding,
                                             const shared_ptr<PropertyGraphTable> &edge_table, idx_t lower, idx_t upper,
-                                            unique_ptr<ParsedExpression> anchor_filter, bool any_shortest) {
-	const string &src_pk = edge_table->source_pk[0];
-	const string &dst_pk = edge_table->destination_pk[0];
-	const string &src_fk = edge_table->source_fk[0];
-	const string &dst_fk = edge_table->destination_fk[0];
+                                            unique_ptr<ParsedExpression> anchor_filter, bool any_shortest,
+                                            bool reverse = false) {
+	// reverse=true walks edges backwards (for left-directed patterns like
+	// (a)<-[e]-{1,3}(b)): the anchor sits on the edge's *destination* side and each
+	// step follows an edge from its dst to its src. Implemented by swapping the
+	// source/destination roles here; the join skeleton below is direction-agnostic.
+	// Path lists stay in traversal order (anchor -> far end), matching the
+	// undirected convention: v1/v2 in ONE ROW PER STEP are traversal order, not
+	// physical edge direction.
+	const string &src_pk = reverse ? edge_table->destination_pk[0] : edge_table->source_pk[0];
+	const string &dst_pk = reverse ? edge_table->source_pk[0] : edge_table->destination_pk[0];
+	const string &src_fk = reverse ? edge_table->destination_fk[0] : edge_table->source_fk[0];
+	const string &dst_fk = reverse ? edge_table->source_fk[0] : edge_table->destination_fk[0];
+	const shared_ptr<PropertyGraphTable> &anchor_side_table =
+	    reverse ? edge_table->destination_pg_table : edge_table->source_pg_table;
+	const shared_ptr<PropertyGraphTable> &far_side_table =
+	    reverse ? edge_table->source_pg_table : edge_table->destination_pg_table;
 
 	const auto cte_idx = select_node->cte_map.map.size();
 	const string cte_name = "__rvl_" + std::to_string(cte_idx);
@@ -2509,7 +2532,7 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 	// FROM src_table AS prev_binding
 	// [WHERE anchor_filter]
 	auto anchor = make_uniq<SelectNode>();
-	anchor->from_table = edge_table->source_pg_table->CreateBaseTableRef(prev_binding);
+	anchor->from_table = anchor_side_table->CreateBaseTableRef(prev_binding);
 
 	auto a_src = make_uniq<ColumnRefExpression>("rowid", prev_binding);
 	a_src->alias = "src_rowid";
@@ -2550,7 +2573,7 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 	cte_ref->alias = rec_alias;
 
 	// JOIN src_table AS mid ON mid.rowid = r.dst_rowid
-	auto mid_ref = edge_table->source_pg_table->CreateBaseTableRef(mid_alias);
+	auto mid_ref = anchor_side_table->CreateBaseTableRef(mid_alias);
 	auto join_mid = make_uniq<JoinRef>(JoinRefType::REGULAR);
 	join_mid->type = JoinType::INNER;
 	join_mid->left = std::move(cte_ref);
@@ -2570,7 +2593,7 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 	    make_uniq<ColumnRefExpression>(src_pk, mid_alias));
 
 	// JOIN dst_table AS b ON b.dst_pk = e.dst_fk
-	auto b_ref = edge_table->destination_pg_table->CreateBaseTableRef(b_alias);
+	auto b_ref = far_side_table->CreateBaseTableRef(b_alias);
 	auto join_b = make_uniq<JoinRef>(JoinRefType::REGULAR);
 	join_b->type = JoinType::INNER;
 	join_b->left = std::move(join_e);
@@ -2690,9 +2713,9 @@ static void AddBoundedVLPathFinding(unique_ptr<SelectNode> &select_node,
                                     vector<unique_ptr<ParsedExpression>> &conditions, const string &prev_binding,
                                     const string &next_binding, const shared_ptr<PropertyGraphTable> &edge_table,
                                     idx_t lower, idx_t upper, unique_ptr<ParsedExpression> anchor_filter,
-                                    bool any_shortest) {
+                                    bool any_shortest, bool reverse = false) {
 	const string scan_name = BuildBoundedVLReachabilityCTE(select_node, prev_binding, edge_table, lower, upper,
-	                                                       std::move(anchor_filter), any_shortest);
+	                                                       std::move(anchor_filter), any_shortest, reverse);
 	const string cte_alias = scan_name + "_scan";
 
 	// ── Add CTE to FROM (cross join) ─────────────────────────────────────────────
@@ -2732,11 +2755,11 @@ static void AddBoundedVLPathFindingOptional(unique_ptr<SelectNode> &select_node,
                                             const shared_ptr<PropertyGraphTable> &next_vertex_table,
                                             PathElement *next_elem, const shared_ptr<PropertyGraphTable> &edge_table,
                                             idx_t lower, idx_t upper,
-                                            unique_ptr<ParsedExpression> anchor_filter) {
+                                            unique_ptr<ParsedExpression> anchor_filter, bool reverse = false) {
 	// anchor_filter (a prev-only WHERE predicate) limits the reachability BFS to
 	// the source vertices that survive the outer WHERE, instead of every source.
 	const string scan_name = BuildBoundedVLReachabilityCTE(select_node, prev_binding, edge_table, lower, upper,
-	                                                       std::move(anchor_filter), /*any_shortest=*/false);
+	                                                       std::move(anchor_filter), /*any_shortest=*/false, reverse);
 	const string cte_alias = scan_name + "_optscan";
 
 	// LEFT JOIN reachability CTE ON prev.rowid = cte.src_rowid AND depth BETWEEN lo AND hi
@@ -2788,9 +2811,12 @@ void PGQMatchFunction::AddPathFinding(unique_ptr<SelectNode> &select_node,
 	// For finite bounded directed edges, use a recursive CTE instead of CSR+iterativelength.
 	// This reads only the reachable subgraph rather than the full edge/vertex tables,
 	// which is critical for large remote (httpfs) graphs in browser or constrained environments.
-	if (edge_type == PGQMatchType::MATCH_EDGE_RIGHT && subpath->upper < static_cast<idx_t>(1 << 30)) {
+	if ((edge_type == PGQMatchType::MATCH_EDGE_RIGHT || edge_type == PGQMatchType::MATCH_EDGE_LEFT) &&
+	    subpath->upper < static_cast<idx_t>(1 << 30)) {
+		// Left-directed (a)<-[e]-{lo,hi}(b): same recursive CTE walked in reverse.
 		AddBoundedVLPathFinding(select_node, conditions, prev_binding, next_binding, edge_table, subpath->lower,
-		                        subpath->upper, std::move(anchor_filter), any_shortest);
+		                        subpath->upper, std::move(anchor_filter), any_shortest,
+		                        edge_type == PGQMatchType::MATCH_EDGE_LEFT);
 		return;
 	}
 
@@ -3216,9 +3242,11 @@ void PGQMatchFunction::ProcessPathList(vector<unique_ptr<PathReference>> &path_l
 					// Unbounded or undirected edges fall back to CSR + shortestpath().
 					static const string kPathCTE = "shortest_path_cte";
 					if (final_select_node->cte_map.map.find(kPathCTE) == final_select_node->cte_map.map.end()) {
-						if (edge_element->match_type == PGQMatchType::MATCH_EDGE_RIGHT &&
+						if ((edge_element->match_type == PGQMatchType::MATCH_EDGE_RIGHT ||
+						     edge_element->match_type == PGQMatchType::MATCH_EDGE_LEFT) &&
 						    edge_subpath->upper < static_cast<idx_t>(1 << 30)) {
 							// Recursive CTE path: reads only reachable rows.
+							// Left-directed walks the same CTE in reverse.
 							unique_ptr<ParsedExpression> anchor_filter;
 							if (original_ref.where_clause) {
 								anchor_filter = ExtractSrcFilter(*original_ref.where_clause,
@@ -3228,7 +3256,8 @@ void PGQMatchFunction::ProcessPathList(vector<unique_ptr<PathReference>> &path_l
 							                          previous_vertex_element->variable_binding,
 							                          next_vertex_element->variable_binding, edge_table,
 							                          edge_subpath->lower, edge_subpath->upper,
-							                          std::move(anchor_filter));
+							                          std::move(anchor_filter),
+							                          edge_element->match_type == PGQMatchType::MATCH_EDGE_LEFT);
 						} else {
 							// CSR fallback for unbounded or undirected ONE ROW PER.
 							if (final_select_node->cte_map.map.find("cte1") ==
@@ -3244,7 +3273,7 @@ void PGQMatchFunction::ProcessPathList(vector<unique_ptr<PathReference>> &path_l
 								} else {
 									throw NotImplementedException(
 									    "ONE ROW PER path finding is not supported for "
-									    "left-directed or bidirectional edges");
+									    "unbounded left-directed or bidirectional edges");
 								}
 							}
 							vector<unique_ptr<ParsedExpression>> pfc;
@@ -3270,7 +3299,8 @@ void PGQMatchFunction::ProcessPathList(vector<unique_ptr<PathReference>> &path_l
 					// The recursive-CTE path (finite bounded directed) already prevents vertex revisits
 					// via list_contains cycle detection, so skip the filter there.
 					const bool used_recursive_cte =
-					    (edge_element->match_type == PGQMatchType::MATCH_EDGE_RIGHT &&
+					    ((edge_element->match_type == PGQMatchType::MATCH_EDGE_RIGHT ||
+					      edge_element->match_type == PGQMatchType::MATCH_EDGE_LEFT) &&
 					     edge_subpath->upper < static_cast<idx_t>(1 << 30));
 					if (!used_recursive_cte && edge_subpath->path_mode != PGQPathMode::NONE &&
 					    edge_subpath->path_mode != PGQPathMode::WALK) {
@@ -3359,8 +3389,9 @@ void PGQMatchFunction::ProcessOptionalPathList(
 
 			// Variable-length quantified edge, e.g. OPTIONAL MATCH (a)-[e]->{1,5}(b):
 			// the edge slot is a SubPath so GetPathElement returns null. Build a
-			// LEFT-JOINed bounded reachability. Only right-directed, bounded VL is
-			// supported (mirrors the mandatory AddBoundedVLPathFinding).
+			// LEFT-JOINed bounded reachability. Directed (-> or <-), bounded VL is
+			// supported (mirrors the mandatory AddBoundedVLPathFinding; <- walks
+			// the reachability CTE in reverse).
 			if (!edge_elem) {
 				auto *edge_subpath = dynamic_cast<SubPath *>(path_elements[idx_j].get());
 				if (!edge_subpath || edge_subpath->path_list.empty() || !next_elem) {
@@ -3370,9 +3401,10 @@ void PGQMatchFunction::ProcessOptionalPathList(
 				if (!vl_edge) {
 					throw NotImplementedException("Unsupported variable-length OPTIONAL MATCH shape.");
 				}
-				if (vl_edge->match_type != PGQMatchType::MATCH_EDGE_RIGHT) {
+				if (vl_edge->match_type != PGQMatchType::MATCH_EDGE_RIGHT &&
+				    vl_edge->match_type != PGQMatchType::MATCH_EDGE_LEFT) {
 					throw NotImplementedException(
-					    "Only right-directed (->) variable-length edges are supported in OPTIONAL MATCH.");
+					    "Only directed (-> or <-) variable-length edges are supported in OPTIONAL MATCH.");
 				}
 				if (edge_subpath->upper >= static_cast<idx_t>(1 << 30)) {
 					throw NotImplementedException("Unbounded variable-length OPTIONAL MATCH is not yet supported.");
@@ -3391,7 +3423,8 @@ void PGQMatchFunction::ProcessOptionalPathList(
 				AddBoundedVLPathFindingOptional(select_node, prev_elem->variable_binding, next_elem->variable_binding,
 				                                vl_next_table, next_elem, vl_edge_table,
 				                                static_cast<idx_t>(edge_subpath->lower),
-				                                static_cast<idx_t>(edge_subpath->upper), std::move(anchor_filter));
+				                                static_cast<idx_t>(edge_subpath->upper), std::move(anchor_filter),
+				                                vl_edge->match_type == PGQMatchType::MATCH_EDGE_LEFT);
 				if (!vl_edge->variable_binding.empty()) {
 					opt_alias_map[vl_edge->variable_binding] = vl_edge_table;
 				}
