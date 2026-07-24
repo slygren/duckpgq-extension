@@ -44,9 +44,7 @@ static string RowKey(MaterializedQueryResult &res, idx_t row) {
 }
 
 // Run the graph query both ways on an internal connection and multiset-compare
-// the results. This runs at EXECUTION time (not bind): the outer statement is
-// fully planned by then, so the nested GRAPH_TABLE parse/bind on the internal
-// connection does not re-enter the outer binder.
+// the results.
 static void ComputeVerify(ClientContext &context, const string &query, VerifyABIRewriteRow &row) {
 	// Internal connection: shares the database (property graphs, tables, the
 	// parser extension) but has its own settings, so toggling
@@ -56,11 +54,15 @@ static void ComputeVerify(ClientContext &context, const string &query, VerifyABI
 	auto conn = make_uniq<Connection>(*context.db);
 	conn->Query("SET pgq_require_abi_paths=false;");
 
-	// Run the nested graph queries single-threaded. We are executing inside the
-	// outer statement (itself on a task-scheduler worker); letting the nested
-	// GRAPH_TABLE fan out onto the same scheduler re-enters it and crashes under
-	// parallelism. Force threads=1 for the duration, then restore. threads is an
-	// instance-wide setting, so we save and restore the original value.
+	// Run the nested graph queries single-threaded. Binding a GRAPH_TABLE concurrently
+	// with itself is not safe, and letting the nested query fan out crashes; threads is
+	// instance-wide, so save and restore the caller's value.
+	//
+	// This is why the verification runs at BIND time rather than during execution: the
+	// outer statement has not started executing yet, so no task-scheduler worker is
+	// blocked waiting on us. Shrinking the pool from inside an executing worker instead
+	// makes the scheduler join the running thread, which intermittently fails with
+	// "Resource deadlock avoided".
 	string saved_threads;
 	{
 		auto tq = conn->Query("SELECT current_setting('threads')");
@@ -77,8 +79,6 @@ static void ComputeVerify(ClientContext &context, const string &query, VerifyABI
 	// GRAPH_TABLE(...) is recognized.
 	const string routed = "-" + query;
 
-	// Do the two runs + comparison in an inner lambda so threads can be restored
-	// on every exit path below.
 	auto run = [&]() {
 		// ── Fast path (ABI rewrite on) ────────────────────────────────────────
 		conn->Query("SET pgq_disable_abi_rewrite=false;");
@@ -130,9 +130,18 @@ static void ComputeVerify(ClientContext &context, const string &query, VerifyABI
 		row.only_in_fallback = only_fb;
 		row.status = (only_abi == 0 && only_fb == 0) ? "match" : "MISMATCH";
 	};
-	run();
 
-	// Restore the original thread count.
+	try {
+		run();
+	} catch (const std::exception &ex) {
+		row.status = "error";
+		row.detail = string("verification failed: ") + ex.what();
+	} catch (...) {
+		row.status = "error";
+		row.detail = "verification failed with an unknown exception";
+	}
+
+	// Restore the caller's thread count.
 	if (!saved_threads.empty()) {
 		conn->Query("SET threads=" + saved_threads + ";");
 	} else {
@@ -148,7 +157,7 @@ unique_ptr<FunctionData> VerifyABIRewriteFunction::VerifyABIRewriteBind(ClientCo
                                                                         vector<string> &names) {
 	AddOutputColumns(return_types, names);
 	auto bind_data = make_uniq<VerifyABIRewriteBindData>();
-	bind_data->query = input.inputs[0].GetValue<string>();
+	ComputeVerify(context, input.inputs[0].GetValue<string>(), bind_data->row);
 	return std::move(bind_data);
 }
 
@@ -167,9 +176,7 @@ void VerifyABIRewriteFunction::VerifyABIRewriteFunc(ClientContext &context, Tabl
 	}
 	global_data.emitted = true;
 
-	VerifyABIRewriteRow row;
-	ComputeVerify(context, bind_data.query, row);
-
+	const auto &row = bind_data.row;
 	output.SetValue(0, 0, Value(row.status));
 	output.SetValue(1, 0, row.abi_rows < 0 ? Value() : Value::BIGINT(row.abi_rows));
 	output.SetValue(2, 0, row.fallback_rows < 0 ? Value() : Value::BIGINT(row.fallback_rows));

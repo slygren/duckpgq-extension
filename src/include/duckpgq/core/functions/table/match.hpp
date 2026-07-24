@@ -91,15 +91,27 @@ struct PGQPathTableCache {
 	case_insensitive_map_t<vector<idx_t>> direct_link_index;
 };
 
-//! A resolved ABI `edge` artifact standing in for a bridge edge-table scan inside a
-//! recursive traversal step. The artifact is keyed by vertex key values in v0/v1, so it
-//! drops into the same join skeleton as the bridge. `valid == false` means "no ABI
-//! coverage for this edge -- scan the bridge".
-struct PGQABIEdgeScan {
+//! A resolved ABI artifact reference. For an `edge` artifact the vertex keys live in
+//! v0/v1; for a k-hop `fixed_path` artifact they live in v0..vk. Either way the artifact
+//! is keyed by vertex key values, so it drops into the same key-to-key join skeleton as a
+//! bridge table. `valid == false` means "no ABI coverage -- use the bridge".
+struct PGQABIArtifactScan {
 	string catalog_name;
 	string schema_name;
 	string table_name;
 	bool valid = false;
+};
+
+//! How much of a quantified variable-length traversal ABI artifacts can absorb. Coverage
+//! is graded: `exact` answers the whole quantifier from one artifact scan, otherwise
+//! `step` at least backs each recursive step with an artifact instead of the bridge.
+struct PGQABITraversalPlan {
+	//! 7a: `edge` artifact scanned by each recursive step in place of the bridge table.
+	PGQABIArtifactScan step;
+	//! 7b: artifact answering an exact-length quantifier {k,k} outright, no recursion.
+	PGQABIArtifactScan exact;
+	//! Hop count k of the `exact` artifact.
+	idx_t exact_hops = 0;
 };
 
 struct PGQMatchFunction : public TableFunction {
@@ -205,7 +217,7 @@ public:
 	                           const shared_ptr<PropertyGraphTable> &edge_table, CreatePropertyGraphInfo &pg_table,
 	                           SubPath *subpath, PGQMatchType edge_type,
 	                           unique_ptr<ParsedExpression> anchor_filter = nullptr, bool any_shortest = false,
-	                           const PGQABIEdgeScan *abi_edge = nullptr);
+	                           const PGQABITraversalPlan *abi_plan = nullptr);
 
 	static void AddPathModeFilter(PGQPathMode mode, const string &path_cte,
 	                              vector<unique_ptr<ParsedExpression>> &conditions);

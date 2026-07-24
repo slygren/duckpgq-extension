@@ -40,7 +40,7 @@ public:
 	}
 
 	struct VerifyABIRewriteBindData : public TableFunctionData {
-		string query;
+		VerifyABIRewriteRow row;
 	};
 
 	struct VerifyABIRewriteGlobalData : public GlobalTableFunctionState {

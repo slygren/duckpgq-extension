@@ -20,6 +20,7 @@
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 
+#include "duckdb/parser/result_modifier.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/query_node/recursive_cte_node.hpp"
 
@@ -866,36 +867,68 @@ static const PGQPathTableInfo *FindPathTableInfo(const PGQPathTableCache &path_t
 // parallel edges are two distinct PGQL paths, so a deduplicated artifact would silently
 // drop rows. The catalog's multiplicity contract is generator-declared metadata we cannot
 // verify at bind time, so the bridge scan is kept for that case.
-static PGQABIEdgeScan ResolveABIEdgeScan(const PGQPathTableCache *path_table_cache, const string &graph_name,
-                                          const shared_ptr<PropertyGraphTable> &edge_table, bool any_shortest) {
-	PGQABIEdgeScan scan;
+// Also plans 7b: an exact-length quantifier {k,k} is answerable from the k-hop artifact in
+// one scan, with no recursion at all. An explicitly written k-hop chain already rewrites
+// this way (see the fixed_path lookup in TryPathTableRewrite); a quantifier expressing the
+// same shape did not, which is the gap this closes. Under ANY SHORTEST the wanted answer is
+// one row per endpoint pair, so collapsing the artifact's routes with DISTINCT is exactly
+// right regardless of how many k-hop routes it stores.
+static PGQABITraversalPlan ResolveABITraversalPlan(const PGQPathTableCache *path_table_cache,
+                                                    const string &graph_name,
+                                                    const shared_ptr<PropertyGraphTable> &edge_table,
+                                                    idx_t lower, idx_t upper, bool any_shortest) {
+	PGQABITraversalPlan plan;
 	if (!path_table_cache || !any_shortest || !edge_table) {
-		return scan;
+		return plan;
 	}
 	const auto &src_table = edge_table->source_pg_table;
 	const auto &dst_table = edge_table->destination_pg_table;
 	if (!src_table || !dst_table || edge_table->source_pk.empty() || edge_table->destination_pk.empty()) {
-		return scan;
+		return plan;
 	}
 	const string &src_label = src_table->main_label;
 	const string &edge_label = edge_table->main_label;
 	const string &dst_label = dst_table->main_label;
 	if (src_label.empty() || edge_label.empty() || dst_label.empty()) {
-		return scan;
+		return plan;
 	}
+
+	// ── 7a: per-step `edge` artifact ─────────────────────────────────────────────
 	// The artifact is always stored in semantic source->destination orientation, so its
 	// name and lookup are independent of the direction the pattern walks it.
-	const string table_name = "__pg_" + graph_name + "__" + src_label + "__" + edge_label + "__" + dst_label;
-	const auto *info =
-	    FindPathTableInfo(*path_table_cache, table_name, "edge", {src_label, dst_label}, {edge_label});
-	if (!info) {
-		return scan;
+	const string edge_tname = "__pg_" + graph_name + "__" + src_label + "__" + edge_label + "__" + dst_label;
+	if (const auto *edge_info =
+	        FindPathTableInfo(*path_table_cache, edge_tname, "edge", {src_label, dst_label}, {edge_label})) {
+		plan.step.catalog_name = edge_info->catalog_name;
+		plan.step.schema_name = edge_info->schema_name;
+		plan.step.table_name = edge_info->table_name;
+		plan.step.valid = true;
 	}
-	scan.catalog_name = info->catalog_name;
-	scan.schema_name = info->schema_name;
-	scan.table_name = info->table_name;
-	scan.valid = true;
-	return scan;
+
+	// ── 7b: whole-quantifier artifact for an exact length ────────────────────────
+	// Repeating one edge label k times only composes when the edge's endpoints share a
+	// label (L -E-> L -E-> L), so a differing src/dst label rules the shape out for k >= 2.
+	const idx_t hops = lower;
+	if (lower != upper || hops < 2 || !StringUtil::CIEquals(src_label, dst_label)) {
+		return plan;
+	}
+	string exact_tname = "__pg_" + graph_name + "__" + src_label;
+	vector<string> vertex_sequence {src_label};
+	vector<string> edge_sequence;
+	for (idx_t i = 0; i < hops; i++) {
+		exact_tname += "__" + edge_label + "__" + dst_label;
+		edge_sequence.push_back(edge_label);
+		vertex_sequence.push_back(dst_label);
+	}
+	if (const auto *exact_info =
+	        FindPathTableInfo(*path_table_cache, exact_tname, "fixed_path", vertex_sequence, edge_sequence)) {
+		plan.exact.catalog_name = exact_info->catalog_name;
+		plan.exact.schema_name = exact_info->schema_name;
+		plan.exact.table_name = exact_info->table_name;
+		plan.exact.valid = true;
+		plan.exact_hops = hops;
+	}
+	return plan;
 }
 
 static const PGQPathTableInfo *FindBranchSummaryInfo(const PGQPathTableCache &path_table_cache,
@@ -2646,7 +2679,7 @@ static void AddBoundedORPRecursiveCTE(unique_ptr<SelectNode> &select_node, const
 static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node, const string &prev_binding,
                                             const shared_ptr<PropertyGraphTable> &edge_table, idx_t lower, idx_t upper,
                                             unique_ptr<ParsedExpression> anchor_filter, bool any_shortest,
-                                            bool reverse = false, const PGQABIEdgeScan *abi_edge = nullptr) {
+                                            bool reverse = false, const PGQABIArtifactScan *abi_edge = nullptr) {
 	// reverse=true walks edges backwards (for left-directed patterns like
 	// (a)<-[e]-{1,3}(b)): the anchor sits on the edge's *destination* side and each
 	// step follows an edge from its dst to its src. Implemented by swapping the
@@ -2910,14 +2943,108 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 
 // Mandatory bounded variable-length: reachability CTE cross-joined into FROM,
 // with the endpoint/depth match pushed into the outer WHERE.
+// Answer an exact-length quantifier {k,k} from a k-hop ABI artifact in a single scan,
+// producing the same (src_rowid, dst_rowid, depth) shape the recursive reachability CTE
+// would have produced -- so the caller's outer wiring is identical.
+//
+// Only reached under ANY SHORTEST, where the wanted answer is one row per endpoint pair.
+// DISTINCT therefore collapses however many k-hop routes the artifact stores, which is what
+// makes this insensitive to the artifact's row multiplicity. The self-pair exclusion mirrors
+// the reachability CTE, whose walk form can never return to its own source (the source
+// starts in `visited`) and whose lean form filters src = dst at depth > 0 to match.
+static string BuildExactLengthABIScanCTE(unique_ptr<SelectNode> &select_node, const string &prev_binding,
+                                         const shared_ptr<PropertyGraphTable> &edge_table,
+                                         const PGQABIArtifactScan &artifact, idx_t hops,
+                                         unique_ptr<ParsedExpression> anchor_filter, bool reverse) {
+	const auto cte_idx = select_node->cte_map.map.size();
+	const string cte_name = "__fpx_" + std::to_string(cte_idx);
+	const string fp_alias = "_fpx_a_" + std::to_string(cte_idx);
+	const string far_alias = "_fpx_b_" + std::to_string(cte_idx);
+
+	// The artifact is stored in semantic source->destination orientation (v0 .. vk). A
+	// reverse (left-directed) pattern anchors on the destination end, so it reads vk as its
+	// near column and v0 as its far column.
+	const string near_col = reverse ? "v" + std::to_string(hops) : "v0";
+	const string far_col = reverse ? "v0" : "v" + std::to_string(hops);
+	const string &near_pk = reverse ? edge_table->destination_pk[0] : edge_table->source_pk[0];
+	const string &far_pk = reverse ? edge_table->source_pk[0] : edge_table->destination_pk[0];
+	const shared_ptr<PropertyGraphTable> &near_table =
+	    reverse ? edge_table->destination_pg_table : edge_table->source_pg_table;
+	const shared_ptr<PropertyGraphTable> &far_table =
+	    reverse ? edge_table->source_pg_table : edge_table->destination_pg_table;
+
+	auto scan = make_uniq<SelectNode>();
+
+	auto fp_ref = make_uniq<BaseTableRef>();
+	fp_ref->catalog_name = artifact.catalog_name;
+	fp_ref->schema_name = artifact.schema_name;
+	fp_ref->table_name = artifact.table_name;
+	fp_ref->alias = fp_alias;
+
+	// JOIN near vertex AS prev_binding ON prev.near_pk = fp.near_col
+	// (aliased to prev_binding so an anchor_filter written against it still binds)
+	auto near_ref = near_table->CreateBaseTableRef(prev_binding);
+	auto join_near = make_uniq<JoinRef>(JoinRefType::REGULAR);
+	join_near->type = JoinType::INNER;
+	join_near->left = std::move(fp_ref);
+	join_near->right = std::move(near_ref);
+	join_near->condition = make_uniq<ComparisonExpression>(
+	    ExpressionType::COMPARE_EQUAL, make_uniq<ColumnRefExpression>(near_pk, prev_binding),
+	    make_uniq<ColumnRefExpression>(near_col, fp_alias));
+
+	// JOIN far vertex ON far.far_pk = fp.far_col
+	auto far_ref = far_table->CreateBaseTableRef(far_alias);
+	auto join_far = make_uniq<JoinRef>(JoinRefType::REGULAR);
+	join_far->type = JoinType::INNER;
+	join_far->left = std::move(join_near);
+	join_far->right = std::move(far_ref);
+	join_far->condition = make_uniq<ComparisonExpression>(
+	    ExpressionType::COMPARE_EQUAL, make_uniq<ColumnRefExpression>(far_pk, far_alias),
+	    make_uniq<ColumnRefExpression>(far_col, fp_alias));
+	scan->from_table = std::move(join_far);
+
+	auto s_src = make_uniq<ColumnRefExpression>("rowid", prev_binding);
+	s_src->alias = "src_rowid";
+	scan->select_list.push_back(std::move(s_src));
+	auto s_dst = make_uniq<ColumnRefExpression>("rowid", far_alias);
+	s_dst->alias = "dst_rowid";
+	scan->select_list.push_back(std::move(s_dst));
+	auto s_depth = make_uniq<ConstantExpression>(Value::INTEGER(static_cast<int32_t>(hops)));
+	s_depth->alias = "depth";
+	scan->select_list.push_back(std::move(s_depth));
+
+	vector<unique_ptr<ParsedExpression>> where_parts;
+	where_parts.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_NOTEQUAL,
+	                                                      make_uniq<ColumnRefExpression>("rowid", prev_binding),
+	                                                      make_uniq<ColumnRefExpression>("rowid", far_alias)));
+	if (anchor_filter) {
+		where_parts.push_back(std::move(anchor_filter));
+	}
+	scan->where_clause = PGQMatchFunction::CreateWhereClause(where_parts);
+	scan->modifiers.push_back(make_uniq<DistinctModifier>());
+
+	auto scan_stmt = make_uniq<SelectStatement>();
+	scan_stmt->node = std::move(scan);
+	auto scan_info = make_uniq<CommonTableExpressionInfo>();
+	scan_info->query = std::move(scan_stmt);
+	select_node->cte_map.map[cte_name] = std::move(scan_info);
+	return cte_name;
+}
+
 static void AddBoundedVLPathFinding(unique_ptr<SelectNode> &select_node,
                                     vector<unique_ptr<ParsedExpression>> &conditions, const string &prev_binding,
                                     const string &next_binding, const shared_ptr<PropertyGraphTable> &edge_table,
                                     idx_t lower, idx_t upper, unique_ptr<ParsedExpression> anchor_filter,
                                     bool any_shortest, bool reverse = false,
-                                    const PGQABIEdgeScan *abi_edge = nullptr) {
-	const string scan_name = BuildBoundedVLReachabilityCTE(select_node, prev_binding, edge_table, lower, upper,
-	                                                       std::move(anchor_filter), any_shortest, reverse, abi_edge);
+                                    const PGQABITraversalPlan *abi_plan = nullptr) {
+	// An exact-length quantifier backed by a k-hop artifact needs no recursion at all.
+	const string scan_name =
+	    (abi_plan && abi_plan->exact.valid)
+	        ? BuildExactLengthABIScanCTE(select_node, prev_binding, edge_table, abi_plan->exact, abi_plan->exact_hops,
+	                                     std::move(anchor_filter), reverse)
+	        : BuildBoundedVLReachabilityCTE(select_node, prev_binding, edge_table, lower, upper,
+	                                        std::move(anchor_filter), any_shortest, reverse,
+	                                        abi_plan ? &abi_plan->step : nullptr);
 	const string cte_alias = scan_name + "_scan";
 
 	// ── Add CTE to FROM (cross join) ─────────────────────────────────────────────
@@ -3010,7 +3137,7 @@ void PGQMatchFunction::AddPathFinding(unique_ptr<SelectNode> &select_node,
                                       const shared_ptr<PropertyGraphTable> &edge_table,
                                       CreatePropertyGraphInfo &pg_table, SubPath *subpath, PGQMatchType edge_type,
                                       unique_ptr<ParsedExpression> anchor_filter, bool any_shortest,
-                                      const PGQABIEdgeScan *abi_edge) {
+                                      const PGQABITraversalPlan *abi_plan) {
 	// For finite bounded directed edges, use a recursive CTE instead of CSR+iterativelength.
 	// This reads only the reachable subgraph rather than the full edge/vertex tables,
 	// which is critical for large remote (httpfs) graphs in browser or constrained environments.
@@ -3019,7 +3146,7 @@ void PGQMatchFunction::AddPathFinding(unique_ptr<SelectNode> &select_node,
 		// Left-directed (a)<-[e]-{lo,hi}(b): same recursive CTE walked in reverse.
 		AddBoundedVLPathFinding(select_node, conditions, prev_binding, next_binding, edge_table, subpath->lower,
 		                        subpath->upper, std::move(anchor_filter), any_shortest,
-		                        edge_type == PGQMatchType::MATCH_EDGE_LEFT, abi_edge);
+		                        edge_type == PGQMatchType::MATCH_EDGE_LEFT, abi_plan);
 		return;
 	}
 
@@ -3495,14 +3622,16 @@ void PGQMatchFunction::ProcessPathList(vector<unique_ptr<PathReference>> &path_l
 						anchor_filter = ExtractSrcFilter(*original_ref.where_clause,
 						                                 previous_vertex_element->variable_binding);
 					}
-					// Graded ABI coverage: even though no whole-pattern rewrite applied, the
-					// recursive step can still scan an ABI edge artifact instead of the bridge.
-					const PGQABIEdgeScan abi_edge = ResolveABIEdgeScan(
-					    path_table_cache, pg_table.property_graph_name, edge_table, any_shortest);
+					// Graded ABI coverage: even though no whole-pattern rewrite applied, an
+					// exact-length quantifier can still be answered from one artifact scan, and
+					// otherwise each recursive step can scan an artifact instead of the bridge.
+					const PGQABITraversalPlan abi_plan =
+					    ResolveABITraversalPlan(path_table_cache, pg_table.property_graph_name, edge_table,
+					                            edge_subpath->lower, edge_subpath->upper, any_shortest);
 					AddPathFinding(final_select_node, conditions, previous_vertex_element->variable_binding,
 					               edge_element->variable_binding, next_vertex_element->variable_binding,
 					               edge_table, pg_table, edge_subpath, edge_element->match_type,
-					               std::move(anchor_filter), any_shortest, &abi_edge);
+					               std::move(anchor_filter), any_shortest, &abi_plan);
 					// AddPathModeFilter references the shortest_path_cte produced by the CSR path.
 					// The recursive-CTE path (finite bounded directed) already prevents vertex revisits
 					// via list_contains cycle detection, so skip the filter there.
