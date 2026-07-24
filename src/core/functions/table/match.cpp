@@ -3403,11 +3403,6 @@ void PGQMatchFunction::ProcessOptionalPathList(
 			if (!next_elem) {
 				throw NotImplementedException("Unsupported OPTIONAL MATCH path shape.");
 			}
-			if (edge_elem->match_type == PGQMatchType::MATCH_EDGE_LEFT_RIGHT) {
-				throw NotImplementedException(
-				    "Bidirectional edges in OPTIONAL MATCH are not yet supported.");
-			}
-
 			auto edge_table = ResolveTable(edge_elem->label, edge_elem->match_type, pg_table);
 			auto next_vertex_table = ResolveTable(next_elem->label, next_elem->match_type, pg_table);
 
@@ -3472,6 +3467,65 @@ void PGQMatchFunction::ProcessOptionalPathList(
 				vertex_join->right = std::move(vertex_ref);
 				vertex_join->condition = std::move(vertex_on);
 				select_node->from_table = std::move(vertex_join);
+
+				opt_alias_map[edge_binding] = edge_table;
+				opt_alias_map[next_binding] = next_vertex_table;
+				prev_elem = next_elem;
+				prev_vertex_table = next_vertex_table;
+				continue;
+			}
+
+			// Bidirectional edge (prev)<-[e]->(next): a reciprocal pair -- an edge
+			// next->prev AND an edge prev->next must both exist (matches the mandatory
+			// EdgeTypeLeftRight). Build the inner join {next INNER JOIN e (next->prev)
+			// INNER JOIN e2 (prev->next)} as one atomic block, then LEFT JOIN it onto
+			// prev. Atomicity avoids partial matches (a one-way edge must not bind next
+			// with a NULL e); a prev with no reciprocal pair survives with NULLs.
+			if (edge_elem->match_type == PGQMatchType::MATCH_EDGE_LEFT_RIGHT) {
+				if (require_abi_paths) {
+					ThrowABIPathRequired();
+				}
+				const string e2_alias = edge_binding + "_recip_" + std::to_string(extra_alias_counter++);
+				opt_alias_map[e2_alias] = edge_table;
+
+				// inner: next INNER JOIN e ON e.src = next  (e goes next->prev)
+				auto e_to_next = CreateMatchJoinExpression(edge_table->source_pk, edge_table->source_fk, next_binding,
+				                                           edge_binding);
+				auto j1 = make_uniq<JoinRef>(JoinRefType::REGULAR);
+				j1->type = JoinType::INNER;
+				j1->left = next_vertex_table->CreateBaseTableRef(next_binding);
+				j1->right = edge_table->CreateBaseTableRef(edge_binding);
+				j1->condition = std::move(e_to_next);
+				// INNER JOIN e2 ON e2.dst = next  (e2 goes prev->next)
+				auto e2_to_next = CreateMatchJoinExpression(edge_table->destination_pk, edge_table->destination_fk,
+				                                            next_binding, e2_alias);
+				auto j2 = make_uniq<JoinRef>(JoinRefType::REGULAR);
+				j2->type = JoinType::INNER;
+				j2->left = std::move(j1);
+				j2->right = edge_table->CreateBaseTableRef(e2_alias);
+				j2->condition = std::move(e2_to_next);
+
+				// outer LEFT JOIN block ON e.dst = prev AND e2.src = prev (+ next label)
+				auto e_to_prev = CreateMatchJoinExpression(edge_table->destination_pk, edge_table->destination_fk,
+				                                           prev_binding, edge_binding);
+				auto e2_to_prev = CreateMatchJoinExpression(edge_table->source_pk, edge_table->source_fk, prev_binding,
+				                                            e2_alias);
+				unique_ptr<ParsedExpression> outer_on = make_uniq<ConjunctionExpression>(
+				    ExpressionType::CONJUNCTION_AND, std::move(e_to_prev), std::move(e2_to_prev));
+				if (!next_elem->label.empty()) {
+					vector<unique_ptr<ParsedExpression>> label_conds;
+					CheckInheritance(next_vertex_table, next_elem, label_conds);
+					if (!label_conds.empty()) {
+						outer_on = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND,
+						                                            std::move(outer_on), CreateWhereClause(label_conds));
+					}
+				}
+				auto outer_join = make_uniq<JoinRef>(JoinRefType::REGULAR);
+				outer_join->type = JoinType::LEFT;
+				outer_join->left = std::move(select_node->from_table);
+				outer_join->right = std::move(j2);
+				outer_join->condition = std::move(outer_on);
+				select_node->from_table = std::move(outer_join);
 
 				opt_alias_map[edge_binding] = edge_table;
 				opt_alias_map[next_binding] = next_vertex_table;

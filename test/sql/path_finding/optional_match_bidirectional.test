@@ -1,0 +1,62 @@
+# name: test/sql/path_finding/optional_match_bidirectional.test
+# description: OPTIONAL MATCH with a bidirectional edge (<-[e]->) requires a reciprocal pair, keeps LEFT JOIN semantics
+# group: [path_finding]
+
+require duckpgq
+
+statement ok
+CREATE TABLE Person(id BIGINT, name VARCHAR);
+
+statement ok
+CREATE TABLE Knows(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO Person VALUES (0,'A'),(1,'B'),(2,'C'),(3,'D');
+
+# A<->B reciprocal; A->C one-way; D isolated.
+statement ok
+INSERT INTO Knows VALUES (0,1),(1,0),(0,2);
+
+statement ok
+-CREATE PROPERTY GRAPH bg
+VERTEX TABLES (
+    Person PROPERTIES (id, name) LABEL Person
+)
+EDGE TABLES (
+    Knows SOURCE KEY (src) REFERENCES Person (id)
+          DESTINATION KEY (dst) REFERENCES Person (id)
+          LABEL Knows
+);
+
+# Bidirectional: only reciprocal pairs. A matches B (both ways); the one-way
+# A->C is excluded. C (no reciprocal) and D (isolated) keep NULL rows.
+query TT
+-FROM GRAPH_TABLE (bg
+    MATCH (p:Person)
+    OPTIONAL MATCH (p)<-[k:Knows]->(o:Person)
+    COLUMNS (p.name AS p, o.name AS o)
+    ) r ORDER BY 1, 2;
+----
+A	B
+B	A
+C	NULL
+D	NULL
+
+# Directed contrast: -> follows every stored edge, so A->C appears and A has two
+# targets. This is what proves the bidirectional result above is the stricter
+# reciprocal semantic, not just "any edge".
+query TT
+-FROM GRAPH_TABLE (bg
+    MATCH (p:Person)
+    OPTIONAL MATCH (p)-[k:Knows]->(o:Person)
+    COLUMNS (p.name AS p, o.name AS o)
+    ) r ORDER BY 1, 2;
+----
+A	B
+A	C
+B	A
+C	NULL
+D	NULL
+
+statement ok
+-DROP PROPERTY GRAPH bg;
