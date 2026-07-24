@@ -2518,6 +2518,19 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 	const shared_ptr<PropertyGraphTable> &far_side_table =
 	    reverse ? edge_table->source_pg_table : edge_table->destination_pg_table;
 
+	// ANY SHORTEST only needs the minimum depth per (src, dst) pair, never the walk
+	// contents. In that case emit a LEAN reachability CTE: no `visited` list and a
+	// UNION (distinct) recursive step instead of UNION ALL. UNION-distinct collapses
+	// the many routes that reach the same (src, dst, depth) to one row, so the CTE
+	// holds O(reachable pairs × depths) rows instead of O(walks) — polynomial where
+	// walk enumeration is exponential in dense regions. Cycles are handled by the
+	// depth bound (a cycle only ever *lengthens* a path, so it never wins the min),
+	// so dropping `visited` does not change the ANY SHORTEST result.
+	//
+	// Mode-less {lo,hi} (any_shortest=false) genuinely wants every walk, so it keeps
+	// the full walk CTE (visited + UNION ALL) below.
+	const bool lean = any_shortest;
+
 	const auto cte_idx = select_node->cte_map.map.size();
 	const string cte_name = "__rvl_" + std::to_string(cte_idx);
 	// Internal aliases used only inside the recursive step — must not clash with outer bindings.
@@ -2546,7 +2559,7 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 	a_depth->alias = "depth";
 	anchor->select_list.push_back(std::move(a_depth));
 
-	{
+	if (!lean) {
 		vector<unique_ptr<ParsedExpression>> lv;
 		lv.push_back(make_uniq<ColumnRefExpression>("rowid", prev_binding));
 		auto a_visited = make_uniq<FunctionExpression>("list_value", std::move(lv));
@@ -2619,7 +2632,7 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 		r_depth->alias = "depth";
 		recursive->select_list.push_back(std::move(r_depth));
 	}
-	{
+	if (!lean) {
 		vector<unique_ptr<ParsedExpression>> app_args;
 		app_args.push_back(make_uniq<ColumnRefExpression>("visited", rec_alias));
 		app_args.push_back(make_uniq<ColumnRefExpression>("rowid", b_alias));
@@ -2633,21 +2646,27 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 		rec_where.push_back(make_uniq<ComparisonExpression>(
 		    ExpressionType::COMPARE_LESSTHAN, make_uniq<ColumnRefExpression>("depth", rec_alias),
 		    make_uniq<ConstantExpression>(Value::INTEGER(static_cast<int32_t>(upper)))));
-		vector<unique_ptr<ParsedExpression>> lc_args;
-		lc_args.push_back(make_uniq<ColumnRefExpression>("visited", rec_alias));
-		lc_args.push_back(make_uniq<ColumnRefExpression>("rowid", b_alias));
-		auto lc_fn = make_uniq<FunctionExpression>("list_contains", std::move(lc_args));
-		rec_where.push_back(make_uniq<OperatorExpression>(ExpressionType::OPERATOR_NOT, std::move(lc_fn)));
+		if (!lean) {
+			// Walk mode: prevent vertex revisits so acyclic walks are enumerated.
+			// Lean mode drops this — UNION-distinct + the depth bound handle cycles.
+			vector<unique_ptr<ParsedExpression>> lc_args;
+			lc_args.push_back(make_uniq<ColumnRefExpression>("visited", rec_alias));
+			lc_args.push_back(make_uniq<ColumnRefExpression>("rowid", b_alias));
+			auto lc_fn = make_uniq<FunctionExpression>("list_contains", std::move(lc_args));
+			rec_where.push_back(make_uniq<OperatorExpression>(ExpressionType::OPERATOR_NOT, std::move(lc_fn)));
+		}
 		recursive->where_clause = PGQMatchFunction::CreateWhereClause(rec_where);
 	}
 
 	// ── Build RecursiveCTENode ───────────────────────────────────────────────────
 	auto rec_cte = make_uniq<RecursiveCTENode>();
 	rec_cte->ctename = cte_name;
-	rec_cte->union_all = true;
+	// UNION ALL keeps every distinct walk; UNION (distinct, lean) collapses routes.
+	rec_cte->union_all = !lean;
 	rec_cte->left = std::move(anchor);
 	rec_cte->right = std::move(recursive);
-	rec_cte->aliases = {"src_rowid", "dst_rowid", "depth", "visited"};
+	rec_cte->aliases = lean ? vector<string> {"src_rowid", "dst_rowid", "depth"}
+	                        : vector<string> {"src_rowid", "dst_rowid", "depth", "visited"};
 
 	auto cte_stmt = make_uniq<SelectStatement>();
 	cte_stmt->node = std::move(rec_cte);
@@ -2656,11 +2675,9 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 	select_node->cte_map.map[cte_name] = std::move(cte_info);
 
 	// ── ANY SHORTEST: collapse to one row per endpoint pair ──────────────────────
-	// The recursive CTE emits one row per distinct path, because `visited` differs
-	// between them. ANY SHORTEST asks for a single shortest path per (src, dst)
-	// binding, so group to the minimum depth per pair. Without this, a bounded
-	// quantifier returns every path in range and the shortest prefix is silently
-	// ignored.
+	// The lean CTE above emits one row per (src, dst, depth) reachable tuple; group
+	// to the minimum depth per (src, dst) pair to get a single shortest per binding.
+	// (Only any_shortest reaches here, so the CTE is always lean at this point.)
 	//
 	// The depth range is folded in here, so the outer BETWEEN is skipped below.
 	//
@@ -2685,10 +2702,28 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 			sp->select_list.push_back(std::move(min_fn));
 		}
 
-		sp->where_clause = make_uniq<BetweenExpression>(
+		unique_ptr<ParsedExpression> sp_where = make_uniq<BetweenExpression>(
 		    make_uniq<ColumnRefExpression>("depth"),
 		    make_uniq<ConstantExpression>(Value::INTEGER(static_cast<int32_t>(lower))),
 		    make_uniq<ConstantExpression>(Value::INTEGER(static_cast<int32_t>(upper))));
+		// The walk CTE's `visited` list excluded self-returns (a path back to its own
+		// source): the source starts in `visited`, so it is never re-reached. The lean
+		// CTE has no `visited`, so a cycle can produce (src, src, depth>0). Drop those
+		// to stay equivalent, but keep the trivial depth-0 self (which {0,hi} wants).
+		{
+			auto is_self = make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+			                                               make_uniq<ColumnRefExpression>("src_rowid"),
+			                                               make_uniq<ColumnRefExpression>("dst_rowid"));
+			auto deep = make_uniq<ComparisonExpression>(ExpressionType::COMPARE_GREATERTHAN,
+			                                            make_uniq<ColumnRefExpression>("depth"),
+			                                            make_uniq<ConstantExpression>(Value::INTEGER(0)));
+			auto self_cycle = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND,
+			                                                   std::move(is_self), std::move(deep));
+			auto not_self_cycle = make_uniq<OperatorExpression>(ExpressionType::OPERATOR_NOT, std::move(self_cycle));
+			sp_where = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(sp_where),
+			                                            std::move(not_self_cycle));
+		}
+		sp->where_clause = std::move(sp_where);
 
 		sp->groups.group_expressions.push_back(make_uniq<ColumnRefExpression>("src_rowid"));
 		sp->groups.group_expressions.push_back(make_uniq<ColumnRefExpression>("dst_rowid"));
