@@ -1,0 +1,137 @@
+--- a/scripts/compile_graph_layout.py
++++ b/scripts/compile_graph_layout.py
+@@ -872,9 +872,12 @@
+ 
+     table_name = f"__pg_{graph_name}__tc__{edge.src_label}__{edge.label}"
+     full_table = relation(catalog, abi_schema, table_name)
++    stage_table = f"__stage_tc__{edge.src_label}__{edge.label}"
+     sql_parts.append(
+-        f"DROP TABLE IF EXISTS {full_table};\n"
+-        f"CREATE TABLE {full_table} AS\n"
++        # Recursion is materialised once into a staging table: the partitioned target has
++        # to be created empty (partitioning only governs writes that happen after it is
++        # declared), so computing the closure inline would evaluate it twice.
++        f"CREATE OR REPLACE TEMP TABLE {stage_table} AS\n"
+         "WITH RECURSIVE tc AS (\n"
+         f"  SELECT {edge.src_col} AS v0, {edge.dst_col} AS v1, 1 AS depth\n"
+         f"  FROM {edge_table}\n"
+@@ -884,7 +887,14 @@
+         f"  JOIN {edge_table} e ON e.{edge.src_col} = tc.v1\n"
+         f"  WHERE tc.depth < {max_depth}\n"
+         ")\n"
+-        "SELECT DISTINCT v0, v1, depth FROM tc ORDER BY v0, v1, depth;\n"
++        "SELECT DISTINCT v0, v1, depth FROM tc;\n"
++        f"DROP TABLE IF EXISTS {full_table};\n"
++        f"CREATE TABLE {full_table} AS SELECT * FROM {stage_table} LIMIT 0;\n"
++        # depth is pruned by partition elimination (queries are almost always depth-bounded,
++        # e.g. {1,3}); v0 is pruned by row-group zonemaps within each partition.
++        f"ALTER TABLE {full_table} SET PARTITIONED BY (depth);\n"
++        f"INSERT INTO {full_table} SELECT * FROM {stage_table} ORDER BY v0, v1;\n"
++        f"DROP TABLE {stage_table};\n"
+     )
+     rows.append(
+         {
+@@ -907,9 +917,9 @@
+     if witness:
+         witness_name = f"__pg_{graph_name}__tc_witness__{edge.src_label}__{edge.label}"
+         witness_table = relation(catalog, abi_schema, witness_name)
++        witness_stage = f"__stage_tc_witness__{edge.src_label}__{edge.label}"
+         sql_parts.append(
+-            f"DROP TABLE IF EXISTS {witness_table};\n"
+-            f"CREATE TABLE {witness_table} AS\n"
++            f"CREATE OR REPLACE TEMP TABLE {witness_stage} AS\n"
+             "WITH RECURSIVE tc_w AS (\n"
+             f"  SELECT {edge.src_col} AS v0, {edge.dst_col} AS v1, 1 AS depth,\n"
+             f"         list_value({edge.src_col}, {edge.dst_col}) AS path_vertices\n"
+@@ -924,6 +934,11 @@
+             "SELECT DISTINCT ON (v0, v1) v0, v1, depth, path_vertices\n"
+             "FROM tc_w\n"
+             "ORDER BY v0, v1, depth;\n"
++            f"DROP TABLE IF EXISTS {witness_table};\n"
++            f"CREATE TABLE {witness_table} AS SELECT * FROM {witness_stage} LIMIT 0;\n"
++            f"ALTER TABLE {witness_table} SET PARTITIONED BY (depth);\n"
++            f"INSERT INTO {witness_table} SELECT * FROM {witness_stage} ORDER BY v0, v1;\n"
++            f"DROP TABLE {witness_stage};\n"
+         )
+         rows.append(
+             {
+@@ -1037,6 +1052,31 @@
+         "max_depth": None,
+     }
+     return sql, row
++
++
++def render_reverse_twin(catalog: str, abi_schema: str, row: dict[str, Any]) -> tuple[str, dict[str, Any]]:
++    """Reverse-sorted twin of an artifact: identical rows, ordered by the destination key.
++
++    Every artifact is ordered by v0, so a destination-anchored lookup ("which tags feed this
++    work order", or any <- pattern) filters v1 against a v0-ordered file and prunes nothing.
++    The twin gives those queries something to prune on. The binder picks it automatically
++    when only the destination endpoint is bound (is_sorted_by_v1 in __pgq_path_catalog).
++
++    Costs a second copy of the family, so enable it per relationship via
++    access_policy.abi.reverse_sorted_twins rather than globally.
++    """
++    twin_name = f"{row['path_table_name']}__rev"
++    twin_table = relation(catalog, abi_schema, twin_name)
++    sql = (
++        f"DROP TABLE IF EXISTS {twin_table};\n"
++        f"CREATE TABLE {twin_table} AS SELECT * FROM {row['full_table']} ORDER BY v1;\n"
++    )
++    twin_row = dict(row)
++    twin_row["path_table_name"] = twin_name
++    twin_row["full_table"] = twin_table
++    twin_row["is_sorted_by_v0"] = False
++    twin_row["is_sorted_by_v1"] = True
++    return sql, twin_row
+ 
+ 
+ def render_catalog(catalog: str, abi_schema: str, rows: list[dict[str, Any]]) -> str:
+@@ -1072,7 +1112,8 @@
+             f"{str(row['is_deduplicated']).lower()} AS is_deduplicated, "
+             f"(SELECT count(*) FROM {row['full_table']}) AS estimated_rows, "
+             "current_timestamp AS last_refreshed_at, "
+-            "true AS is_sorted_by_v0, "
++            f"{str(row.get('is_sorted_by_v0', True)).lower()} AS is_sorted_by_v0, "
++            f"{str(row.get('is_sorted_by_v1', False)).lower()} AS is_sorted_by_v1, "
+             f"{min_depth} AS min_depth, "
+             f"{max_depth} AS max_depth, "
+             f"{sql_literal(row['bridge_table_names'])} AS bridge_table_names, "
+@@ -1177,11 +1218,18 @@
+     max_hops = int(fixed_policy.get("max_hops", 1))
+     exclude_self = bool(fixed_policy.get("exclude_self_referential_relationships_for_multi_hop", True))
+ 
++    # Smaller Parquet row groups give zonemaps finer granularity, so a v0 point lookup can
++    # skip most of a large closure instead of paying the whole file. Measured motivation:
++    # on a 5.2M-row tc_witness a cold point lookup (~306ms) cost the same as a full scan
++    # (~315ms) -- the ordering was already right, the row groups were simply too coarse.
++    row_group_size = int(abi_policy.get("parquet_row_group_size", 16384))
++
+     sql_parts = [
+         "-- Generated by scripts/compile_graph_layout.py",
+         f"-- Layout hash: {layout_hash(layout)}",
+         "",
+         f"CREATE SCHEMA IF NOT EXISTS {catalog}.{abi_schema};",
++        f"CALL {catalog}.set_option('parquet_row_group_size', {row_group_size});",
+         "",
+     ]
+     catalog_rows: list[dict[str, Any]] = []
+@@ -1216,6 +1264,18 @@
+         sql_parts.append(sql)
+         catalog_rows.append(row)
+ 
++    # Reverse-sorted twins for the families named in the policy. Matched on either the
++    # artifact name or its edge-label sequence so a whole relationship can be named once.
++    twin_targets = {str(name) for name in abi_policy.get("reverse_sorted_twins", [])}
++    if twin_targets:
++        twin_rows: list[dict[str, Any]] = []
++        for row in catalog_rows:
++            if row["path_table_name"] in twin_targets or row.get("edge_label_sequence") in twin_targets:
++                twin_sql, twin_row = render_reverse_twin(catalog, abi_schema, row)
++                sql_parts.append(twin_sql)
++                twin_rows.append(twin_row)
++        catalog_rows.extend(twin_rows)
++
+     apply_catalog_metadata_defaults(layout, catalog_rows)
+     sql_parts.append(render_catalog(catalog, abi_schema, catalog_rows))
+     sql_parts.append(render_direct_link_catalog(graph_name, catalog, abi_schema, vertices, direct_links))
