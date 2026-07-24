@@ -3289,10 +3289,9 @@ void PGQMatchFunction::ProcessOptionalPathList(
 			if (!edge_elem || !next_elem) {
 				throw NotImplementedException("Variable-length paths in OPTIONAL MATCH are not yet supported.");
 			}
-			if (edge_elem->match_type == PGQMatchType::MATCH_EDGE_ANY ||
-			    edge_elem->match_type == PGQMatchType::MATCH_EDGE_LEFT_RIGHT) {
+			if (edge_elem->match_type == PGQMatchType::MATCH_EDGE_LEFT_RIGHT) {
 				throw NotImplementedException(
-				    "Undirected or bidirectional edges in OPTIONAL MATCH are not yet supported.");
+				    "Bidirectional edges in OPTIONAL MATCH are not yet supported.");
 			}
 
 			auto edge_table = ResolveTable(edge_elem->label, edge_elem->match_type, pg_table);
@@ -3301,6 +3300,71 @@ void PGQMatchFunction::ProcessOptionalPathList(
 			const string &prev_binding = prev_elem->variable_binding;
 			const string &edge_binding = edge_elem->variable_binding;
 			const string &next_binding = next_elem->variable_binding;
+
+			// Undirected edge (prev)-[e]-(next): the edge matches in either stored
+			// orientation. Mirror the mandatory-path EdgeTypeAny construction -- a
+			// UNION ALL that presents the edge both ways -- but LEFT JOIN it so the
+			// OPTIONAL semantics survive (no match keeps the mandatory row with NULLs).
+			if (edge_elem->match_type == PGQMatchType::MATCH_EDGE_ANY) {
+				if (require_abi_paths) {
+					ThrowABIPathRequired();
+				}
+				// (SELECT src,dst,* FROM edge UNION ALL SELECT dst,src,* FROM edge) AS edge_binding
+				auto fwd = make_uniq<SelectNode>();
+				fwd->from_table = edge_table->CreateBaseTableRef(edge_binding);
+				fwd->select_list.push_back(make_uniq<ColumnRefExpression>(edge_table->source_fk[0], edge_binding));
+				fwd->select_list.push_back(make_uniq<ColumnRefExpression>(edge_table->destination_fk[0], edge_binding));
+				fwd->select_list.push_back(make_uniq<StarExpression>());
+				auto rev = make_uniq<SelectNode>();
+				rev->from_table = edge_table->CreateBaseTableRef(edge_binding);
+				rev->select_list.push_back(make_uniq<ColumnRefExpression>(edge_table->destination_fk[0], edge_binding));
+				rev->select_list.push_back(make_uniq<ColumnRefExpression>(edge_table->source_fk[0], edge_binding));
+				rev->select_list.push_back(make_uniq<StarExpression>());
+				auto un = make_uniq<SetOperationNode>();
+				un->setop_type = SetOperationType::UNION;
+				un->setop_all = true;
+				un->children.push_back(std::move(fwd));
+				un->children.push_back(std::move(rev));
+				auto un_stmt = make_uniq<SelectStatement>();
+				un_stmt->node = std::move(un);
+				auto un_sub = make_uniq<SubqueryRef>(std::move(un_stmt));
+				un_sub->alias = edge_binding;
+
+				// LEFT JOIN symmetric edge ON prev.src_pk = edge.src_fk
+				auto edge_on = CreateMatchJoinExpression(edge_table->source_pk, edge_table->source_fk, prev_binding,
+				                                         edge_binding);
+				auto edge_join = make_uniq<JoinRef>(JoinRefType::REGULAR);
+				edge_join->type = JoinType::LEFT;
+				edge_join->left = std::move(select_node->from_table);
+				edge_join->right = std::move(un_sub);
+				edge_join->condition = std::move(edge_on);
+				select_node->from_table = std::move(edge_join);
+
+				// LEFT JOIN next vertex ON next.dst_pk = edge.dst_fk (+ optional label)
+				unique_ptr<ParsedExpression> vertex_on = CreateMatchJoinExpression(
+				    edge_table->destination_pk, edge_table->destination_fk, next_binding, edge_binding);
+				if (!next_elem->label.empty()) {
+					vector<unique_ptr<ParsedExpression>> label_conds;
+					CheckInheritance(next_vertex_table, next_elem, label_conds);
+					if (!label_conds.empty()) {
+						vertex_on = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND,
+						                                             std::move(vertex_on), CreateWhereClause(label_conds));
+					}
+				}
+				auto vertex_ref = next_vertex_table->CreateBaseTableRef(next_binding);
+				auto vertex_join = make_uniq<JoinRef>(JoinRefType::REGULAR);
+				vertex_join->type = JoinType::LEFT;
+				vertex_join->left = std::move(select_node->from_table);
+				vertex_join->right = std::move(vertex_ref);
+				vertex_join->condition = std::move(vertex_on);
+				select_node->from_table = std::move(vertex_join);
+
+				opt_alias_map[edge_binding] = edge_table;
+				opt_alias_map[next_binding] = next_vertex_table;
+				prev_elem = next_elem;
+				prev_vertex_table = next_vertex_table;
+				continue;
+			}
 
 			// For 1-hop patterns (right-directed or left-directed), prefer a pre-computed
 			// path table over a bridge edge table scan. LEFT JOIN semantics are preserved:

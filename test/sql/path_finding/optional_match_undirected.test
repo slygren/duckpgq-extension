@@ -1,0 +1,68 @@
+# name: test/sql/path_finding/optional_match_undirected.test
+# description: OPTIONAL MATCH with an undirected edge matches either stored orientation, keeps LEFT JOIN semantics
+# group: [path_finding]
+
+require duckpgq
+
+statement ok
+CREATE TABLE Tag(id BIGINT, name VARCHAR);
+
+statement ok
+CREATE TABLE Peer(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO Tag VALUES (0,'A'),(1,'B'),(2,'C');
+
+# Only A->B is stored. Undirected traversal must also see it from B's side.
+statement ok
+INSERT INTO Peer VALUES (0,1);
+
+statement ok
+-CREATE PROPERTY GRAPH g
+VERTEX TABLES (
+    Tag PROPERTIES (id, name) LABEL Tag
+)
+EDGE TABLES (
+    Peer SOURCE KEY (src) REFERENCES Tag (id)
+         DESTINATION KEY (dst) REFERENCES Tag (id)
+         LABEL Peer
+);
+
+# Undirected: A finds B (forward), B finds A (reverse), C has no peer -> NULL kept.
+query TT
+-FROM GRAPH_TABLE (g
+    MATCH (t:Tag)
+    OPTIONAL MATCH (t)-[e:Peer]-(o:Tag)
+    COLUMNS (t.name AS t, o.name AS o)
+    ) r ORDER BY 1, 2;
+----
+A	B
+B	A
+C	NULL
+
+# Contrast: the same pattern directed (->) only matches the stored orientation,
+# so B gets NULL. This is what proves the undirected result above is real.
+query TT
+-FROM GRAPH_TABLE (g
+    MATCH (t:Tag)
+    OPTIONAL MATCH (t)-[e:Peer]->(o:Tag)
+    COLUMNS (t.name AS t, o.name AS o)
+    ) r ORDER BY 1, 2;
+----
+A	B
+B	NULL
+C	NULL
+
+# Undirected OPTIONAL MATCH with a WHERE on the mandatory vertex still works.
+query TT
+-FROM GRAPH_TABLE (g
+    MATCH (t:Tag)
+    OPTIONAL MATCH (t)-[e:Peer]-(o:Tag)
+    WHERE t.name = 'B'
+    COLUMNS (t.name AS t, o.name AS o)
+    ) r ORDER BY 1, 2;
+----
+B	A
+
+statement ok
+-DROP PROPERTY GRAPH g;
