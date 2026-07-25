@@ -1,6 +1,26 @@
 --- a/scripts/compile_graph_layout.py
 +++ b/scripts/compile_graph_layout.py
-@@ -872,9 +872,12 @@
+@@ -598,12 +598,18 @@
+         normalized["branches"] = branches
+         branch_summaries.append(normalized)
+ 
+-    return {
++    # Physical-layout knobs are passed through explicitly: this normaliser whitelists the
++    # keys it returns, so anything not named here never reaches render_abi_sql.
++    normalized_policy = {
+         "fixed_paths": fixed_paths,
+         "transitive_closures": transitive_closures,
+         "branch_summaries": branch_summaries,
++        "reverse_sorted_twins": list(raw.get("reverse_sorted_twins", [])),
+         "metadata": optional_metadata(raw),
+     }
++    if "parquet_row_group_size" in raw:
++        normalized_policy["parquet_row_group_size"] = int(raw["parquet_row_group_size"])
++    return normalized_policy
+ 
+ 
+ def build_vertices(layout: dict[str, Any]) -> dict[str, Vertex]:
+@@ -872,9 +878,12 @@
  
      table_name = f"__pg_{graph_name}__tc__{edge.src_label}__{edge.label}"
      full_table = relation(catalog, abi_schema, table_name)
@@ -15,7 +35,7 @@
          "WITH RECURSIVE tc AS (\n"
          f"  SELECT {edge.src_col} AS v0, {edge.dst_col} AS v1, 1 AS depth\n"
          f"  FROM {edge_table}\n"
-@@ -884,7 +887,14 @@
+@@ -884,7 +893,14 @@
          f"  JOIN {edge_table} e ON e.{edge.src_col} = tc.v1\n"
          f"  WHERE tc.depth < {max_depth}\n"
          ")\n"
@@ -31,7 +51,7 @@
      )
      rows.append(
          {
-@@ -907,9 +917,9 @@
+@@ -907,9 +923,9 @@
      if witness:
          witness_name = f"__pg_{graph_name}__tc_witness__{edge.src_label}__{edge.label}"
          witness_table = relation(catalog, abi_schema, witness_name)
@@ -43,7 +63,7 @@
              "WITH RECURSIVE tc_w AS (\n"
              f"  SELECT {edge.src_col} AS v0, {edge.dst_col} AS v1, 1 AS depth,\n"
              f"         list_value({edge.src_col}, {edge.dst_col}) AS path_vertices\n"
-@@ -924,6 +934,11 @@
+@@ -924,6 +940,11 @@
              "SELECT DISTINCT ON (v0, v1) v0, v1, depth, path_vertices\n"
              "FROM tc_w\n"
              "ORDER BY v0, v1, depth;\n"
@@ -55,7 +75,7 @@
          )
          rows.append(
              {
-@@ -1037,6 +1052,31 @@
+@@ -1037,6 +1058,31 @@
          "max_depth": None,
      }
      return sql, row
@@ -87,7 +107,7 @@
  
  
  def render_catalog(catalog: str, abi_schema: str, rows: list[dict[str, Any]]) -> str:
-@@ -1072,7 +1112,8 @@
+@@ -1072,7 +1118,8 @@
              f"{str(row['is_deduplicated']).lower()} AS is_deduplicated, "
              f"(SELECT count(*) FROM {row['full_table']}) AS estimated_rows, "
              "current_timestamp AS last_refreshed_at, "
@@ -97,7 +117,7 @@
              f"{min_depth} AS min_depth, "
              f"{max_depth} AS max_depth, "
              f"{sql_literal(row['bridge_table_names'])} AS bridge_table_names, "
-@@ -1177,11 +1218,18 @@
+@@ -1177,11 +1224,18 @@
      max_hops = int(fixed_policy.get("max_hops", 1))
      exclude_self = bool(fixed_policy.get("exclude_self_referential_relationships_for_multi_hop", True))
  
@@ -116,16 +136,24 @@
          "",
      ]
      catalog_rows: list[dict[str, Any]] = []
-@@ -1216,6 +1264,18 @@
+@@ -1216,6 +1270,26 @@
          sql_parts.append(sql)
          catalog_rows.append(row)
  
 +    # Reverse-sorted twins for the families named in the policy. Matched on either the
 +    # artifact name or its edge-label sequence so a whole relationship can be named once.
++    #
++    # Restricted to the kinds the binder can actually select a twin for -- it resolves
++    # reverse artifacts only in the exact edge/fixed_path lookup. Naming a relationship
++    # that also has closures (e.g. HAS_PARENT -> tc, tc_witness, tc_chain) would otherwise
++    # duplicate millions of rows that no query could ever be routed to.
++    TWINNABLE_KINDS = ("edge", "fixed_path")
 +    twin_targets = {str(name) for name in abi_policy.get("reverse_sorted_twins", [])}
 +    if twin_targets:
 +        twin_rows: list[dict[str, Any]] = []
 +        for row in catalog_rows:
++            if row.get("path_kind") not in TWINNABLE_KINDS:
++                continue
 +            if row["path_table_name"] in twin_targets or row.get("edge_label_sequence") in twin_targets:
 +                twin_sql, twin_row = render_reverse_twin(catalog, abi_schema, row)
 +                sql_parts.append(twin_sql)

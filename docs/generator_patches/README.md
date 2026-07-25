@@ -56,15 +56,27 @@ Note the previous `ORDER BY v0, v1, depth` had `depth` last, so depth predicates
 nothing regardless of row-group size.
 
 **3. Reverse-sorted twins (opt-in)** — a second copy of chosen families ordered by the
-destination key, plus an `is_sorted_by_v1` column on `__pgq_path_catalog`:
+destination key, plus an `is_sorted_by_v1` column on `__pgq_path_catalog`. In
+`maintenance_graph.simple.yml` the policy sits under the top-level `abi:` block:
 
 ```yaml
-access_policy:
-  abi:
-    reverse_sorted_twins:
-      - IN_AREA                                          # by edge label, or
-      - __pg_maintenance_graph__TAG__HAS_PARENT__TAG     # by artifact name
+abi:
+  reverse_sorted_twins:
+    - HAS_PARENT                                       # by edge label, or
+    - __pg_maintenance_graph__TAG__HAS_PARENT__TAG     # by artifact name
 ```
+
+Two constraints are enforced in the generator, both learned the hard way:
+
+- **Only `edge` and `fixed_path` artifacts are twinned.** The binder resolves reverse
+  artifacts in the exact edge/fixed_path lookup only, not the TC path. Naming a
+  relationship that also has closures (`HAS_PARENT` → `tc`, `tc_witness`, `tc_chain`)
+  would otherwise duplicate millions of rows no query could ever be routed to — on this
+  graph that was ~12.7M wasted rows.
+- **`normalize_abi_policy` whitelists the keys it returns.** `reverse_sorted_twins` and
+  `parquet_row_group_size` are passed through explicitly; anything not named there is
+  silently dropped before `render_abi_sql` sees it, so the feature would appear to do
+  nothing at all.
 
 Every artifact is ordered by `v0`, so a destination-anchored lookup — "which tags feed this
 work order", or any `<-` pattern the rewrite normalizes — filters `v1` against a `v0`-ordered
