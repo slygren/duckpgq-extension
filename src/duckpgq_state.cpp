@@ -172,6 +172,12 @@ void DuckPGQState::QueryEnd() {
 		csr_list.erase(csr_id);
 	}
 	csr_to_delete.clear();
+	// Only safe to restart numbering when nothing is left holding a slot; if a CSR was
+	// built but never consumed (so never marked for deletion) it keeps its id and the
+	// counter keeps climbing past it rather than handing the same slot out twice.
+	if (csr_list.empty()) {
+		csr_id_counter = 0;
+	}
 }
 
 CreatePropertyGraphInfo *DuckPGQState::GetPropertyGraph(const string &pg_name) {

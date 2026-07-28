@@ -54,6 +54,11 @@ struct PGQPathTableInfo {
 	//! scanning the whole family. Selected by the binder when only the destination
 	//! endpoint is bound.
 	bool is_sorted_by_v1 = false;
+	//! Verified at generation time (artifact row count == bridge row count), not declared:
+	//! true means the artifact's DISTINCT collapsed nothing, so it holds one row per edge
+	//! and can stand in for the bridge in multiplicity-sensitive walk traversal. Defaults
+	//! false for artifacts predating the probe, which keeps walk mode on the bridge.
+	bool preserves_multiplicity = false;
 	bool from_metadata = false;
 };
 
@@ -97,6 +102,11 @@ struct PGQPathTableCache {
 	case_insensitive_map_t<PGQBranchSummaryLookup> branch_summary_index;
 	vector<PGQDirectLinkInfo> direct_links;
 	case_insensitive_map_t<vector<idx_t>> direct_link_index;
+	//! One-hop `edge` artifact row counts keyed by edge label, used to size a fallback
+	//! traversal before running it. Populated from the same catalog rows as semantic_index.
+	//! Catalog-derived and therefore safe to share via the ObjectCache; the session-scoped
+	//! budget it is compared against is threaded in separately, never cached here.
+	case_insensitive_map_t<int64_t> edge_label_rows;
 };
 
 //! A resolved ABI artifact reference. For an `edge` artifact the vertex keys live in
@@ -148,12 +158,21 @@ public:
 	// Populate all vertex and edge tables and their alias into
 	// [alias_to_vertex_and_edge_tables], from paths information from
 	// [path_reference].
+	//
+	// An unlabeled-but-named vertex has no table of its own, so an arbitrary one is
+	// registered as a STUB purely so qualified column references can be validated. A stub
+	// is a placeholder, NOT a statement about which label the binding actually has -- any
+	// consumer that reports the binding's identity (label(), x.*) must treat it as unknown
+	// rather than as fact. Pass [stub_bindings] to find out which entries are stubs; the
+	// overload without it keeps the historical behaviour for callers that only validate.
 	static void
 	PopulateGraphTableAliasMap(const CreatePropertyGraphInfo &pg_table, const unique_ptr<PathReference> &path_reference,
-	                           case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_to_vertex_and_edge_tables);
+	                           case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_to_vertex_and_edge_tables,
+	                           case_insensitive_set_t *stub_bindings = nullptr);
 
 	static case_insensitive_map_t<shared_ptr<PropertyGraphTable>>
-	PopulateGraphTableAliasMap(const CreatePropertyGraphInfo &pg_table, const MatchExpression &match_expr);
+	PopulateGraphTableAliasMap(const CreatePropertyGraphInfo &pg_table, const MatchExpression &match_expr,
+	                           case_insensitive_set_t *stub_bindings = nullptr);
 
 	static PathElement *GetPathElement(const unique_ptr<PathReference> &path_reference);
 
@@ -187,10 +206,11 @@ public:
 	static PathElement *HandleNestedSubPath(unique_ptr<PathReference> &path_reference,
 	                                        vector<unique_ptr<ParsedExpression>> &conditions, idx_t element_idx);
 
+	// csr_id must match the slot the paired CSR CTE was built into.
 	static unique_ptr<ParsedExpression> AddPathQuantifierCondition(const string &prev_binding,
 	                                                               const string &next_binding,
 	                                                               const shared_ptr<PropertyGraphTable> &edge_table,
-	                                                               const SubPath *subpath);
+	                                                               const SubPath *subpath, int32_t csr_id);
 
 	static unique_ptr<TableRef> MatchBindReplace(ClientContext &context, TableFunctionBindInput &input);
 
@@ -202,7 +222,7 @@ public:
 	static unique_ptr<CommonTableExpressionInfo>
 	GenerateShortestPathCTE(CreatePropertyGraphInfo &pg_table, SubPath *edge_subpath, PathElement *path_element,
 	                        PathElement *next_vertex_element,
-	                        vector<unique_ptr<ParsedExpression>> &path_finding_conditions,
+	                        vector<unique_ptr<ParsedExpression>> &path_finding_conditions, int32_t csr_id,
 	                        bool all_shortest = false);
 
 	static unique_ptr<ParsedExpression> CreatePathFindingFunction(vector<unique_ptr<PathReference>> &path_list,
@@ -210,6 +230,7 @@ public:
 	                                                              const string &path_variable,
 	                                                              unique_ptr<SelectNode> &final_select_node,
 	                                                              vector<unique_ptr<ParsedExpression>> &conditions,
+	                                                              int32_t &csr_id_counter, int32_t &cte1_slot,
 	                                                              bool all_shortest = false);
 
 	static void AddTraversalPathFinding(unique_ptr<SelectNode> &select_node,
@@ -220,10 +241,13 @@ public:
 	                                    const vector<shared_ptr<PropertyGraphTable>> &edge_tables, bool undirected,
 	                                    idx_t lower, idx_t upper);
 
+	// csr_id_counter hands out a distinct registry slot per CSR built in this query. It is
+	// a reference to DuckPGQState::csr_id_counter, threaded because this call chain carries
+	// no ClientContext (same reason as vl_fallback_budget).
 	static void AddPathFinding(unique_ptr<SelectNode> &select_node, vector<unique_ptr<ParsedExpression>> &conditions,
 	                           const string &prev_binding, const string &edge_binding, const string &next_binding,
 	                           const shared_ptr<PropertyGraphTable> &edge_table, CreatePropertyGraphInfo &pg_table,
-	                           SubPath *subpath, PGQMatchType edge_type,
+	                           SubPath *subpath, PGQMatchType edge_type, int32_t &csr_id_counter, int32_t &cte1_slot,
 	                           unique_ptr<ParsedExpression> anchor_filter = nullptr, bool any_shortest = false,
 	                           const PGQABITraversalPlan *abi_plan = nullptr);
 
@@ -241,13 +265,17 @@ public:
 	// path_table_cache (optional) lets the recursive-CTE fallback still scan ABI edge
 	// artifacts for its traversal steps when no whole-pattern ABI rewrite applied --
 	// i.e. ABI coverage is graded, not all-or-nothing.
+	// vl_fallback_budget is pgq_max_vl_fallback_rows, read where a ClientContext exists and
+	// passed down because this call chain carries none. 0 disables the guard.
 	static void ProcessPathList(vector<unique_ptr<PathReference>> &path_pattern,
 	                            vector<unique_ptr<ParsedExpression>> &conditions, unique_ptr<SelectNode> &select_node,
 	                            case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map,
 	                            CreatePropertyGraphInfo &pg_table, int32_t &extra_alias_counter,
-	                            MatchExpression &original_ref, bool all_shortest = false,
+	                            MatchExpression &original_ref, int32_t &csr_id_counter, int32_t &cte1_slot,
+	                            bool all_shortest = false,
 	                            bool any_shortest = false,
-	                            const PGQPathTableCache *path_table_cache = nullptr);
+	                            const PGQPathTableCache *path_table_cache = nullptr,
+	                            int64_t vl_fallback_budget = 0);
 
 	// Process one OPTIONAL MATCH group: adds LEFT JOINs for each edge+vertex pair directly
 	// to select_node->from_table. Populates opt_alias_map with the new aliases.
@@ -264,7 +292,8 @@ public:
 
 	static void CheckNamedSubpath(SubPath &subpath, MatchExpression &original_ref, CreatePropertyGraphInfo &pg_table,
 	                              unique_ptr<SelectNode> &final_select_node,
-	                              vector<unique_ptr<ParsedExpression>> &conditions, bool all_shortest = false);
+	                              vector<unique_ptr<ParsedExpression>> &conditions, int32_t &csr_id_counter,
+	                              int32_t &cte1_slot, bool all_shortest = false);
 
 	// Check whether columns to query are valid against the property graph, throws
 	// BinderException if error.

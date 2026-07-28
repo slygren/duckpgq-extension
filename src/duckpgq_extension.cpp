@@ -26,6 +26,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    "Used by pgq_verify_abi_rewrite() to run a query both ways and compare.",
 		    LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::SESSION);
 	}
+	if (!config.HasExtensionOption("pgq_max_vl_fallback_rows")) {
+		config.AddExtensionOption(
+		    "pgq_max_vl_fallback_rows",
+		    "Row budget for a variable-length MATCH that cannot be answered from ABI path tables. When the bind-time "
+		    "estimate for the fallback traversal (CSR construction or bridge recursion) exceeds this, the query fails "
+		    "immediately instead of running an unbounded scan. 0 disables the guard.",
+		    LogicalType::BIGINT, Value::BIGINT(20000000), nullptr, SetScope::SESSION);
+	}
 	CoreModule::Register(loader);
 }
 

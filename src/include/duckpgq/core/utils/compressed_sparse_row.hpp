@@ -64,22 +64,22 @@ struct CSRFunctionData : FunctionData {
 
 // CSR BindReplace functions
 unique_ptr<CommonTableExpressionInfo> CreateUndirectedCSRCTE(const shared_ptr<PropertyGraphTable> &edge_table,
-                                                             const unique_ptr<SelectNode> &select_node);
+                                                             const unique_ptr<SelectNode> &select_node, int32_t csr_id);
 unique_ptr<CommonTableExpressionInfo> CreateDirectedCSRCTE(const shared_ptr<PropertyGraphTable> &edge_table,
                                                            const string &prev_binding, const string &edge_binding,
-                                                           const string &next_binding);
+                                                           const string &next_binding, int32_t csr_id);
 unique_ptr<CommonTableExpressionInfo> CreateWeightedDirectedCSRCTE(const shared_ptr<PropertyGraphTable> &edge_table,
                                                                    const string &prev_binding,
                                                                    const string &edge_binding,
                                                                    const string &next_binding,
-                                                                   unique_ptr<ParsedExpression> weight_expr);
+                                                                   unique_ptr<ParsedExpression> weight_expr, int32_t csr_id);
 
 // Helper functions
 unique_ptr<CommonTableExpressionInfo> MakeEdgesCTE(const shared_ptr<PropertyGraphTable> &edge_table);
 unique_ptr<SubqueryExpression> CreateDirectedCSRVertexSubquery(const shared_ptr<PropertyGraphTable> &edge_table,
                                                                const string &binding);
 unique_ptr<SubqueryExpression> CreateUndirectedCSRVertexSubquery(const shared_ptr<PropertyGraphTable> &edge_table,
-                                                                 const string &binding);
+                                                                 const string &binding, int32_t csr_id);
 unique_ptr<SelectNode> CreateOuterSelectEdgesNode();
 unique_ptr<SelectNode> CreateOuterSelectNode(unique_ptr<FunctionExpression> create_csr_edge_function);
 unique_ptr<JoinRef> GetJoinRef(const shared_ptr<PropertyGraphTable> &edge_table, const string &edge_binding,

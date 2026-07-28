@@ -59,7 +59,7 @@ shared_ptr<PropertyGraphTable> ValidateSourceNodeAndEdgeTable(CreatePropertyGrap
 
 // Function to create the SELECT node
 unique_ptr<SelectNode> CreateSelectNode(const shared_ptr<PropertyGraphTable> &edge_pg_entry,
-                                        const string &function_name, const string &function_alias) {
+                                        const string &function_name, const string &function_alias, int32_t csr_id) {
 	auto select_node = make_uniq<SelectNode>();
 	std::vector<unique_ptr<ParsedExpression>> select_expression;
 
@@ -69,7 +69,7 @@ unique_ptr<SelectNode> CreateSelectNode(const shared_ptr<PropertyGraphTable> &ed
 	auto cte_col_ref = make_uniq<ColumnRefExpression>("temp", "__x");
 
 	vector<unique_ptr<ParsedExpression>> function_children;
-	function_children.push_back(make_uniq<ConstantExpression>(Value::INTEGER(0)));
+	function_children.push_back(make_uniq<ConstantExpression>(Value::INTEGER(csr_id)));
 	function_children.push_back(make_uniq<ColumnRefExpression>("rowid", edge_pg_entry->source_reference));
 	auto function = make_uniq<FunctionExpression>(function_name, std::move(function_children));
 

@@ -20,9 +20,12 @@ WeaklyConnectedComponentFunction::WeaklyConnectedComponentBindReplace(ClientCont
 	auto pg_info = GetPropertyGraphInfo(duckpgq_state, pg_name);
 	auto edge_pg_entry = ValidateSourceNodeAndEdgeTable(pg_info, node_table, edge_table);
 
-	auto select_node = CreateSelectNode(edge_pg_entry, "weakly_connected_component", "componentId");
+	// One registry slot per invocation, so two graph algorithms in one query cannot
+	// overwrite each other's CSR (every call site used to pass a hardcoded 0).
+	const int32_t csr_id = duckpgq_state->AllocateCSRId();
+	auto select_node = CreateSelectNode(edge_pg_entry, "weakly_connected_component", "componentId", csr_id);
 
-	select_node->cte_map.map["csr_cte"] = CreateUndirectedCSRCTE(edge_pg_entry, select_node);
+	select_node->cte_map.map["csr_cte"] = CreateUndirectedCSRCTE(edge_pg_entry, select_node, csr_id);
 
 	auto subquery = make_uniq<SelectStatement>();
 	subquery->node = std::move(select_node);

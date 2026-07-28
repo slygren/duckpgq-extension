@@ -1,0 +1,207 @@
+# name: test/sql/path_finding/unlabeled_destination_parity.test
+# description: A vertex written without a label must behave like the labeled form or say why not
+# group: [path_finding]
+
+# Naming the destination label was hiding defects. Three separate bugs (2026-07-28) all
+# bound fine as (x:Workorder) and misbehaved as (x) or ():
+#
+#   1. a k-hop artifact's mixed-type keys failed to bind      -> abi_context_mixed_key_types
+#   2. label(x) folded an arbitrary placeholder table into a constant, silently wrong
+#   3. ONE ROW PER over a compound edge label returned zero rows, silently wrong
+#
+# 2 and 3 are the dangerous shape: the query succeeds and the answer is untrue. So the
+# rule this file encodes is not "unlabeled must work" -- sometimes it genuinely cannot --
+# but "unlabeled must match the labeled answer, or refuse out loud". Never silence.
+
+require duckpgq
+
+statement ok
+CREATE TABLE tag(id VARCHAR, name VARCHAR);
+
+statement ok
+INSERT INTO tag VALUES ('T1', 'Pump A'), ('T2', 'Parent');
+
+statement ok
+CREATE TABLE workorder(id BIGINT, title VARCHAR);
+
+statement ok
+INSERT INTO workorder VALUES (10, 'WO-10'), (11, 'WO-11');
+
+statement ok
+CREATE TABLE note(id VARCHAR, body VARCHAR);
+
+statement ok
+INSERT INTO note VALUES ('N-1', 'note one');
+
+statement ok
+CREATE TABLE has_parent(src VARCHAR, dst VARCHAR);
+
+statement ok
+INSERT INTO has_parent VALUES ('T1', 'T2');
+
+statement ok
+CREATE TABLE has_workorder(src VARCHAR, dst BIGINT);
+
+statement ok
+INSERT INTO has_workorder VALUES ('T1', 10), ('T1', 11);
+
+statement ok
+CREATE TABLE has_note(src VARCHAR, dst VARCHAR);
+
+statement ok
+INSERT INTO has_note VALUES ('T1', 'N-1');
+
+statement ok
+-CREATE PROPERTY GRAPH g
+VERTEX TABLES (
+    tag PROPERTIES (id, name) LABEL Tag,
+    workorder PROPERTIES (id, title) LABEL Workorder,
+    note PROPERTIES (id, body) LABEL Note
+)
+EDGE TABLES (
+    has_parent SOURCE KEY (src) REFERENCES tag(id)
+               DESTINATION KEY (dst) REFERENCES tag(id)
+               LABEL HasParent,
+    has_workorder SOURCE KEY (src) REFERENCES tag(id)
+                  DESTINATION KEY (dst) REFERENCES workorder(id)
+                  LABEL HasWorkorder,
+    has_note SOURCE KEY (src) REFERENCES tag(id)
+             DESTINATION KEY (dst) REFERENCES note(id)
+             LABEL HasNote
+);
+
+# ── label() on an unlabeled destination ─────────────────────────────────────────
+# A named edge DETERMINES the destination table, so (x) is not ambiguous here and
+# label(x) must give the real answer -- not the placeholder registered for column
+# validation, which is what silently produced a wrong label before.
+
+query T rowsort
+-FROM GRAPH_TABLE ( g MATCH (t:Tag)-[:HasWorkorder]->(x) WHERE t.id = 'T1'
+    COLUMNS (label(x) AS lbl) );
+----
+workorder
+workorder
+
+# Must equal the labeled form exactly -- that equality is the point of the file.
+query T rowsort
+-FROM GRAPH_TABLE ( g MATCH (t:Tag)-[:HasWorkorder]->(x:Workorder) WHERE t.id = 'T1'
+    COLUMNS (label(x) AS lbl) );
+----
+workorder
+workorder
+
+# Properties must resolve against the real table too, not the placeholder.
+query T rowsort
+-FROM GRAPH_TABLE ( g MATCH (t:Tag)-[:HasWorkorder]->(x) WHERE t.id = 'T1'
+    COLUMNS (x.title AS title) );
+----
+WO-10
+WO-11
+
+# Direction is what decides which end the vertex sits on; the left-directed form must
+# resolve to the same table rather than to the edge's other endpoint.
+query T rowsort
+-FROM GRAPH_TABLE ( g MATCH (x)<-[:HasWorkorder]-(t:Tag) WHERE t.id = 'T1'
+    COLUMNS (label(x) AS lbl) );
+----
+workorder
+workorder
+
+# ── when it is genuinely ambiguous, refuse ──────────────────────────────────────
+# An unlabeled edge can reach Workorder, Note or Tag, so x has no single label. The
+# only wrong behaviour is to answer anyway. On a graph without ABI artifacts the
+# generic path refuses first, with its own wording; on an artifact-backed graph the
+# traversal is answerable and label() itself refuses (see abi_context_mixed_key_types).
+# Either message is fine -- returning a label is not.
+
+statement error
+-FROM GRAPH_TABLE ( g MATCH (t:Tag)-[]->(x) WHERE t.id = 'T1'
+    COLUMNS (label(x) AS lbl) );
+----
+ambiguous
+
+# ── ONE ROW PER over a compound edge label ──────────────────────────────────────
+# Named edge: works, and is the baseline the compound form is measured against.
+
+query I rowsort
+-FROM GRAPH_TABLE ( g MATCH (t:Tag)-[:HasParent]->{1,2}(a:Tag) ONE ROW PER STEP (v1, e, v2)
+    WHERE t.id = 'T1' COLUMNS (element_id(v1) AS a) );
+----
+0
+
+# Compound edge: must NOT return zero rows as if the graph were empty.
+statement error
+-FROM GRAPH_TABLE ( g MATCH (t:Tag)-[:!HasParent]->{1,2}(x:Workorder) ONE ROW PER STEP (v1, e, v2)
+    WHERE t.id = 'T1' COLUMNS (element_id(v1) AS a) );
+----
+ONE ROW PER over a compound edge label
+
+statement error
+-FROM GRAPH_TABLE ( g MATCH (t:Tag)-[:!HasParent]->{1,2}(x:Workorder) ONE ROW PER VERTEX (v)
+    WHERE t.id = 'T1' COLUMNS (element_id(v) AS a) );
+----
+ONE ROW PER over a compound edge label
+
+statement error
+-FROM GRAPH_TABLE ( g MATCH (t:Tag)-[:!HasParent]->{1,2}(x:Workorder) ONE ROW PER EDGE (e)
+    WHERE t.id = 'T1' COLUMNS (element_id(e) AS a) );
+----
+ONE ROW PER over a compound edge label
+
+# The same pattern without ONE ROW PER is answerable, which is what the error tells the
+# user to fall back to -- so that claim has to be true. T1 has two Workorders, and now
+# that traversal keys on the vertex key both come back.
+query T
+-SELECT list_sort(list(title)) AS got FROM GRAPH_TABLE ( g MATCH (t:Tag)-[:HasWorkorder]->{1,2}(x:Workorder)
+    WHERE t.id = 'T1' COLUMNS (x.title AS title) );
+----
+[WO-10, WO-11]
+
+# A negated edge label with a Workorder destination correctly returns NOTHING here, and
+# the reason is worth pinning: '!HasParent' is resolved to has_parent itself rather than
+# to its complement (a separate pre-existing defect, see the note at the end of this
+# file), so the walk stays on tag->tag and never reaches a Workorder.
+#
+# Before traversal keyed on the vertex key this returned ONE row -- a PHANTOM. The walk
+# landed on tag T2 (rowid 1) and the outer join matched it against workorder rowid 1,
+# WO-11. Nothing about that row was real. An earlier version of this test asserted that
+# 1, which is exactly the "freeze the wrong number in as expected behaviour" trap; the
+# empty result below is the correct answer.
+query I rowsort
+-SELECT DISTINCT depth FROM GRAPH_TABLE ( g MATCH p = (t:Tag)-[:!HasParent]->{1,2}(x:Workorder)
+    WHERE t.id = 'T1' COLUMNS (path_length(p) AS depth) );
+----
+
+# ── variable length on a graph with NO ABI artifacts ────────────────────────────
+# The artifact-backed expansion answers an unlabeled variable-length destination per
+# row (see abi_context_mixed_key_types). This graph has no artifacts, so the same
+# query falls to the generic path, which cannot enumerate the destination table. That
+# is a real capability difference and it is allowed -- what matters is that it SAYS so
+# instead of returning a partial or empty result. These assertions exist to catch the
+# day that refusal silently becomes zero rows.
+
+statement error
+-FROM GRAPH_TABLE ( g MATCH p = (t:Tag)-[:!HasParent]->{1,1}(x) WHERE t.id = 'T1'
+    COLUMNS (path_length(p) AS depth, label(x) AS lbl) );
+----
+Unlabeled vertex pattern is ambiguous
+
+statement error
+-FROM GRAPH_TABLE ( g MATCH p = (t:Tag)-[:!HasParent]->{1,1}() WHERE t.id = 'T1'
+    COLUMNS (path_length(p) AS depth) );
+----
+Unlabeled vertex pattern is ambiguous
+
+# Two further PRE-EXISTING defects were found here and deliberately left unasserted,
+# because writing them down as expectations would freeze wrong behaviour in place. Both
+# reproduce on a build with none of the 2026-07-28 changes:
+#
+#   * {1,1} with a negated edge label fails with "Label tag is not registered as a
+#     destination reference for edge pattern of table has_parent" -- the negation is
+#     resolved to the single table it names instead of to its complement. {1,2} of the
+#     same shape works, so it is specific to the degenerate one-hop quantifier.
+#   * (fixed 2026-07-28) the generic traversal addressed vertices by rowid, so a
+#     cross-vertex-table edge leaked rows between unrelated vertices -- see
+#     rowid_id_space_collision.test. It now carries vertex keys.
+#
+# Neither is about unlabeled destinations, so neither is fixed here.

@@ -84,27 +84,33 @@ SELECT
     true AS is_sorted_by_v0,
     1 AS min_depth,
     1 AS max_depth,
-    'has_parent' AS bridge_table_names
+    'has_parent' AS bridge_table_names,
+    -- Declared true, not probed. The generator measures this as artifact-rows ==
+    -- bridge-rows, but this fixture leaves the bridges empty on purpose so that any
+    -- result must have come from an artifact -- which makes a count comparison
+    -- meaningless here. Each artifact below is a single literal row per edge, so it
+    -- is one-row-per-edge by construction and walk mode may use it.
+    true AS preserves_multiplicity
 UNION ALL
 SELECT 'test_graph', '__pg_test_graph__Tag__HasWorkorder__Workorder', 'edge', 1,
        'Tag', 'Workorder', 'Tag,Workorder', 'HasWorkorder', true, true,
        (SELECT count(*) FROM graph.__pg_test_graph__Tag__HasWorkorder__Workorder),
-       current_timestamp, true, 1, 1, 'has_workorder'
+       current_timestamp, true, 1, 1, 'has_workorder', true
 UNION ALL
 SELECT 'test_graph', '__pg_test_graph__Tag__HasNotification__Notification', 'edge', 1,
        'Tag', 'Notification', 'Tag,Notification', 'HasNotification', true, true,
        (SELECT count(*) FROM graph.__pg_test_graph__Tag__HasNotification__Notification),
-       current_timestamp, true, 1, 1, 'has_notification'
+       current_timestamp, true, 1, 1, 'has_notification', true
 UNION ALL
 SELECT 'test_graph', '__pg_test_graph__Workorder__HasOperation__Operation', 'edge', 1,
        'Workorder', 'Operation', 'Workorder,Operation', 'HasOperation', true, true,
        (SELECT count(*) FROM graph.__pg_test_graph__Workorder__HasOperation__Operation),
-       current_timestamp, true, 1, 1, 'has_operation'
+       current_timestamp, true, 1, 1, 'has_operation', true
 UNION ALL
 SELECT 'test_graph', '__pg_test_graph__Notification__NotifiedOperation__Operation', 'edge', 1,
        'Notification', 'Operation', 'Notification,Operation', 'NotifiedOperation', true, true,
        (SELECT count(*) FROM graph.__pg_test_graph__Notification__NotifiedOperation__Operation),
-       current_timestamp, true, 1, 1, 'notified_operation';
+       current_timestamp, true, 1, 1, 'notified_operation', true;
 
 statement ok
 -CREATE PROPERTY GRAPH test_graph
@@ -231,3 +237,44 @@ query ITTT rowsort
 
 statement ok
 SET pgq_require_abi_paths = false;
+
+# ── Cost guard on the expansion itself ──────────────────────────────────────────
+# The expansion is artifact-backed, so it is not costed like the CSR fallback: its
+# cost is the frontier, and a pinned seed collapses that to a handful of seeks. The
+# guard therefore keys on the seed rather than on artifact size, which is what lets
+# a seeded expansion over a huge artifact stay on the fast path.
+#
+# Unanchored here: two one-hop edges leave Tag (HasParent is negated away), and no
+# fixed_path artifact exists for depth 2, so that depth is projected from the growth
+# observed at depth 1 rather than counted as free. Estimate 4, budget 3.
+
+statement ok
+SET pgq_max_vl_fallback_rows = 3;
+
+statement error
+-FROM GRAPH_TABLE (
+    test_graph
+    MATCH p = (t:Tag)-[:!HasParent]->{1,2}(x)
+    COLUMNS (path_length(p) AS depth, label(x) AS dst_label)
+);
+----
+expands from every Tag vertex
+
+# Same pattern, same budget, seed pinned: must still run. This is the assertion that
+# fails if the guard is ever widened into a size check -- the numbers here are tiny,
+# so only the anchor can be what exempts it.
+query IT rowsort
+-FROM GRAPH_TABLE (
+    test_graph
+    MATCH p = (t:Tag)-[:!HasParent]->{1,2}(x)
+    WHERE t.id = 1
+    COLUMNS (path_length(p) AS depth, label(x) AS dst_label)
+);
+----
+1	Notification
+1	Workorder
+2	Operation
+2	Operation
+
+statement ok
+SET pgq_max_vl_fallback_rows = 20000000;

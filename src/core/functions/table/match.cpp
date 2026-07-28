@@ -207,6 +207,7 @@ static case_insensitive_set_t LatestPathCatalogColumns() {
 	columns.insert("freshness_policy");
 	columns.insert("covered_target_properties");
 	columns.insert("is_sorted_by_v1");
+	columns.insert("preserves_multiplicity");
 	return columns;
 }
 
@@ -414,7 +415,7 @@ static void LoadPathTableCatalogMetadata(Connection &connection, const string &c
 	    "       CAST(min_depth AS BIGINT) AS min_depth, "
 	    "       CAST(max_depth AS BIGINT) AS max_depth, "
 	    "       bridge_table_names, "
-	    "       %s, %s, %s, %s, %s, %s, %s "
+	    "       %s, %s, %s, %s, %s, %s, %s, %s "
 	    "FROM %s WHERE lower(graph_name) = lower(%s)",
 	    OptionalStringCatalogColumn(columns, "semantic_grain", "identity"),
 	    OptionalStringCatalogColumn(columns, "temporal_mode", "snapshot"),
@@ -423,6 +424,10 @@ static void LoadPathTableCatalogMetadata(Connection &connection, const string &c
 	    OptionalStringCatalogColumn(columns, "freshness_policy", "unknown"),
 	    OptionalStringCatalogColumn(columns, "covered_target_properties", ""),
 	    OptionalBoolCatalogColumn(columns, "is_sorted_by_v1", false),
+	    // Absent column defaults to FALSE: an artifact that has not been *proven* to
+	    // preserve edge multiplicity must not be substituted into walk-mode traversal.
+	    // Erring to false costs performance; erring to true would change answers.
+	    OptionalBoolCatalogColumn(columns, "preserves_multiplicity", false),
 	    catalog_table, KeywordHelper::WriteQuoted(graph_name, '\''));
 
 	auto query_result = connection.Query(query);
@@ -456,6 +461,7 @@ static void LoadPathTableCatalogMetadata(Connection &connection, const string &c
 		info.freshness_policy = GetOptionalString(materialized_result, 18, row_idx);
 		info.covered_target_properties = GetOptionalString(materialized_result, 19, row_idx);
 		info.is_sorted_by_v1 = GetOptionalBool(materialized_result, 20, row_idx);
+		info.preserves_multiplicity = GetOptionalBool(materialized_result, 21, row_idx);
 		info.from_metadata = true;
 		AddPathTableInfo(path_table_catalog, std::move(info));
 	}
@@ -666,6 +672,15 @@ static shared_ptr<PGQPathTableCache> BuildPathTableCache(ClientContext &context,
 			// last would displace the other for every lookup.
 			auto &index = info.is_sorted_by_v1 ? cache->reverse_semantic_index : cache->semantic_index;
 			index[PathSemanticKey(info.path_kind, vertex_parts, edge_parts)] = info.table_name;
+		}
+		// Size of each 1-hop edge family, so a fallback traversal can be costed before it
+		// runs. Forward artifacts only -- a reverse twin duplicates its forward artifact's
+		// rows and would double the estimate. Take the max when several artifacts share an
+		// edge label so the estimate is never optimistic.
+		if (StringUtil::CIEquals(info.path_kind, "edge") && !info.is_sorted_by_v1 && edge_parts.size() == 1 &&
+		    info.estimated_rows > 0) {
+			auto &slot = cache->edge_label_rows[edge_parts[0]];
+			slot = MaxValue<int64_t>(slot, info.estimated_rows);
 		}
 		if (!StringUtil::CIEquals(info.path_kind, "branch_summary")) {
 			continue;
@@ -1734,10 +1749,140 @@ static bool DisableABIRewrite(ClientContext &context) {
 	return result && !value.IsNull() && value.GetValue<bool>();
 }
 
+//! Refuse a rowid-addressed traversal whose edge spans two different vertex tables.
+//!
+//! BOTH generic traversal routes address vertices by `rowid` in ONE id space: the CSR
+//! (`create_csr_edge` inserts src and dst rowids into the same array) and the bounded
+//! recursive CTE (whose recursive step joins `mid.rowid = r.dst_rowid`, reading a
+//! DESTINATION-table rowid as a SOURCE-table rowid). When source and destination are the same vertex table
+//! that is sound. When they differ the two rowid spaces COLLIDE: with tag(T1,T2) and
+//! workorder(WO-10..13), tag rowid 0 and workorder rowid 0 are the same CSR vertex. The
+//! BFS then walks out of the destination table as if it were a source, and the result is
+//! not merely incomplete -- it attributes another vertex's rows to this one. Measured on a
+//! 4-row fixture: T1 owns WO-10/11/12, and `->{1,2}` returned WO-11/12/13, dropping one of
+//! its own and claiming T2's. Adding path_length(p) read past the end of the CSR arrays
+//! and took the database down with it.
+//!
+//! This is why "multi-label traversal across different source/destination vertex types is
+//! not yet supported" exists a few frames below: same root cause, caught only for compound
+//! labels. A single named edge between two tables reaches both routes unchecked.
+//!
+//! Depth 1 is safe on the CTE route -- the first step joins the anchor's own rowid, which is
+//! genuinely a source rowid -- so only upper >= 2 is refused there. The ABI context
+//! expansion is unaffected and must NOT be blocked: it joins v0/v1 vertex KEYS and never
+//! materialises a rowid, which is why the artifact-backed graph has been returning correct
+//! answers over exactly these cross-table shapes all along.
+static void RejectCrossTableCSR(const shared_ptr<PropertyGraphTable> &edge_table, idx_t lower, idx_t upper) {
+	if (!edge_table || edge_table->source_reference.empty() || edge_table->destination_reference.empty()) {
+		return;
+	}
+	if (StringUtil::CIEquals(edge_table->source_reference, edge_table->destination_reference)) {
+		return; // one vertex table, one id space -- sound
+	}
+	throw NotImplementedException(
+	    "Variable-length traversal over edge '%s' cannot be answered correctly by the generic path finder: it "
+	    "connects two different vertex tables ('%s' -> '%s'), and the generic routes address vertices by rowid in a "
+	    "single id space, so the two tables' rowids collide and paths leak between unrelated vertices. Refusing "
+	    "rather than returning rows that belong to a different vertex. Generate ABI path artifacts for this edge -- "
+	    "the artifact-backed expansion joins vertex keys and is unaffected -- or restrict the pattern to a single "
+	    "hop (->{1,1} or an unquantified edge), which does not recurse. (lower=%llu, upper=%llu)",
+	    edge_table->table_name.c_str(), edge_table->source_reference.c_str(),
+	    edge_table->destination_reference.c_str(), static_cast<unsigned long long>(lower ? lower : 1),
+	    static_cast<unsigned long long>(upper >= static_cast<idx_t>(1 << 30) ? 3 : upper));
+}
+
 static void ThrowABIPathRequired() {
 	throw BinderException(
 	    "DuckPGQ ABI path required by pgq_require_abi_paths, but no matching ABI path table rewrite was available. "
 	    "Generate the required ABI path metadata/table or SET pgq_require_abi_paths=false to allow fallback traversal.");
+}
+
+//! The connection's CSR id allocator. Returned by reference: the state object is owned by
+//! ClientContext::registered_state, so it outlives every binder call that threads this.
+static int32_t &CSRIdCounter(ClientContext &context) {
+	return GetDuckPGQState(context)->csr_id_counter;
+}
+
+//! Row budget for a variable-length pattern that cannot be served from ABI artifacts.
+//! Read once per bind where a ClientContext is available and threaded down, because the
+//! site that needs it sits below several frames that carry no context.
+static int64_t MaxVLFallbackRows(ClientContext &context) {
+	Value value;
+	auto result = context.TryGetCurrentSetting("pgq_max_vl_fallback_rows", value);
+	if (!result || value.IsNull()) {
+		return 0;
+	}
+	return value.GetValue<int64_t>();
+}
+
+//! Every edge label in `pg_table` that the pattern's label expression admits. A bare label
+//! yields one; a negation such as !HAS_PARENT yields every *other* edge label, which is the
+//! case the single-table resolver cannot represent and the one that degrades to CSR.
+static vector<string> EdgeLabelsAllowedByExpression(const string &edge_label_expr,
+                                                    CreatePropertyGraphInfo &pg_table) {
+	vector<string> labels;
+	for (const auto &tbl : pg_table.edge_tables) {
+		if (tbl->main_label.empty()) {
+			continue;
+		}
+		if (edge_label_expr.empty() || LabelExpressionAllows(edge_label_expr, tbl->main_label)) {
+			labels.push_back(tbl->main_label);
+		}
+	}
+	return labels;
+}
+
+//! Fail a variable-length MATCH that would fall back to CSR construction or bridge
+//! recursion over more rows than the session permits.
+//!
+//! The fallback reads whole edge tables before any predicate is applied -- the source
+//! filter is only pushed into the *recursive-CTE* path, so on the CSR path it cannot
+//! shrink the work. That makes an unservable pattern cost O(sum of edge rows) regardless
+//! of how selective the query looks, which is how a single-seed lookup ends up scanning
+//! tens of millions of rows. Costing it here turns a query that runs for half an hour
+//! into one that explains itself immediately.
+static void CheckVLFallbackBudget(int64_t budget, const PGQPathTableCache *path_table_cache,
+                                  CreatePropertyGraphInfo &pg_table, const string &edge_label_expr, idx_t lower,
+                                  idx_t upper, const PGQABITraversalPlan *abi_plan) {
+	if (budget <= 0 || !path_table_cache) {
+		return; // guard disabled, or no catalog to cost against
+	}
+	if (upper <= 1) {
+		return; // single hop: no recursion, no CSR
+	}
+	if (abi_plan && (abi_plan->step.valid || abi_plan->exact.valid)) {
+		return; // ABI covers the traversal; this is the fast path, not the fallback
+	}
+
+	const auto labels = EdgeLabelsAllowedByExpression(edge_label_expr, pg_table);
+	int64_t rows = 0;
+	for (const auto &label : labels) {
+		auto entry = path_table_cache->edge_label_rows.find(label);
+		if (entry != path_table_cache->edge_label_rows.end()) {
+			rows += entry->second;
+		}
+	}
+	if (rows <= budget) {
+		return;
+	}
+
+	const bool multi_table = labels.size() > 1;
+	string detail =
+	    StringUtil::Format("Variable-length pattern {%llu,%llu} over edge label expression '%s' cannot be answered "
+	                       "from ABI path tables and would fall back to scanning ~%lld rows across %llu edge "
+	                       "%s, exceeding pgq_max_vl_fallback_rows (%lld).",
+	                       static_cast<unsigned long long>(lower), static_cast<unsigned long long>(upper),
+	                       edge_label_expr.empty() ? "<any>" : edge_label_expr.c_str(),
+	                       static_cast<long long>(rows), static_cast<unsigned long long>(labels.size()),
+	                       labels.size() == 1 ? "family" : "families", static_cast<long long>(budget));
+	if (multi_table) {
+		detail += " A negated or multi-label edge pattern spans several edge tables, which the binder cannot map to "
+		          "a single ABI artifact, so the whole graph is materialised before any filter applies. Name one "
+		          "edge label to stay on the artifact-backed path.";
+	}
+	detail += " Alternatives: use ANY SHORTEST (ABI-accelerated), bound the pattern to a single edge label, query "
+	          "the closure artifacts directly, or raise/disable the budget with SET pgq_max_vl_fallback_rows.";
+	throw BinderException(detail);
 }
 
 static string OneRowPerModeToString(OneRowPerMode mode) {
@@ -2210,20 +2355,21 @@ unique_ptr<CommonTableExpressionInfo>
 PGQMatchFunction::GenerateShortestPathCTE(CreatePropertyGraphInfo &pg_table, SubPath *edge_subpath,
                                           PathElement *previous_vertex_element, PathElement *next_vertex_element,
                                           vector<unique_ptr<ParsedExpression>> &path_finding_conditions,
-                                          bool all_shortest) {
+                                          int32_t csr_id, bool all_shortest) {
 	auto cte_info = make_uniq<CommonTableExpressionInfo>();
 	auto select_statement = make_uniq<SelectStatement>();
 	auto select_node = make_uniq<SelectNode>();
 
 	auto edge_element = GetPathElement(edge_subpath->path_list[0]);
 	auto edge_table = ResolveTable(edge_element->label, edge_element->match_type, pg_table);
+	RejectCrossTableCSR(edge_table, edge_subpath->lower, edge_subpath->upper);
 
 	auto src_row_id = make_uniq<ColumnRefExpression>("rowid", previous_vertex_element->variable_binding);
 	auto dst_row_id = make_uniq<ColumnRefExpression>("rowid", next_vertex_element->variable_binding);
-	auto csr_id = make_uniq<ConstantExpression>(Value::INTEGER(0));
+	auto csr_id_const = make_uniq<ConstantExpression>(Value::INTEGER(csr_id));
 
 	vector<unique_ptr<ParsedExpression>> pathfinding_children;
-	pathfinding_children.push_back(std::move(csr_id));
+	pathfinding_children.push_back(std::move(csr_id_const));
 	pathfinding_children.push_back(std::move(GetCountTable(
 	    edge_table->source_pg_table, previous_vertex_element->variable_binding, edge_table->source_pk[0])));
 	pathfinding_children.push_back(std::move(src_row_id));
@@ -2266,8 +2412,9 @@ PGQMatchFunction::GenerateShortestPathCTE(CreatePropertyGraphInfo &pg_table, Sub
 	count_children.push_back(make_uniq<ColumnRefExpression>("temp", "cte1"));
 	auto count_function = make_uniq<FunctionExpression>("count", std::move(count_children));
 
-	path_finding_conditions.push_back(AddPathQuantifierCondition(
-	    previous_vertex_element->variable_binding, next_vertex_element->variable_binding, edge_table, edge_subpath));
+	path_finding_conditions.push_back(AddPathQuantifierCondition(previous_vertex_element->variable_binding,
+	                                                             next_vertex_element->variable_binding, edge_table,
+	                                                             edge_subpath, csr_id));
 
 	select_node->where_clause = CreateWhereClause(path_finding_conditions);
 
@@ -2282,7 +2429,7 @@ PGQMatchFunction::GenerateShortestPathCTE(CreatePropertyGraphInfo &pg_table, Sub
 unique_ptr<ParsedExpression> PGQMatchFunction::CreatePathFindingFunction(
     vector<unique_ptr<PathReference>> &path_list, CreatePropertyGraphInfo &pg_table, const string &path_variable,
     unique_ptr<SelectNode> &final_select_node, vector<unique_ptr<ParsedExpression>> &conditions,
-    bool all_shortest) {
+    int32_t &csr_id_counter, int32_t &csr_slot, bool all_shortest) {
 	// This method will return a SubqueryRef of a list of rowids
 	// For every vertex and edge element, we add the rowid to the list using
 	// list_append, or list_prepend The difficulty is that there may be a
@@ -2326,14 +2473,20 @@ unique_ptr<ParsedExpression> PGQMatchFunction::CreatePathFindingFunction(
 				if (final_select_node->cte_map.map.find("cte1") == final_select_node->cte_map.map.end()) {
 					edge_element = reinterpret_cast<PathElement *>(edge_subpath->path_list[0].get());
 					if (edge_element->match_type == PGQMatchType::MATCH_EDGE_RIGHT) {
+						if (csr_slot < 0) {
+							csr_slot = csr_id_counter++;
+						}
 						final_select_node->cte_map.map["cte1"] = CreateDirectedCSRCTE(
 						    ResolveTable(edge_element->label, edge_element->match_type, pg_table),
 						    previous_vertex_element->variable_binding, edge_element->variable_binding,
-						    next_vertex_element->variable_binding);
+						    next_vertex_element->variable_binding, csr_slot);
 					} else if (edge_element->match_type == PGQMatchType::MATCH_EDGE_ANY) {
+						if (csr_slot < 0) {
+							csr_slot = csr_id_counter++;
+						}
 						final_select_node->cte_map.map["cte1"] =
 						    CreateUndirectedCSRCTE(ResolveTable(edge_element->label, edge_element->match_type, pg_table),
-						                          final_select_node);
+						                          final_select_node, csr_slot);
 					} else {
 						throw NotImplementedException("Cannot do shortest path for edge type %s",
 						                              edge_element->match_type == PGQMatchType::MATCH_EDGE_LEFT
@@ -2346,7 +2499,7 @@ unique_ptr<ParsedExpression> PGQMatchFunction::CreatePathFindingFunction(
 				    final_select_node->cte_map.map.end()) {
 					final_select_node->cte_map.map[shortest_path_cte_name] = GenerateShortestPathCTE(
 					    pg_table, edge_subpath, previous_vertex_element, next_vertex_element, path_finding_conditions,
-					    all_shortest);
+					    csr_slot, all_shortest);
 					auto cte_shortest_path_ref = make_uniq<BaseTableRef>();
 					cte_shortest_path_ref->table_name = shortest_path_cte_name;
 					if (!final_select_node->from_table) {
@@ -2454,13 +2607,14 @@ void PGQMatchFunction::AddEdgeJoins(const shared_ptr<PropertyGraphTable> &edge_t
 
 unique_ptr<ParsedExpression>
 PGQMatchFunction::AddPathQuantifierCondition(const string &prev_binding, const string &next_binding,
-                                             const shared_ptr<PropertyGraphTable> &edge_table, const SubPath *subpath) {
+                                             const shared_ptr<PropertyGraphTable> &edge_table, const SubPath *subpath,
+                                             int32_t csr_id) {
 	auto src_row_id = make_uniq<ColumnRefExpression>("rowid", prev_binding);
 	auto dst_row_id = make_uniq<ColumnRefExpression>("rowid", next_binding);
-	auto csr_id = make_uniq<ConstantExpression>(Value::INTEGER(0));
+	auto csr_id_const = make_uniq<ConstantExpression>(Value::INTEGER(csr_id));
 
 	vector<unique_ptr<ParsedExpression>> pathfinding_children;
-	pathfinding_children.push_back(std::move(csr_id));
+	pathfinding_children.push_back(std::move(csr_id_const));
 	pathfinding_children.push_back(
 	    std::move(GetCountTable(edge_table->source_pg_table, prev_binding, edge_table->source_pk[0])));
 	pathfinding_children.push_back(std::move(src_row_id));
@@ -2495,6 +2649,23 @@ static void AddBoundedORPRecursiveCTE(unique_ptr<SelectNode> &select_node, const
                                       const string &next_binding,
                                       const shared_ptr<PropertyGraphTable> &edge_table, idx_t lower, idx_t upper,
                                       unique_ptr<ParsedExpression> anchor_filter, bool reverse = false) {
+	// ONE ROW PER cannot be made key-based the way the reachability CTE was. Its `path` is
+	// an interleaved list of rowids that BuildORPStepsCTE unnests and rejoins to the vertex
+	// and edge tables BY ROWID, and for a cross-table edge the v1 and v2 of ONE ROW PER STEP
+	// are not even the same vertex table -- there is no single table to rejoin against.
+	// Measured before this guard, cross-table ONE ROW PER STEP reported 4 steps where 3 is
+	// the truth, and ONE ROW PER VERTEX 5 vertices where 4 is: silently wrong, like every
+	// other symptom of the shared rowid space.
+	if (!edge_table->source_reference.empty() && !edge_table->destination_reference.empty() &&
+	    !StringUtil::CIEquals(edge_table->source_reference, edge_table->destination_reference)) {
+		throw NotImplementedException(
+		    "ONE ROW PER over edge '%s' is not supported: it connects two different vertex tables ('%s' -> '%s'), and "
+		    "the per-step output is addressed by rowid within a single vertex table. Refusing rather than reporting "
+		    "steps that do not exist. Drop ONE ROW PER -- the same pattern without it is answered by the key-based "
+		    "traversal and is correct for cross-table edges.",
+		    edge_table->table_name.c_str(), edge_table->source_reference.c_str(),
+		    edge_table->destination_reference.c_str());
+	}
 	// reverse=true walks edges backwards (for left-directed patterns like
 	// (a)<-[e]-{1,3}(b)): the anchor sits on the edge's *destination* side and each
 	// step follows an edge from its dst to its src. Implemented by swapping the
@@ -2700,15 +2871,41 @@ static void AddBoundedORPRecursiveCTE(unique_ptr<SelectNode> &select_node, const
 // source vertices.  anchor_filter is a copy of any outer WHERE conjuncts that reference
 // only prev_binding — pushing them in limits the anchor to matched source rows.
 //
-// Produces columns: (src_rowid, dst_rowid, depth, visited).
-// Outer conditions added: prev_binding.rowid = cte.src_rowid,
-//                         next_binding.rowid = cte.dst_rowid,
+// Produces columns: (src_key, dst_key, depth, visited) -- vertex KEYS, not rowids.
+// Outer conditions added: prev_binding.<src_pk> = cte.src_key,
+//                         next_binding.<dst_pk> = cte.dst_key,
 //                         depth BETWEEN lower AND upper.
 // Builds a bounded variable-length reachability CTE (columns src_rowid, dst_rowid,
 // depth, visited) rooted at prev_binding's source table, registers it on
 // select_node, and returns the name of the relation to scan. Shared verbatim by
 // the mandatory path (cross join + WHERE) and OPTIONAL MATCH (LEFT JOIN) so both
 // compute reachability identically.
+//! Vertex identity for the generic traversal CTEs: the vertex KEY, never the rowid.
+//!
+//! A rowid is a position within one table. An edge whose two ends reference different
+//! vertex tables therefore puts two disjoint rowid spaces into a single column, and the
+//! traversal walks out of one table into the other as if they were the same vertex --
+//! silently returning rows that belong to an unrelated vertex, and reading past the end of
+//! the CSR arrays. Keys do not have that property: they are the graph's own identifiers.
+//!
+//! Normalised to VARCHAR because an edge's two ends need not share a column type
+//! (TAG.tagname is VARCHAR, EQUIPMENT's key is BIGINT), and the recursive CTE carries both
+//! in one column.
+static unique_ptr<ParsedExpression> VertexKeyExpr(const string &alias, const string &column) {
+	return make_uniq<CastExpression>(LogicalType::VARCHAR, make_uniq<ColumnRefExpression>(column, alias));
+}
+
+//! The same key qualified by its vertex table -- '<table>:<key>'. Used for the visited set,
+//! where two different vertex tables may legitimately carry the same key value and must
+//! still count as different vertices.
+static unique_ptr<ParsedExpression> QualifiedVertexKeyExpr(const string &table, const string &alias,
+                                                           const string &column) {
+	vector<unique_ptr<ParsedExpression>> parts;
+	parts.push_back(make_uniq<ConstantExpression>(Value(table + ":")));
+	parts.push_back(VertexKeyExpr(alias, column));
+	return make_uniq<FunctionExpression>("concat", std::move(parts));
+}
+
 static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node, const string &prev_binding,
                                             const shared_ptr<PropertyGraphTable> &edge_table, idx_t lower, idx_t upper,
                                             unique_ptr<ParsedExpression> anchor_filter, bool any_shortest,
@@ -2758,12 +2955,12 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 	auto anchor = make_uniq<SelectNode>();
 	anchor->from_table = anchor_side_table->CreateBaseTableRef(prev_binding);
 
-	auto a_src = make_uniq<ColumnRefExpression>("rowid", prev_binding);
-	a_src->alias = "src_rowid";
+	auto a_src = VertexKeyExpr(prev_binding, src_pk);
+	a_src->alias = "src_key";
 	anchor->select_list.push_back(std::move(a_src));
 
-	auto a_dst = make_uniq<ColumnRefExpression>("rowid", prev_binding);
-	a_dst->alias = "dst_rowid";
+	auto a_dst = VertexKeyExpr(prev_binding, src_pk);
+	a_dst->alias = "dst_key";
 	anchor->select_list.push_back(std::move(a_dst));
 
 	auto a_depth = make_uniq<ConstantExpression>(Value::INTEGER(0));
@@ -2772,7 +2969,7 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 
 	if (!lean) {
 		vector<unique_ptr<ParsedExpression>> lv;
-		lv.push_back(make_uniq<ColumnRefExpression>("rowid", prev_binding));
+		lv.push_back(QualifiedVertexKeyExpr(anchor_side_table->table_name, prev_binding, src_pk));
 		auto a_visited = make_uniq<FunctionExpression>("list_value", std::move(lv));
 		a_visited->alias = "visited";
 		anchor->select_list.push_back(std::move(a_visited));
@@ -2802,9 +2999,13 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 	join_mid->type = JoinType::INNER;
 	join_mid->left = std::move(cte_ref);
 	join_mid->right = std::move(mid_ref);
-	join_mid->condition = make_uniq<ComparisonExpression>(
-	    ExpressionType::COMPARE_EQUAL, make_uniq<ColumnRefExpression>("rowid", mid_alias),
-	    make_uniq<ColumnRefExpression>("dst_rowid", rec_alias));
+	// THE fix: the frontier is a key, so it is matched against the anchor-side table's key.
+	// Reading it as a rowid is what let a destination-table position be interpreted as a
+	// source-table position. A cross-table edge now simply yields nothing beyond depth 1,
+	// which is the correct answer -- there is no second hop over the same edge table.
+	join_mid->condition = make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+	                                                     VertexKeyExpr(mid_alias, src_pk),
+	                                                     make_uniq<ColumnRefExpression>("dst_key", rec_alias));
 
 	// JOIN <edge source> AS e ON e.<step-out column> = mid.src_pk
 	//
@@ -2848,12 +3049,12 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 	    make_uniq<ColumnRefExpression>(step_in_col, e_alias));
 	recursive->from_table = std::move(join_b);
 
-	auto r_src = make_uniq<ColumnRefExpression>("src_rowid", rec_alias);
-	r_src->alias = "src_rowid";
+	auto r_src = make_uniq<ColumnRefExpression>("src_key", rec_alias);
+	r_src->alias = "src_key";
 	recursive->select_list.push_back(std::move(r_src));
 
-	auto r_dst = make_uniq<ColumnRefExpression>("rowid", b_alias);
-	r_dst->alias = "dst_rowid";
+	auto r_dst = VertexKeyExpr(b_alias, dst_pk);
+	r_dst->alias = "dst_key";
 	recursive->select_list.push_back(std::move(r_dst));
 
 	{
@@ -2867,7 +3068,7 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 	if (!lean) {
 		vector<unique_ptr<ParsedExpression>> app_args;
 		app_args.push_back(make_uniq<ColumnRefExpression>("visited", rec_alias));
-		app_args.push_back(make_uniq<ColumnRefExpression>("rowid", b_alias));
+		app_args.push_back(QualifiedVertexKeyExpr(far_side_table->table_name, b_alias, dst_pk));
 		auto r_visited = make_uniq<FunctionExpression>("list_append", std::move(app_args));
 		r_visited->alias = "visited";
 		recursive->select_list.push_back(std::move(r_visited));
@@ -2883,7 +3084,7 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 			// Lean mode drops this — UNION-distinct + the depth bound handle cycles.
 			vector<unique_ptr<ParsedExpression>> lc_args;
 			lc_args.push_back(make_uniq<ColumnRefExpression>("visited", rec_alias));
-			lc_args.push_back(make_uniq<ColumnRefExpression>("rowid", b_alias));
+			lc_args.push_back(QualifiedVertexKeyExpr(far_side_table->table_name, b_alias, dst_pk));
 			auto lc_fn = make_uniq<FunctionExpression>("list_contains", std::move(lc_args));
 			rec_where.push_back(make_uniq<OperatorExpression>(ExpressionType::OPERATOR_NOT, std::move(lc_fn)));
 		}
@@ -2897,8 +3098,8 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 	rec_cte->union_all = !lean;
 	rec_cte->left = std::move(anchor);
 	rec_cte->right = std::move(recursive);
-	rec_cte->aliases = lean ? vector<string> {"src_rowid", "dst_rowid", "depth"}
-	                        : vector<string> {"src_rowid", "dst_rowid", "depth", "visited"};
+	rec_cte->aliases = lean ? vector<string> {"src_key", "dst_key", "depth"}
+	                        : vector<string> {"src_key", "dst_key", "depth", "visited"};
 
 	auto cte_stmt = make_uniq<SelectStatement>();
 	cte_stmt->node = std::move(rec_cte);
@@ -2924,8 +3125,8 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 		sp_from->table_name = cte_name;
 		sp->from_table = std::move(sp_from);
 
-		sp->select_list.push_back(make_uniq<ColumnRefExpression>("src_rowid"));
-		sp->select_list.push_back(make_uniq<ColumnRefExpression>("dst_rowid"));
+		sp->select_list.push_back(make_uniq<ColumnRefExpression>("src_key"));
+		sp->select_list.push_back(make_uniq<ColumnRefExpression>("dst_key"));
 		{
 			vector<unique_ptr<ParsedExpression>> min_args;
 			min_args.push_back(make_uniq<ColumnRefExpression>("depth"));
@@ -2944,8 +3145,8 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 		// to stay equivalent, but keep the trivial depth-0 self (which {0,hi} wants).
 		{
 			auto is_self = make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
-			                                               make_uniq<ColumnRefExpression>("src_rowid"),
-			                                               make_uniq<ColumnRefExpression>("dst_rowid"));
+			                                               make_uniq<ColumnRefExpression>("src_key"),
+			                                               make_uniq<ColumnRefExpression>("dst_key"));
 			auto deep = make_uniq<ComparisonExpression>(ExpressionType::COMPARE_GREATERTHAN,
 			                                            make_uniq<ColumnRefExpression>("depth"),
 			                                            make_uniq<ConstantExpression>(Value::INTEGER(0)));
@@ -2957,8 +3158,8 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 		}
 		sp->where_clause = std::move(sp_where);
 
-		sp->groups.group_expressions.push_back(make_uniq<ColumnRefExpression>("src_rowid"));
-		sp->groups.group_expressions.push_back(make_uniq<ColumnRefExpression>("dst_rowid"));
+		sp->groups.group_expressions.push_back(make_uniq<ColumnRefExpression>("src_key"));
+		sp->groups.group_expressions.push_back(make_uniq<ColumnRefExpression>("dst_key"));
 		GroupingSet sp_grouping_set;
 		sp_grouping_set.insert(ProjectionIndex(0));
 		sp_grouping_set.insert(ProjectionIndex(1));
@@ -3036,20 +3237,25 @@ static string BuildExactLengthABIScanCTE(unique_ptr<SelectNode> &select_node, co
 	    make_uniq<ColumnRefExpression>(far_col, fp_alias));
 	scan->from_table = std::move(join_far);
 
-	auto s_src = make_uniq<ColumnRefExpression>("rowid", prev_binding);
-	s_src->alias = "src_rowid";
+	auto s_src = VertexKeyExpr(prev_binding, near_pk);
+	s_src->alias = "src_key";
 	scan->select_list.push_back(std::move(s_src));
-	auto s_dst = make_uniq<ColumnRefExpression>("rowid", far_alias);
-	s_dst->alias = "dst_rowid";
+	auto s_dst = VertexKeyExpr(far_alias, far_pk);
+	s_dst->alias = "dst_key";
 	scan->select_list.push_back(std::move(s_dst));
 	auto s_depth = make_uniq<ConstantExpression>(Value::INTEGER(static_cast<int32_t>(hops)));
 	s_depth->alias = "depth";
 	scan->select_list.push_back(std::move(s_depth));
 
 	vector<unique_ptr<ParsedExpression>> where_parts;
-	where_parts.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_NOTEQUAL,
-	                                                      make_uniq<ColumnRefExpression>("rowid", prev_binding),
-	                                                      make_uniq<ColumnRefExpression>("rowid", far_alias)));
+	// Exclude a path that ends where it started. Only meaningful when both ends are the
+	// same vertex table -- comparing a near rowid to a far rowid across two different
+	// tables compared positions, not vertices, and dropped rows whose positions coincided.
+	if (StringUtil::CIEquals(near_table->table_name, far_table->table_name)) {
+		where_parts.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_NOTEQUAL,
+		                                                      VertexKeyExpr(prev_binding, near_pk),
+		                                                      VertexKeyExpr(far_alias, far_pk)));
+	}
 	if (anchor_filter) {
 		where_parts.push_back(std::move(anchor_filter));
 	}
@@ -3094,12 +3300,16 @@ static void AddBoundedVLPathFinding(unique_ptr<SelectNode> &select_node,
 	}
 
 	// ── Outer WHERE conditions ────────────────────────────────────────────────────
+	// Bound by vertex KEY on both ends, matching the CTE's contract. Binding by rowid was
+	// only ever correct when the edge's two ends referenced the same vertex table.
+	const string &outer_src_pk = reverse ? edge_table->destination_pk[0] : edge_table->source_pk[0];
+	const string &outer_dst_pk = reverse ? edge_table->source_pk[0] : edge_table->destination_pk[0];
 	conditions.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
-	    make_uniq<ColumnRefExpression>("rowid", prev_binding),
-	    make_uniq<ColumnRefExpression>("src_rowid", cte_alias)));
+	    VertexKeyExpr(prev_binding, outer_src_pk),
+	    make_uniq<ColumnRefExpression>("src_key", cte_alias)));
 	conditions.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
-	    make_uniq<ColumnRefExpression>("rowid", next_binding),
-	    make_uniq<ColumnRefExpression>("dst_rowid", cte_alias)));
+	    VertexKeyExpr(next_binding, outer_dst_pk),
+	    make_uniq<ColumnRefExpression>("dst_key", cte_alias)));
 	if (!any_shortest) {
 		// For ANY SHORTEST this is already applied inside the grouping CTE above.
 		conditions.push_back(make_uniq<BetweenExpression>(
@@ -3124,13 +3334,15 @@ static void AddBoundedVLPathFindingOptional(unique_ptr<SelectNode> &select_node,
 	                                                       std::move(anchor_filter), /*any_shortest=*/false, reverse);
 	const string cte_alias = scan_name + "_optscan";
 
-	// LEFT JOIN reachability CTE ON prev.rowid = cte.src_rowid AND depth BETWEEN lo AND hi
+	// LEFT JOIN reachability CTE ON prev.<key> = cte.src_key AND depth BETWEEN lo AND hi
+	const string &opt_src_pk = reverse ? edge_table->destination_pk[0] : edge_table->source_pk[0];
+	const string &opt_dst_pk = reverse ? edge_table->source_pk[0] : edge_table->destination_pk[0];
 	auto cte_scan = make_uniq<BaseTableRef>();
 	cte_scan->table_name = scan_name;
 	cte_scan->alias = cte_alias;
 	unique_ptr<ParsedExpression> cte_on = make_uniq<ComparisonExpression>(
-	    ExpressionType::COMPARE_EQUAL, make_uniq<ColumnRefExpression>("rowid", prev_binding),
-	    make_uniq<ColumnRefExpression>("src_rowid", cte_alias));
+	    ExpressionType::COMPARE_EQUAL, VertexKeyExpr(prev_binding, opt_src_pk),
+	    make_uniq<ColumnRefExpression>("src_key", cte_alias));
 	cte_on = make_uniq<ConjunctionExpression>(
 	    ExpressionType::CONJUNCTION_AND, std::move(cte_on),
 	    make_uniq<BetweenExpression>(make_uniq<ColumnRefExpression>("depth", cte_alias),
@@ -3143,10 +3355,10 @@ static void AddBoundedVLPathFindingOptional(unique_ptr<SelectNode> &select_node,
 	cte_join->condition = std::move(cte_on);
 	select_node->from_table = std::move(cte_join);
 
-	// LEFT JOIN next vertex ON next.rowid = cte.dst_rowid (+ optional label)
+	// LEFT JOIN next vertex ON next.<key> = cte.dst_key (+ optional label)
 	unique_ptr<ParsedExpression> vertex_on = make_uniq<ComparisonExpression>(
-	    ExpressionType::COMPARE_EQUAL, make_uniq<ColumnRefExpression>("rowid", next_binding),
-	    make_uniq<ColumnRefExpression>("dst_rowid", cte_alias));
+	    ExpressionType::COMPARE_EQUAL, VertexKeyExpr(next_binding, opt_dst_pk),
+	    make_uniq<ColumnRefExpression>("dst_key", cte_alias));
 	if (next_elem && !next_elem->label.empty()) {
 		vector<unique_ptr<ParsedExpression>> label_conds;
 		PGQMatchFunction::CheckInheritance(next_vertex_table, next_elem, label_conds);
@@ -3169,8 +3381,12 @@ void PGQMatchFunction::AddPathFinding(unique_ptr<SelectNode> &select_node,
                                       const string &edge_binding, const string &next_binding,
                                       const shared_ptr<PropertyGraphTable> &edge_table,
                                       CreatePropertyGraphInfo &pg_table, SubPath *subpath, PGQMatchType edge_type,
+                                      int32_t &csr_id_counter, int32_t &csr_slot,
                                       unique_ptr<ParsedExpression> anchor_filter, bool any_shortest,
                                       const PGQABITraversalPlan *abi_plan) {
+	// The bounded route below is key-addressed and handles cross-table edges correctly, so
+	// it is deliberately NOT guarded. Only the CSR fallback further down still needs the
+	// cross-table refusal, and it carries its own call.
 	// For finite bounded directed edges, use a recursive CTE instead of CSR+iterativelength.
 	// This reads only the reachable subgraph rather than the full edge/vertex tables,
 	// which is critical for large remote (httpfs) graphs in browser or constrained environments.
@@ -3183,13 +3399,20 @@ void PGQMatchFunction::AddPathFinding(unique_ptr<SelectNode> &select_node,
 		return;
 	}
 
-	// Fallback: CSR+iterativelength for unbounded paths or non-directed edges.
+	// Fallback: CSR+iterativelength for unbounded paths or non-directed edges. The CSR
+	// collides id spaces at ANY depth, not just >= 2, so it is guarded unconditionally.
+	RejectCrossTableCSR(edge_table, subpath->lower, subpath->upper);
+	// One slot per select node, shared with the iterativelength() call below and with any
+	// other code that reuses this node's "cte1", so all of them name the same entry.
+	if (csr_slot < 0) {
+		csr_slot = csr_id_counter++;
+	}
 	if (select_node->cte_map.map.find("cte1") == select_node->cte_map.map.end()) {
 		if (edge_type == PGQMatchType::MATCH_EDGE_RIGHT) {
 			select_node->cte_map.map["cte1"] =
-			    CreateDirectedCSRCTE(edge_table, prev_binding, edge_binding, next_binding);
+			    CreateDirectedCSRCTE(edge_table, prev_binding, edge_binding, next_binding, csr_slot);
 		} else if (edge_type == PGQMatchType::MATCH_EDGE_ANY) {
-			select_node->cte_map.map["cte1"] = CreateUndirectedCSRCTE(edge_table, select_node);
+			select_node->cte_map.map["cte1"] = CreateUndirectedCSRCTE(edge_table, select_node, csr_slot);
 		} else {
 			throw NotImplementedException("Cannot do shortest path for edge type %s",
 			                              edge_type == PGQMatchType::MATCH_EDGE_LEFT ? "MATCH_EDGE_LEFT"
@@ -3208,7 +3431,7 @@ void PGQMatchFunction::AddPathFinding(unique_ptr<SelectNode> &select_node,
 	} else {
 		select_node->from_table = std::move(temp_cte_select_subquery);
 	}
-	conditions.push_back(AddPathQuantifierCondition(prev_binding, next_binding, edge_table, subpath));
+	conditions.push_back(AddPathQuantifierCondition(prev_binding, next_binding, edge_table, subpath, csr_slot));
 }
 
 void PGQMatchFunction::AddPathModeFilter(PGQPathMode mode, const string &path_cte,
@@ -3252,24 +3475,35 @@ void PGQMatchFunction::AddTraversalPathFinding(
 	auto anchor = make_uniq<SelectNode>();
 	anchor->from_table = prev_vertex_table->CreateBaseTableRef();
 
-	auto a_src_rowid = make_uniq<ColumnRefExpression>("rowid");
-	a_src_rowid->alias = "src_rowid";
-	anchor->select_list.push_back(std::move(a_src_rowid));
+	// Keys, not rowids. cur_pk was already a key -- the traversal itself joins
+	// __edges.src_pk = t.cur_pk -- but src_rowid/cur_rowid/visited were positions, and
+	// cur_rowid in particular held a PREV-table position at depth 0 and a NEXT-table
+	// position afterwards. Two tables, one column: the same collision fixed in
+	// BuildBoundedVLReachabilityCTE. cur_key replaces cur_rowid outright.
+	// The anchor's FROM carries no alias, so these column refs are unqualified.
+	auto a_src_key = make_uniq<CastExpression>(LogicalType::VARCHAR, make_uniq<ColumnRefExpression>(src_pk_col));
+	a_src_key->alias = "src_key";
+	anchor->select_list.push_back(std::move(a_src_key));
 
 	auto a_cur_pk = make_uniq<ColumnRefExpression>(src_pk_col);
 	a_cur_pk->alias = "cur_pk";
 	anchor->select_list.push_back(std::move(a_cur_pk));
 
-	auto a_cur_rowid = make_uniq<ColumnRefExpression>("rowid");
-	a_cur_rowid->alias = "cur_rowid";
-	anchor->select_list.push_back(std::move(a_cur_rowid));
+	auto a_cur_key = make_uniq<CastExpression>(LogicalType::VARCHAR, make_uniq<ColumnRefExpression>(src_pk_col));
+	a_cur_key->alias = "cur_key";
+	anchor->select_list.push_back(std::move(a_cur_key));
 
 	auto a_depth = make_uniq<ConstantExpression>(Value::INTEGER(0));
 	a_depth->alias = "depth";
 	anchor->select_list.push_back(std::move(a_depth));
 
 	vector<unique_ptr<ParsedExpression>> lv_args;
-	lv_args.push_back(make_uniq<ColumnRefExpression>("rowid"));
+	{
+		vector<unique_ptr<ParsedExpression>> qk;
+		qk.push_back(make_uniq<ConstantExpression>(Value(prev_vertex_table->table_name + ":")));
+		qk.push_back(make_uniq<CastExpression>(LogicalType::VARCHAR, make_uniq<ColumnRefExpression>(src_pk_col)));
+		lv_args.push_back(make_uniq<FunctionExpression>("concat", std::move(qk)));
+	}
 	auto a_visited = make_uniq<FunctionExpression>("list_value", std::move(lv_args));
 	a_visited->alias = "visited";
 	anchor->select_list.push_back(std::move(a_visited));
@@ -3302,17 +3536,17 @@ void PGQMatchFunction::AddTraversalPathFinding(
 	recursive->from_table = std::move(join_dst);
 
 	// SELECT t.src_rowid, b.<dst_pk_col>, b.rowid, t.depth + 1, list_append(t.visited, b.rowid)
-	auto r_src_rowid = make_uniq<ColumnRefExpression>("src_rowid", "t");
-	r_src_rowid->alias = "src_rowid";
-	recursive->select_list.push_back(std::move(r_src_rowid));
+	auto r_src_key = make_uniq<ColumnRefExpression>("src_key", "t");
+	r_src_key->alias = "src_key";
+	recursive->select_list.push_back(std::move(r_src_key));
 
 	auto r_cur_pk = make_uniq<ColumnRefExpression>(dst_pk_col, "b");
 	r_cur_pk->alias = "cur_pk";
 	recursive->select_list.push_back(std::move(r_cur_pk));
 
-	auto r_cur_rowid = make_uniq<ColumnRefExpression>("rowid", "b");
-	r_cur_rowid->alias = "cur_rowid";
-	recursive->select_list.push_back(std::move(r_cur_rowid));
+	auto r_cur_key = VertexKeyExpr("b", dst_pk_col);
+	r_cur_key->alias = "cur_key";
+	recursive->select_list.push_back(std::move(r_cur_key));
 
 	vector<unique_ptr<ParsedExpression>> add_args;
 	add_args.push_back(make_uniq<ColumnRefExpression>("depth", "t"));
@@ -3323,7 +3557,7 @@ void PGQMatchFunction::AddTraversalPathFinding(
 
 	vector<unique_ptr<ParsedExpression>> app_args;
 	app_args.push_back(make_uniq<ColumnRefExpression>("visited", "t"));
-	app_args.push_back(make_uniq<ColumnRefExpression>("rowid", "b"));
+	app_args.push_back(QualifiedVertexKeyExpr(next_vertex_table->table_name, "b", dst_pk_col));
 	auto r_visited = make_uniq<FunctionExpression>("list_append", std::move(app_args));
 	r_visited->alias = "visited";
 	recursive->select_list.push_back(std::move(r_visited));
@@ -3335,7 +3569,7 @@ void PGQMatchFunction::AddTraversalPathFinding(
 	    make_uniq<ConstantExpression>(Value::INTEGER(static_cast<int32_t>(upper)))));
 	vector<unique_ptr<ParsedExpression>> lc_args;
 	lc_args.push_back(make_uniq<ColumnRefExpression>("visited", "t"));
-	lc_args.push_back(make_uniq<ColumnRefExpression>("rowid", "b"));
+	lc_args.push_back(QualifiedVertexKeyExpr(next_vertex_table->table_name, "b", dst_pk_col));
 	auto lc_fn = make_uniq<FunctionExpression>("list_contains", std::move(lc_args));
 	rec_where.push_back(make_uniq<OperatorExpression>(ExpressionType::OPERATOR_NOT, std::move(lc_fn)));
 	recursive->where_clause = CreateWhereClause(rec_where);
@@ -3346,7 +3580,7 @@ void PGQMatchFunction::AddTraversalPathFinding(
 	rec_cte->union_all = true;
 	rec_cte->left = std::move(anchor);
 	rec_cte->right = std::move(recursive);
-	rec_cte->aliases = {"src_rowid", "cur_pk", "cur_rowid", "depth", "visited"};
+	rec_cte->aliases = {"src_key", "cur_pk", "cur_key", "depth", "visited"};
 
 	auto cte_stmt = make_uniq<SelectStatement>();
 	cte_stmt->node = std::move(rec_cte);
@@ -3367,13 +3601,13 @@ void PGQMatchFunction::AddTraversalPathFinding(
 		select_node->from_table = std::move(cte_scan);
 	}
 
-	// Outer WHERE: tie CTE rows to the vertex bindings and filter by depth
+	// Outer WHERE: tie CTE rows to the vertex bindings by KEY and filter by depth
 	conditions.push_back(make_uniq<ComparisonExpression>(
-	    ExpressionType::COMPARE_EQUAL, make_uniq<ColumnRefExpression>("rowid", prev_binding),
-	    make_uniq<ColumnRefExpression>("src_rowid", cte_alias)));
+	    ExpressionType::COMPARE_EQUAL, VertexKeyExpr(prev_binding, src_pk_col),
+	    make_uniq<ColumnRefExpression>("src_key", cte_alias)));
 	conditions.push_back(make_uniq<ComparisonExpression>(
-	    ExpressionType::COMPARE_EQUAL, make_uniq<ColumnRefExpression>("rowid", next_binding),
-	    make_uniq<ColumnRefExpression>("cur_rowid", cte_alias)));
+	    ExpressionType::COMPARE_EQUAL, VertexKeyExpr(next_binding, dst_pk_col),
+	    make_uniq<ColumnRefExpression>("cur_key", cte_alias)));
 	conditions.push_back(make_uniq<BetweenExpression>(
 	    make_uniq<ColumnRefExpression>("depth", cte_alias),
 	    make_uniq<ConstantExpression>(Value::INTEGER(static_cast<int32_t>(lower))),
@@ -3382,7 +3616,8 @@ void PGQMatchFunction::AddTraversalPathFinding(
 
 void PGQMatchFunction::CheckNamedSubpath(SubPath &subpath, MatchExpression &original_ref,
                                          CreatePropertyGraphInfo &pg_table, unique_ptr<SelectNode> &final_select_node,
-                                         vector<unique_ptr<ParsedExpression>> &conditions, bool all_shortest) {
+                                         vector<unique_ptr<ParsedExpression>> &conditions, int32_t &csr_id_counter,
+                                         int32_t &csr_slot, bool all_shortest) {
 	for (idx_t idx_i = 0; idx_i < original_ref.column_list.size(); idx_i++) {
 		auto parsed_ref = dynamic_cast<FunctionExpression *>(original_ref.column_list[idx_i].get());
 		if (parsed_ref == nullptr) {
@@ -3402,7 +3637,8 @@ void PGQMatchFunction::CheckNamedSubpath(SubPath &subpath, MatchExpression &orig
 			// Check subpath name matches the column referenced in the function -->
 			// element_id(named_subpath)
 			auto shortest_path_function = CreatePathFindingFunction(subpath.path_list, pg_table, subpath.path_variable,
-			                                                        final_select_node, conditions, all_shortest);
+			                                                        final_select_node, conditions, csr_id_counter,
+			                                                        csr_slot, all_shortest);
 
 			if (column_alias.empty()) {
 				shortest_path_function->alias = "element_id(" + subpath.path_variable + ")";
@@ -3414,7 +3650,8 @@ void PGQMatchFunction::CheckNamedSubpath(SubPath &subpath, MatchExpression &orig
 			                                std::move(shortest_path_function));
 		} else if (parsed_ref->function_name == "path_length") {
 			auto shortest_path_function = CreatePathFindingFunction(subpath.path_list, pg_table, subpath.path_variable,
-			                                                        final_select_node, conditions, all_shortest);
+			                                                        final_select_node, conditions, csr_id_counter,
+			                                                        csr_slot, all_shortest);
 			auto path_len_children = vector<unique_ptr<ParsedExpression>>();
 			path_len_children.push_back(std::move(shortest_path_function));
 			auto path_len = make_uniq<FunctionExpression>("len", std::move(path_len_children));
@@ -3431,7 +3668,8 @@ void PGQMatchFunction::CheckNamedSubpath(SubPath &subpath, MatchExpression &orig
 		} else if (parsed_ref->function_name == "vertices" || parsed_ref->function_name == "edges") {
 			auto list_slice_children = vector<unique_ptr<ParsedExpression>>();
 			auto shortest_path_function = CreatePathFindingFunction(subpath.path_list, pg_table, subpath.path_variable,
-			                                                        final_select_node, conditions, all_shortest);
+			                                                        final_select_node, conditions, csr_id_counter,
+			                                                        csr_slot, all_shortest);
 			list_slice_children.push_back(std::move(shortest_path_function));
 
 			if (parsed_ref->function_name == "vertices") {
@@ -3478,13 +3716,17 @@ void PGQMatchFunction::CheckNamedSubpath(SubPath &subpath, MatchExpression &orig
 				if (edge_elem->match_type != PGQMatchType::MATCH_EDGE_RIGHT) {
 					throw NotImplementedException("COST() is only supported for right-directed edges (->) currently");
 				}
+				csr_slot = csr_id_counter++;
 				final_select_node->cte_map.map["cte1"] = CreateWeightedDirectedCSRCTE(
 				    edge_table, prev_elem->variable_binding, edge_elem->variable_binding,
-				    next_elem->variable_binding, edge_sub->cost_expr->Copy());
+				    next_elem->variable_binding, edge_sub->cost_expr->Copy(), csr_slot);
 			}
-			// Generate cheapest_path_length(0, v_size, src_rowid, dst_rowid).
+			// Generate cheapest_path_length(<slot>, v_size, src_rowid, dst_rowid).
 			vector<unique_ptr<ParsedExpression>> cpl_args;
-			cpl_args.push_back(make_uniq<ConstantExpression>(Value::INTEGER(0)));
+			// Reuses whatever slot built "cte1" for this select node -- the CTE is shared by
+			// name, so the id must be shared too. Allocating a second one here pointed
+			// cheapest_path_length() at an empty registry entry ("Invalid ID").
+			cpl_args.push_back(make_uniq<ConstantExpression>(Value::INTEGER(csr_slot)));
 			cpl_args.push_back(GetCountTable(edge_table->source_pg_table, prev_elem->variable_binding,
 			                                 edge_table->source_pk[0]));
 			cpl_args.push_back(make_uniq<ColumnRefExpression>("rowid", prev_elem->variable_binding));
@@ -3503,8 +3745,9 @@ void PGQMatchFunction::ProcessPathList(vector<unique_ptr<PathReference>> &path_l
                                        unique_ptr<SelectNode> &final_select_node,
                                        case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map,
                                        CreatePropertyGraphInfo &pg_table, int32_t &extra_alias_counter,
-                                       MatchExpression &original_ref, bool all_shortest, bool any_shortest,
-                                       const PGQPathTableCache *path_table_cache) {
+                                       MatchExpression &original_ref, int32_t &csr_id_counter, int32_t &csr_slot,
+                                       bool all_shortest, bool any_shortest,
+                                       const PGQPathTableCache *path_table_cache, int64_t vl_fallback_budget) {
 	PathElement *previous_vertex_element = GetPathElement(path_list[0]);
 	if (!previous_vertex_element) {
 		const auto previous_vertex_subpath = reinterpret_cast<SubPath *>(path_list[0].get());
@@ -3513,22 +3756,74 @@ void PGQMatchFunction::ProcessPathList(vector<unique_ptr<PathReference>> &path_l
 		}
 		if (!previous_vertex_subpath->path_variable.empty() && previous_vertex_subpath->path_list.size() > 1) {
 			CheckNamedSubpath(*previous_vertex_subpath, original_ref, pg_table, final_select_node, conditions,
-			                  all_shortest);
+			                  csr_id_counter, csr_slot, all_shortest);
 		}
 		if (previous_vertex_subpath->path_list.size() == 1) {
 			previous_vertex_element = GetPathElement(previous_vertex_subpath->path_list[0]);
 		} else {
 			// Add the shortest path if the name is found in the column_list
 			ProcessPathList(previous_vertex_subpath->path_list, conditions, final_select_node, alias_map, pg_table,
-			                extra_alias_counter, original_ref, all_shortest, any_shortest, path_table_cache);
+			                extra_alias_counter, original_ref, csr_id_counter, csr_slot, all_shortest, any_shortest,
+			                path_table_cache, vl_fallback_budget);
 			return;
 		}
 	}
+	// A vertex written without a label is not automatically ambiguous: a concrete edge label
+	// declares which table each of its ends references, so (t:Tag)-[:HasWorkorder]->(x) and
+	// its anonymous form ->() both pin x to one table. Without this the generic path refused
+	// them outright ("Unlabeled vertex pattern is ambiguous ... Specify a label"), even
+	// though the pattern determines the answer. Keyed by element pointer rather than by
+	// binding so an anonymous vertex, which has no binding to look up, is covered too.
+	unordered_map<PathElement *, shared_ptr<PropertyGraphTable>> edge_determined_tables;
+	for (idx_t idx = 1; idx + 1 < path_list.size(); idx += 2) {
+		PathElement *edge = GetPathElement(path_list[idx]);
+		if (!edge) {
+			auto *edge_subpath = reinterpret_cast<SubPath *>(path_list[idx].get());
+			if (edge_subpath->path_list.size() != 1) {
+				continue;
+			}
+			edge = GetPathElement(edge_subpath->path_list[0]);
+		}
+		PathElement *prev = GetPathElement(path_list[idx - 1]);
+		PathElement *next = GetPathElement(path_list[idx + 1]);
+		if (!edge || !prev || !next || edge->label.empty() || IsCompoundLabel(edge->label)) {
+			continue; // no single edge table, so no single endpoint table either
+		}
+		const bool right = edge->match_type == PGQMatchType::MATCH_EDGE_RIGHT;
+		const bool left = edge->match_type == PGQMatchType::MATCH_EDGE_LEFT;
+		if (!right && !left) {
+			continue; // undirected: either end could be either table
+		}
+		shared_ptr<PropertyGraphTable> edge_table;
+		try {
+			edge_table = ResolveTable(edge->label, PGQMatchType::MATCH_EDGE_RIGHT, pg_table);
+		} catch (...) {
+			continue;
+		}
+		if (!edge_table) {
+			continue;
+		}
+		if (prev->label.empty() && edge_table->source_pg_table && right) {
+			edge_determined_tables[prev] = edge_table->source_pg_table;
+		} else if (prev->label.empty() && edge_table->destination_pg_table && left) {
+			edge_determined_tables[prev] = edge_table->destination_pg_table;
+		}
+		if (next->label.empty() && edge_table->destination_pg_table && right) {
+			edge_determined_tables[next] = edge_table->destination_pg_table;
+		} else if (next->label.empty() && edge_table->source_pg_table && left) {
+			edge_determined_tables[next] = edge_table->source_pg_table;
+		}
+	}
+
 	auto resolve_vertex_table = [&](PathElement *element) {
 		if (element->label.empty()) {
 			auto existing = alias_map.find(element->variable_binding);
 			if (existing != alias_map.end()) {
 				return existing->second;
+			}
+			auto determined = edge_determined_tables.find(element);
+			if (determined != edge_determined_tables.end()) {
+				return determined->second;
 			}
 		}
 		return ResolveTable(element->label, element->match_type, pg_table);
@@ -3627,13 +3922,15 @@ void PGQMatchFunction::ProcessPathList(vector<unique_ptr<PathReference>> &path_l
 							if (final_select_node->cte_map.map.find("cte1") ==
 							    final_select_node->cte_map.map.end()) {
 								if (edge_element->match_type == PGQMatchType::MATCH_EDGE_RIGHT) {
+									csr_slot = csr_id_counter++;
 									final_select_node->cte_map.map["cte1"] = CreateDirectedCSRCTE(
 									    edge_table, previous_vertex_element->variable_binding,
 									    edge_element->variable_binding,
-									    next_vertex_element->variable_binding);
+									    next_vertex_element->variable_binding, csr_slot);
 								} else if (edge_element->match_type == PGQMatchType::MATCH_EDGE_ANY) {
+									csr_slot = csr_id_counter++;
 									final_select_node->cte_map.map["cte1"] =
-									    CreateUndirectedCSRCTE(edge_table, final_select_node);
+									    CreateUndirectedCSRCTE(edge_table, final_select_node, csr_slot);
 								} else {
 									throw NotImplementedException(
 									    "ONE ROW PER path finding is not supported for "
@@ -3642,7 +3939,7 @@ void PGQMatchFunction::ProcessPathList(vector<unique_ptr<PathReference>> &path_l
 							}
 							vector<unique_ptr<ParsedExpression>> pfc;
 							final_select_node->cte_map.map[kPathCTE] = GenerateShortestPathCTE(
-							    pg_table, edge_subpath, previous_vertex_element, next_vertex_element, pfc,
+							    pg_table, edge_subpath, previous_vertex_element, next_vertex_element, pfc, csr_slot,
 							    all_shortest);
 						}
 					}
@@ -3661,10 +3958,15 @@ void PGQMatchFunction::ProcessPathList(vector<unique_ptr<PathReference>> &path_l
 					const PGQABITraversalPlan abi_plan =
 					    ResolveABITraversalPlan(path_table_cache, pg_table.property_graph_name, edge_table,
 					                            edge_subpath->lower, edge_subpath->upper, any_shortest);
+					// Cost the fallback before building it. Everything needed is known here:
+					// whether ABI covers the traversal, how many edge families the label
+					// expression admits, and how large each of those families is.
+					CheckVLFallbackBudget(vl_fallback_budget, path_table_cache, pg_table, edge_element->label,
+					                      edge_subpath->lower, edge_subpath->upper, &abi_plan);
 					AddPathFinding(final_select_node, conditions, previous_vertex_element->variable_binding,
 					               edge_element->variable_binding, next_vertex_element->variable_binding,
-					               edge_table, pg_table, edge_subpath, edge_element->match_type,
-					               std::move(anchor_filter), any_shortest, &abi_plan);
+					               edge_table, pg_table, edge_subpath, edge_element->match_type, csr_id_counter,
+					               csr_slot, std::move(anchor_filter), any_shortest, &abi_plan);
 					// AddPathModeFilter references the shortest_path_cte produced by the CSR path.
 					// The recursive-CTE path (finite bounded directed) already prevents vertex revisits
 					// via list_contains cycle detection, so skip the filter there.
@@ -4094,7 +4396,8 @@ void PGQMatchFunction::ProcessOptionalPathList(
 
 void PGQMatchFunction::PopulateGraphTableAliasMap(
     const CreatePropertyGraphInfo &pg_table, const unique_ptr<PathReference> &path_reference,
-    case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_to_vertex_and_edge_tables) {
+    case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_to_vertex_and_edge_tables,
+    case_insensitive_set_t *stub_bindings) {
 	PathElement *path_elem = GetPathElement(path_reference);
 
 	// Populate binding from PathElement.
@@ -4143,8 +4446,13 @@ void PGQMatchFunction::PopulateGraphTableAliasMap(
 				alias_to_vertex_and_edge_tables[path_elem->variable_binding] = tables[0];
 			} else if (!path_elem->variable_binding.empty() && !tables.empty()) {
 				// Named unlabeled: TryPathTableRewrite handles enumeration.
-				// Register first table as stub so column validation works.
+				// Register first table as stub so column validation works. Record it as a
+				// stub too -- this table is an arbitrary placeholder, and anything that
+				// reports the binding's identity must not read it as the answer.
 				alias_to_vertex_and_edge_tables[path_elem->variable_binding] = tables[0];
+				if (stub_bindings) {
+					stub_bindings->insert(path_elem->variable_binding);
+				}
 			}
 			// Anonymous unlabeled (no variable_binding): nothing to register.
 		}
@@ -4156,19 +4464,85 @@ void PGQMatchFunction::PopulateGraphTableAliasMap(
 	D_ASSERT(sub_path != nullptr);
 	const auto &path_list = sub_path->path_list;
 	for (const auto &cur_path : path_list) {
-		PopulateGraphTableAliasMap(pg_table, cur_path, alias_to_vertex_and_edge_tables);
+		PopulateGraphTableAliasMap(pg_table, cur_path, alias_to_vertex_and_edge_tables, stub_bindings);
+	}
+}
+
+//! Upgrade stub registrations that the pattern actually determines.
+//!
+//! A vertex written without a label is not necessarily of unknown label: in
+//! (t:TAG)-[:HAS_WORKORDER]->(x) the edge is declared to end at one vertex table, so x is
+//! a WORK_ORDER and saying so is not a guess. Resolving it here is what makes label(x) and
+//! x.<property> work on the shape a user would naturally write, instead of reporting the
+//! arbitrary placeholder table that was registered for column validation.
+//!
+//! Only concrete single edge labels qualify. An unlabeled or compound edge can end at
+//! several tables, so the binding stays a stub and its identity stays unknown.
+static void ResolveStubBindingsFromEdges(const CreatePropertyGraphInfo &pg_table,
+                                         const vector<unique_ptr<PathReference>> &path_elements,
+                                         case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map,
+                                         case_insensitive_set_t &stub_bindings) {
+	if (stub_bindings.empty()) {
+		return;
+	}
+	// Flatten one level: a quantified segment carries its edge in a SubPath, and the
+	// vertices around it are siblings in this same list.
+	vector<PathElement *> flat;
+	for (const auto &ref : path_elements) {
+		flat.push_back(PGQMatchFunction::GetPathElement(ref));
+	}
+	for (idx_t idx = 1; idx + 1 < flat.size(); idx++) {
+		PathElement *edge = flat[idx];
+		PathElement *prev = flat[idx - 1];
+		PathElement *next = flat[idx + 1];
+		if (!edge || !prev || !next) {
+			continue;
+		}
+		if (edge->label.empty() || IsCompoundLabel(edge->label)) {
+			continue; // several possible endpoint tables -- identity genuinely unknown
+		}
+		auto edge_entry = pg_table.label_map.find(edge->label);
+		if (edge_entry == pg_table.label_map.end()) {
+			continue;
+		}
+		const auto &edge_table = edge_entry->second;
+		// Which side of the edge each vertex sits on depends on the arrow direction.
+		const bool right = edge->match_type == PGQMatchType::MATCH_EDGE_RIGHT;
+		const bool left = edge->match_type == PGQMatchType::MATCH_EDGE_LEFT;
+		if (!right && !left) {
+			continue; // undirected: either endpoint table is possible
+		}
+		auto resolve = [&](PathElement *vertex, const shared_ptr<PropertyGraphTable> &table) {
+			if (!vertex || !table || vertex->variable_binding.empty()) {
+				return;
+			}
+			if (stub_bindings.find(vertex->variable_binding) == stub_bindings.end()) {
+				return; // labelled explicitly, or already resolved
+			}
+			alias_map[vertex->variable_binding] = table;
+			stub_bindings.erase(vertex->variable_binding);
+		};
+		resolve(right ? prev : next, edge_table->source_pg_table);
+		resolve(right ? next : prev, edge_table->destination_pg_table);
 	}
 }
 
 case_insensitive_map_t<shared_ptr<PropertyGraphTable>>
 PGQMatchFunction::PopulateGraphTableAliasMap(const CreatePropertyGraphInfo &pg_table,
-                                             const MatchExpression &match_expr) {
+                                             const MatchExpression &match_expr,
+                                             case_insensitive_set_t *stub_bindings) {
 	case_insensitive_map_t<shared_ptr<PropertyGraphTable>> alias_to_vertex_and_edge_tables;
+	case_insensitive_set_t local_stubs;
+	case_insensitive_set_t &stubs = stub_bindings ? *stub_bindings : local_stubs;
 	for (idx_t idx_i = 0; idx_i < match_expr.path_patterns.size(); idx_i++) {
 		const auto &path_list = match_expr.path_patterns[idx_i]->path_elements;
 		for (const auto &cur_path : path_list) {
-			PopulateGraphTableAliasMap(pg_table, cur_path, alias_to_vertex_and_edge_tables);
+			PopulateGraphTableAliasMap(pg_table, cur_path, alias_to_vertex_and_edge_tables, &stubs);
 		}
+	}
+	for (idx_t idx_i = 0; idx_i < match_expr.path_patterns.size(); idx_i++) {
+		ResolveStubBindingsFromEdges(pg_table, match_expr.path_patterns[idx_i]->path_elements,
+		                             alias_to_vertex_and_edge_tables, stubs);
 	}
 	return alias_to_vertex_and_edge_tables;
 }
@@ -4759,12 +5133,42 @@ static bool FindQuantifiedPathElements(const vector<unique_ptr<PathReference>> &
 	return false;
 }
 
+//! ONE ROW PER unnests a shortest-path CTE whose step relation is built from a single edge
+//! table. A compound edge label (!X, A|B, A&B) spans several, and the CSR path finder
+//! already refuses that -- but only for alternation: a NEGATION reached the same code
+//! without tripping the check and produced an EMPTY CTE rather than an error, so the query
+//! returned zero rows and read as "there is no data". Silence is the worst answer here,
+//! because nothing in the result says the pattern was not honoured. Refuse it explicitly.
+static void RejectCompoundEdgeForOneRowPer(MatchExpression &ref) {
+	for (auto &pattern : ref.path_patterns) {
+		for (auto &element : pattern->path_elements) {
+			auto *sub_path = PGQMatchFunction::GetSubPath(element);
+			if (!sub_path) {
+				continue;
+			}
+			for (auto &inner : sub_path->path_list) {
+				auto *edge = PGQMatchFunction::GetPathElement(inner);
+				if (!edge || edge->label.empty() || !IsCompoundLabel(edge->label)) {
+					continue;
+				}
+				throw NotImplementedException(
+				    "ONE ROW PER over a compound edge label ('%s') is not yet supported: the step relation is built "
+				    "from one edge table and a compound label spans several. Name a single edge label, or drop ONE "
+				    "ROW PER -- the same pattern without it is answered from ABI path artifacts and does support "
+				    "compound labels.",
+				    edge->label);
+			}
+		}
+	}
+}
+
 // Apply ONE ROW PER transformation after ProcessPathList has run.
 // Replaces the from_clause and conditions with step-unnested equivalents.
 static void ApplyOneRowPer(MatchExpression &ref, CreatePropertyGraphInfo &pg_table,
                            unique_ptr<SelectNode> &final_select_node,
                            vector<unique_ptr<ParsedExpression>> &conditions,
                            case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_to_vertex_and_edge_tables) {
+	RejectCompoundEdgeForOneRowPer(ref);
 	static const string kPathCTE = "shortest_path_cte";
 	static const string kORPCTE = "__orp_steps";
 	static const string kKeyStepsCTE = "__orp_key_steps";
@@ -5323,8 +5727,10 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
                                                         const string &dst_label_expr,
                                                         idx_t lower, idx_t upper,
                                                         const WhereConstraints &where_constraints,
-                                                        string &src_pk_out,
-                                                        bool include_vertex_properties) {
+                                                        string &src_pk_out, string &dst_pk_out,
+                                                        bool include_vertex_properties,
+                                                        bool require_multiplicity_preserving,
+                                                        int64_t vl_fallback_budget) {
 	if (upper >= static_cast<idx_t>(1 << 30)) {
 		return nullptr;
 	}
@@ -5337,6 +5743,15 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 		string catalog_name;
 		string schema_name;
 		string src_pk;
+		//! Key column of the destination vertex. Lets the caller bind the destination
+		//! vertex table to the expansion's v1 so property projections (x.some_column)
+		//! can be answered without leaving this artifact-backed path.
+		string dst_pk;
+		//! Generation-time row count, or -1 when the catalog did not record one. Used to
+		//! cost the plan below; an unknown count contributes nothing, which is why the
+		//! estimate is a floor rather than a bound. No default initializer: it would make
+		//! the struct a non-aggregate and break the braced construction used below.
+		int64_t estimated_rows;
 	};
 
 	vector<ContextEdgeTable> edge_tables;
@@ -5345,6 +5760,22 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 		const auto &info = entry.second;
 		if (!info.from_metadata || !StringUtil::CIEquals(info.path_kind, "edge")) {
 			continue;
+		}
+		// A reverse-sorted twin holds exactly the rows of its forward artifact, ordered by
+		// v1. Including both would put every twinned family into the UNION ALL twice and
+		// duplicate every edge it contributes -- visible as each destination appearing once
+		// per copy. The twin exists to serve destination-anchored lookups, not expansion.
+		if (info.is_sorted_by_v1) {
+			continue;
+		}
+		// Walk semantics count every distinct edge, so an artifact may only stand in for
+		// its bridge here if it was *verified* to have collapsed nothing -- see the
+		// generation-time probe behind preserves_multiplicity. Bailing out entirely rather
+		// than skipping the artifact is deliberate: dropping one family from the union
+		// would silently lose edges, which is worse than falling back to the bridge.
+		// ANY SHORTEST is multiplicity-insensitive and imposes no such requirement.
+		if (require_multiplicity_preserving && !info.preserves_multiplicity) {
+			return nullptr;
 		}
 		const auto vertex_parts = SplitCatalogSequence(info.vertex_label_sequence);
 		const auto edge_parts = SplitCatalogSequence(info.edge_label_sequence);
@@ -5364,10 +5795,76 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 			continue;
 		}
 		edge_tables.push_back({vertex_parts[0], vertex_parts[1], edge_parts[0], info.table_name,
-		                       info.catalog_name, info.schema_name, edge_table->source_pk[0]});
+		                       info.catalog_name, info.schema_name, edge_table->source_pk[0],
+		                       edge_table->destination_pk.empty() ? string() : edge_table->destination_pk[0],
+		                       info.estimated_rows});
 	}
 	if (edge_tables.empty()) {
 		return nullptr;
+	}
+
+	// ── Multi-hop artifacts, for answering a whole depth in one scan ────────────────
+	// A k-hop fixed_path artifact already materialises the endpoints of every length-k
+	// label path it covers, so where they are complete for a depth there is nothing to
+	// recurse: seek each artifact on v0 and read the answer off. Indexed by label path
+	// because that is what the query shape selects on.
+	struct ContextPathArtifact {
+		idx_t hops = 0;
+		vector<string> vertex_labels; // hops + 1 entries
+		vector<string> edge_labels;   // hops entries
+		string catalog_name;
+		string schema_name;
+		string table_name;
+		//! Generation-time row count. For a k-hop artifact this is the measured number of
+		//! length-k walks over its label path, which is what makes it a real estimate of
+		//! the expansion's output at that depth rather than a guess.
+		int64_t estimated_rows = -1;
+	};
+	vector<ContextPathArtifact> path_artifacts;
+	case_insensitive_set_t path_artifact_keys;
+	for (const auto &entry : path_table_cache.catalog) {
+		const auto &info = entry.second;
+		if (!info.from_metadata || !StringUtil::CIEquals(info.path_kind, "fixed_path") || info.is_sorted_by_v1) {
+			continue;
+		}
+		const auto vertex_parts = SplitCatalogSequence(info.vertex_label_sequence);
+		const auto edge_parts = SplitCatalogSequence(info.edge_label_sequence);
+		if (edge_parts.size() < 2 || vertex_parts.size() != edge_parts.size() + 1) {
+			continue;
+		}
+		if (edge_parts.size() > upper) {
+			continue; // longer than the pattern can use
+		}
+		// Required in EVERY mode, unlike the 1-hop step relation which only needs it for
+		// walk semantics. Reading a k-hop artifact as a whole depth asserts its contents
+		// equal what composing k single steps would produce, and the probe is exactly that
+		// proof: it counts the artifact against the same join chain that defines it. An
+		// artifact that is merely *present* for a label path may still be partial -- from a
+		// generator policy filter, say -- and substituting it would silently drop paths.
+		// ANY SHORTEST being multiplicity-insensitive does not excuse incompleteness.
+		if (!info.preserves_multiplicity) {
+			continue;
+		}
+		bool edges_allowed = true;
+		for (const auto &edge_label : edge_parts) {
+			if (!LabelExpressionAllows(edge_label_expr, edge_label)) {
+				edges_allowed = false;
+				break;
+			}
+		}
+		if (!edges_allowed) {
+			continue;
+		}
+		ContextPathArtifact artifact;
+		artifact.hops = edge_parts.size();
+		artifact.vertex_labels = vertex_parts;
+		artifact.edge_labels = edge_parts;
+		artifact.catalog_name = info.catalog_name;
+		artifact.schema_name = info.schema_name;
+		artifact.table_name = info.table_name;
+		artifact.estimated_rows = info.estimated_rows;
+		path_artifact_keys.insert(PathSemanticKey("fixed_path", vertex_parts, edge_parts));
+		path_artifacts.push_back(std::move(artifact));
 	}
 
 	string canonical_src_label;
@@ -5380,6 +5877,19 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 	}
 	if (src_pk_out.empty()) {
 		return nullptr;
+	}
+
+	// Key of the destination vertex, when the pattern pins it to exactly one label. The
+	// expansion already restricts dst_label to that label (see final_filter below), so the
+	// caller can join the destination table on v1 without risking a key collision against
+	// a same-valued key of some other label.
+	if (!dst_label_expr.empty() && !IsCompoundLabel(dst_label_expr)) {
+		for (const auto &edge_table : edge_tables) {
+			if (StringUtil::CIEquals(edge_table.dst_label, dst_label_expr) && !edge_table.dst_pk.empty()) {
+				dst_pk_out = edge_table.dst_pk;
+				break;
+			}
+		}
 	}
 
 	shared_ptr<PropertyGraphTable> src_table;
@@ -5417,6 +5927,141 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 		}
 	}
 
+	// ── Which depths can be answered from artifacts alone ───────────────────────────
+	// The 1-hop set is the label graph: walking it from the source label enumerates every
+	// label path the pattern can take. A depth is coverable only if EVERY path of that
+	// length has a matching artifact -- one missing path would silently drop a branch,
+	// which is worse than recursing. Enumeration is bounded; blowing the cap simply means
+	// "not covered", so the fallback stays correct.
+	//
+	// Vertex-property projection is excluded: that output shape is produced by a separate
+	// CTE the direct scans do not build, so those queries keep the recursive path.
+	static constexpr idx_t kMaxEnumeratedLabelPaths = 512;
+	vector<bool> depth_covered(upper + 1, false);
+	vector<vector<ContextPathArtifact>> artifacts_by_depth(upper + 1);
+	if (!include_vertex_properties && !path_artifacts.empty() && !canonical_src_label.empty()) {
+		for (const auto &artifact : path_artifacts) {
+			if (StringUtil::CIEquals(artifact.vertex_labels.front(), canonical_src_label)) {
+				artifacts_by_depth[artifact.hops].push_back(artifact);
+			}
+		}
+		// frontier holds (current label, vertex label path, edge label path)
+		struct LabelPath {
+			string label;
+			vector<string> vertices;
+			vector<string> edges;
+		};
+		vector<LabelPath> frontier {{canonical_src_label, {canonical_src_label}, {}}};
+		bool exploded = false;
+		for (idx_t depth = 1; depth <= upper && !exploded; depth++) {
+			vector<LabelPath> next;
+			for (const auto &node : frontier) {
+				for (const auto &edge_table : edge_tables) {
+					if (!StringUtil::CIEquals(edge_table.src_label, node.label)) {
+						continue;
+					}
+					LabelPath step;
+					step.label = edge_table.dst_label;
+					step.vertices = node.vertices;
+					step.vertices.push_back(edge_table.dst_label);
+					step.edges = node.edges;
+					step.edges.push_back(edge_table.edge_label);
+					next.push_back(std::move(step));
+					if (next.size() > kMaxEnumeratedLabelPaths) {
+						exploded = true;
+						break;
+					}
+				}
+				if (exploded) {
+					break;
+				}
+			}
+			if (exploded || next.empty()) {
+				break;
+			}
+			// depth 1 is always served by the step relation itself; only 2+ can be replaced
+			// by a single artifact scan.
+			if (depth >= 2 && !artifacts_by_depth[depth].empty()) {
+				bool all_present = true;
+				for (const auto &candidate : next) {
+					if (path_artifact_keys.find(PathSemanticKey("fixed_path", candidate.vertices,
+					                                            candidate.edges)) == path_artifact_keys.end()) {
+						all_present = false;
+						break;
+					}
+				}
+				depth_covered[depth] = all_present;
+			}
+			frontier = std::move(next);
+		}
+	}
+
+	// Direct scans for every covered depth, shaped exactly like the recursive branch so the
+	// two can be unioned. Each is a seek on v0 rather than a scan, which is what makes a
+	// large artifact cheap to consult.
+	vector<string> direct_selects;
+	//! Rows read by direct scans that the seed constraint could not anchor. A pinned v0 is
+	//! a seek and costs nothing worth counting; without one the artifact is read whole, and
+	//! a whole k-hop artifact is the largest thing this plan can touch.
+	int64_t unanchored_direct_rows = 0;
+	for (idx_t depth = 2; depth <= upper; depth++) {
+		if (!depth_covered[depth] || depth < lower) {
+			continue;
+		}
+		for (const auto &artifact : artifacts_by_depth[depth]) {
+			if (!dst_label_expr.empty() && !LabelExpressionAllows(dst_label_expr, artifact.vertex_labels.back())) {
+				continue;
+			}
+			const string endpoint = "v" + to_string(artifact.hops);
+			string vertex_list;
+			string vertex_label_list;
+			for (idx_t idx = 0; idx <= artifact.hops; idx++) {
+				// CAST is required, not cosmetic. A k-hop artifact's v0..vk are the keys of
+				// k+1 DIFFERENT vertex labels, whose column types need not agree -- e.g.
+				// TAG,BOM,BOM_EQUIPMENT is (VARCHAR, VARCHAR, BIGINT). A bare list literal
+				// over them is list_value(VARCHAR, VARCHAR, BIGINT), which fails to bind at
+				// all: "Cannot deduce template type 'T'". A concrete destination label hides
+				// this by admitting only paths that end at one label; an unlabeled
+				// destination admits every label path and hits it immediately.
+				vertex_list += (idx ? ", " : "") + string("CAST(a.v") + to_string(idx) + " AS VARCHAR)";
+				vertex_label_list +=
+				    (idx ? ", " : "") + KeywordHelper::WriteQuoted(artifact.vertex_labels[idx], '\'');
+			}
+			string edge_label_list;
+			for (idx_t idx = 0; idx < artifact.hops; idx++) {
+				edge_label_list += (idx ? ", " : "") + KeywordHelper::WriteQuoted(artifact.edge_labels[idx], '\'');
+			}
+			vector<string> artifact_filters;
+			PushConstraintToSQLFilter(where_constraints, src_binding, src_pk_out, "a.v0", artifact_filters);
+			string artifact_where;
+			for (idx_t idx = 0; idx < artifact_filters.size(); idx++) {
+				artifact_where += (idx ? " AND " : " WHERE ") + artifact_filters[idx];
+			}
+			if (artifact_filters.empty() && artifact.estimated_rows > 0) {
+				unanchored_direct_rows += artifact.estimated_rows;
+			}
+			direct_selects.push_back(StringUtil::Format(
+			    "SELECT a.v0 AS v0, a.%s AS v1, %s AS __pgq_dst_label, %s AS __pgq_path_length, "
+			    "[%s] AS __pgq_path_vertices, [%s] AS __pgq_vertex_labels, [%s] AS __pgq_edge_labels "
+			    "FROM %s a%s",
+			    endpoint, KeywordHelper::WriteQuoted(artifact.vertex_labels.back(), '\''),
+			    to_string(static_cast<int64_t>(artifact.hops)), vertex_list, vertex_label_list, edge_label_list,
+			    QualifiedTableName(artifact.catalog_name, artifact.schema_name, artifact.table_name),
+			    artifact_where));
+		}
+	}
+
+	// The recursion exists only to produce depths no artifact covers, so it must not run
+	// deeper than the deepest such depth -- otherwise the direct scans are added *on top of*
+	// unchanged traversal work rather than replacing it, and nothing gets faster. When every
+	// requested depth is covered it is not built at all.
+	idx_t recursion_limit = 0;
+	for (idx_t depth = lower > 1 ? lower : 1; depth <= upper; depth++) {
+		if (!depth_covered[depth]) {
+			recursion_limit = depth;
+		}
+	}
+
 	vector<string> dst_label_filters;
 	for (const auto &vertex_table : pg_table.vertex_tables) {
 		if (LabelExpressionAllows(dst_label_expr, vertex_table->main_label)) {
@@ -5425,6 +6070,15 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 		}
 	}
 	string final_filter = "c.depth >= " + std::to_string(static_cast<int64_t>(lower));
+	// Depths served by a direct artifact scan must not also be emitted here, or every path
+	// at that depth would be returned twice -- once composed from 1-hop steps and once read
+	// whole. The recursion still *traverses* those depths, since deeper uncovered depths are
+	// reached through them; only its output is withheld.
+	for (idx_t depth = 2; depth <= upper; depth++) {
+		if (depth_covered[depth]) {
+			final_filter += " AND c.depth <> " + std::to_string(static_cast<int64_t>(depth));
+		}
+	}
 	if (!dst_label_expr.empty()) {
 		if (dst_label_filters.empty()) {
 			return nullptr;
@@ -5451,18 +6105,98 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 	                                 vertex_properties_union.empty() ? "" : "__pgq_vertex_props");
 	const string vertex_properties_select =
 	    include_vertex_properties ? ", " + vertex_properties_expr + " AS __pgq_vertex_properties " : "";
+
+	// ── Cost guard ──────────────────────────────────────────────────────────────────
+	// This plan is artifact-backed, so it is NOT costed the way the CSR fallback is. There
+	// the cost is a flat scan of every edge table and the seed cannot reduce it; here the
+	// cost is the frontier, and a pinned seed collapses it to a handful of seeks. That is
+	// the whole difference between the shapes measured at 0.16s and the ones that never
+	// finish, so the seed is what this guard keys on rather than raw artifact size -- a
+	// seeded expansion over 35M rows of artifact is cheap and must not be refused.
+	//
+	// Unanchored, the estimate is the output itself: every walk from every source vertex.
+	// The catalog has already measured that, because a k-hop fixed_path artifact holds
+	// exactly the length-k walks over its label path. Depths with no artifact are projected
+	// from the growth observed at the depths that do have one, so an unmeasured depth is
+	// not silently free. Artifacts whose row count was never recorded contribute nothing,
+	// which makes the whole figure a floor -- it under-reports, never over-reports, so a
+	// query it rejects is genuinely over budget.
+	if (vl_fallback_budget > 0) {
+		int64_t estimated_rows = unanchored_direct_rows;
+		if (recursion_limit > 0 && seed_filters.empty()) {
+			// walks[d] = length-d walks leaving the source label. The recursion materialises
+			// each level on the way to recursion_limit, including levels whose output is
+			// withheld because a direct scan covers them -- it still traverses through them.
+			vector<int64_t> walks(recursion_limit + 1, 0);
+			for (const auto &edge_table : edge_tables) {
+				if (edge_table.estimated_rows > 0 &&
+				    StringUtil::CIEquals(edge_table.src_label, canonical_src_label)) {
+					walks[1] += edge_table.estimated_rows;
+				}
+			}
+			for (const auto &artifact : path_artifacts) {
+				if (artifact.hops >= 2 && artifact.hops <= recursion_limit && artifact.estimated_rows > 0 &&
+				    StringUtil::CIEquals(artifact.vertex_labels.front(), canonical_src_label)) {
+					walks[artifact.hops] += artifact.estimated_rows;
+				}
+			}
+			double growth = 1.0;
+			for (idx_t depth = 1; depth <= recursion_limit; depth++) {
+				if (walks[depth] > 0) {
+					if (depth > 1 && walks[depth - 1] > 0) {
+						growth = static_cast<double>(walks[depth]) / static_cast<double>(walks[depth - 1]);
+					}
+				} else if (depth > 1) {
+					walks[depth] = static_cast<int64_t>(static_cast<double>(walks[depth - 1]) * growth);
+				}
+				estimated_rows += walks[depth];
+			}
+		}
+		if (estimated_rows > vl_fallback_budget) {
+			string detail = StringUtil::Format(
+			    "Variable-length pattern {%llu,%llu} over edge label expression '%s' expands from every %s vertex "
+			    "and is estimated to produce at least ~%lld rows, exceeding pgq_max_vl_fallback_rows (%lld).",
+			    static_cast<unsigned long long>(lower), static_cast<unsigned long long>(upper),
+			    edge_label_expr.empty() ? "<any>" : edge_label_expr.c_str(),
+			    canonical_src_label.c_str(), static_cast<long long>(estimated_rows),
+			    static_cast<long long>(vl_fallback_budget));
+			detail += StringUtil::Format(
+			    " The pattern is answerable from ABI artifacts, so this is not a fallback -- it is the size of the "
+			    "answer. Constrain the source: an equality on %s.%s is pushed into the expansion and turns it into "
+			    "seeks. Otherwise lower the upper bound, name a narrower edge label, or raise/disable the budget "
+			    "with SET pgq_max_vl_fallback_rows.",
+			    src_binding.c_str(), src_pk_out.c_str());
+			throw BinderException(detail);
+		}
+	}
+
+	// Every requested depth is artifact-covered: emit the seeks alone and never build the
+	// recursive CTE. This is the case the whole design exists for -- traversal replaced by
+	// lookups, rather than lookups added alongside unchanged traversal.
+	if (recursion_limit == 0 && !direct_selects.empty()) {
+		return make_uniq<SubqueryRef>(ParseSelectStatement(JoinSQLUnionAll(direct_selects)), path_alias);
+	}
+
+	// path_vertices is VARCHAR[] by construction, matching the direct scans above: a path
+	// crosses vertex labels whose keys have different column types, so the element type has
+	// to be the one type they all convert to. Without the casts this branch only bound by
+	// luck -- the edge UNION ALL happened to coerce every v1 to VARCHAR -- which would break
+	// the moment a graph's admitted edges were uniformly integer-keyed.
+	//
+	// src_id is carried through the recursion rather than read back out of path_vertices, so
+	// v0 keeps the source key's own type and still joins natively to the source table.
 	const string query = StringUtil::Format(
-	    "WITH RECURSIVE __pgq_ctx(dst_label, dst_id, depth, path_vertices, path_vertex_labels, "
+	    "WITH RECURSIVE __pgq_ctx(dst_label, src_id, dst_id, depth, path_vertices, path_vertex_labels, "
 	    "path_edge_labels, path_participants) AS ("
-	    "  SELECT %s::VARCHAR AS dst_label, s.%s AS dst_id, 0 AS depth, "
-	    "         list_value(s.%s) AS path_vertices, "
+	    "  SELECT %s::VARCHAR AS dst_label, s.%s AS src_id, s.%s AS dst_id, 0 AS depth, "
+	    "         list_value(CAST(s.%s AS VARCHAR)) AS path_vertices, "
 	    "         list_value(%s::VARCHAR) AS path_vertex_labels, "
 	    "         []::VARCHAR[] AS path_edge_labels, "
 	    "         list_value(%s::VARCHAR || ':' || CAST(s.%s AS VARCHAR)) AS path_participants "
 	    "  FROM %s s%s "
 	    "  UNION ALL "
-	    "  SELECT e.dst_label, e.v1 AS dst_id, c.depth + 1 AS depth, "
-	    "         list_append(c.path_vertices, e.v1) AS path_vertices, "
+	    "  SELECT e.dst_label, c.src_id, e.v1 AS dst_id, c.depth + 1 AS depth, "
+	    "         list_append(c.path_vertices, CAST(e.v1 AS VARCHAR)) AS path_vertices, "
 	    "         list_append(c.path_vertex_labels, e.dst_label) AS path_vertex_labels, "
 	    "         list_append(c.path_edge_labels, e.edge_label) AS path_edge_labels, "
 	    "         list_append(c.path_participants, e.dst_label || ':' || CAST(e.v1 AS VARCHAR)) AS path_participants "
@@ -5471,17 +6205,18 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 	    "  WHERE c.depth < %s "
 	    "    AND NOT list_contains(c.path_participants, e.dst_label || ':' || CAST(e.v1 AS VARCHAR))"
 	    ") %s "
-	    "SELECT list_extract(c.path_vertices, 1) AS v0, c.dst_id AS v1, "
+	    "SELECT c.src_id AS v0, c.dst_id AS v1, "
 	    "       c.dst_label AS __pgq_dst_label, "
 	    "       c.depth AS __pgq_path_length, "
 	    "       c.path_vertices AS __pgq_path_vertices, "
 	    "       c.path_vertex_labels AS __pgq_vertex_labels, "
 	    "       c.path_edge_labels AS __pgq_edge_labels%s "
 	    "FROM __pgq_ctx c "
-	    "WHERE %s",
-	    src_label_sql, src_pk, src_pk, src_label_sql, src_label_sql, src_pk,
+	    "WHERE %s%s",
+	    src_label_sql, src_pk, src_pk, src_pk, src_label_sql, src_label_sql, src_pk,
 	    src_table_name, seed_where, JoinSQLUnionAll(edge_selects),
-	    std::to_string(static_cast<int64_t>(upper)), vertex_properties_cte, vertex_properties_select, final_filter);
+	    std::to_string(static_cast<int64_t>(recursion_limit)), vertex_properties_cte, vertex_properties_select,
+	    final_filter, direct_selects.empty() ? string() : " UNION ALL " + JoinSQLUnionAll(direct_selects));
 
 	return make_uniq<SubqueryRef>(ParseSelectStatement(query), path_alias);
 }
@@ -5612,7 +6347,7 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
                                  const ReferencedBindings &referenced_bindings,
                                  CoveredBindingMap &covered_columns,
                                  OneRowPerMode one_row_per_mode,
-                                 const ParsedExpression *where_hint = nullptr);
+                                 const ParsedExpression *where_hint = nullptr, bool any_shortest = false);
 
 static unique_ptr<ParsedExpression> TryBuildBranchSummaryExistsSubquery(
     MatchExpression &inner_match, CreatePropertyGraphInfo &pg_table,
@@ -5741,16 +6476,19 @@ static unique_ptr<ParsedExpression> BuildExistsSubquery(
 		                         path_table_cache, referenced_bindings,
 		                         covered_columns,
 		                         inner_match.one_row_per,
-		                         inner_match.where_clause.get())) {
+		                         inner_match.where_clause.get(), any_shortest)) {
 			if (require_abi_paths && PathPatternRequiresABIPath(path_pattern->path_elements)) {
 				ThrowABIPathRequired();
 			}
 			// Withholding the cache disables the fallback's ABI edge-artifact scans too, so
 			// pgq_disable_abi_rewrite forces a fully bridge-based traversal -- which is what
 			// makes pgq_verify_abi_rewrite able to verify this rewrite.
+			int32_t inner_cte1_slot = -1;
 			PGQMatchFunction::ProcessPathList(path_pattern->path_elements, conditions, inner_select, inner_alias_map,
-			                                  pg_table, extra_alias_counter, inner_match, all_shortest, any_shortest,
-			                                  DisableABIRewrite(context) ? nullptr : &path_table_cache);
+			                                  pg_table, extra_alias_counter, inner_match, CSRIdCounter(context),
+			                                  inner_cte1_slot, all_shortest, any_shortest,
+			                                  DisableABIRewrite(context) ? nullptr : &path_table_cache,
+			                                  MaxVLFallbackRows(context));
 		}
 	}
 
@@ -6150,7 +6888,8 @@ static idx_t RewriteDirectLinkReferences(CreatePropertyGraphInfo &pg_table, uniq
 
 static vector<unique_ptr<ParsedExpression>>
 BuildFinalColumnList(vector<unique_ptr<ParsedExpression>> col_list,
-                     const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_to_vertex_and_edge_tables) {
+                     const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_to_vertex_and_edge_tables,
+                     const case_insensitive_set_t &stub_bindings) {
 	vector<unique_ptr<ParsedExpression>> final_column_list;
 	for (auto &expression : col_list) {
 		unordered_set<string> named_subpaths;
@@ -6200,6 +6939,20 @@ BuildFinalColumnList(vector<unique_ptr<ParsedExpression>> col_list,
 				if (column_ref != nullptr && !column_ref->column_names.empty()) {
 					string var = column_ref->column_names.back();
 					auto tbl_iter = alias_to_vertex_and_edge_tables.find(var);
+					// A stub entry is a placeholder table picked for column validation, not
+					// this binding's actual label. Folding it into a constant reports a
+					// confidently wrong answer -- the traversal and element_id() stay
+					// correct, so nothing looks broken and the label is simply untrue.
+					// Refuse instead, and say what to write to get an answer.
+					if (tbl_iter != alias_to_vertex_and_edge_tables.end() &&
+					    stub_bindings.find(var) != stub_bindings.end()) {
+						throw BinderException(
+						    "label(%s) cannot be resolved: '%s' has no label in the pattern and the edge reaching it "
+						    "does not determine one, so its label varies per row. Give the vertex a label "
+						    "(%s:SOME_LABEL), or name a single edge label so the destination table is implied. For a "
+						    "variable-length pattern, label() is answered per row and works without either.",
+						    var.c_str(), var.c_str(), var.c_str());
+					}
 					if (tbl_iter != alias_to_vertex_and_edge_tables.end()) {
 						auto label_const = make_uniq<ConstantExpression>(Value(tbl_iter->second->main_label));
 						label_const->alias = function_ref->alias.empty() ? "label(" + var + ")" : function_ref->alias;
@@ -6274,7 +7027,7 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
                                  const ReferencedBindings &referenced_bindings,
                                  CoveredBindingMap &covered_columns,
                                  OneRowPerMode one_row_per_mode,
-                                 const ParsedExpression *where_hint) {
+                                 const ParsedExpression *where_hint, bool any_shortest) {
 	// Verification/diagnostic escape hatch: force the fallback traversal so
 	// pgq_verify_abi_rewrite() can compare the two paths.
 	if (DisableABIRewrite(context)) {
@@ -6623,11 +7376,30 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 			const bool vertex_properties_projection =
 			    HasTopLevelNamedPathFunction(match_ref, named_path_variable, "vertex_properties");
 			const bool dst_endpoint_projection = HasTopLevelEndpointFunction(match_ref, ctx_dst->variable_binding);
+			// A concrete destination label means the expansion's v1 can be joined straight to
+			// that vertex table, so projections of real properties (x.workorder_number) are
+			// answerable here instead of dropping the whole query to CSR. Without this, any
+			// property reference on the destination cost the entire artifact-backed path.
+			const bool dst_label_concrete = !ctx_dst->label.empty() && !IsCompoundLabel(ctx_dst->label);
+			shared_ptr<PropertyGraphTable> dst_vtable;
+			if (dst_label_concrete) {
+				try {
+					dst_vtable = ResolveTable(ctx_dst->label, PGQMatchType::MATCH_VERTEX, pg_table);
+				} catch (...) {
+					dst_vtable = nullptr;
+				}
+			}
+			// Only widen admission for a genuine range. An exact-length quantifier {k,k} has
+			// a dedicated rewrite that answers it from the k-hop fixed_path artifact in one
+			// scan; letting context expansion accept it here would shadow that more specific
+			// path and re-derive the answer by stepping 1-hop artifacts instead.
+			const bool dst_properties_bindable = dst_vtable != nullptr && ctx_sp->lower != ctx_sp->upper;
+
 			if (ctx_edge && ctx_edge->match_type == PGQMatchType::MATCH_EDGE_RIGHT &&
 			    !binding_is_referenced(ctx_edge->variable_binding) &&
-			    (named_path_projection || dst_endpoint_projection)) {
+			    (named_path_projection || dst_endpoint_projection || dst_properties_bindable)) {
 				if (!ctx_dst->variable_binding.empty() && binding_is_referenced(ctx_dst->variable_binding) &&
-				    !dst_endpoint_projection) {
+				    !dst_endpoint_projection && !dst_properties_bindable) {
 					return false;
 				}
 
@@ -6640,12 +7412,15 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 
 				const string path_alias = "__pgq_context_path_" + to_string(extra_alias_counter++);
 				string src_pk;
+				string dst_pk;
 				auto path_ref = BuildABIContextNamedPathRef(path_table_cache, pg_table, path_alias,
 				                                            src_vtable->main_label, ctx_src->variable_binding,
 				                                            ctx_edge->label, ctx_dst->label,
 				                                            ctx_sp->lower, ctx_sp->upper,
-				                                            where_constraints, src_pk,
-				                                            vertex_properties_projection);
+				                                            where_constraints, src_pk, dst_pk,
+				                                            vertex_properties_projection,
+				                                            /*require_multiplicity_preserving=*/!any_shortest,
+				                                            MaxVLFallbackRows(context));
 				if (!path_ref || src_pk.empty()) {
 					return false;
 				}
@@ -6664,6 +7439,20 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 				    ExpressionType::COMPARE_EQUAL,
 				    make_uniq<ColumnRefExpression>(src_pk, ctx_src->variable_binding),
 				    make_uniq<ColumnRefExpression>("v0", path_alias)));
+				// Bind the destination vertex table on v1 when the pattern named a single
+				// destination label and the query actually reads properties off it. Skipped
+				// when only endpoint functions are projected -- those are rewritten onto the
+				// expansion below and need no table.
+				const bool bind_dst_table = dst_properties_bindable && !dst_pk.empty() &&
+				                            !ctx_dst->variable_binding.empty() &&
+				                            binding_is_referenced(ctx_dst->variable_binding);
+				if (bind_dst_table) {
+					alias_map[ctx_dst->variable_binding] = dst_vtable;
+					conditions.push_back(make_uniq<ComparisonExpression>(
+					    ExpressionType::COMPARE_EQUAL,
+					    make_uniq<ColumnRefExpression>(dst_pk, ctx_dst->variable_binding),
+					    make_uniq<ColumnRefExpression>("v1", path_alias)));
+				}
 				RewriteTopLevelNamedPathFunctions(match_ref, named_path_variable, path_alias);
 				RewriteTopLevelEndpointFunctions(match_ref, ctx_dst->variable_binding, path_alias);
 				PGQRewriteDiagnostic diagnostic;
@@ -7386,7 +8175,7 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 		                          path_table_cache, referenced_bindings,
 		                          covered_columns,
 		                          ref->one_row_per,
-		                          ref->where_clause.get())) {
+		                          ref->where_clause.get(), any_shortest)) {
 			if (require_abi_paths && PathPatternRequiresABIPath(path_pattern->path_elements)) {
 				PGQRewriteDiagnostic diagnostic;
 				diagnostic.graph_name = pg_table->property_graph_name;
@@ -7397,9 +8186,10 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 				RecordRewriteDiagnostic(context, std::move(diagnostic));
 				ThrowABIPathRequired();
 			}
+			int32_t cte1_slot = -1;
 			ProcessPathList(path_pattern->path_elements, conditions, final_select_node, alias_map, *pg_table,
-			                extra_alias_counter, *ref, all_shortest, any_shortest,
-			                DisableABIRewrite(context) ? nullptr : &path_table_cache);
+			                extra_alias_counter, *ref, CSRIdCounter(context), cte1_slot, all_shortest, any_shortest,
+			                DisableABIRewrite(context) ? nullptr : &path_table_cache, MaxVLFallbackRows(context));
 		}
 	}
 
@@ -7429,7 +8219,8 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	}
 
 	// Maps from table alias to table, including vertex and edge tables.
-	auto alias_to_vertex_and_edge_tables = PopulateGraphTableAliasMap(*pg_table, *ref);
+	case_insensitive_set_t stub_bindings;
+	auto alias_to_vertex_and_edge_tables = PopulateGraphTableAliasMap(*pg_table, *ref, &stub_bindings);
 	// Merge optional aliases so column binding and function rewriting cover them too.
 	for (auto &entry : optional_alias_map) {
 		alias_to_vertex_and_edge_tables.emplace(entry.first, entry.second);
@@ -7518,7 +8309,8 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	}
 
 	final_select_node->where_clause = CreateWhereClause(conditions);
-	final_select_node->select_list = BuildFinalColumnList(std::move(ref->column_list), alias_to_vertex_and_edge_tables);
+	final_select_node->select_list =
+	    BuildFinalColumnList(std::move(ref->column_list), alias_to_vertex_and_edge_tables, stub_bindings);
 
 	if (ref->union_matches.empty()) {
 		auto subquery = make_uniq<SelectStatement>();
@@ -7553,7 +8345,7 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 			                         path_table_cache, branch_referenced_bindings,
 			                         branch_covered_columns,
 			                         branch.one_row_per,
-			                         branch.where_clause.get())) {
+			                         branch.where_clause.get(), any_shortest)) {
 				if (require_abi_paths && PathPatternRequiresABIPath(path_pattern->path_elements)) {
 					PGQRewriteDiagnostic diagnostic;
 					diagnostic.graph_name = pg_table->property_graph_name;
@@ -7564,9 +8356,12 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 					RecordRewriteDiagnostic(context, std::move(diagnostic));
 					ThrowABIPathRequired();
 				}
+				int32_t branch_cte1_slot = -1;
 				ProcessPathList(path_pattern->path_elements, branch_conditions, branch_select,
-				                branch_alias_map, *pg_table, branch_counter, branch, all_shortest, any_shortest,
-				                DisableABIRewrite(context) ? nullptr : &path_table_cache);
+				                branch_alias_map, *pg_table, branch_counter, branch, CSRIdCounter(context),
+				                branch_cte1_slot, all_shortest, any_shortest,
+				                DisableABIRewrite(context) ? nullptr : &path_table_cache,
+				                MaxVLFallbackRows(context));
 			}
 		}
 
@@ -7592,7 +8387,8 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 			                        branch_alias_map, path_table_cache, require_abi_paths, branch.where_clause.get());
 		}
 
-		auto branch_alias_to_ve = PopulateGraphTableAliasMap(*pg_table, branch);
+		case_insensitive_set_t branch_stub_bindings;
+		auto branch_alias_to_ve = PopulateGraphTableAliasMap(*pg_table, branch, &branch_stub_bindings);
 		for (auto &entry : branch_opt_alias_map) {
 			branch_alias_to_ve.emplace(entry.first, entry.second);
 		}
@@ -7625,7 +8421,8 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 		}
 
 		branch_select->where_clause = CreateWhereClause(branch_conditions);
-		branch_select->select_list = BuildFinalColumnList(std::move(union_col_copies[ui]), branch_alias_to_ve);
+		branch_select->select_list =
+		    BuildFinalColumnList(std::move(union_col_copies[ui]), branch_alias_to_ve, branch_stub_bindings);
 
 		auto set_op = make_uniq<SetOperationNode>();
 		set_op->setop_type = SetOperationType::UNION;

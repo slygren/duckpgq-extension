@@ -1,0 +1,164 @@
+# name: test/sql/path_finding/abi_context_mixed_key_types.test
+# description: Context expansion over a label path whose vertex keys have different column types
+# group: [path_finding]
+
+# A path crosses vertex labels, and nothing requires their key columns to share a type.
+# A k-hop fixed_path artifact therefore holds v0..vk of MIXED types -- here
+# (VARCHAR, BIGINT, VARCHAR) -- and the direct-scan branch builds a list literal from
+# them. Un-cast, that is list_value(VARCHAR, BIGINT, VARCHAR) and the query does not
+# bind at all: "Cannot deduce template type 'T' in function: 'list_value(T, [T...])'".
+#
+# A concrete destination label masks this, because it admits only paths ending at one
+# label and those tend to be type-homogeneous. An unlabeled destination admits every
+# label path, so it is the shape that exposes it -- which is why this test leaves the
+# destination unlabeled.
+
+require duckpgq
+
+statement ok
+CREATE TABLE tag(id VARCHAR, name VARCHAR);
+
+statement ok
+INSERT INTO tag VALUES ('TAG-1', 'Pump A');
+
+# Deliberately BIGINT: the intermediate vertex is what makes the path heterogeneous.
+statement ok
+CREATE TABLE device(id BIGINT, name VARCHAR);
+
+statement ok
+INSERT INTO device VALUES (900, 'Sensor');
+
+statement ok
+CREATE TABLE reading(id VARCHAR, value VARCHAR);
+
+statement ok
+INSERT INTO reading VALUES ('R-1', '42');
+
+statement ok
+CREATE TABLE has_device(src VARCHAR, dst BIGINT);
+
+statement ok
+CREATE TABLE has_reading(src BIGINT, dst VARCHAR);
+
+statement ok
+CREATE SCHEMA graph;
+
+statement ok
+CREATE TABLE graph.__pg_m__Tag__HasDevice__Device AS
+SELECT 'TAG-1'::VARCHAR AS v0, hash('d') AS e1, 900::BIGINT AS v1;
+
+statement ok
+CREATE TABLE graph.__pg_m__Device__HasReading__Reading AS
+SELECT 900::BIGINT AS v0, hash('r') AS e1, 'R-1'::VARCHAR AS v1;
+
+# The mixed-type one: VARCHAR, BIGINT, VARCHAR across v0/v1/v2.
+statement ok
+CREATE TABLE graph.__pg_m__Tag__HasDevice__Device__HasReading__Reading AS
+SELECT 'TAG-1'::VARCHAR AS v0, 900::BIGINT AS v1, 'R-1'::VARCHAR AS v2;
+
+statement ok
+CREATE TABLE graph.__pgq_path_catalog AS
+SELECT * FROM (VALUES
+  ('m','__pg_m__Tag__HasDevice__Device','edge',1,'Tag','Device','Tag,Device','HasDevice',
+   true,true,1,now(),true,1,1,'has_device',true),
+  ('m','__pg_m__Device__HasReading__Reading','edge',1,'Device','Reading','Device,Reading','HasReading',
+   true,true,1,now(),true,1,1,'has_reading',true),
+  ('m','__pg_m__Tag__HasDevice__Device__HasReading__Reading','fixed_path',2,'Tag','Reading',
+   'Tag,Device,Reading','HasDevice,HasReading',true,true,1,now(),true,2,2,'has_device,has_reading',true)
+) t(graph_name,path_table_name,path_kind,hop_count,src_label,dst_label,vertex_label_sequence,edge_label_sequence,
+    supports_one_row_per_step,is_deduplicated,estimated_rows,last_refreshed_at,is_sorted_by_v0,min_depth,max_depth,
+    bridge_table_names,preserves_multiplicity);
+
+statement ok
+-CREATE PROPERTY GRAPH m
+VERTEX TABLES (
+    tag PROPERTIES (id, name) LABEL Tag,
+    device PROPERTIES (id, name) LABEL Device,
+    reading PROPERTIES (id, value) LABEL Reading
+)
+EDGE TABLES (
+    has_device SOURCE KEY (src) REFERENCES tag(id)
+               DESTINATION KEY (dst) REFERENCES device(id)
+               LABEL HasDevice,
+    has_reading SOURCE KEY (src) REFERENCES device(id)
+                DESTINATION KEY (dst) REFERENCES reading(id)
+                LABEL HasReading
+);
+
+# Depth 2 is artifact-covered, so it comes from the direct scan of the mixed-type
+# fixed_path artifact -- the branch that could not bind before.
+query IT rowsort
+-FROM GRAPH_TABLE (
+    m
+    MATCH p = (t:Tag)-[]->{1,2}(x)
+    WHERE t.id = 'TAG-1'
+    COLUMNS (path_length(p) AS depth, label(x) AS dst_label)
+);
+----
+1	Device
+2	Reading
+
+# vertices(p) spans VARCHAR and BIGINT keys; the list is VARCHAR[] so both survive
+# with their values intact rather than the query failing to bind.
+query ITT rowsort
+-FROM GRAPH_TABLE (
+    m
+    MATCH p = (t:Tag)-[]->{1,2}(x)
+    WHERE t.id = 'TAG-1'
+    COLUMNS (path_length(p) AS depth, vertices(p) AS vertex_ids, vertex_labels(p) AS vertex_labels)
+);
+----
+1	[TAG-1, 900]	[Tag, Device]
+2	[TAG-1, 900, R-1]	[Tag, Device, Reading]
+
+# v0 must keep the source key's own type rather than being read back out of the
+# VARCHAR[] path, so it still joins natively to the source table.
+query TT rowsort
+-FROM GRAPH_TABLE (
+    m
+    MATCH p = (t:Tag)-[]->{1,2}(x)
+    WHERE t.id = 'TAG-1'
+    COLUMNS (t.name AS seed_name, label(x) AS dst_label)
+);
+----
+Pump A	Device
+Pump A	Reading
+
+# ── label() must never invent an answer ─────────────────────────────────────────
+# Here the traversal IS answerable (artifacts back it), so the query gets far enough
+# for label() to be asked. With an unlabeled edge the destination varies per row, and
+# label() used to fold an arbitrary placeholder table into a constant -- a confidently
+# wrong label on an otherwise correct result. It must refuse instead.
+
+statement error
+-FROM GRAPH_TABLE (
+    m
+    MATCH (t:Tag)-[]->(x)
+    WHERE t.id = 'TAG-1'
+    COLUMNS (label(x) AS lbl)
+);
+----
+label(x) cannot be resolved
+
+# A named edge determines the destination table, so the same shape is answerable and
+# must give the real label rather than refusing.
+query T rowsort
+-FROM GRAPH_TABLE (
+    m
+    MATCH (t:Tag)-[:HasDevice]->(x)
+    WHERE t.id = 'TAG-1'
+    COLUMNS (label(x) AS lbl)
+);
+----
+device
+
+# ...and identically to the labeled form.
+query T rowsort
+-FROM GRAPH_TABLE (
+    m
+    MATCH (t:Tag)-[:HasDevice]->(x:Device)
+    WHERE t.id = 'TAG-1'
+    COLUMNS (label(x) AS lbl)
+);
+----
+device

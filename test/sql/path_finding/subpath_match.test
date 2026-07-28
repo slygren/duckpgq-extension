@@ -99,7 +99,10 @@ FROM GRAPH_TABLE (pg
 Constraint Error: ALL unbounded with path mode WALK is not possible as this could lead to infinite results. Consider specifying an upper bound or path mode other than WALK
 
 
-query II
+# rowsort: the query has no ORDER BY, so row order is not part of the contract. It only
+# happened to be stable while traversal was rowid-ordered; keying by vertex key changed
+# the scan order without changing the row multiset.
+query II rowsort
 -SELECT study.a_name, study.b_name
 FROM GRAPH_TABLE (pg
     MATCH
@@ -109,8 +112,8 @@ FROM GRAPH_TABLE (pg
     ) study
 ----
 Peter	Daniel
-Peter	Tavneet
 Peter	Gabor
+Peter	Tavneet
 
 statement error
 -SELECT study.a_name, study.b_name

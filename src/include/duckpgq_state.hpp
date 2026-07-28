@@ -75,6 +75,18 @@ public:
 	std::unordered_map<int32_t, unique_ptr<CSR>> csr_list;
 	std::mutex csr_lock;
 	std::unordered_set<int32_t> csr_to_delete;
+
+	//! Allocator for CSR ids. Every call site used to pass a hardcoded 0, so all CSRs in a
+	//! connection shared one registry slot: a second CSR built in the same query would find
+	//! initialized_v already true, skip initialisation, and then have its edges appended to
+	//! the FIRST CSR's arrays -- running the bump pointers past the end. Ids are handed out
+	//! monotonically and never reused within a connection, so a slot always means one CSR.
+	//! Reset in QueryEnd() alongside csr_to_delete, once the entries are gone.
+	int32_t csr_id_counter = 0;
+	int32_t AllocateCSRId() {
+		const lock_guard<std::mutex> guard(csr_lock);
+		return csr_id_counter++;
+	}
 };
 
 } // namespace duckdb

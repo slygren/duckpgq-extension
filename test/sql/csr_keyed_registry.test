@@ -1,0 +1,96 @@
+# name: test/sql/csr_keyed_registry.test
+# description: Each CSR gets its own registry slot, so two of them can coexist in one query
+# group: [sql]
+
+# Every call site used to pass a hardcoded csr_id of 0, so all CSRs in a connection shared
+# ONE registry slot. A second CSR built in the same query found initialized_v already true,
+# skipped initialisation, and then had its edges appended to the FIRST CSR's arrays --
+# running the bump pointers past the end.
+#
+# Measured on the build before this change, the joined query below died with:
+#   INTERNAL Error: Attempted to access index 2 within vector of size 2
+#   ... duckdb::CreateCsrEdgeFunction(...)
+#
+# Ids now come from DuckPGQState::AllocateCSRId(), monotonic and never reused while a slot
+# is live, so a slot always means exactly one CSR.
+
+require duckpgq
+
+statement ok
+CREATE TABLE person(id BIGINT, name VARCHAR);
+
+statement ok
+INSERT INTO person VALUES (0, 'a'), (1, 'b'), (2, 'c'), (3, 'd');
+
+# Two edge relations with deliberately different shapes, so a collision between their CSRs
+# would change the numbers rather than happening to agree.
+statement ok
+CREATE TABLE knows(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO knows VALUES (0, 1), (1, 2), (2, 0);
+
+statement ok
+CREATE TABLE likes(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO likes VALUES (0, 3), (3, 0);
+
+statement ok
+-CREATE PROPERTY GRAPH g
+VERTEX TABLES ( person PROPERTIES (id, name) LABEL P )
+EDGE TABLES (
+    knows SOURCE KEY (src) REFERENCES person(id)
+          DESTINATION KEY (dst) REFERENCES person(id)
+          LABEL Knows,
+    likes SOURCE KEY (src) REFERENCES person(id)
+          DESTINATION KEY (dst) REFERENCES person(id)
+          LABEL Likes
+);
+
+# Baselines, one CSR per query.
+query IR
+select id, round(pagerank, 4) from pagerank(g, p, knows);
+----
+0	0.2899
+1	0.2899
+2	0.2899
+3	0.0435
+
+query IR
+select id, round(pagerank, 4) from pagerank(g, p, likes);
+----
+0	0.3846
+1	0.0577
+2	0.0577
+3	0.3846
+
+# Two CSRs in one query. Each column must equal its baseline above -- that equality is the
+# assertion; a shared slot cannot produce it.
+query IRR
+select k.id, round(k.pagerank, 4) AS pr_knows, round(l.pagerank, 4) AS pr_likes
+from pagerank(g, p, knows) k join pagerank(g, p, likes) l on k.id = l.id;
+----
+0	0.2899	0.3846
+1	0.2899	0.0577
+2	0.2899	0.0577
+3	0.0435	0.3846
+
+# Two DIFFERENT algorithms, each needing its own CSR.
+query IIR
+select w.id, w.componentId, round(p.pagerank, 4) AS pr
+from weakly_connected_component(g, p, knows) w join pagerank(g, p, likes) p on w.id = p.id;
+----
+0	1	0.3846
+1	1	0.0577
+2	1	0.0577
+3	3	0.3846
+
+# Sequential queries in one connection must not inherit a previous query's CSR either.
+query IR
+select id, round(pagerank, 4) from pagerank(g, p, knows);
+----
+0	0.2899
+1	0.2899
+2	0.2899
+3	0.0435
