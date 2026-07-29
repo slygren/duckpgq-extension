@@ -1,7 +1,10 @@
 # ABI artifact sharing across property graphs
 
-**Status:** design, not implemented.
-**Author context:** written 2026-07-29 against `3e257aa`. All code references verified at that revision.
+**Status:** design, not implemented — *except* the artifact-identity groundwork in §4.4, which
+shipped separately as `4ca4817` (see that section). Sharing artifacts between graphs, the actual
+subject of this document, is not built.
+**Author context:** written 2026-07-29 against `3e257aa`. All code references verified at that
+revision; line numbers predate `42b2407` and `4ca4817` and have shifted since.
 
 ---
 
@@ -249,11 +252,28 @@ guarded by a `find(...) == end()` check and *shared* by design; `__x` is unguard
 pre-existing limitation, orthogonal to this design, and does not affect the multi-snapshot shape.
 It has no test coverage and is worth one.
 
-**Required alongside the main change (fixes (b) independently):** make artifact identity qualified.
-`PGQPathTableCatalog` must be keyed by `(catalog, schema, table)` rather than bare table name, and
-`semantic_index` / `reverse_semantic_index` / `branch_summary_index` must store that qualified key
-instead of `info.table_name`. This is a small, self-contained correction and should land **first**,
-as it is a correctness fix valid on its own merits.
+**SHIPPED — `4ca4817`, ahead of the rest of this design.** Artifact identity is now
+`(catalog, schema, table)` throughout: the catalog map, a new `name_index` for the constructed-name
+fast path, `semantic_index`, `reverse_semantic_index` and `branch_summary_index` all key or resolve
+on it. A bare name claimed by two databases is deleted from `name_index` rather than resolved to
+either candidate, and a semantic key claimed by two is dropped from its index; both then miss and
+the bridge answers — slower, and correct.
+
+Two corrections to what this section predicted:
+
+- **(b) was not the path that actually bites first.** Writing the test found a wider one that needs
+  no collision at all: `BuildPathTableCatalog`'s fallback swept *every* attached database, so a
+  graph over one snapshot adopted another's artifacts outright as soon as a second lake was
+  attached. The sweep is now confined to the databases the graph binds tables from — and because
+  unqualified tables carry no `catalog_name`, they resolve to the default database rather than
+  degrading the scope to "unrestricted", which would have reopened the hole. This was open question
+  3 below; it is closed.
+- **Confirmed by measurement, not reading.** Stashing the change and rebuilding,
+  `test/sql/path_finding/abi_snapshot_isolation.test` returns `Alice -> Alice` for a query over
+  snapshot A — snapshot B's synthetic artifact row, an edge in no base table anywhere.
+
+What this does *not* do: artifacts still never cross a database boundary, so a graph cannot yet
+reuse another graph's artifacts even within one database. That remains the subject of §3 onward.
 
 ---
 
@@ -343,10 +363,11 @@ New tests in `test/sql/`:
 5. **Fingerprint.** Regenerating graph A's artifacts invalidates graph B's cache.
 6. **Alias independence.** Attach the same lake under a second alias; sharing still resolves
    (validates the §4.3 decision).
-7. **Snapshot isolation (§4.4b).** Attach two frozen files carrying identically-named artifacts.
-   Assert each graph resolves artifacts from **its own** catalog — check `catalog_name` in
-   `pgq_last_rewrite_diagnostics()`, and assert row counts differ where the snapshots differ. This
-   test fails on `HEAD` today and is the regression guard for the collision fix.
+7. ~~**Snapshot isolation (§4.4b).**~~ — **written and passing:**
+   `test/sql/path_finding/abi_snapshot_isolation.test` (`4ca4817`). Two attached databases carrying
+   identically-named artifacts, each holding a synthetic row absent from every base table, so *which*
+   artifact answered is visible in the result rather than inferred from diagnostics. Verified to fail
+   on the pre-change build.
 8. **Per-snapshot graph naming (§4.4a).** A graph named anything other than `maintenance_graph`, over
    a frozen file whose catalog says `maintenance_graph`, resolves that file's artifacts.
 9. **Cross-version query.** One statement joining the same shape across two attached snapshots
@@ -365,13 +386,13 @@ bytes, and its first query must resolve artifacts at the same rate as the origin
 1. ~~§4.3 qualified-name normalization~~ — **resolved.** Aliases are positional; match on
    `(schema, table, key)` scoped to the consuming graph's attached databases. No generator change
    needed for this part.
-2. **Should the qualified-key fix ship separately?** Recommended yes — §4.4(b) is a correctness bug
-   on `HEAD`, independent of sharing, and a smaller change to review in isolation.
-3. **`BuildPathTableCatalog`'s all-databases fallback** ([:566-618](../src/core/functions/table/match.cpp))
-   scans every attached database when the graph-scoped build finds nothing. Once eligibility is
-   physical, this fallback can load artifacts from an unrelated snapshot. It should either be scoped
-   to the graph's own databases or dropped — it exists for the no-`pg_table` case, which needs
-   confirming as still reachable.
+2. ~~Should the qualified-key fix ship separately?~~ — **done, `4ca4817`.** It did, and ahead of the
+   rest of this design. See §4.4.
+3. ~~`BuildPathTableCatalog`'s all-databases fallback~~ — **closed in `4ca4817`.** It turned out to
+   be the more dangerous of the two paths, not a follow-on: it needs no name collision, just a
+   second attached lake. Now scoped to the databases the graph binds tables from, with unqualified
+   tables resolving to the default database. The sweep itself is kept — it is what finds artifacts
+   in schemas other than `<catalog>.graph` / `<catalog>.abi`.
 4. **Multi-label vertices.** A vertex table with `sub_labels` can be addressed by several labels.
    Re-keying should probably index the artifact under the consuming graph's `main_label` only, with
    sub-label resolution left to the existing label→table machinery. Needs confirmation against the
