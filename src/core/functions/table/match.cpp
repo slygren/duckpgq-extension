@@ -2119,6 +2119,38 @@ SubPath *PGQMatchFunction::GetSubPath(const unique_ptr<PathReference> &path_refe
 	throw InternalException("Unknown path reference type detected");
 }
 
+// Identity of the traversal a select node's CSR was built from: the edge table plus the
+// direction it is walked in. A directed and an undirected CSR over the same table are
+// different structures, so direction is part of the key.
+static string CSREdgeKey(const shared_ptr<PropertyGraphTable> &edge_table, PGQMatchType edge_type) {
+	return StringUtil::Lower(edge_table->FullTableName()) + "|" + to_string(static_cast<int>(edge_type));
+}
+
+// Claim this select node's single CSR slot for `edge_key`, allocating it on first use.
+//
+// "cte1" is keyed by name per select node and deliberately shared by every CSR-route site in
+// that node (see csr_keyed_registry.test). That is correct only while they all mean the SAME
+// CSR. Two path patterns in one MATCH share a select node, so a second pattern over a
+// different edge table would find "cte1" present, skip building its own, and then run
+// iterativelength() against the FIRST pattern's CSR -- a wrong answer, not an error.
+//
+// Until each traversal can carry its own CSR CTE, refuse. A refusal costs a query that never
+// worked anyway (it previously died on the duplicate "__x" alias); sharing would cost silence.
+static void ClaimCSRSlot(PGQCSRSlot &csr_slot, const string &edge_key, int32_t &csr_id_counter) {
+	if (csr_slot.slot < 0) {
+		csr_slot.slot = csr_id_counter++;
+		csr_slot.edge_key = edge_key;
+		return;
+	}
+	if (!csr_slot.edge_key.empty() && !StringUtil::CIEquals(csr_slot.edge_key, edge_key)) {
+		throw BinderException(
+		    "Two path patterns in one MATCH both need a CSR traversal but over different edges (%s and %s). "
+		    "A single MATCH builds one CSR, so the second pattern would traverse the first's edge table. "
+		    "Put each pattern in its own GRAPH_TABLE and join them instead.",
+		    csr_slot.edge_key, edge_key);
+	}
+}
+
 unique_ptr<SubqueryRef> PGQMatchFunction::CreateCountCTESubquery() {
 	//! BEGIN OF (SELECT count(cte1.temp) as temp * 0 from cte1) __x
 
@@ -2429,7 +2461,7 @@ PGQMatchFunction::GenerateShortestPathCTE(CreatePropertyGraphInfo &pg_table, Sub
 unique_ptr<ParsedExpression> PGQMatchFunction::CreatePathFindingFunction(
     vector<unique_ptr<PathReference>> &path_list, CreatePropertyGraphInfo &pg_table, const string &path_variable,
     unique_ptr<SelectNode> &final_select_node, vector<unique_ptr<ParsedExpression>> &conditions,
-    int32_t &csr_id_counter, int32_t &csr_slot, bool all_shortest) {
+    int32_t &csr_id_counter, PGQCSRSlot &csr_slot, bool all_shortest) {
 	// This method will return a SubqueryRef of a list of rowids
 	// For every vertex and edge element, we add the rowid to the list using
 	// list_append, or list_prepend The difficulty is that there may be a
@@ -2470,23 +2502,24 @@ unique_ptr<ParsedExpression> PGQMatchFunction::CreatePathFindingFunction(
 				if (next_vertex_subpath) {
 					path_finding_conditions.push_back(std::move(next_vertex_subpath->where_clause));
 				}
+				edge_element = reinterpret_cast<PathElement *>(edge_subpath->path_list[0].get());
+				// Claimed whether or not "cte1" already exists: a second pattern reusing this
+				// node's CSR must agree on which traversal built it, or it silently walks the
+				// first pattern's edges.
+				ClaimCSRSlot(csr_slot,
+				             CSREdgeKey(ResolveTable(edge_element->label, edge_element->match_type, pg_table),
+				                        edge_element->match_type),
+				             csr_id_counter);
 				if (final_select_node->cte_map.map.find("cte1") == final_select_node->cte_map.map.end()) {
-					edge_element = reinterpret_cast<PathElement *>(edge_subpath->path_list[0].get());
 					if (edge_element->match_type == PGQMatchType::MATCH_EDGE_RIGHT) {
-						if (csr_slot < 0) {
-							csr_slot = csr_id_counter++;
-						}
 						final_select_node->cte_map.map["cte1"] = CreateDirectedCSRCTE(
 						    ResolveTable(edge_element->label, edge_element->match_type, pg_table),
 						    previous_vertex_element->variable_binding, edge_element->variable_binding,
-						    next_vertex_element->variable_binding, csr_slot);
+						    next_vertex_element->variable_binding, csr_slot.slot);
 					} else if (edge_element->match_type == PGQMatchType::MATCH_EDGE_ANY) {
-						if (csr_slot < 0) {
-							csr_slot = csr_id_counter++;
-						}
 						final_select_node->cte_map.map["cte1"] =
 						    CreateUndirectedCSRCTE(ResolveTable(edge_element->label, edge_element->match_type, pg_table),
-						                          final_select_node, csr_slot);
+						                          final_select_node, csr_slot.slot);
 					} else {
 						throw NotImplementedException("Cannot do shortest path for edge type %s",
 						                              edge_element->match_type == PGQMatchType::MATCH_EDGE_LEFT
@@ -2499,7 +2532,7 @@ unique_ptr<ParsedExpression> PGQMatchFunction::CreatePathFindingFunction(
 				    final_select_node->cte_map.map.end()) {
 					final_select_node->cte_map.map[shortest_path_cte_name] = GenerateShortestPathCTE(
 					    pg_table, edge_subpath, previous_vertex_element, next_vertex_element, path_finding_conditions,
-					    csr_slot, all_shortest);
+					    csr_slot.slot, all_shortest);
 					auto cte_shortest_path_ref = make_uniq<BaseTableRef>();
 					cte_shortest_path_ref->table_name = shortest_path_cte_name;
 					if (!final_select_node->from_table) {
@@ -3381,7 +3414,7 @@ void PGQMatchFunction::AddPathFinding(unique_ptr<SelectNode> &select_node,
                                       const string &edge_binding, const string &next_binding,
                                       const shared_ptr<PropertyGraphTable> &edge_table,
                                       CreatePropertyGraphInfo &pg_table, SubPath *subpath, PGQMatchType edge_type,
-                                      int32_t &csr_id_counter, int32_t &csr_slot,
+                                      int32_t &csr_id_counter, PGQCSRSlot &csr_slot,
                                       unique_ptr<ParsedExpression> anchor_filter, bool any_shortest,
                                       const PGQABITraversalPlan *abi_plan) {
 	// The bounded route below is key-addressed and handles cross-table edges correctly, so
@@ -3403,16 +3436,16 @@ void PGQMatchFunction::AddPathFinding(unique_ptr<SelectNode> &select_node,
 	// collides id spaces at ANY depth, not just >= 2, so it is guarded unconditionally.
 	RejectCrossTableCSR(edge_table, subpath->lower, subpath->upper);
 	// One slot per select node, shared with the iterativelength() call below and with any
-	// other code that reuses this node's "cte1", so all of them name the same entry.
-	if (csr_slot < 0) {
-		csr_slot = csr_id_counter++;
-	}
+	// other code that reuses this node's "cte1", so all of them name the same entry. Claiming
+	// it also records which traversal built it, so a second pattern over a different edge
+	// table is refused rather than silently answered from this one's CSR.
+	ClaimCSRSlot(csr_slot, CSREdgeKey(edge_table, edge_type), csr_id_counter);
 	if (select_node->cte_map.map.find("cte1") == select_node->cte_map.map.end()) {
 		if (edge_type == PGQMatchType::MATCH_EDGE_RIGHT) {
 			select_node->cte_map.map["cte1"] =
-			    CreateDirectedCSRCTE(edge_table, prev_binding, edge_binding, next_binding, csr_slot);
+			    CreateDirectedCSRCTE(edge_table, prev_binding, edge_binding, next_binding, csr_slot.slot);
 		} else if (edge_type == PGQMatchType::MATCH_EDGE_ANY) {
-			select_node->cte_map.map["cte1"] = CreateUndirectedCSRCTE(edge_table, select_node, csr_slot);
+			select_node->cte_map.map["cte1"] = CreateUndirectedCSRCTE(edge_table, select_node, csr_slot.slot);
 		} else {
 			throw NotImplementedException("Cannot do shortest path for edge type %s",
 			                              edge_type == PGQMatchType::MATCH_EDGE_LEFT ? "MATCH_EDGE_LEFT"
@@ -3422,16 +3455,25 @@ void PGQMatchFunction::AddPathFinding(unique_ptr<SelectNode> &select_node,
 	if (select_node->cte_map.map.find("shortest_path_cte") != select_node->cte_map.map.end()) {
 		return;
 	}
-	auto temp_cte_select_subquery = CreateCountCTESubquery();
-	if (select_node->from_table) {
-		auto from_join = make_uniq<JoinRef>(JoinRefType::CROSS);
-		from_join->left = std::move(select_node->from_table);
-		from_join->right = std::move(temp_cte_select_subquery);
-		select_node->from_table = std::move(from_join);
-	} else {
-		select_node->from_table = std::move(temp_cte_select_subquery);
+	// The count anchor is `(SELECT 0 * count(cte1.temp) AS temp FROM cte1) __x`: a dependency
+	// edge that forces the CSR CTE to be evaluated before iterativelength() runs. It is a
+	// constant zero, and every pattern in this select node reads the same "cte1", so one copy
+	// serves them all. Adding a second cross-joined it under the same alias and the query died
+	// with `Ambiguous reference to table "__x"` -- which is why two CSR-route patterns in one
+	// MATCH never worked.
+	if (!csr_slot.anchor_added) {
+		csr_slot.anchor_added = true;
+		auto temp_cte_select_subquery = CreateCountCTESubquery();
+		if (select_node->from_table) {
+			auto from_join = make_uniq<JoinRef>(JoinRefType::CROSS);
+			from_join->left = std::move(select_node->from_table);
+			from_join->right = std::move(temp_cte_select_subquery);
+			select_node->from_table = std::move(from_join);
+		} else {
+			select_node->from_table = std::move(temp_cte_select_subquery);
+		}
 	}
-	conditions.push_back(AddPathQuantifierCondition(prev_binding, next_binding, edge_table, subpath, csr_slot));
+	conditions.push_back(AddPathQuantifierCondition(prev_binding, next_binding, edge_table, subpath, csr_slot.slot));
 }
 
 void PGQMatchFunction::AddPathModeFilter(PGQPathMode mode, const string &path_cte,
@@ -3617,7 +3659,7 @@ void PGQMatchFunction::AddTraversalPathFinding(
 void PGQMatchFunction::CheckNamedSubpath(SubPath &subpath, MatchExpression &original_ref,
                                          CreatePropertyGraphInfo &pg_table, unique_ptr<SelectNode> &final_select_node,
                                          vector<unique_ptr<ParsedExpression>> &conditions, int32_t &csr_id_counter,
-                                         int32_t &csr_slot, bool all_shortest) {
+                                         PGQCSRSlot &csr_slot, bool all_shortest) {
 	for (idx_t idx_i = 0; idx_i < original_ref.column_list.size(); idx_i++) {
 		auto parsed_ref = dynamic_cast<FunctionExpression *>(original_ref.column_list[idx_i].get());
 		if (parsed_ref == nullptr) {
@@ -3716,17 +3758,17 @@ void PGQMatchFunction::CheckNamedSubpath(SubPath &subpath, MatchExpression &orig
 				if (edge_elem->match_type != PGQMatchType::MATCH_EDGE_RIGHT) {
 					throw NotImplementedException("COST() is only supported for right-directed edges (->) currently");
 				}
-				csr_slot = csr_id_counter++;
+				ClaimCSRSlot(csr_slot, CSREdgeKey(edge_table, edge_elem->match_type), csr_id_counter);
 				final_select_node->cte_map.map["cte1"] = CreateWeightedDirectedCSRCTE(
 				    edge_table, prev_elem->variable_binding, edge_elem->variable_binding,
-				    next_elem->variable_binding, edge_sub->cost_expr->Copy(), csr_slot);
+				    next_elem->variable_binding, edge_sub->cost_expr->Copy(), csr_slot.slot);
 			}
 			// Generate cheapest_path_length(<slot>, v_size, src_rowid, dst_rowid).
 			vector<unique_ptr<ParsedExpression>> cpl_args;
 			// Reuses whatever slot built "cte1" for this select node -- the CTE is shared by
 			// name, so the id must be shared too. Allocating a second one here pointed
 			// cheapest_path_length() at an empty registry entry ("Invalid ID").
-			cpl_args.push_back(make_uniq<ConstantExpression>(Value::INTEGER(csr_slot)));
+			cpl_args.push_back(make_uniq<ConstantExpression>(Value::INTEGER(csr_slot.slot)));
 			cpl_args.push_back(GetCountTable(edge_table->source_pg_table, prev_elem->variable_binding,
 			                                 edge_table->source_pk[0]));
 			cpl_args.push_back(make_uniq<ColumnRefExpression>("rowid", prev_elem->variable_binding));
@@ -3745,7 +3787,7 @@ void PGQMatchFunction::ProcessPathList(vector<unique_ptr<PathReference>> &path_l
                                        unique_ptr<SelectNode> &final_select_node,
                                        case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map,
                                        CreatePropertyGraphInfo &pg_table, int32_t &extra_alias_counter,
-                                       MatchExpression &original_ref, int32_t &csr_id_counter, int32_t &csr_slot,
+                                       MatchExpression &original_ref, int32_t &csr_id_counter, PGQCSRSlot &csr_slot,
                                        bool all_shortest, bool any_shortest,
                                        const PGQPathTableCache *path_table_cache, int64_t vl_fallback_budget) {
 	PathElement *previous_vertex_element = GetPathElement(path_list[0]);
@@ -3922,15 +3964,16 @@ void PGQMatchFunction::ProcessPathList(vector<unique_ptr<PathReference>> &path_l
 							if (final_select_node->cte_map.map.find("cte1") ==
 							    final_select_node->cte_map.map.end()) {
 								if (edge_element->match_type == PGQMatchType::MATCH_EDGE_RIGHT) {
-									csr_slot = csr_id_counter++;
+									ClaimCSRSlot(csr_slot, CSREdgeKey(edge_table, edge_element->match_type), csr_id_counter);
 									final_select_node->cte_map.map["cte1"] = CreateDirectedCSRCTE(
 									    edge_table, previous_vertex_element->variable_binding,
 									    edge_element->variable_binding,
-									    next_vertex_element->variable_binding, csr_slot);
+									    next_vertex_element->variable_binding, csr_slot.slot);
 								} else if (edge_element->match_type == PGQMatchType::MATCH_EDGE_ANY) {
-									csr_slot = csr_id_counter++;
+									ClaimCSRSlot(csr_slot, CSREdgeKey(edge_table, edge_element->match_type),
+									             csr_id_counter);
 									final_select_node->cte_map.map["cte1"] =
-									    CreateUndirectedCSRCTE(edge_table, final_select_node, csr_slot);
+									    CreateUndirectedCSRCTE(edge_table, final_select_node, csr_slot.slot);
 								} else {
 									throw NotImplementedException(
 									    "ONE ROW PER path finding is not supported for "
@@ -3939,7 +3982,7 @@ void PGQMatchFunction::ProcessPathList(vector<unique_ptr<PathReference>> &path_l
 							}
 							vector<unique_ptr<ParsedExpression>> pfc;
 							final_select_node->cte_map.map[kPathCTE] = GenerateShortestPathCTE(
-							    pg_table, edge_subpath, previous_vertex_element, next_vertex_element, pfc, csr_slot,
+							    pg_table, edge_subpath, previous_vertex_element, next_vertex_element, pfc, csr_slot.slot,
 							    all_shortest);
 						}
 					}
@@ -6483,7 +6526,7 @@ static unique_ptr<ParsedExpression> BuildExistsSubquery(
 			// Withholding the cache disables the fallback's ABI edge-artifact scans too, so
 			// pgq_disable_abi_rewrite forces a fully bridge-based traversal -- which is what
 			// makes pgq_verify_abi_rewrite able to verify this rewrite.
-			int32_t inner_cte1_slot = -1;
+			PGQCSRSlot inner_cte1_slot;
 			PGQMatchFunction::ProcessPathList(path_pattern->path_elements, conditions, inner_select, inner_alias_map,
 			                                  pg_table, extra_alias_counter, inner_match, CSRIdCounter(context),
 			                                  inner_cte1_slot, all_shortest, any_shortest,
@@ -8154,6 +8197,13 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	CoveredBindingMap covered_columns;
 
 	int32_t extra_alias_counter = 0;
+	// One CSR slot for the whole MATCH, not one per path pattern: every pattern here writes
+	// into the SAME final_select_node, and "cte1" is keyed by name on that node. Declaring it
+	// inside the loop reset both the slot and the anchor flag for the second pattern, which
+	// then allocated a fresh id, found "cte1" already present, skipped building a CSR for it,
+	// and pointed iterativelength() at an empty registry entry -- while also cross-joining a
+	// second "__x". Same shape as the COST()/recursive-ProcessPathList slot bugs.
+	PGQCSRSlot cte1_slot;
 	for (idx_t idx_i = 0; idx_i < ref->path_patterns.size(); idx_i++) {
 		auto &path_pattern = ref->path_patterns[idx_i];
 		// Check if the element is PathElement or a Subpath with potentially many
@@ -8186,7 +8236,6 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 				RecordRewriteDiagnostic(context, std::move(diagnostic));
 				ThrowABIPathRequired();
 			}
-			int32_t cte1_slot = -1;
 			ProcessPathList(path_pattern->path_elements, conditions, final_select_node, alias_map, *pg_table,
 			                extra_alias_counter, *ref, CSRIdCounter(context), cte1_slot, all_shortest, any_shortest,
 			                DisableABIRewrite(context) ? nullptr : &path_table_cache, MaxVLFallbackRows(context));
@@ -8356,7 +8405,7 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 					RecordRewriteDiagnostic(context, std::move(diagnostic));
 					ThrowABIPathRequired();
 				}
-				int32_t branch_cte1_slot = -1;
+				PGQCSRSlot branch_cte1_slot;
 				ProcessPathList(path_pattern->path_elements, branch_conditions, branch_select,
 				                branch_alias_map, *pg_table, branch_counter, branch, CSRIdCounter(context),
 				                branch_cte1_slot, all_shortest, any_shortest,

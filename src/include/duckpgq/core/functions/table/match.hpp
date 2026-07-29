@@ -69,6 +69,26 @@ struct PGQBranchSummaryLookup {
 	string branch_edge_label;
 };
 
+//! The one CSR built for a select node: its registry slot, plus which edge traversal built it.
+//!
+//! `"cte1"` is keyed by name per select node, so every CSR-route site in that node names the
+//! same entry -- that part is deliberate (see csr_keyed_registry.test). What was missing is
+//! *which* traversal it was built from. Two path patterns in one MATCH share a select node,
+//! so the second used to find `"cte1"` present and reuse it, silently traversing the FIRST
+//! pattern's edge table. Recording the key lets a mismatch be refused instead of answered
+//! wrongly.
+struct PGQCSRSlot {
+	//! Registry slot handed out by DuckPGQState::AllocateCSRId; -1 until the CSR is built.
+	int32_t slot = -1;
+	//! Qualified edge table + direction that built "cte1". Empty until then.
+	string edge_key;
+	//! True once the count-anchor subquery `__x` has been cross-joined into this select
+	//! node's FROM clause. It is `0 * count(cte1.temp)` -- a dependency edge forcing the CSR
+	//! CTE to be evaluated first -- so one per select node is both sufficient and necessary:
+	//! a second copy is an ambiguous duplicate alias, not extra work.
+	bool anchor_added = false;
+};
+
 struct PGQDirectLinkInfo {
 	string graph_name;
 	string link_name;
@@ -230,7 +250,7 @@ public:
 	                                                              const string &path_variable,
 	                                                              unique_ptr<SelectNode> &final_select_node,
 	                                                              vector<unique_ptr<ParsedExpression>> &conditions,
-	                                                              int32_t &csr_id_counter, int32_t &cte1_slot,
+	                                                              int32_t &csr_id_counter, PGQCSRSlot &cte1_slot,
 	                                                              bool all_shortest = false);
 
 	static void AddTraversalPathFinding(unique_ptr<SelectNode> &select_node,
@@ -247,7 +267,7 @@ public:
 	static void AddPathFinding(unique_ptr<SelectNode> &select_node, vector<unique_ptr<ParsedExpression>> &conditions,
 	                           const string &prev_binding, const string &edge_binding, const string &next_binding,
 	                           const shared_ptr<PropertyGraphTable> &edge_table, CreatePropertyGraphInfo &pg_table,
-	                           SubPath *subpath, PGQMatchType edge_type, int32_t &csr_id_counter, int32_t &cte1_slot,
+	                           SubPath *subpath, PGQMatchType edge_type, int32_t &csr_id_counter, PGQCSRSlot &cte1_slot,
 	                           unique_ptr<ParsedExpression> anchor_filter = nullptr, bool any_shortest = false,
 	                           const PGQABITraversalPlan *abi_plan = nullptr);
 
@@ -271,7 +291,7 @@ public:
 	                            vector<unique_ptr<ParsedExpression>> &conditions, unique_ptr<SelectNode> &select_node,
 	                            case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map,
 	                            CreatePropertyGraphInfo &pg_table, int32_t &extra_alias_counter,
-	                            MatchExpression &original_ref, int32_t &csr_id_counter, int32_t &cte1_slot,
+	                            MatchExpression &original_ref, int32_t &csr_id_counter, PGQCSRSlot &cte1_slot,
 	                            bool all_shortest = false,
 	                            bool any_shortest = false,
 	                            const PGQPathTableCache *path_table_cache = nullptr,
@@ -293,7 +313,7 @@ public:
 	static void CheckNamedSubpath(SubPath &subpath, MatchExpression &original_ref, CreatePropertyGraphInfo &pg_table,
 	                              unique_ptr<SelectNode> &final_select_node,
 	                              vector<unique_ptr<ParsedExpression>> &conditions, int32_t &csr_id_counter,
-	                              int32_t &cte1_slot, bool all_shortest = false);
+	                              PGQCSRSlot &cte1_slot, bool all_shortest = false);
 
 	// Check whether columns to query are valid against the property graph, throws
 	// BinderException if error.
