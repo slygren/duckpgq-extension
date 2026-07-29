@@ -229,13 +229,30 @@ static string OptionalBoolCatalogColumn(const case_insensitive_set_t &columns, c
 	return string(default_value ? "true" : "false") + " AS " + column_name;
 }
 
+// An artifact is identified by WHERE it lives, not only by what it is called.
+//
+// Every frozen snapshot of a lake is generated from the same layout, so they all carry
+// artifacts with identical names -- `__pg_maintenance_graph__TAG__HAS_WORKORDER__WORK_ORDER`
+// exists in each. Keying the catalog on the bare name meant that with two snapshots attached,
+// the second silently lost to the first, and a query over one snapshot could be answered from
+// the other's precomputed paths: right shape, wrong data, no error.
+static string PathTableKey(const string &catalog_name, const string &schema_name, const string &table_name) {
+	return StringUtil::Lower(catalog_name) + "." + StringUtil::Lower(schema_name) + "." +
+	       StringUtil::Lower(table_name);
+}
+
+static string PathTableKey(const PGQPathTableInfo &info) {
+	return PathTableKey(info.catalog_name, info.schema_name, info.table_name);
+}
+
 static void AddPathTableInfo(PGQPathTableCatalog &path_table_catalog, PGQPathTableInfo info) {
 	if (info.table_name.empty()) {
 		return;
 	}
-	auto existing = path_table_catalog.find(info.table_name);
+	const string key = PathTableKey(info);
+	auto existing = path_table_catalog.find(key);
 	if (existing == path_table_catalog.end() || (!existing->second.from_metadata && info.from_metadata)) {
-		path_table_catalog[info.table_name] = std::move(info);
+		path_table_catalog[key] = std::move(info);
 	}
 }
 
@@ -563,7 +580,34 @@ static PGQPathTableCatalog BuildPathTableCatalogFromGraphTables(ClientContext &c
 	return path_table_catalog;
 }
 
-static PGQPathTableCatalog BuildPathTableCatalog(ClientContext &context, const string &graph_name) {
+// Databases the graph actually binds tables from. An artifact outside them describes a
+// different physical dataset -- a different frozen snapshot, typically -- so it must never be
+// used to answer this graph's queries, however well its name and labels match.
+static case_insensitive_set_t GraphDatabaseNames(ClientContext &context, const CreatePropertyGraphInfo &pg_table) {
+	case_insensitive_set_t names;
+	// An unqualified table in CREATE PROPERTY GRAPH carries no catalog_name; it lives in the
+	// default database. Resolving it keeps the scope tight instead of degrading to
+	// "unrestricted", which would let another attached snapshot back in.
+	auto add = [&](const shared_ptr<PropertyGraphTable> &table) {
+		if (!table) {
+			return;
+		}
+		names.insert(table->catalog_name.empty() ? DatabaseManager::GetDefaultDatabase(context)
+		                                         : table->catalog_name);
+	};
+	for (const auto &table : pg_table.vertex_tables) {
+		add(table);
+	}
+	for (const auto &table : pg_table.edge_tables) {
+		add(table);
+	}
+	return names;
+}
+
+// `allowed_databases` empty means "no restriction" -- the caller had no property graph to
+// scope by. When it is populated, the sweep below is confined to those databases.
+static PGQPathTableCatalog BuildPathTableCatalog(ClientContext &context, const string &graph_name,
+                                                 const case_insensitive_set_t &allowed_databases) {
 	PGQPathTableCatalog path_table_catalog;
 	const string pt_prefix = "__pg_" + graph_name + "__";
 	auto metadata_connection = make_shared_ptr<Connection>(*context.db);
@@ -601,17 +645,30 @@ static PGQPathTableCatalog BuildPathTableCatalog(ClientContext &context, const s
 		}
 	}
 
+	auto permitted = [&allowed_databases](const string &db_name) {
+		return allowed_databases.empty() || allowed_databases.find(db_name) != allowed_databases.end();
+	};
+
 	auto &db_manager = DatabaseManager::Get(context);
 	for (auto &db : db_manager.GetDatabases(context)) {
 		const string &db_name = db->GetName();
+		if (!permitted(db_name)) {
+			continue;
+		}
 		ScanSchemaPathTables(context, db_name, "graph", pt_prefix, metadata_catalogs, fallback_tables);
 		ScanSchemaPathTables(context, db_name, "abi", pt_prefix, metadata_catalogs, fallback_tables);
 	}
 
 	for (const auto &entry : metadata_catalogs) {
+		if (!permitted(entry.first)) {
+			continue;
+		}
 		LoadPathTableCatalogMetadata(*metadata_connection, entry.first, entry.second, graph_name, path_table_catalog);
 	}
 	for (auto &info : fallback_tables) {
+		if (!permitted(info.catalog_name)) {
+			continue;
+		}
 		AddPathTableInfo(path_table_catalog, std::move(info));
 	}
 
@@ -656,10 +713,33 @@ static shared_ptr<PGQPathTableCache> BuildPathTableCache(ClientContext &context,
 		cache->catalog = BuildPathTableCatalogFromGraphTables(context, graph_name, *pg_table);
 	}
 	if (cache->catalog.empty()) {
-		cache->catalog = BuildPathTableCatalog(context, graph_name);
+		// Wider sweep (any schema, not just <catalog>.graph/.abi), but still confined to the
+		// databases this graph binds tables from. Unconfined, a graph over one attached
+		// snapshot would happily pick up another snapshot's artifacts.
+		cache->catalog = BuildPathTableCatalog(context, graph_name,
+		                                       pg_table ? GraphDatabaseNames(context, *pg_table) : case_insensitive_set_t());
+	}
+
+	// Bare artifact names seen more than once, across different databases. Two attached
+	// snapshots carry the same names, and neither is the right answer for a lookup that only
+	// knows the name -- so such a name resolves to nothing and the bridge is used instead.
+	case_insensitive_set_t ambiguous_names;
+	for (const auto &entry : cache->catalog) {
+		const auto &key = entry.first;
+		const auto &info = entry.second;
+		auto name_hit = cache->name_index.find(info.table_name);
+		if (name_hit == cache->name_index.end()) {
+			if (ambiguous_names.find(info.table_name) == ambiguous_names.end()) {
+				cache->name_index[info.table_name] = key;
+			}
+		} else if (!StringUtil::CIEquals(name_hit->second, key)) {
+			cache->name_index.erase(name_hit);
+			ambiguous_names.insert(info.table_name);
+		}
 	}
 
 	for (const auto &entry : cache->catalog) {
+		const auto &key = entry.first;
 		const auto &info = entry.second;
 		if (!info.from_metadata) {
 			continue;
@@ -671,7 +751,17 @@ static shared_ptr<PGQPathTableCache> BuildPathTableCache(ClientContext &context,
 			// forward artifact, so it is indexed separately -- otherwise whichever loaded
 			// last would displace the other for every lookup.
 			auto &index = info.is_sorted_by_v1 ? cache->reverse_semantic_index : cache->semantic_index;
-			index[PathSemanticKey(info.path_kind, vertex_parts, edge_parts)] = info.table_name;
+			const string semantic_key = PathSemanticKey(info.path_kind, vertex_parts, edge_parts);
+			auto seen = index.find(semantic_key);
+			if (seen != index.end() && !StringUtil::CIEquals(seen->second, key)) {
+				// Same labels, same kind, different physical artifact: two snapshots of the
+				// same layout. Neither can be preferred from labels alone, so drop the entry
+				// and let the bridge answer. Within one database the generator does not emit
+				// duplicates, so this only fires across attached lakes.
+				index.erase(seen);
+			} else {
+				index[semantic_key] = key;
+			}
 		}
 		// Size of each 1-hop edge family, so a fallback traversal can be costed before it
 		// runs. Forward artifacts only -- a reverse twin duplicates its forward artifact's
@@ -690,7 +780,7 @@ static shared_ptr<PGQPathTableCache> BuildPathTableCache(ClientContext &context,
 		}
 		for (idx_t idx = 0; idx < edge_parts.size(); idx++) {
 			PGQBranchSummaryLookup lookup;
-			lookup.table_name = info.table_name;
+			lookup.table_key = key;
 			lookup.branch_edge_label = edge_parts[idx];
 			cache->branch_summary_index[BranchSummaryKey(vertex_parts[0], edge_parts[idx], vertex_parts[idx + 1])] =
 			    lookup;
@@ -884,9 +974,16 @@ static const PGQPathTableInfo *FindPathTableInfo(const PGQPathTableCache &path_t
 			}
 		}
 	}
-	auto table_entry = path_table_catalog.find(table_name);
-	if (table_entry != path_table_catalog.end()) {
-		return &table_entry->second;
+	// `table_name` is the constructed `__pg_<graph>__…` name, which says nothing about which
+	// attached database holds it -- so it is resolved through name_index, where any name
+	// claimed by more than one database has been removed. An ambiguous name misses here and
+	// falls through to the semantic index, and failing that to the bridge.
+	auto name_entry = path_table_cache.name_index.find(table_name);
+	if (name_entry != path_table_cache.name_index.end()) {
+		auto table_entry = path_table_catalog.find(name_entry->second);
+		if (table_entry != path_table_catalog.end()) {
+			return &table_entry->second;
+		}
 	}
 
 	auto index_entry = path_table_cache.semantic_index.find(PathSemanticKey(path_kind, vertex_label_sequence,
@@ -987,7 +1084,7 @@ static const PGQPathTableInfo *FindBranchSummaryInfo(const PGQPathTableCache &pa
 		lookup_entry = path_table_cache.branch_summary_index.find(BranchSummaryKey(src_label, edge_label, ""));
 	}
 	if (lookup_entry != path_table_cache.branch_summary_index.end()) {
-		auto table_entry = path_table_cache.catalog.find(lookup_entry->second.table_name);
+		auto table_entry = path_table_cache.catalog.find(lookup_entry->second.table_key);
 		if (table_entry != path_table_cache.catalog.end()) {
 			branch_edge_label = lookup_entry->second.branch_edge_label;
 			return &table_entry->second;
@@ -7910,10 +8007,24 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 		}
 
 		PGQRewriteDiagnostic diagnostic;
-		if (hits.size() == 1) {
-			diagnostic = MakeArtifactDiagnostic(
-			    graph_name, "enumerated_edge", "selected enumerated edge artifact", path_table_cache.catalog.find(hits[0].tname)->second,
-			    {hits[0].src_label, hits[0].dst_label}, {hits[0].edge_label}, pt_alias, one_row_per_mode);
+		auto single_hit_info =
+		    hits.size() == 1
+		        ? path_table_cache.catalog.find(PathTableKey(hits[0].catalog, hits[0].schema, hits[0].tname))
+		        : path_table_cache.catalog.end();
+		if (single_hit_info != path_table_cache.catalog.end()) {
+			diagnostic = MakeArtifactDiagnostic(graph_name, "enumerated_edge", "selected enumerated edge artifact",
+			                                    single_hit_info->second,
+			                                    {hits[0].src_label, hits[0].dst_label}, {hits[0].edge_label}, pt_alias,
+			                                    one_row_per_mode);
+		} else if (hits.size() == 1) {
+			// Diagnostics only: the artifact is still used, we just cannot describe it.
+			diagnostic.graph_name = graph_name;
+			diagnostic.rewrite_type = "enumerated_edge";
+			diagnostic.status = "selected";
+			diagnostic.reason = "selected enumerated edge artifact";
+			diagnostic.path_kind = "edge";
+			diagnostic.table_alias = pt_alias;
+			diagnostic.one_row_per_mode = OneRowPerModeToString(one_row_per_mode);
 		} else {
 			diagnostic.graph_name = graph_name;
 			diagnostic.rewrite_type = "enumerated_edge_union";
@@ -7931,7 +8042,7 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 			diagnostic.property_support = "late_vertex_property_fetch";
 			diagnostic.freshness_policy = "mixed";
 			for (const auto &hit : hits) {
-				auto hit_info = path_table_cache.catalog.find(hit.tname);
+				auto hit_info = path_table_cache.catalog.find(PathTableKey(hit.catalog, hit.schema, hit.tname));
 				if (hit_info != path_table_cache.catalog.end() && hit_info->second.estimated_rows > 0) {
 					diagnostic.estimated_rows += hit_info->second.estimated_rows;
 				}

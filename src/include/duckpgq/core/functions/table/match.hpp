@@ -65,7 +65,9 @@ struct PGQPathTableInfo {
 using PGQPathTableCatalog = case_insensitive_map_t<PGQPathTableInfo>;
 
 struct PGQBranchSummaryLookup {
-	string table_name;
+	//! Qualified catalog key (catalog.schema.table), not the bare artifact name -- see
+	//! PathTableKey in match.cpp.
+	string table_key;
 	string branch_edge_label;
 };
 
@@ -114,7 +116,14 @@ struct PGQDirectLinkInfo {
 };
 
 struct PGQPathTableCache {
+	//! Keyed by PathTableKey (catalog.schema.table). Every index below stores that same
+	//! qualified key, never a bare artifact name.
 	PGQPathTableCatalog catalog;
+	//! Bare artifact name -> qualified key, for the constructed-name fast path. A name that
+	//! occurs in more than one attached database is DELETED from here rather than resolved to
+	//! either candidate: the lookup then misses and the query falls back to the bridge, which
+	//! is slower but correct. Guessing would answer one snapshot's query from another's rows.
+	case_insensitive_map_t<string> name_index;
 	case_insensitive_map_t<string> semantic_index;
 	//! Same keys as semantic_index, but resolving to reverse-sorted twins. Kept separate
 	//! so a twin never displaces the forward artifact for source-anchored lookups.

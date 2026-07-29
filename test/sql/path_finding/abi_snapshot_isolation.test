@@ -1,0 +1,210 @@
+# name: test/sql/path_finding/abi_snapshot_isolation.test
+# description: ABI artifacts never cross a database boundary, and identically-named artifacts in two attached databases do not displace each other
+# group: [path_finding]
+
+# Every frozen snapshot of a lake is generated from the same layout, so they all carry
+# artifacts under the SAME names -- `__pg_<graph>__<SRC>__<EDGE>__<DST>` is identical in each,
+# and each `__pgq_path_catalog` names the same graph. Attaching more than one at a time is a
+# supported thing to do (comparing today against last week is one query over two attachments),
+# so the binder has to keep them apart.
+#
+# Two ways it did not:
+#
+#  1. The catalog was keyed by BARE table name, so the second snapshot's artifact silently lost
+#     to the first and a query over one could be answered from the other's precomputed paths.
+#     Identity is now (catalog, schema, table), and a bare name claimed by two databases
+#     resolves to neither -- the lookup misses and the bridge answers, which is slower and
+#     correct rather than fast and wrong.
+#
+#  2. When the graph-scoped catalog build found nothing, the fallback swept EVERY attached
+#     database. A graph over one snapshot would then happily adopt another snapshot's
+#     artifacts. The sweep is now confined to the databases the graph binds tables from.
+#
+# The proof technique throughout: an artifact holds a synthetic row that is NOT in the base
+# edge table, so "was the artifact used, and which one" is visible in the answer.
+
+require duckpgq
+
+statement ok
+ATTACH '__TEST_DIR__/snap_a.db' AS snap_a;
+
+statement ok
+ATTACH '__TEST_DIR__/snap_b.db' AS snap_b;
+
+# Identical schema in both snapshots -- as two freezes of one lake would be.
+statement ok
+CREATE TABLE snap_a.person(id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO snap_a.person VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol');
+
+statement ok
+CREATE TABLE snap_a.knows(src INTEGER, dst INTEGER);
+
+statement ok
+INSERT INTO snap_a.knows VALUES (1, 2), (2, 3);
+
+statement ok
+CREATE TABLE snap_b.person(id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO snap_b.person VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol');
+
+statement ok
+CREATE TABLE snap_b.knows(src INTEGER, dst INTEGER);
+
+statement ok
+INSERT INTO snap_b.knows VALUES (1, 2), (2, 3);
+
+# ── snapshot B carries artifacts; snapshot A carries none ───────────────────────────────────
+#
+# B's artifact says Alice -> Alice, a row in no base table anywhere. If it ever answers a query
+# over A, it is unmistakable.
+statement ok
+CREATE SCHEMA snap_b.graph;
+
+statement ok
+CREATE TABLE snap_b.graph.__pg_test_graph__custom_edge AS
+SELECT 1 AS v0, hash('from_snapshot_b') AS e1, 1 AS v1;
+
+statement ok
+CREATE TABLE snap_b.graph.__pgq_path_catalog AS
+SELECT
+    'test_graph' AS graph_name,
+    '__pg_test_graph__custom_edge' AS path_table_name,
+    'edge' AS path_kind,
+    1 AS hop_count,
+    'Person' AS src_label,
+    'Person' AS dst_label,
+    'Person,Person' AS vertex_label_sequence,
+    'Knows' AS edge_label_sequence,
+    true AS supports_one_row_per_step,
+    true AS is_deduplicated,
+    (SELECT count(*) FROM snap_b.graph.__pg_test_graph__custom_edge) AS estimated_rows,
+    current_timestamp AS last_refreshed_at,
+    true AS is_sorted_by_v0,
+    1 AS min_depth,
+    1 AS max_depth,
+    'knows' AS bridge_table_names;
+
+# The graph binds ONLY snapshot A's tables.
+statement ok
+-CREATE PROPERTY GRAPH test_graph
+VERTEX TABLES (
+    snap_a.person PROPERTIES (id, name) LABEL Person
+)
+EDGE TABLES (
+    snap_a.knows SOURCE KEY (src) REFERENCES snap_a.person(id)
+                 DESTINATION KEY (dst) REFERENCES snap_a.person(id)
+                 LABEL Knows
+);
+
+# A has no artifacts, so this must come from A's bridge table. Adopting B's artifact would
+# return the single row Alice/Alice instead.
+query II
+-FROM GRAPH_TABLE (
+    test_graph
+    MATCH (a:Person)-[:Knows]->(b:Person)
+    COLUMNS (a.name AS src, b.name AS dst)
+) ORDER BY src;
+----
+Alice	Bob
+Bob	Carol
+
+# ── both snapshots carry the same artifact name, and the graph spans both ────────────────────
+#
+# This is the case where the bare-name key silently picked a winner. A's artifact says
+# Alice -> Carol, B's says Alice -> Alice; neither is derivable from the base tables, so
+# whichever answered would be visible. Correct behaviour is to use neither.
+statement ok
+CREATE SCHEMA snap_a.graph;
+
+statement ok
+CREATE TABLE snap_a.graph.__pg_span_graph__custom_edge AS
+SELECT 1 AS v0, hash('from_snapshot_a') AS e1, 3 AS v1;
+
+statement ok
+CREATE TABLE snap_a.graph.__pgq_path_catalog AS
+SELECT
+    'span_graph' AS graph_name,
+    '__pg_span_graph__custom_edge' AS path_table_name,
+    'edge' AS path_kind,
+    1 AS hop_count,
+    'Person' AS src_label,
+    'Person' AS dst_label,
+    'Person,Person' AS vertex_label_sequence,
+    'Knows' AS edge_label_sequence,
+    true AS supports_one_row_per_step,
+    true AS is_deduplicated,
+    1::BIGINT AS estimated_rows,
+    current_timestamp AS last_refreshed_at,
+    true AS is_sorted_by_v0,
+    1 AS min_depth,
+    1 AS max_depth,
+    'knows' AS bridge_table_names;
+
+# Same artifact name, same labels, same graph name -- different database, different rows.
+statement ok
+CREATE TABLE snap_b.graph.__pg_span_graph__custom_edge AS
+SELECT 1 AS v0, hash('from_snapshot_b') AS e1, 1 AS v1;
+
+statement ok
+INSERT INTO snap_b.graph.__pgq_path_catalog
+SELECT
+    'span_graph',
+    '__pg_span_graph__custom_edge',
+    'edge',
+    1,
+    'Person',
+    'Person',
+    'Person,Person',
+    'Knows',
+    true,
+    true,
+    1::BIGINT,
+    current_timestamp,
+    true,
+    1,
+    1,
+    'knows';
+
+# Binds tables from BOTH databases, so both catalogs are candidates and the artifact name is
+# claimed twice.
+statement ok
+-CREATE PROPERTY GRAPH span_graph
+VERTEX TABLES (
+    snap_a.person PROPERTIES (id, name) LABEL Person,
+    snap_b.person PROPERTIES (id, name) LABEL PersonB
+)
+EDGE TABLES (
+    snap_a.knows SOURCE KEY (src) REFERENCES snap_a.person(id)
+                 DESTINATION KEY (dst) REFERENCES snap_a.person(id)
+                 LABEL Knows,
+    snap_b.knows SOURCE KEY (src) REFERENCES snap_b.person(id)
+                 DESTINATION KEY (dst) REFERENCES snap_b.person(id)
+                 LABEL KnowsB
+);
+
+# Ambiguous -> no artifact -> the bridge answers. Alice/Carol would mean A's artifact won,
+# Alice/Alice would mean B's did.
+query II
+-FROM GRAPH_TABLE (
+    span_graph
+    MATCH (a:Person)-[:Knows]->(b:Person)
+    COLUMNS (a.name AS src, b.name AS dst)
+) ORDER BY src;
+----
+Alice	Bob
+Bob	Carol
+
+# The unambiguous side of the same graph is unaffected: snap_b's Knows edges are reached under
+# their own label and still resolve normally.
+query II
+-FROM GRAPH_TABLE (
+    span_graph
+    MATCH (a:PersonB)-[:KnowsB]->(b:PersonB)
+    COLUMNS (a.name AS src, b.name AS dst)
+) ORDER BY src;
+----
+Alice	Bob
+Bob	Carol
