@@ -76,6 +76,84 @@ FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (good_graph MATCH (a:Person)-[:Kno
 ----
 match	3	3	0	0
 
+# ── The two failures that are not a verdict, and the one that is ───────────────
+# These used to be a single status, 'error', which meant a sweep could not tell
+# "the rewrite emits something broken" from "there is no reference answer to
+# compare against". The second is a hole in the ORACLE, not a fault in the
+# rewrite, and conflating them is how an unverifiable shape gets read as noise
+# and quietly stays unverified. On the real lake every negated-edge-label shape
+# lands in that second bucket.
+
+statement ok
+CREATE TABLE lonely(src INTEGER, dst INTEGER);
+
+statement ok
+INSERT INTO lonely VALUES (1,2),(2,3);
+
+# Faithful artifact for the edge below.
+statement ok
+CREATE TABLE graph.__pg_lonely_graph__custom_edge AS
+SELECT src AS v0, hash('l' || src || dst) AS e1, dst AS v1 FROM lonely;
+
+# ... and one missing the v1 column the rewrite will project.
+statement ok
+CREATE TABLE graph.__pg_broken_graph__custom_edge AS
+SELECT src AS v0, hash('b') AS e1 FROM lonely;
+
+statement ok
+INSERT INTO graph.__pgq_path_catalog
+SELECT * FROM (VALUES
+  ('lonely_graph','__pg_lonely_graph__custom_edge','edge',1,'Person','Person','Person,Person','Lonely',true,true,2,now(),true,1,1,'lonely'),
+  ('broken_graph','__pg_broken_graph__custom_edge','edge',1,'Person','Person','Person,Person','Lonely',true,true,2,now(),true,1,1,'lonely')
+) t(graph_name,path_table_name,path_kind,hop_count,src_label,dst_label,vertex_label_sequence,edge_label_sequence,
+    supports_one_row_per_step,is_deduplicated,estimated_rows,last_refreshed_at,is_sorted_by_v0,min_depth,max_depth,bridge_table_names);
+
+statement ok
+-CREATE PROPERTY GRAPH lonely_graph
+VERTEX TABLES (person PROPERTIES (id, name) LABEL Person)
+EDGE TABLES (lonely SOURCE KEY (src) REFERENCES person(id)
+                    DESTINATION KEY (dst) REFERENCES person(id) LABEL Lonely);
+
+statement ok
+-CREATE PROPERTY GRAPH broken_graph
+VERTEX TABLES (person PROPERTIES (id, name) LABEL Person)
+EDGE TABLES (lonely SOURCE KEY (src) REFERENCES person(id)
+                    DESTINATION KEY (dst) REFERENCES person(id) LABEL Lonely);
+
+# The rewrite reads the artifact and never touches the edge table; the fallback
+# scans the edge table and cannot run at all. Standing in here for "only the
+# rewrite can bind this shape", which is what a negated edge label does for real.
+statement ok
+DROP TABLE lonely;
+
+query TII
+SELECT status, abi_rows, fallback_rows
+FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (lonely_graph MATCH (a:Person)-[:Lonely]->(b:Person) COLUMNS (a.id AS aid, b.id AS bid))');
+----
+unverified	2	NULL
+
+# abi_rows is carried deliberately: the reader can see the rewrite DID run and
+# what it returned, so 'unverified' reads as "unchecked", not as "broken".
+query T
+SELECT detail LIKE 'no reference answer%'
+FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (lonely_graph MATCH (a:Person)-[:Lonely]->(b:Person) COLUMNS (a.id AS aid, b.id AS bid))');
+----
+true
+
+# The other direction: the artifact has no v1, so the REWRITE emits a query that
+# will not bind. That IS a verdict on the thing under test, and keeps its own status.
+query T
+SELECT status
+FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (broken_graph MATCH (a:Person)-[:Lonely]->(b:Person) COLUMNS (a.id AS aid, b.id AS bid))');
+----
+abi_error
+
+statement ok
+-DROP PROPERTY GRAPH lonely_graph;
+
+statement ok
+-DROP PROPERTY GRAPH broken_graph;
+
 statement ok
 -DROP PROPERTY GRAPH good_graph;
 

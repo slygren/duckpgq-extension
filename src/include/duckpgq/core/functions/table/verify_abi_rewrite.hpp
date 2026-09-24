@@ -21,7 +21,15 @@ namespace duckdb {
 // differential-testing keystone that lets ABI rewrites be added aggressively: a
 // divergence is a caught bug, not a shipped one.
 struct VerifyABIRewriteRow {
-	string status;               // 'match' | 'MISMATCH' | 'error'
+	//! 'match'       -- the two paths agree as multisets
+	//! 'MISMATCH'    -- they disagree; the rewrite is wrong (or the fallback is)
+	//! 'abi_error'   -- the REWRITE produced a query that will not run
+	//! 'unverified'  -- the ORACLE could not run this shape, so nothing was checked.
+	//!                 Not a verdict on the rewrite: abi_rows still reports what it
+	//!                 returned. A sweep must count these as coverage gaps, never as
+	//!                 passes and never as failures.
+	//! 'error'       -- the harness itself failed
+	string status;
 	int64_t abi_rows = -1;       // rows produced with the rewrite
 	int64_t fallback_rows = -1;  // rows produced by the fallback
 	int64_t only_in_abi = -1;    // multiset rows in ABI but not fallback

@@ -84,31 +84,41 @@ static void ComputeVerify(ClientContext &context, const string &query, VerifyABI
 		conn->Query("SET pgq_disable_abi_rewrite=false;");
 		auto abi = conn->Query(routed);
 		if (!abi || abi->HasError()) {
-			row.status = "error";
+			// The REWRITE produced something that will not run. A defect, and the one
+			// failure here that is genuinely about the thing under test.
+			row.status = "abi_error";
 			row.detail = "ABI path: " + (abi ? abi->GetError() : string("null result"));
 			return;
 		}
+		row.abi_rows = static_cast<int64_t>(abi->RowCount());
 
 		// ── Reference path (fallback traversal) ───────────────────────────────
 		conn->Query("SET pgq_disable_abi_rewrite=true;");
 		auto fb = conn->Query(routed);
 		conn->Query("SET pgq_disable_abi_rewrite=false;");
 		if (!fb || fb->HasError()) {
-			row.status = "error";
-			row.detail = "fallback path: " + (fb ? fb->GetError() : string("null result"));
+			// The ORACLE failed, not the rewrite. Some shapes only the rewrite can bind at
+			// all -- a negated edge label with a destination property projection is one --
+			// so there is no reference answer to compare against and this query is simply
+			// UNCHECKED. Reporting that as "error" is how a hole in the oracle comes to
+			// look like a verdict: a sweep shows a non-match, a reader dismisses it as
+			// noise, and nobody learns that the shape can never be verified this way.
+			// Distinguish it, and carry abi_rows so the reader can see the rewrite did run.
+			row.status = "unverified";
+			row.detail = "no reference answer -- the fallback path cannot run this shape: " +
+			             (fb ? fb->GetError() : string("null result"));
 			return;
 		}
+		row.fallback_rows = static_cast<int64_t>(fb->RowCount());
 
 		if (abi->ColumnCount() != fb->ColumnCount()) {
-			row.status = "error";
+			row.status = "MISMATCH";
 			row.detail = "column-count mismatch between paths (" + std::to_string(abi->ColumnCount()) + " vs " +
 			             std::to_string(fb->ColumnCount()) + ")";
 			return;
 		}
 
 		// ── Multiset comparison ───────────────────────────────────────────────
-		row.abi_rows = static_cast<int64_t>(abi->RowCount());
-		row.fallback_rows = static_cast<int64_t>(fb->RowCount());
 
 		std::unordered_map<string, int64_t> counts;
 		for (idx_t r = 0; r < abi->RowCount(); r++) {

@@ -1467,9 +1467,13 @@ void PGQMatchFunction::CheckEdgeTableConstraints(const string &src_reference, co
 		                      src_reference, edge_table->table_name);
 	}
 	if (dst_reference != edge_table->destination_reference) {
+		// dst_reference, not src_reference. Naming the source in the destination complaint
+		// sends the reader after the wrong half of the pattern -- it cost a detour here,
+		// with the message insisting dim_tag was an unregistered DESTINATION when dim_tag
+		// was the source and fact_maintenance__workorders was the destination that did not fit.
 		throw BinderException("Label %s is not registered as a destination "
-		                      "reference for edge pattern of table %s",
-		                      src_reference, edge_table->table_name);
+		                      "reference for edge pattern of table %s (which declares %s)",
+		                      dst_reference, edge_table->table_name, edge_table->destination_reference);
 	}
 }
 
