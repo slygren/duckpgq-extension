@@ -93,3 +93,64 @@ edge	selected	selected exact edge artifact	__pg_test_graph__custom_edge	edge	ide
 
 statement ok
 SET pgq_require_abi_paths = false;
+
+# ── The caller's own filter form anchors the artifact ───────────────────────────
+# The scalar pushdown matches a bare `binding.key = <constant>` and nothing else.
+# The workbench compiler writes every node filter as `CAST(binding.col AS VARCHAR)
+# IN (...)`, which matched neither that nor the non-key subquery push, so it was
+# never pushed at all. Measured on the deployed lake before this: 82.3ms against
+# 37.4ms for the same traversal written with a bare equality.
+#
+# `person.id` is INTEGER, so `CAST(a.id AS VARCHAR)` is a REAL type change. That is
+# deliberate: it proves what fires is the semi-join against the vertex table, not a
+# cast re-addressed at the artifact's own v0 column -- which would be comparing
+# `CAST(v0 AS VARCHAR)` against `CAST(key AS VARCHAR)` and would part company with
+# the answer the moment those two columns differed in type.
+
+statement ok
+SET pgq_require_abi_paths = true;
+
+query TT
+-FROM GRAPH_TABLE (
+    test_graph
+    MATCH (a:Person)-[:Knows]->(b:Person)
+    WHERE CAST(a.id AS VARCHAR) IN ('1')
+    COLUMNS (a.name AS src, b.name AS dst)
+);
+----
+Alice	Carol
+
+query TI
+SELECT rewrite_type, endpoint_filter_count FROM pgq_last_rewrite_diagnostics();
+----
+edge	1
+
+# Several values, and a filter on a non-key column, go the same way.
+query TT
+-FROM GRAPH_TABLE (
+    test_graph
+    MATCH (a:Person)-[:Knows]->(b:Person)
+    WHERE CAST(a.id AS VARCHAR) IN ('1', '99')
+    COLUMNS (a.name AS src, b.name AS dst)
+);
+----
+Alice	Carol
+
+query TI
+SELECT rewrite_type, endpoint_filter_count FROM pgq_last_rewrite_diagnostics();
+----
+edge	1
+
+# A value the filter excludes must still be excluded: the push narrows, it never
+# widens, and an over-restrictive push would drop the Alice row above instead.
+query I
+-FROM GRAPH_TABLE (
+    test_graph
+    MATCH (a:Person)-[:Knows]->(b:Person)
+    WHERE CAST(a.id AS VARCHAR) IN ('99')
+    COLUMNS (a.name AS src)
+);
+----
+
+statement ok
+SET pgq_require_abi_paths = false;
