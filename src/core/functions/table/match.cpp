@@ -4174,7 +4174,17 @@ void PGQMatchFunction::ProcessPathList(vector<unique_ptr<PathReference>> &path_l
 					}
 				}
 			} else {
-				// Single hop.
+				// Single hop -- `{1,1}` and friends. The label expression still has to be
+				// applied: ResolveTable() finds the table by STRIPPING the '!', so a bare
+				// `[:!HasParent]->{1,1}` resolves to the HasParent table itself and, without
+				// this, traverses exactly the edge it was told to exclude. Measured on the
+				// real graph: `(t:TAG)-[:!HAS_PARENT]->{1,1}(x:TAG)` returned the one
+				// HAS_PARENT edge where the answer is empty, because HAS_PARENT is the only
+				// TAG->TAG label there. The unquantified form of the same pattern was already
+				// correct -- it takes the branch below, which has always called this.
+				if (!edge_element->label.empty()) {
+					CheckInheritance(edge_table, edge_element, conditions);
+				}
 				AddEdgeJoins(edge_table, previous_vertex_table, next_vertex_table,
 				             edge_element->match_type, edge_element->variable_binding,
 				             previous_vertex_element->variable_binding,

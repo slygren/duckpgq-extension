@@ -39,3 +39,49 @@ Alice	Carol
 Bob	Bob
 Bob	Carol
 Carol	Carol
+
+# ── A label restriction survives the quantifier ────────────────────────────────
+# The case above passes whether or not the expression is applied, because
+# Colleague|Friend covers every row of `knows`. A restriction that excludes rows
+# does not: ResolveTable() finds the backing table by stripping the expression
+# down to a leaf, and the quantified branch used to hand that table straight to
+# the traversal without ever building the predicate -- so the walk ran over every
+# label in the table. The unquantified form of the same pattern was always right,
+# which is what makes this a silent wrong answer rather than a visible one.
+#
+# knows holds exactly two rows: (0,1) is Colleague, (1,2) is Friend.
+
+query II
+-FROM GRAPH_TABLE (pg
+    MATCH (a:Person)-[e:Colleague]->{1,1}(b:Person)
+    COLUMNS (a.name, b.name)
+) t ORDER BY 1, 2;
+----
+Alice	Bob
+
+query II
+-FROM GRAPH_TABLE (pg
+    MATCH (a:Person)-[e:Friend]->{1,1}(b:Person)
+    COLUMNS (a.name, b.name)
+) t ORDER BY 1, 2;
+----
+Bob	Carol
+
+# Negation, which is the form that reads most wrongly when it is dropped: it
+# resolves to the very table it excludes and traverses exactly those rows.
+query II
+-FROM GRAPH_TABLE (pg
+    MATCH (a:Person)-[e:!Colleague]->{1,1}(b:Person)
+    COLUMNS (a.name, b.name)
+) t ORDER BY 1, 2;
+----
+Bob	Carol
+
+# And the unquantified form still agrees, which is the invariant that was broken.
+query II
+-FROM GRAPH_TABLE (pg
+    MATCH (a:Person)-[e:Colleague]->(b:Person)
+    COLUMNS (a.name, b.name)
+) t ORDER BY 1, 2;
+----
+Alice	Bob
