@@ -1740,6 +1740,42 @@ static void RewriteCoveredPathColumns(vector<unique_ptr<ParsedExpression>> &expr
 	}
 }
 
+//! Does this binding appear as a vertex in MORE THAN ONE path pattern?
+//!
+//! A binding shared between two comma-separated patterns IS the join between them --
+//! `(t:TAG)-[:IN_AREA]->(a), (t:TAG)-[:HAS_NOTIFICATION]->(n)` means one tag, not two. That
+//! correlation lives in the pattern structure, nowhere in `column_list` or `where_clause`, so
+//! `BindingReferencesOnlyCovered` cannot see it by inspecting expressions alone.
+//!
+//! Measured on the frozen lake before this guard: the query above returned 3,753,784 rows where
+//! the truth is 4 -- exactly 938,446 TAG->AREA edges times 4 notifications, i.e. a clean cartesian
+//! product, because each leg's vertex join was elided as "fully covered" and nothing was left
+//! tying the two path tables together. `count(DISTINCT n)` was 4 in both, so every DISTINCT
+//! query looked right and every count/sum/avg was wrong by six orders of magnitude.
+static bool BindingSpansMultiplePatterns(const MatchExpression &ref, const string &binding) {
+	if (binding.empty()) {
+		return false;
+	}
+	idx_t patterns_containing = 0;
+	for (const auto &pattern : ref.path_patterns) {
+		if (!pattern) {
+			continue;
+		}
+		bool found = false;
+		for (const auto &element : pattern->path_elements) {
+			auto *path_element = PGQMatchFunction::GetPathElement(element);
+			if (path_element && StringUtil::CIEquals(path_element->variable_binding, binding)) {
+				found = true;
+				break;
+			}
+		}
+		if (found && ++patterns_containing > 1) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static bool BindingReferencesOnlyCovered(const MatchExpression &ref, const string &binding,
                                          const CoveredPropertyMap &covered_properties) {
 	if (binding.empty()) {
@@ -1785,6 +1821,11 @@ static bool BindingReferencesOnlyCovered(const MatchExpression &ref, const strin
 			    }
 		    });
 	};
+	// STRUCTURAL REFERENCE COUNTS TOO. Eliding the vertex join is safe only while this binding
+	// is local to one pattern; shared, the table being dropped is the correlation itself.
+	if (BindingSpansMultiplePatterns(ref, binding)) {
+		return false;
+	}
 	for (const auto &expr : ref.column_list) {
 		inspect_expr(expr.get());
 	}
