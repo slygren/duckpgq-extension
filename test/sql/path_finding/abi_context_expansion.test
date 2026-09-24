@@ -278,3 +278,75 @@ query IT rowsort
 
 statement ok
 SET pgq_max_vl_fallback_rows = 20000000;
+
+# ── The seed is anchored by the filter the caller actually wrote ────────────────
+# Only a bare `binding.key = <constant>` used to count as an anchor. Every property
+# filter the workbench compiler emits is `CAST(binding.col AS VARCHAR) IN (...)`, so
+# a traversal pinned to one tag was costed -- and refused -- as though it expanded
+# from every tag in the graph. Each shape below must return the same four rows as the
+# bare `t.id = 1` case above, at the same budget of 3.
+#
+# `t.id` is INTEGER here on purpose: the cast is a real type change, so a rewrite that
+# re-addressed `CAST(... AS VARCHAR)` at the artifact's own v0 column would be assuming
+# the two columns share a type. The artifact side goes through a semi-join instead and
+# evaluates the predicate against the vertex column, which is why this passes.
+
+statement ok
+SET pgq_max_vl_fallback_rows = 3;
+
+query IT rowsort
+-FROM GRAPH_TABLE (
+    test_graph
+    MATCH p = (t:Tag)-[:!HasParent]->{1,2}(x)
+    WHERE CAST(t.id AS VARCHAR) IN ('1')
+    COLUMNS (path_length(p) AS depth, label(x) AS dst_label)
+);
+----
+1	Notification
+1	Workorder
+2	Operation
+2	Operation
+
+query IT rowsort
+-FROM GRAPH_TABLE (
+    test_graph
+    MATCH p = (t:Tag)-[:!HasParent]->{1,2}(x)
+    WHERE t.id IN (1, 99)
+    COLUMNS (path_length(p) AS depth, label(x) AS dst_label)
+);
+----
+1	Notification
+1	Workorder
+2	Operation
+2	Operation
+
+# A non-key property narrows the seed just as well, and never could have matched the
+# old key-equality pattern.
+query IT rowsort
+-FROM GRAPH_TABLE (
+    test_graph
+    MATCH p = (t:Tag)-[:!HasParent]->{1,2}(x)
+    WHERE CAST(t.name AS VARCHAR) = 'Pump A'
+    COLUMNS (path_length(p) AS depth, label(x) AS dst_label)
+);
+----
+1	Notification
+1	Workorder
+2	Operation
+2	Operation
+
+# The guard is NOT simply defanged by the presence of a WHERE clause. This filter
+# mentions the destination, so it cannot be evaluated before the traversal runs and
+# cannot anchor the seed -- the expansion is still unbounded and must still be refused.
+statement error
+-FROM GRAPH_TABLE (
+    test_graph
+    MATCH p = (t:Tag)-[:!HasParent]->{1,2}(x)
+    WHERE (CAST(t.id AS VARCHAR) = '1' OR label(x) = 'Nope')
+    COLUMNS (path_length(p) AS depth, label(x) AS dst_label)
+);
+----
+expands from every Tag vertex
+
+statement ok
+SET pgq_max_vl_fallback_rows = 20000000;

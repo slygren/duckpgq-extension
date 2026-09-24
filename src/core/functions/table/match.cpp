@@ -1593,6 +1593,15 @@ static bool ExprOnlyReferencesSingleBinding(const ParsedExpression &expr, const 
 		return col->column_names.size() >= 2 && col->column_names[0] == binding;
 	}
 	if (dynamic_cast<const ConstantExpression *>(&expr)) return true;
+	// A CAST around the column is transparent here: the contract is "references this binding
+	// and nothing else", which a cast of a qualified column still satisfies. Leaving it out
+	// made the product's own filter form invisible to every pushdown on this path -- the
+	// compiler emits `CAST(t.col AS VARCHAR) IN (...)` for every property filter, so no
+	// traversal it generated ever anchored anything.
+	auto *cast = dynamic_cast<const CastExpression *>(&expr);
+	if (cast) {
+		return ExprOnlyReferencesSingleBinding(*cast->child, binding);
+	}
 	auto *comp = dynamic_cast<const ComparisonExpression *>(&expr);
 	if (comp) {
 		return ExprOnlyReferencesSingleBinding(*comp->left, binding) &&
@@ -5899,6 +5908,27 @@ static string BuildVertexPropertiesListSQL(const string &vertices_expr, const st
 	    properties_relation, labels_expr, KeywordHelper::WriteQuoted("{}", '\''), vertices_expr);
 }
 
+//! Copy `expr`, re-pointing every `from_alias.column` reference at `to_alias`.
+//! A filter is written against the pattern's variable binding; the SQL this file generates
+//! gives that same table a different alias, so the predicate has to be re-addressed before
+//! it can be emitted as text.
+static unique_ptr<ParsedExpression> RebindColumnAlias(unique_ptr<ParsedExpression> expr,
+                                                      const string &from_alias, const string &to_alias) {
+	if (!expr) {
+		return expr;
+	}
+	if (auto *col_ref = dynamic_cast<ColumnRefExpression *>(expr.get())) {
+		if (col_ref->column_names.size() == 2 && StringUtil::CIEquals(col_ref->column_names[0], from_alias)) {
+			col_ref->column_names[0] = to_alias;
+		}
+		return expr;
+	}
+	ParsedExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<ParsedExpression> &child) {
+		child = RebindColumnAlias(std::move(child), from_alias, to_alias);
+	});
+	return expr;
+}
+
 static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache &path_table_cache,
                                                         CreatePropertyGraphInfo &pg_table,
                                                         const string &path_alias,
@@ -5908,6 +5938,7 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
                                                         const string &dst_label_expr,
                                                         idx_t lower, idx_t upper,
                                                         const WhereConstraints &where_constraints,
+                                                        const ParsedExpression *where_hint,
                                                         string &src_pk_out, string &dst_pk_out,
                                                         bool include_vertex_properties,
                                                         bool require_multiplicity_preserving,
@@ -6094,9 +6125,42 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 		    qualified_table));
 	}
 
+	const string src_table_name = QualifiedTableName(src_table->catalog_name, src_table->schema_name,
+	                                                 src_table->table_name);
+	const string src_pk = KeywordHelper::WriteOptionallyQuoted(src_pk_out);
+
 	vector<string> seed_filters;
 	PushConstraintToSQLFilter(where_constraints, src_binding, src_pk_out,
 	                          "s." + KeywordHelper::WriteOptionallyQuoted(src_pk_out), seed_filters);
+
+	// The scalar push above matches only a bare `binding.key = <constant>`. Every property
+	// filter the product's compiler writes is `CAST(binding.col AS VARCHAR) IN (...)`, which
+	// that pattern misses -- so a traversal pinned to one tag was costed, and refused, as if
+	// it expanded from every tag in the graph. Fall back to the binding's whole filter,
+	// re-addressed to the seed's own alias. `s` IS this binding's table here, so what gets
+	// emitted is the predicate the user wrote, not a weaker stand-in for it.
+	unique_ptr<ParsedExpression> src_binding_filter;
+	if (where_hint && !src_binding.empty()) {
+		src_binding_filter = ExtractSrcFilter(*where_hint, src_binding);
+	}
+	if (seed_filters.empty() && src_binding_filter) {
+		seed_filters.push_back(RebindColumnAlias(src_binding_filter->Copy(), src_binding, "s")->ToString());
+	}
+
+	// The direct artifact scans cannot take that predicate the same way: `a.v0` is the
+	// artifact's copy of the source key, and re-addressing a CAST at it would assume the two
+	// columns share a TYPE as well as a value -- `CAST(v0 AS VARCHAR)` and `CAST(key AS
+	// VARCHAR)` differ the moment they do not. A semi-join assumes only the value
+	// correspondence, which is what the rewrite's own `binding.key = path.v0` join already
+	// asserts, and evaluates the predicate against the real vertex column.
+	string src_key_semi_join;
+	if (src_binding_filter) {
+		static const char *kSeedAlias = "__pgq_seed";
+		auto seed_filter = RebindColumnAlias(src_binding_filter->Copy(), src_binding, kSeedAlias);
+		src_key_semi_join = "a.v0 IN (SELECT " + string(kSeedAlias) + "." + src_pk + " FROM " + src_table_name +
+		                    " " + kSeedAlias + " WHERE " + seed_filter->ToString() + ")";
+	}
+
 	string seed_where;
 	if (!seed_filters.empty()) {
 		seed_where = " WHERE ";
@@ -6214,6 +6278,9 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 			}
 			vector<string> artifact_filters;
 			PushConstraintToSQLFilter(where_constraints, src_binding, src_pk_out, "a.v0", artifact_filters);
+			if (artifact_filters.empty() && !src_key_semi_join.empty()) {
+				artifact_filters.push_back(src_key_semi_join);
+			}
 			string artifact_where;
 			for (idx_t idx = 0; idx < artifact_filters.size(); idx++) {
 				artifact_where += (idx ? " AND " : " WHERE ") + artifact_filters[idx];
@@ -6274,9 +6341,6 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 		final_filter += ")";
 	}
 
-	const string src_table_name = QualifiedTableName(src_table->catalog_name, src_table->schema_name,
-	                                                 src_table->table_name);
-	const string src_pk = KeywordHelper::WriteOptionallyQuoted(src_pk_out);
 	const string src_label_sql = KeywordHelper::WriteQuoted(canonical_src_label, '\'');
 	const string vertex_properties_union = include_vertex_properties ? BuildVertexPropertiesUnionSQL(pg_table) : "";
 	const string vertex_properties_cte =
@@ -6343,10 +6407,10 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 			    static_cast<long long>(vl_fallback_budget));
 			detail += StringUtil::Format(
 			    " The pattern is answerable from ABI artifacts, so this is not a fallback -- it is the size of the "
-			    "answer. Constrain the source: an equality on %s.%s is pushed into the expansion and turns it into "
-			    "seeks. Otherwise lower the upper bound, name a narrower edge label, or raise/disable the budget "
-			    "with SET pgq_max_vl_fallback_rows.",
-			    src_binding.c_str(), src_pk_out.c_str());
+			    "answer. Constrain the source: any filter on %s alone is pushed into the expansion and turns it "
+			    "into seeks. Otherwise lower the upper bound, name a narrower edge label, or raise/disable the "
+			    "budget with SET pgq_max_vl_fallback_rows.",
+			    src_binding.c_str());
 			throw BinderException(detail);
 		}
 	}
@@ -7598,7 +7662,7 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 				                                            src_vtable->main_label, ctx_src->variable_binding,
 				                                            ctx_edge->label, ctx_dst->label,
 				                                            ctx_sp->lower, ctx_sp->upper,
-				                                            where_constraints, src_pk, dst_pk,
+				                                            where_constraints, where_hint, src_pk, dst_pk,
 				                                            vertex_properties_projection,
 				                                            /*require_multiplicity_preserving=*/!any_shortest,
 				                                            MaxVLFallbackRows(context));
