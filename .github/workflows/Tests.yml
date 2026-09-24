@@ -14,6 +14,15 @@ name: Tests
 #
 #     make release && make test_release
 #
+# Because nothing here runs automatically, the real gate is the pre-push hook at
+# scripts/githooks/pre-push. Install it once with:
+#
+#     git config core.hooksPath scripts/githooks
+#
+# It builds AND tests, in that order, because `make test` does not depend on
+# `release`: on its own it runs whatever binary is already in build/release and
+# will happily report a full green suite against a source tree it never compiled.
+#
 # To go back to automatic runs -- once minutes are available, or if this repo
 # is made public, where Actions is free and unlimited -- restore:
 #
