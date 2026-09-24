@@ -278,7 +278,8 @@ public:
 	                           const shared_ptr<PropertyGraphTable> &edge_table, CreatePropertyGraphInfo &pg_table,
 	                           SubPath *subpath, PGQMatchType edge_type, int32_t &csr_id_counter, PGQCSRSlot &cte1_slot,
 	                           unique_ptr<ParsedExpression> anchor_filter = nullptr, bool any_shortest = false,
-	                           const PGQABITraversalPlan *abi_plan = nullptr);
+	                           const PGQABITraversalPlan *abi_plan = nullptr,
+	                           const string &edge_label = string());
 
 	static void AddPathModeFilter(PGQPathMode mode, const string &path_cte,
 	                              vector<unique_ptr<ParsedExpression>> &conditions);

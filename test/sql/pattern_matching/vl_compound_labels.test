@@ -85,3 +85,52 @@ query II
 ) t ORDER BY 1, 2;
 ----
 Alice	Bob
+
+# ── The same restriction, past one hop ─────────────────────────────────────────
+# {1,2} used to return the SAME rows for all four forms below, because the label
+# expression was discarded and the walk ran over every row of `knows`. The tell was
+# that a restriction produced byte-identical output to no restriction at all.
+#
+# Only Alice-[Colleague]->Bob and Bob-[Friend]->Carol exist, so:
+#   Colleague only        -> Alice/Bob            (no 2-hop Colleague walk exists)
+#   Colleague|Friend      -> all three            (admits every row)
+#   no label              -> all three
+#   NOT Colleague         -> Bob/Carol            (the Friend edge alone)
+#
+# The second case is why this went unnoticed for so long: it is correct whether or
+# not the expression is applied. A label test has to EXCLUDE something.
+
+query II
+-FROM GRAPH_TABLE (pg MATCH (a:Person)-[e:Colleague]->{1,2}(b:Person)
+                   COLUMNS (a.name, b.name)) t ORDER BY 1, 2;
+----
+Alice	Bob
+
+query II
+-FROM GRAPH_TABLE (pg MATCH (a:Person)-[e:Colleague|Friend]->{1,2}(b:Person)
+                   COLUMNS (a.name, b.name)) t ORDER BY 1, 2;
+----
+Alice	Bob
+Alice	Carol
+Bob	Carol
+
+query II
+-FROM GRAPH_TABLE (pg MATCH (a:Person)-[e]->{1,2}(b:Person)
+                   COLUMNS (a.name, b.name)) t ORDER BY 1, 2;
+----
+Alice	Bob
+Alice	Carol
+Bob	Carol
+
+query II
+-FROM GRAPH_TABLE (pg MATCH (a:Person)-[e:!Colleague]->{1,2}(b:Person)
+                   COLUMNS (a.name, b.name)) t ORDER BY 1, 2;
+----
+Bob	Carol
+
+# Deeper bound, same restriction: still only the one Colleague edge.
+query II
+-FROM GRAPH_TABLE (pg MATCH (a:Person)-[e:Colleague]->{1,5}(b:Person)
+                   COLUMNS (a.name, b.name)) t ORDER BY 1, 2;
+----
+Alice	Bob

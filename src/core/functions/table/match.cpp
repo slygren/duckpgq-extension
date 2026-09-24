@@ -3093,7 +3093,8 @@ static unique_ptr<ParsedExpression> QualifiedVertexKeyExpr(const string &table, 
 static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node, const string &prev_binding,
                                             const shared_ptr<PropertyGraphTable> &edge_table, idx_t lower, idx_t upper,
                                             unique_ptr<ParsedExpression> anchor_filter, bool any_shortest,
-                                            bool reverse = false, const PGQABIArtifactScan *abi_edge = nullptr) {
+                                            bool reverse = false, const PGQABIArtifactScan *abi_edge = nullptr,
+                                            const string &edge_label = string()) {
 	// reverse=true walks edges backwards (for left-directed patterns like
 	// (a)<-[e]-{1,3}(b)): the anchor sits on the edge's *destination* side and each
 	// step follows an edge from its dst to its src. Implemented by swapping the
@@ -3199,7 +3200,18 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 	// only the table ref and the two column names change. The artifact is always stored in
 	// semantic source->destination orientation, so a reverse (left-directed) walk steps out
 	// of v1 and lands on v0.
-	const bool use_abi_edge = abi_edge && abi_edge->valid;
+	// The label expression, as a predicate over the edge rows this step walks. ResolveTable()
+	// found the backing table by stripping the expression to a leaf, so without re-applying it
+	// here the traversal runs over every label in that table -- and for a negation, over exactly
+	// the rows the pattern excludes. A null condition means the expression admits the whole
+	// table (the common case: the label IS the table's main label), and nothing is added.
+	auto edge_label_cond = edge_label.empty()
+	                           ? nullptr
+	                           : BuildLabelExprCond(edge_label, edge_table, e_alias, edge_table->table_name);
+	// An ABI artifact holds ONE label path, and it was chosen from the stripped leaf -- so for
+	// `!X` it is X's own artifact. When the expression actually restricts, walk the edge table
+	// and apply the predicate instead of trusting an artifact picked for the wrong label.
+	const bool use_abi_edge = abi_edge && abi_edge->valid && !edge_label_cond;
 	const string step_out_col = use_abi_edge ? (reverse ? "v1" : "v0") : src_fk;
 	const string step_in_col = use_abi_edge ? (reverse ? "v0" : "v1") : dst_fk;
 
@@ -3221,6 +3233,10 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 	join_e->condition = make_uniq<ComparisonExpression>(
 	    ExpressionType::COMPARE_EQUAL, make_uniq<ColumnRefExpression>(step_out_col, e_alias),
 	    make_uniq<ColumnRefExpression>(src_pk, mid_alias));
+	if (edge_label_cond) {
+		join_e->condition = make_uniq<ConjunctionExpression>(
+		    ExpressionType::CONJUNCTION_AND, std::move(join_e->condition), std::move(edge_label_cond));
+	}
 
 	// JOIN dst_table AS b ON b.dst_pk = e.<step-in column>
 	auto b_ref = far_side_table->CreateBaseTableRef(b_alias);
@@ -3459,7 +3475,8 @@ static void AddBoundedVLPathFinding(unique_ptr<SelectNode> &select_node,
                                     const string &next_binding, const shared_ptr<PropertyGraphTable> &edge_table,
                                     idx_t lower, idx_t upper, unique_ptr<ParsedExpression> anchor_filter,
                                     bool any_shortest, bool reverse = false,
-                                    const PGQABITraversalPlan *abi_plan = nullptr) {
+                                    const PGQABITraversalPlan *abi_plan = nullptr,
+                                    const string &edge_label = string()) {
 	// An exact-length quantifier backed by a k-hop artifact needs no recursion at all.
 	const string scan_name =
 	    (abi_plan && abi_plan->exact.valid)
@@ -3467,7 +3484,7 @@ static void AddBoundedVLPathFinding(unique_ptr<SelectNode> &select_node,
 	                                     std::move(anchor_filter), reverse)
 	        : BuildBoundedVLReachabilityCTE(select_node, prev_binding, edge_table, lower, upper,
 	                                        std::move(anchor_filter), any_shortest, reverse,
-	                                        abi_plan ? &abi_plan->step : nullptr);
+	                                        abi_plan ? &abi_plan->step : nullptr, edge_label);
 	const string cte_alias = scan_name + "_scan";
 
 	// ── Add CTE to FROM (cross join) ─────────────────────────────────────────────
@@ -3567,7 +3584,7 @@ void PGQMatchFunction::AddPathFinding(unique_ptr<SelectNode> &select_node,
                                       CreatePropertyGraphInfo &pg_table, SubPath *subpath, PGQMatchType edge_type,
                                       int32_t &csr_id_counter, PGQCSRSlot &csr_slot,
                                       unique_ptr<ParsedExpression> anchor_filter, bool any_shortest,
-                                      const PGQABITraversalPlan *abi_plan) {
+                                      const PGQABITraversalPlan *abi_plan, const string &edge_label) {
 	// The bounded route below is key-addressed and handles cross-table edges correctly, so
 	// it is deliberately NOT guarded. Only the CSR fallback further down still needs the
 	// cross-table refusal, and it carries its own call.
@@ -3579,7 +3596,7 @@ void PGQMatchFunction::AddPathFinding(unique_ptr<SelectNode> &select_node,
 		// Left-directed (a)<-[e]-{lo,hi}(b): same recursive CTE walked in reverse.
 		AddBoundedVLPathFinding(select_node, conditions, prev_binding, next_binding, edge_table, subpath->lower,
 		                        subpath->upper, std::move(anchor_filter), any_shortest,
-		                        edge_type == PGQMatchType::MATCH_EDGE_LEFT, abi_plan);
+		                        edge_type == PGQMatchType::MATCH_EDGE_LEFT, abi_plan, edge_label);
 		return;
 	}
 
@@ -4160,7 +4177,8 @@ void PGQMatchFunction::ProcessPathList(vector<unique_ptr<PathReference>> &path_l
 					AddPathFinding(final_select_node, conditions, previous_vertex_element->variable_binding,
 					               edge_element->variable_binding, next_vertex_element->variable_binding,
 					               edge_table, pg_table, edge_subpath, edge_element->match_type, csr_id_counter,
-					               csr_slot, std::move(anchor_filter), any_shortest, &abi_plan);
+					               csr_slot, std::move(anchor_filter), any_shortest, &abi_plan,
+					               edge_element->label);
 					// AddPathModeFilter references the shortest_path_cte produced by the CSR path.
 					// The recursive-CTE path (finite bounded directed) already prevents vertex revisits
 					// via list_contains cycle detection, so skip the filter there.
