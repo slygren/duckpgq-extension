@@ -2273,8 +2273,56 @@ SubPath *PGQMatchFunction::GetSubPath(const unique_ptr<PathReference> &path_refe
 // Identity of the traversal a select node's CSR was built from: the edge table plus the
 // direction it is walked in. A directed and an undirected CSR over the same table are
 // different structures, so direction is part of the key.
-static string CSREdgeKey(const shared_ptr<PropertyGraphTable> &edge_table, PGQMatchType edge_type) {
-	return StringUtil::Lower(edge_table->FullTableName()) + "|" + to_string(static_cast<int>(edge_type));
+//! The label expression as an alias-parameterised filter over the edge rows a CSR is built
+//! from. Returns an empty filter when the expression admits every row, so the generated SQL is
+//! byte-identical to before in the overwhelmingly common case.
+static PGQEdgeRowFilter EdgeLabelRowFilter(const string &edge_label,
+                                           const shared_ptr<PropertyGraphTable> &edge_table) {
+	if (edge_label.empty() || !edge_table) {
+		return {};
+	}
+	// Probe once with a throwaway alias: a null result means the expression is always true for
+	// this table, and there is nothing to carry.
+	if (!BuildLabelExprCond(edge_label, edge_table, "__probe", edge_table->table_name)) {
+		return {};
+	}
+	auto table = edge_table;
+	const string label = edge_label;
+	return [table, label](const string &alias) -> unique_ptr<ParsedExpression> {
+		return BuildLabelExprCond(label, table, alias, table->table_name);
+	};
+}
+
+//! True when the label expression admits NO row of this table -- `!X` where X is the table's
+//! own main label, for instance. BuildLabelExprCond folds that to a constant false.
+//!
+//! Worth separating from "restricts some rows", because a CSR cannot be built at all from an
+//! empty edge set: every part of its construction hangs off a scan of the edge table, so with
+//! no qualifying rows nothing is registered and the scalar path-finding function fails with
+//! "Invalid ID" rather than returning no rows. That is pre-existing -- an empty edge table does
+//! it too -- but applying a label filter is the first thing that made it reachable.
+static bool EdgeLabelAdmitsNothing(const string &edge_label, const shared_ptr<PropertyGraphTable> &edge_table) {
+	if (edge_label.empty() || !edge_table) {
+		return false;
+	}
+	auto cond = BuildLabelExprCond(edge_label, edge_table, "__probe", edge_table->table_name);
+	if (!cond) {
+		return false;
+	}
+	auto *constant = dynamic_cast<ConstantExpression *>(cond.get());
+	return constant && !constant->value.IsNull() && constant->value.type().id() == LogicalTypeId::BOOLEAN &&
+	       !BooleanValue::Get(constant->value);
+}
+
+static string CSREdgeKey(const shared_ptr<PropertyGraphTable> &edge_table, PGQMatchType edge_type,
+                         const string &edge_label = string()) {
+	// The label expression belongs in the key. "cte1" and "edges_cte" are shared by name across
+	// every CSR site in a select node, so without it a second pattern over the SAME table with a
+	// DIFFERENT label expression would find them present, skip building its own, and be answered
+	// from the first pattern's CSR -- the silent-sharing failure the claim below exists to stop,
+	// just one level finer than the table.
+	return StringUtil::Lower(edge_table->FullTableName()) + "|" + to_string(static_cast<int>(edge_type)) + "|" +
+	       StringUtil::Lower(edge_label);
 }
 
 // Claim this select node's single CSR slot for `edge_key`, allocating it on first use.
@@ -2657,20 +2705,18 @@ unique_ptr<ParsedExpression> PGQMatchFunction::CreatePathFindingFunction(
 				// Claimed whether or not "cte1" already exists: a second pattern reusing this
 				// node's CSR must agree on which traversal built it, or it silently walks the
 				// first pattern's edges.
-				ClaimCSRSlot(csr_slot,
-				             CSREdgeKey(ResolveTable(edge_element->label, edge_element->match_type, pg_table),
-				                        edge_element->match_type),
+				const auto sp_edge_table = ResolveTable(edge_element->label, edge_element->match_type, pg_table);
+				const auto sp_edge_filter = EdgeLabelRowFilter(edge_element->label, sp_edge_table);
+				ClaimCSRSlot(csr_slot, CSREdgeKey(sp_edge_table, edge_element->match_type, edge_element->label),
 				             csr_id_counter);
 				if (final_select_node->cte_map.map.find("cte1") == final_select_node->cte_map.map.end()) {
 					if (edge_element->match_type == PGQMatchType::MATCH_EDGE_RIGHT) {
 						final_select_node->cte_map.map["cte1"] = CreateDirectedCSRCTE(
-						    ResolveTable(edge_element->label, edge_element->match_type, pg_table),
-						    previous_vertex_element->variable_binding, edge_element->variable_binding,
-						    next_vertex_element->variable_binding, csr_slot.slot);
+						    sp_edge_table, previous_vertex_element->variable_binding, edge_element->variable_binding,
+						    next_vertex_element->variable_binding, csr_slot.slot, sp_edge_filter);
 					} else if (edge_element->match_type == PGQMatchType::MATCH_EDGE_ANY) {
 						final_select_node->cte_map.map["cte1"] =
-						    CreateUndirectedCSRCTE(ResolveTable(edge_element->label, edge_element->match_type, pg_table),
-						                          final_select_node, csr_slot.slot);
+						    CreateUndirectedCSRCTE(sp_edge_table, final_select_node, csr_slot.slot, sp_edge_filter);
 					} else {
 						throw NotImplementedException("Cannot do shortest path for edge type %s",
 						                              edge_element->match_type == PGQMatchType::MATCH_EDGE_LEFT
@@ -3585,6 +3631,22 @@ void PGQMatchFunction::AddPathFinding(unique_ptr<SelectNode> &select_node,
                                       int32_t &csr_id_counter, PGQCSRSlot &csr_slot,
                                       unique_ptr<ParsedExpression> anchor_filter, bool any_shortest,
                                       const PGQABITraversalPlan *abi_plan, const string &edge_label) {
+	// An expression that admits nothing needs no traversal: at lower >= 1 the answer is empty,
+	// and saying so here avoids asking the CSR to exist without edges. `lower == 0` would still
+	// have the zero-length walks to produce, and those come from a route that is not built here,
+	// so that combination is refused rather than guessed at.
+	if (EdgeLabelAdmitsNothing(edge_label, edge_table)) {
+		if (subpath->lower == 0) {
+			throw NotImplementedException(
+			    "Edge label expression '%s' admits no edge of table %s, and the quantifier starts at 0, "
+			    "so the answer is exactly the zero-length walks. That combination is not supported yet -- "
+			    "raise the lower bound to 1 for the (empty) non-trivial walks.",
+			    edge_label, edge_table->table_name);
+		}
+		conditions.push_back(make_uniq<ConstantExpression>(Value::BOOLEAN(false)));
+		return;
+	}
+
 	// The bounded route below is key-addressed and handles cross-table edges correctly, so
 	// it is deliberately NOT guarded. Only the CSR fallback further down still needs the
 	// cross-table refusal, and it carries its own call.
@@ -3603,17 +3665,19 @@ void PGQMatchFunction::AddPathFinding(unique_ptr<SelectNode> &select_node,
 	// Fallback: CSR+iterativelength for unbounded paths or non-directed edges. The CSR
 	// collides id spaces at ANY depth, not just >= 2, so it is guarded unconditionally.
 	RejectCrossTableCSR(edge_table, subpath->lower, subpath->upper);
+	const auto edge_filter = EdgeLabelRowFilter(edge_label, edge_table);
 	// One slot per select node, shared with the iterativelength() call below and with any
 	// other code that reuses this node's "cte1", so all of them name the same entry. Claiming
 	// it also records which traversal built it, so a second pattern over a different edge
 	// table is refused rather than silently answered from this one's CSR.
-	ClaimCSRSlot(csr_slot, CSREdgeKey(edge_table, edge_type), csr_id_counter);
+	ClaimCSRSlot(csr_slot, CSREdgeKey(edge_table, edge_type, edge_label), csr_id_counter);
 	if (select_node->cte_map.map.find("cte1") == select_node->cte_map.map.end()) {
 		if (edge_type == PGQMatchType::MATCH_EDGE_RIGHT) {
-			select_node->cte_map.map["cte1"] =
-			    CreateDirectedCSRCTE(edge_table, prev_binding, edge_binding, next_binding, csr_slot.slot);
+			select_node->cte_map.map["cte1"] = CreateDirectedCSRCTE(edge_table, prev_binding, edge_binding,
+			                                                       next_binding, csr_slot.slot, edge_filter);
 		} else if (edge_type == PGQMatchType::MATCH_EDGE_ANY) {
-			select_node->cte_map.map["cte1"] = CreateUndirectedCSRCTE(edge_table, select_node, csr_slot.slot);
+			select_node->cte_map.map["cte1"] =
+			    CreateUndirectedCSRCTE(edge_table, select_node, csr_slot.slot, edge_filter);
 		} else {
 			throw NotImplementedException("Cannot do shortest path for edge type %s",
 			                              edge_type == PGQMatchType::MATCH_EDGE_LEFT ? "MATCH_EDGE_LEFT"
@@ -3926,10 +3990,12 @@ void PGQMatchFunction::CheckNamedSubpath(SubPath &subpath, MatchExpression &orig
 				if (edge_elem->match_type != PGQMatchType::MATCH_EDGE_RIGHT) {
 					throw NotImplementedException("COST() is only supported for right-directed edges (->) currently");
 				}
-				ClaimCSRSlot(csr_slot, CSREdgeKey(edge_table, edge_elem->match_type), csr_id_counter);
+				ClaimCSRSlot(csr_slot, CSREdgeKey(edge_table, edge_elem->match_type, edge_elem->label),
+				             csr_id_counter);
 				final_select_node->cte_map.map["cte1"] = CreateWeightedDirectedCSRCTE(
 				    edge_table, prev_elem->variable_binding, edge_elem->variable_binding,
-				    next_elem->variable_binding, edge_sub->cost_expr->Copy(), csr_slot.slot);
+				    next_elem->variable_binding, edge_sub->cost_expr->Copy(), csr_slot.slot,
+				    EdgeLabelRowFilter(edge_elem->label, edge_table));
 			}
 			// Generate cheapest_path_length(<slot>, v_size, src_rowid, dst_rowid).
 			vector<unique_ptr<ParsedExpression>> cpl_args;
@@ -4131,17 +4197,22 @@ void PGQMatchFunction::ProcessPathList(vector<unique_ptr<PathReference>> &path_l
 							// CSR fallback for unbounded or undirected ONE ROW PER.
 							if (final_select_node->cte_map.map.find("cte1") ==
 							    final_select_node->cte_map.map.end()) {
+								const auto orp_edge_filter =
+								    EdgeLabelRowFilter(edge_element->label, edge_table);
 								if (edge_element->match_type == PGQMatchType::MATCH_EDGE_RIGHT) {
-									ClaimCSRSlot(csr_slot, CSREdgeKey(edge_table, edge_element->match_type), csr_id_counter);
+									ClaimCSRSlot(csr_slot,
+									             CSREdgeKey(edge_table, edge_element->match_type, edge_element->label),
+									             csr_id_counter);
 									final_select_node->cte_map.map["cte1"] = CreateDirectedCSRCTE(
 									    edge_table, previous_vertex_element->variable_binding,
 									    edge_element->variable_binding,
-									    next_vertex_element->variable_binding, csr_slot.slot);
+									    next_vertex_element->variable_binding, csr_slot.slot, orp_edge_filter);
 								} else if (edge_element->match_type == PGQMatchType::MATCH_EDGE_ANY) {
-									ClaimCSRSlot(csr_slot, CSREdgeKey(edge_table, edge_element->match_type),
+									ClaimCSRSlot(csr_slot,
+									             CSREdgeKey(edge_table, edge_element->match_type, edge_element->label),
 									             csr_id_counter);
-									final_select_node->cte_map.map["cte1"] =
-									    CreateUndirectedCSRCTE(edge_table, final_select_node, csr_slot.slot);
+									final_select_node->cte_map.map["cte1"] = CreateUndirectedCSRCTE(
+									    edge_table, final_select_node, csr_slot.slot, orp_edge_filter);
 								} else {
 									throw NotImplementedException(
 									    "ONE ROW PER path finding is not supported for "

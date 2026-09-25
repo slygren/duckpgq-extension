@@ -2,6 +2,7 @@
 #include "duckdb/common/string.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/parser/expression/comparison_expression.hpp"
+#include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
@@ -120,7 +121,7 @@ unique_ptr<JoinRef> CreateJoin(const string &fk_column, const string &pk_column,
 
 // Helper function to setup SelectNode
 void SetupSelectNode(unique_ptr<SelectNode> &select_node, const shared_ptr<PropertyGraphTable> &edge_table,
-                     bool reverse) {
+                     bool reverse, const PGQEdgeRowFilter &edge_filter) {
 	select_node = make_uniq<SelectNode>();
 
 	select_node->select_list.emplace_back(CreateColumnRefExpression("rowid", edge_table->source_reference, "dense_id"));
@@ -139,6 +140,13 @@ void SetupSelectNode(unique_ptr<SelectNode> &select_node, const shared_ptr<Prope
 		    CreateColumnRefExpression(edge_table->source_fk[0], edge_table->table_name, "incoming_edges"));
 		select_node->from_table = CreateJoin(edge_table->destination_fk[0], edge_table->source_pk[0], edge_table,
 		                                     edge_table->source_pg_table);
+	}
+	// The per-vertex degree counts must be taken over the SAME edge rows the scan will insert.
+	// Sizing the CSR offset array from unfiltered degrees while inserting a filtered edge set
+	// is what "Non-existent/non-unique vertices detected" means -- the check fired on the first
+	// attempt at this, which is the one part of the CSR that reports its own inconsistency.
+	if (edge_filter) {
+		select_node->where_clause = edge_filter(edge_table->table_name);
 	}
 }
 
@@ -164,7 +172,8 @@ unique_ptr<SubqueryExpression> GetCountTable(const shared_ptr<PropertyGraphTable
 }
 
 unique_ptr<JoinRef> GetJoinRef(const shared_ptr<PropertyGraphTable> &edge_table, const string &edge_binding,
-                               const string &prev_binding, const string &next_binding) {
+                               const PGQEdgeRowFilter &edge_filter, const string &prev_binding,
+                               const string &next_binding) {
 	auto first_join_ref = make_uniq<JoinRef>(JoinRefType::REGULAR);
 	first_join_ref->type = JoinType::INNER;
 
@@ -184,11 +193,18 @@ unique_ptr<JoinRef> GetJoinRef(const shared_ptr<PropertyGraphTable> &edge_table,
 	auto dst_cid_ref = make_uniq<ColumnRefExpression>(edge_table->destination_pk[0], next_binding);
 	first_join_ref->condition =
 	    make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL, std::move(t_to_ref), std::move(dst_cid_ref));
+	if (edge_filter) {
+		if (auto label_cond = edge_filter(edge_binding)) {
+			first_join_ref->condition = make_uniq<ConjunctionExpression>(
+			    ExpressionType::CONJUNCTION_AND, std::move(first_join_ref->condition), std::move(label_cond));
+		}
+	}
 	return first_join_ref;
 }
 
 unique_ptr<SubqueryExpression> CreateDirectedCSRVertexSubquery(const shared_ptr<PropertyGraphTable> &edge_table,
-                                                               const string &prev_binding, int32_t csr_id) {
+                                                               const string &prev_binding, int32_t csr_id,
+                                                               const PGQEdgeRowFilter &edge_filter) {
 	auto count_create_vertex_expr = GetCountTable(edge_table->source_pg_table, prev_binding, edge_table->source_pk[0]);
 
 	vector<unique_ptr<ParsedExpression>> csr_vertex_children;
@@ -221,7 +237,19 @@ unique_ptr<SubqueryExpression> CreateDirectedCSRVertexSubquery(const shared_ptr<
 	auto join_condition = make_uniq<ComparisonExpression>(
 	    ExpressionType::COMPARE_EQUAL, make_uniq<ColumnRefExpression>(edge_table->source_fk[0], edge_table->table_name),
 	    make_uniq<ColumnRefExpression>(edge_table->source_pk[0], prev_binding));
-	left_join_ref->condition = std::move(join_condition);
+	// ON, not WHERE: a WHERE would drop every vertex with no qualifying edge and shrink the
+	// vertex set the CSR is sized for. In the ON clause those vertices survive with cnt = 0,
+	// which is what an unfiltered zero-degree vertex already produces here.
+	if (edge_filter) {
+		if (auto label_cond = edge_filter(edge_table->table_name)) {
+			left_join_ref->condition = make_uniq<ConjunctionExpression>(
+			    ExpressionType::CONJUNCTION_AND, std::move(join_condition), std::move(label_cond));
+		} else {
+			left_join_ref->condition = std::move(join_condition);
+		}
+	} else {
+		left_join_ref->condition = std::move(join_condition);
+	}
 	inner_select_node->from_table = std::move(left_join_ref);
 
 	auto dense_id_colref = make_uniq<ColumnRefExpression>("dense_id");
@@ -249,7 +277,8 @@ unique_ptr<SubqueryExpression> CreateDirectedCSRVertexSubquery(const shared_ptr<
 
 // Helper function to create CSR Vertex Subquery
 unique_ptr<SubqueryExpression> CreateUndirectedCSRVertexSubquery(const shared_ptr<PropertyGraphTable> &edge_table,
-                                                                 const string &binding, int32_t csr_id) {
+                                                                 const string &binding, int32_t csr_id,
+                                                                 const PGQEdgeRowFilter &edge_filter) {
 	auto count_create_vertex_expr = GetCountTable(edge_table->source_pg_table, binding, edge_table->source_pk[0]);
 
 	vector<unique_ptr<ParsedExpression>> csr_vertex_children;
@@ -293,8 +322,8 @@ unique_ptr<SubqueryExpression> CreateUndirectedCSRVertexSubquery(const shared_pt
 
 	unique_ptr<SelectNode> unique_edges_select_node, unique_edges_select_node_reverse;
 
-	SetupSelectNode(unique_edges_select_node, edge_table, false);
-	SetupSelectNode(unique_edges_select_node_reverse, edge_table, true);
+	SetupSelectNode(unique_edges_select_node, edge_table, false, edge_filter);
+	SetupSelectNode(unique_edges_select_node_reverse, edge_table, true, edge_filter);
 
 	auto union_all_node = make_uniq<SetOperationNode>();
 	union_all_node->setop_type = SetOperationType::UNION_BY_NAME;
@@ -353,7 +382,8 @@ unique_ptr<SelectNode> CreateOuterSelectNode(unique_ptr<FunctionExpression> crea
 }
 
 // Function to create the CTE for the edges
-unique_ptr<CommonTableExpressionInfo> MakeEdgesCTE(const shared_ptr<PropertyGraphTable> &edge_table) {
+unique_ptr<CommonTableExpressionInfo> MakeEdgesCTE(const shared_ptr<PropertyGraphTable> &edge_table,
+                                                   const PGQEdgeRowFilter &edge_filter) {
 	std::vector<unique_ptr<ParsedExpression>> select_expression;
 	auto src_col_ref = make_uniq<ColumnRefExpression>("rowid", "src_table");
 	src_col_ref->alias = "src";
@@ -393,6 +423,12 @@ unique_ptr<CommonTableExpressionInfo> MakeEdgesCTE(const shared_ptr<PropertyGrap
 	    make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL, std::move(edge_to_ref), std::move(dst_cid_ref));
 
 	select_node->from_table = std::move(second_join_ref);
+	// Filtering here covers the undirected CSR entirely: its edge scan and the count that sizes
+	// its arrays (GetCountUndirectedEdgeTable) both read this same edges_cte, so they cannot
+	// disagree about which rows exist.
+	if (edge_filter) {
+		select_node->where_clause = edge_filter(edge_table->table_name);
+	}
 
 	auto select_statement = make_uniq<SelectStatement>();
 	select_statement->node = std::move(select_node);
@@ -404,9 +440,10 @@ unique_ptr<CommonTableExpressionInfo> MakeEdgesCTE(const shared_ptr<PropertyGrap
 
 // Function to create the CTE for the Undirected CSR
 unique_ptr<CommonTableExpressionInfo> CreateUndirectedCSRCTE(const shared_ptr<PropertyGraphTable> &edge_table,
-                                                             const unique_ptr<SelectNode> &select_node, int32_t csr_id) {
+                                                             const unique_ptr<SelectNode> &select_node, int32_t csr_id,
+                                                             const PGQEdgeRowFilter &edge_filter) {
 	if (select_node->cte_map.map.find("edges_cte") == select_node->cte_map.map.end()) {
-		select_node->cte_map.map["edges_cte"] = MakeEdgesCTE(edge_table);
+		select_node->cte_map.map["edges_cte"] = MakeEdgesCTE(edge_table, edge_filter);
 	}
 
 	auto csr_edge_id_constant = make_uniq<ConstantExpression>(Value::INTEGER(csr_id));
@@ -415,7 +452,8 @@ unique_ptr<CommonTableExpressionInfo> CreateUndirectedCSRCTE(const shared_ptr<Pr
 
 	auto count_edges_subquery = GetCountUndirectedEdgeTable();
 
-	auto cast_subquery_expr = CreateUndirectedCSRVertexSubquery(edge_table, edge_table->source_reference, csr_id);
+	auto cast_subquery_expr =
+	    CreateUndirectedCSRVertexSubquery(edge_table, edge_table->source_reference, csr_id, edge_filter);
 
 	auto src_rowid_colref = make_uniq<ColumnRefExpression>("src");
 	auto dst_rowid_colref = make_uniq<ColumnRefExpression>("dst");
@@ -512,7 +550,8 @@ unique_ptr<SubqueryExpression> GetCountUndirectedEdgeTable() {
 	return result;
 }
 
-unique_ptr<SubqueryExpression> GetCountEdgeTable(const shared_ptr<PropertyGraphTable> &edge_table) {
+unique_ptr<SubqueryExpression> GetCountEdgeTable(const shared_ptr<PropertyGraphTable> &edge_table,
+                                                 const PGQEdgeRowFilter &edge_filter) {
 	auto result = make_uniq<SubqueryExpression>();
 	auto outer_select_statement = make_uniq<SelectStatement>();
 	auto outer_select_node = make_uniq<SelectNode>();
@@ -534,6 +573,11 @@ unique_ptr<SubqueryExpression> GetCountEdgeTable(const shared_ptr<PropertyGraphT
 	    make_uniq<ColumnRefExpression>(edge_table->destination_fk[0], edge_table->table_name),
 	    make_uniq<ColumnRefExpression>(edge_table->destination_pk[0], "dst"));
 	outer_select_node->from_table = std::move(second_join);
+	// Here the edge rows carry no explicit alias, so they are addressed by the table's own
+	// name -- as the join conditions above already do.
+	if (edge_filter) {
+		outer_select_node->where_clause = edge_filter(edge_table->table_name);
+	}
 	outer_select_statement->node = std::move(outer_select_node);
 	result->subquery = std::move(outer_select_statement);
 	result->subquery_type = SubqueryType::SCALAR;
@@ -543,12 +587,15 @@ unique_ptr<SubqueryExpression> GetCountEdgeTable(const shared_ptr<PropertyGraphT
 // Function to create the CTE for the Directed CSR
 unique_ptr<CommonTableExpressionInfo> CreateDirectedCSRCTE(const shared_ptr<PropertyGraphTable> &edge_table,
                                                            const string &prev_binding, const string &edge_binding,
-                                                           const string &next_binding, int32_t csr_id) {
+                                                           const string &next_binding, int32_t csr_id,
+                                                           const PGQEdgeRowFilter &edge_filter) {
 	auto csr_edge_id_constant = make_uniq<ConstantExpression>(Value::INTEGER(csr_id));
 	auto count_create_edge_select = GetCountTable(edge_table->source_pg_table, prev_binding, edge_table->source_pk[0]);
 
-	auto cast_subquery_expr = CreateDirectedCSRVertexSubquery(edge_table, prev_binding, csr_id);
-	auto count_edge_table = GetCountEdgeTable(edge_table); // Count the number of edges
+	auto cast_subquery_expr = CreateDirectedCSRVertexSubquery(edge_table, prev_binding, csr_id, edge_filter);
+	// The same filter as the scan below. Sizing the arrays from the unfiltered count while
+	// scanning a filtered set is the kind of mismatch this component crashes on.
+	auto count_edge_table = GetCountEdgeTable(edge_table, edge_filter);
 
 	auto src_rowid_colref = make_uniq<ColumnRefExpression>("rowid", prev_binding);
 	auto dst_rowid_colref = make_uniq<ColumnRefExpression>("rowid", next_binding);
@@ -568,7 +615,7 @@ unique_ptr<CommonTableExpressionInfo> CreateDirectedCSRCTE(const shared_ptr<Prop
 	auto create_csr_edge_function = make_uniq<FunctionExpression>("create_csr_edge", std::move(csr_edge_children));
 	auto outer_select_node = CreateOuterSelectNode(std::move(create_csr_edge_function));
 
-	outer_select_node->from_table = GetJoinRef(edge_table, edge_binding, prev_binding, next_binding);
+	outer_select_node->from_table = GetJoinRef(edge_table, edge_binding, edge_filter, prev_binding, next_binding);
 
 	auto outer_select_statement = make_uniq<SelectStatement>();
 	outer_select_statement->node = std::move(outer_select_node);
@@ -583,11 +630,12 @@ unique_ptr<CommonTableExpressionInfo> CreateWeightedDirectedCSRCTE(const shared_
                                                                    const string &edge_binding,
                                                                    const string &next_binding,
                                                                    unique_ptr<ParsedExpression> weight_expr,
-                                                                   int32_t csr_id) {
+                                                                   int32_t csr_id,
+                                                                   const PGQEdgeRowFilter &edge_filter) {
 	auto csr_edge_id_constant = make_uniq<ConstantExpression>(Value::INTEGER(csr_id));
 	auto count_create_edge_select = GetCountTable(edge_table->source_pg_table, prev_binding, edge_table->source_pk[0]);
-	auto cast_subquery_expr = CreateDirectedCSRVertexSubquery(edge_table, prev_binding, csr_id);
-	auto count_edge_table = GetCountEdgeTable(edge_table);
+	auto cast_subquery_expr = CreateDirectedCSRVertexSubquery(edge_table, prev_binding, csr_id, edge_filter);
+	auto count_edge_table = GetCountEdgeTable(edge_table, edge_filter);
 
 	auto src_rowid_colref = make_uniq<ColumnRefExpression>("rowid", prev_binding);
 	auto dst_rowid_colref = make_uniq<ColumnRefExpression>("rowid", next_binding);
@@ -606,7 +654,7 @@ unique_ptr<CommonTableExpressionInfo> CreateWeightedDirectedCSRCTE(const shared_
 
 	auto create_csr_edge_function = make_uniq<FunctionExpression>("create_csr_edge", std::move(csr_edge_children));
 	auto outer_select_node = CreateOuterSelectNode(std::move(create_csr_edge_function));
-	outer_select_node->from_table = GetJoinRef(edge_table, edge_binding, prev_binding, next_binding);
+	outer_select_node->from_table = GetJoinRef(edge_table, edge_binding, edge_filter, prev_binding, next_binding);
 
 	auto outer_select_statement = make_uniq<SelectStatement>();
 	outer_select_statement->node = std::move(outer_select_node);
