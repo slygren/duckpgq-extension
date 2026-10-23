@@ -1,0 +1,182 @@
+# name: test/sql/grammar_extension/pgql_grammar.test
+# description: PGQL grammar additions: anonymous and unlabeled elements, label expressions, OPTIONAL MATCH
+# group: [grammar_extension]
+
+require duckpgq
+
+# The additions are part of the duckpgq grammar extension and need it active.
+statement error
+FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a:A) OPTIONAL MATCH (a)-[]->(b) COLUMNS (a.id))$$);
+----
+Parser Error
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+# Anonymous elements bind generated variables, numbered left to right; unlabeled elements keep no label.
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH ()-[]->() COLUMNS (1 AS x))$$);
+----
+MATCH (_anon_0) -[_anon_1]-> (_anon_2) COLUMNS (1 AS x)
+
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a)-[:Knows]->(:Person)<-[e]-(b) COLUMNS (a.id))$$);
+----
+MATCH (a) -[_anon_0:Knows]-> (_anon_1:Person) <-[e]- (b) COLUMNS (a.id)
+
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a IS Person) COLUMNS (a.id))$$);
+----
+MATCH (a:Person) COLUMNS (a.id)
+
+# Label expressions keep their spelling; '!' binds tightest, then '&', then '|'.
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a:Admin|User) COLUMNS (a.id))$$);
+----
+MATCH (a:Admin|User) COLUMNS (a.id)
+
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a:Admin&User) COLUMNS (a.id))$$);
+----
+MATCH (a:Admin&User) COLUMNS (a.id)
+
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a:!Admin) COLUMNS (a.id))$$);
+----
+MATCH (a:!Admin) COLUMNS (a.id)
+
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a:A|B&C) COLUMNS (a.id))$$);
+----
+MATCH (a:A|B&C) COLUMNS (a.id)
+
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a:(A|B)&C) COLUMNS (a.id))$$);
+----
+MATCH (a:(A|B)&C) COLUMNS (a.id)
+
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a:!(A|B)) COLUMNS (a.id))$$);
+----
+MATCH (a:!(A|B)) COLUMNS (a.id)
+
+# A negated operand is parenthesized, so "!A|B" cannot be read back as "!(A|B)".
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a:!A|B) COLUMNS (a.id))$$);
+----
+MATCH (a:(!A)|B) COLUMNS (a.id)
+
+# "|!" and "&!" arrive as single operator tokens.
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a:A|!B) COLUMNS (a.id))$$);
+----
+MATCH (a:A|(!B)) COLUMNS (a.id)
+
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a:A&!B) COLUMNS (a.id))$$);
+----
+MATCH (a:A&(!B)) COLUMNS (a.id)
+
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a:A|!B&C) COLUMNS (a.id))$$);
+----
+MATCH (a:A|(!B)&C) COLUMNS (a.id)
+
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a:!A&!B) COLUMNS (a.id))$$);
+----
+MATCH (a:(!A)&(!B)) COLUMNS (a.id)
+
+# Label expressions on edges, including the omit rule on a quantified edge.
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (t:TAG)-[e:HAS_WORKORDER|HAS_NOTIFICATION]->(r:WORK_ORDER|NOTIFICATION) COLUMNS (t.id))$$);
+----
+MATCH (t:TAG) -[e:HAS_WORKORDER|HAS_NOTIFICATION]-> (r:WORK_ORDER|NOTIFICATION) COLUMNS (t.id)
+
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (x:TAG)-[e:!HAS_PARENT]->{1,3}(y) COLUMNS (x.id))$$);
+----
+MATCH (x:TAG) {-[e:!HAS_PARENT]->}{1,3} (y) COLUMNS (x.id)
+
+statement error
+FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a:) COLUMNS (a.id))$$);
+----
+Parser Error
+
+statement error
+FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a:A|) COLUMNS (a.id))$$);
+----
+Parser Error
+
+# OPTIONAL MATCH groups follow the mandatory patterns; the graph-level WHERE comes after all of them.
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (t:TAG) OPTIONAL MATCH (t)-[:HAS_WORKORDER]->(wo:WORK_ORDER) OPTIONAL MATCH (t)-[:HAS_NOTIFICATION]->(n), (t)-[]->(x) WHERE t.tagname = 'X' COLUMNS (t.id, wo.id AS w))$$);
+----
+MATCH (t:TAG) OPTIONAL MATCH (t) -[_anon_0:HAS_WORKORDER]-> (wo:WORK_ORDER) OPTIONAL MATCH (t) -[_anon_1:HAS_NOTIFICATION]-> (n), (t) -[_anon_2]-> (x) WHERE (t.tagname = 'X') COLUMNS (t.id, wo.id AS w)
+
+statement error
+FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a:A) WHERE a.id = 1 OPTIONAL MATCH (a)-[]->(b) COLUMNS (a.id))$$);
+----
+Parser Error
+
+statement error
+FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a:A) OPTIONAL (a)-[]->(b) COLUMNS (a.id))$$);
+----
+Parser Error
+
+# pgq_parse_match finds every GRAPH_TABLE, also inside subqueries and joins, and none in plain SQL.
+query I
+SELECT count(*) FROM pgq_parse_match($$SELECT 42$$);
+----
+0
+
+query II
+SELECT match_index, pattern FROM pgq_parse_match($$SELECT * FROM (FROM GRAPH_TABLE (g MATCH (a:A) COLUMNS (a.id))) s JOIN (FROM GRAPH_TABLE (h MATCH (b:B) COLUMNS (b.id))) t ON true$$) ORDER BY match_index;
+----
+0	MATCH (a:A) COLUMNS (a.id)
+1	MATCH (b:B) COLUMNS (b.id)
+
+# Binding: anonymous labeled elements run today; the rest is parsed but not yet bound.
+statement ok
+CREATE TABLE person(id INT, name VARCHAR);
+
+statement ok
+INSERT INTO person VALUES (1, 'a'), (2, 'b'), (3, 'c');
+
+statement ok
+CREATE TABLE knows(src INT, dst INT);
+
+statement ok
+INSERT INTO knows VALUES (1, 2), (2, 3);
+
+statement ok
+CREATE PROPERTY GRAPH g
+VERTEX TABLES (person)
+EDGE TABLES (knows SOURCE KEY (src) REFERENCES person (id) DESTINATION KEY (dst) REFERENCES person (id));
+
+query T
+FROM GRAPH_TABLE (g MATCH (a:person)-[:knows]->(:person) COLUMNS (a.name)) ORDER BY ALL;
+----
+a
+b
+
+query T
+FROM GRAPH_TABLE (g MATCH (:Person)-[k:Knows]->(b:Person) COLUMNS (b.name)) ORDER BY ALL;
+----
+b
+c
+
+statement error
+FROM GRAPH_TABLE (g MATCH (a:person) OPTIONAL MATCH (a)-[k:knows]->(b:person) COLUMNS (a.name));
+----
+OPTIONAL MATCH is parsed but not yet supported by MATCH
+
+statement error
+FROM GRAPH_TABLE (g MATCH (a:person|person) COLUMNS (a.name));
+----
+Label expression 'person|person' is parsed but not yet supported by MATCH
+
+statement error
+FROM GRAPH_TABLE (g MATCH (a)-[k:knows]->(b:person) COLUMNS (a.name));
+----
+Unlabeled graph element 'a' is parsed but not yet supported by MATCH

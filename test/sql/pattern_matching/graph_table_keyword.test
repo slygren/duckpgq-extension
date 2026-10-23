@@ -24,13 +24,13 @@ EDGE TABLES (
 );
 
 query I
-SELECT id FROM GRAPH TABLE (pg MATCH (Person) COLUMNS (Person.id as id)) ORDER BY id;
+SELECT id FROM GRAPH TABLE (pg MATCH (p:Person) COLUMNS (p.id as id)) ORDER BY id;
 ----
 0
 1
 
 query I
-SELECT id FROM GRAPH_TABLE (pg MATCH (Person) COLUMNS (Person.id as id)) ORDER BY id;
+SELECT id FROM GRAPH_TABLE (pg MATCH (p:Person) COLUMNS (p.id as id)) ORDER BY id;
 ----
 0
 1

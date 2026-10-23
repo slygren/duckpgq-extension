@@ -64,8 +64,31 @@ bool MatchExpression::Equals(const BaseExpression &other_p) const {
 		return false;
 	}
 
-	if (path_patterns.size() != other.path_patterns.size()) {
+	if (path_patterns.size() != other.path_patterns.size() ||
+	    optional_match_patterns.size() != other.optional_match_patterns.size() ||
+	    union_matches.size() != other.union_matches.size()) {
 		return false;
+	}
+	if (one_row_per != other.one_row_per || one_row_per_vars != other.one_row_per_vars ||
+	    union_all_flags != other.union_all_flags) {
+		return false;
+	}
+	for (idx_t i = 0; i < optional_match_patterns.size(); i++) {
+		auto &group = optional_match_patterns[i];
+		auto &other_group = other.optional_match_patterns[i];
+		if (group.size() != other_group.size()) {
+			return false;
+		}
+		for (idx_t j = 0; j < group.size(); j++) {
+			if (!group[j]->Equals(other_group[j].get())) {
+				return false;
+			}
+		}
+	}
+	for (idx_t i = 0; i < union_matches.size(); i++) {
+		if (!union_matches[i]->Equals(*other.union_matches[i])) {
+			return false;
+		}
 	}
 
 	// path_list
@@ -110,11 +133,25 @@ unique_ptr<ParsedExpression> MatchExpression::Copy() const {
 		copy->path_patterns.push_back(path->Copy());
 	}
 
+	for (auto &group : optional_match_patterns) {
+		vector<unique_ptr<PathPattern>> group_copy;
+		for (auto &path : group) {
+			group_copy.push_back(path->Copy());
+		}
+		copy->optional_match_patterns.push_back(std::move(group_copy));
+	}
+
 	for (auto &column : column_list) {
 		copy->column_list.push_back(column->Copy());
 	}
 
 	copy->where_clause = where_clause ? where_clause->Copy() : nullptr;
+	copy->one_row_per = one_row_per;
+	copy->one_row_per_vars = one_row_per_vars;
+	copy->union_all_flags = union_all_flags;
+	for (auto &union_match : union_matches) {
+		copy->union_matches.push_back(unique_ptr_cast<ParsedExpression, MatchExpression>(union_match->Copy()));
+	}
 
 	return std::move(copy);
 }
@@ -127,6 +164,9 @@ void MatchExpression::Serialize(Serializer &serializer) const {
 	serializer.WriteProperty(104, "where_clause", where_clause);
 	serializer.WriteProperty(105, "pg_catalog", pg_catalog);
 	serializer.WriteProperty(106, "pg_schema", pg_schema);
+	serializer.WritePropertyWithDefault(107, "optional_match_patterns", optional_match_patterns);
+	serializer.WritePropertyWithDefault(108, "one_row_per", uint8_t(one_row_per), uint8_t(OneRowPerMode::NONE));
+	serializer.WritePropertyWithDefault(109, "one_row_per_vars", one_row_per_vars);
 }
 
 unique_ptr<ParsedExpression> MatchExpression::Deserialize(Deserializer &deserializer) {
@@ -139,6 +179,11 @@ unique_ptr<ParsedExpression> MatchExpression::Deserialize(Deserializer &deserial
 	deserializer.ReadProperty(104, "where_clause", result->where_clause);
 	deserializer.ReadPropertyWithDefault(105, "pg_catalog", result->pg_catalog);
 	deserializer.ReadPropertyWithDefault(106, "pg_schema", result->pg_schema);
+	deserializer.ReadPropertyWithDefault(107, "optional_match_patterns", result->optional_match_patterns);
+	uint8_t one_row_per = uint8_t(OneRowPerMode::NONE);
+	deserializer.ReadPropertyWithExplicitDefault(108, "one_row_per", one_row_per, uint8_t(OneRowPerMode::NONE));
+	result->one_row_per = OneRowPerMode(one_row_per);
+	deserializer.ReadPropertyWithDefault(109, "one_row_per_vars", result->one_row_per_vars);
 	return std::move(result);
 }
 

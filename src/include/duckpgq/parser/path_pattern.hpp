@@ -19,6 +19,7 @@ public:
 
 	bool all = false;
 	bool shortest = false;
+	bool cheapest = false;
 	bool group = false;
 	int32_t topk = false;
 

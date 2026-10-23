@@ -2,7 +2,9 @@
 # Built-in rules are referenced directly; no DuckDB grammar is copied here.
 # Keep each rule on one line; CMake embeds them in a header at configure time.
 
-DuckPGQGraphTable <- DuckPGQGraphTableKeyword '(' QualifiedName 'MATCH' List(DuckPGQPathPattern) WhereClause? DuckPGQColumns? ')' TableAlias?
+DuckPGQGraphTable <- DuckPGQGraphTableKeyword '(' QualifiedName 'MATCH' List(DuckPGQPathPattern) DuckPGQOptionalMatch* WhereClause? DuckPGQColumns? ')' TableAlias?
+# Each OPTIONAL MATCH group left-joins onto the mandatory patterns; the graph-level WHERE follows all of them.
+DuckPGQOptionalMatch <- 'OPTIONAL' 'MATCH' List(DuckPGQPathPattern)
 DuckPGQGraphTableKeyword <- 'GRAPH_TABLE' / ('GRAPH' 'TABLE')
 DuckPGQColumns <- 'COLUMNS' Parens(TargetList)
 
@@ -28,7 +30,22 @@ DuckPGQQuantifier <- DuckPGQFixedQuantifier / DuckPGQRangeQuantifier / '*' / '+'
 DuckPGQFixedQuantifier <- '{' NumberLiteral '}'
 DuckPGQRangeQuantifier <- '{' NumberLiteral? ',' NumberLiteral? '}'
 
-# Vertex and edge element bodies, with an optional label and element-local WHERE.
-DuckPGQVertex <- '(' Identifier DuckPGQElementLabel? WhereClause? ')'
-DuckPGQEdgeBody <- '[' Identifier DuckPGQElementLabel? WhereClause? ']'
-DuckPGQElementLabel <- (':' / 'IS') ColId
+# Vertex and edge element bodies. The variable and the label are both optional: an anonymous element gets a
+# generated variable, and an unlabeled element matches any label.
+DuckPGQVertex <- '(' Identifier? DuckPGQElementLabel? WhereClause? ')'
+DuckPGQEdgeBody <- '[' Identifier? DuckPGQElementLabel? WhereClause? ']'
+DuckPGQElementLabel <- (':' / 'IS') DuckPGQLabelExpression
+
+# Label expressions: '!' binds tightest, then '&', then '|'. The tokenizer reads "|!" and "&!" as one operator token,
+# so those spellings negate the operand that follows them.
+DuckPGQLabelExpression <- DuckPGQLabelTerm DuckPGQLabelOrTail*
+DuckPGQLabelOrTail <- DuckPGQLabelOrNegated / DuckPGQLabelOrPlain
+DuckPGQLabelOrPlain <- '|' DuckPGQLabelTerm
+DuckPGQLabelOrNegated <- '|!' DuckPGQLabelTerm
+DuckPGQLabelTerm <- DuckPGQLabelFactor DuckPGQLabelAndTail*
+DuckPGQLabelAndTail <- DuckPGQLabelAndNegated / DuckPGQLabelAndPlain
+DuckPGQLabelAndPlain <- '&' DuckPGQLabelFactor
+DuckPGQLabelAndNegated <- '&!' DuckPGQLabelFactor
+DuckPGQLabelFactor <- DuckPGQLabelNegation / DuckPGQLabelParens / ColId
+DuckPGQLabelNegation <- '!' DuckPGQLabelFactor
+DuckPGQLabelParens <- '(' DuckPGQLabelExpression ')'

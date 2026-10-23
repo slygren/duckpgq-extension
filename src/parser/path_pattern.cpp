@@ -9,6 +9,7 @@ void PathPattern::Serialize(Serializer &serializer) const {
 	serializer.WriteProperty(103, "shortest", shortest);
 	serializer.WriteProperty(104, "group", group);
 	serializer.WriteProperty(105, "topk", topk);
+	serializer.WritePropertyWithDefault(106, "cheapest", cheapest, false);
 }
 
 unique_ptr<PathPattern> PathPattern::Deserialize(Deserializer &deserializer) {
@@ -19,6 +20,7 @@ unique_ptr<PathPattern> PathPattern::Deserialize(Deserializer &deserializer) {
 	deserializer.ReadProperty(103, "shortest", result->shortest);
 	deserializer.ReadProperty(104, "group", result->group);
 	deserializer.ReadProperty(105, "topk", result->topk);
+	deserializer.ReadPropertyWithExplicitDefault(106, "cheapest", result->cheapest, false);
 	return result;
 }
 
@@ -56,6 +58,10 @@ bool PathPattern::Equals(const PathPattern *other_p) const {
 		return false;
 	}
 
+	if (cheapest != other_p->cheapest) {
+		return false;
+	}
+
 	return true;
 }
 unique_ptr<PathPattern> PathPattern::Copy() {
@@ -73,6 +79,7 @@ unique_ptr<PathPattern> PathPattern::Copy() {
 	result->shortest = shortest;
 	result->group = group;
 	result->topk = topk;
+	result->cheapest = cheapest;
 
 	return result;
 }

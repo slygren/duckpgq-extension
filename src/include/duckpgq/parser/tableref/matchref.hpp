@@ -7,6 +7,8 @@
 
 namespace duckdb {
 
+enum class OneRowPerMode : uint8_t { NONE = 0, VERTEX = 1, EDGE = 2, STEP = 3 };
+
 class MatchExpression : public ParsedExpression {
 public:
 	// An extension-only placeholder: the GRAPH_TABLE clause is carried in TableFunctionRef::bind_info and is never
@@ -23,10 +25,20 @@ public:
 	string pg_schema;
 	string alias;
 	vector<unique_ptr<PathPattern>> path_patterns;
+	//! One entry per OPTIONAL MATCH clause; each group of patterns left-joins onto the mandatory ones.
+	vector<vector<unique_ptr<PathPattern>>> optional_match_patterns;
 
 	vector<unique_ptr<ParsedExpression>> column_list;
 
 	unique_ptr<ParsedExpression> where_clause;
+
+	OneRowPerMode one_row_per = OneRowPerMode::NONE;
+	//! Variables bound by the ONE ROW PER clause.
+	vector<string> one_row_per_vars;
+
+	//! UNION [ALL] MATCH branches, each an independent MATCH block; union_all_flags runs parallel to it.
+	vector<unique_ptr<MatchExpression>> union_matches;
+	vector<bool> union_all_flags;
 
 public:
 	string ToString() const override;

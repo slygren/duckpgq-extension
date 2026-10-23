@@ -1043,6 +1043,35 @@ void PGQMatchFunction::CheckColumnBinding(
 	}
 }
 
+// The grammar already accepts these constructs; their binding arrives with the ported path-table planner.
+static void RejectUnportedLabel(const PathReference &reference) {
+	if (reference.path_reference_type == PGQPathReferenceType::SUBPATH) {
+		for (auto &child : static_cast<const SubPath &>(reference).path_list) {
+			RejectUnportedLabel(*child);
+		}
+		return;
+	}
+	auto &element = static_cast<const PathElement &>(reference);
+	if (element.label.empty()) {
+		throw NotImplementedException("Unlabeled graph element '%s' is parsed but not yet supported by MATCH",
+		                              element.variable_binding);
+	}
+	if (element.label.find_first_of("|&!()") != string::npos) {
+		throw NotImplementedException("Label expression '%s' is parsed but not yet supported by MATCH", element.label);
+	}
+}
+
+static void RejectUnportedFeatures(const MatchExpression &match) {
+	if (!match.optional_match_patterns.empty()) {
+		throw NotImplementedException("OPTIONAL MATCH is parsed but not yet supported by MATCH");
+	}
+	for (auto &pattern : match.path_patterns) {
+		for (auto &reference : pattern->path_elements) {
+			RejectUnportedLabel(*reference);
+		}
+	}
+}
+
 unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, TableFunctionBindInput &bind_input) {
 	auto duckpgq_state = GetDuckPGQState(context);
 
@@ -1053,6 +1082,7 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	// Rewrite a copy: the expansion consumes the expression, and a prepared statement can be bound again.
 	auto match_expression = unique_ptr_cast<ParsedExpression, MatchExpression>(match_info->match->Copy());
 	auto *ref = match_expression.get();
+	RejectUnportedFeatures(*ref);
 	QualifiedName graph_name(Identifier(ref->pg_catalog), Identifier(ref->pg_schema), Identifier(ref->pg_name));
 	auto *pg_table = duckpgq_state->GetPropertyGraph(context, graph_name);
 
