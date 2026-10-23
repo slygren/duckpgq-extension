@@ -29,6 +29,22 @@ SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a IS Person) CO
 ----
 MATCH (a:Person) COLUMNS (a.id)
 
+# Abbreviated edges are arrows without a body: anonymous edges with any label. Arrows may contain spaces.
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a)->(b)<-(c)-(d)<->(e) COLUMNS (a.id))$$);
+----
+MATCH (a) -[_anon_0]-> (b) <-[_anon_1]- (c) -[_anon_2]- (d) <-[_anon_3]-> (e) COLUMNS (a.id)
+
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a)->*(b), (a)<-*(c), (a)<->*(d), (a)-*(e) COLUMNS (a.id))$$);
+----
+MATCH (a) {-[_anon_0]->}{0,} (b), (a) {<-[_anon_1]-}{0,} (c), (a) {<-[_anon_2]->}{0,} (d), (a) {-[_anon_3]-}{0,} (e) COLUMNS (a.id)
+
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a)< - *(b), (a)< -*(c), (a)< - >*(d), (a)->+(e), (a)<-{1,3}(f), (a)< -?(h) COLUMNS (a.id))$$);
+----
+MATCH (a) {<-[_anon_0]-}{0,} (b), (a) {<-[_anon_1]-}{0,} (c), (a) {<-[_anon_2]->}{0,} (d), (a) {-[_anon_3]->}{1,} (e), (a) {<-[_anon_4]-}{1,3} (f), (a) {<-[_anon_5]-}{0,1} (h) COLUMNS (a.id)
+
 # Label expressions keep their spelling; '!' binds tightest, then '&', then '|'.
 query I
 SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a:Admin|User) COLUMNS (a.id))$$);

@@ -29,7 +29,8 @@ DuckPGQAllCheapest <- 'ALL' 'CHEAPEST'
 DuckPGQAnyCheapest <- 'ANY' 'CHEAPEST'
 DuckPGQPathMode <- 'WALK' / 'TRAIL' / 'SIMPLE' / 'ACYCLIC'
 DuckPGQPathSequence <- DuckPGQVertex DuckPGQEdgeVertex*
-DuckPGQEdgeVertex <- DuckPGQQuantifiedEdge DuckPGQVertex
+DuckPGQEdgeVertex <- DuckPGQEdge DuckPGQVertex
+DuckPGQEdge <- DuckPGQQuantifiedEdge / DuckPGQAbbreviatedEdge
 
 # Edges with optional quantifiers. The tokenizer reads "->*", "->?", "-*" and "-?" as one operator token, so those
 # fused endpoint/quantifier spellings are accepted as a unit.
@@ -41,6 +42,16 @@ DuckPGQEdgeRight <- ('-' '>') / '->' / '-'
 DuckPGQQuantifier <- DuckPGQFixedQuantifier / DuckPGQRangeQuantifier / '*' / '+' / '?'
 DuckPGQFixedQuantifier <- '{' NumberLiteral '}'
 DuckPGQRangeQuantifier <- '{' NumberLiteral? ',' NumberLiteral? '}'
+
+# An abbreviated edge is an arrow without a body: an anonymous edge with any label. Arrows may contain spaces.
+# The tokenizer fuses a trailing '*' into the arrow ("<-*", "->*"), so those spellings are accepted as a unit.
+DuckPGQAbbreviatedEdge <- DuckPGQAbbreviatedFused / (DuckPGQAbbreviatedArrow DuckPGQQuantifier?)
+DuckPGQAbbreviatedFused <- '<->*' / ('<' '->*') / ('<' '-' '>*') / '<-*' / ('<' '-*') / '->*' / ('-' '>*') / '-*'
+DuckPGQAbbreviatedArrow <- DuckPGQArrowBoth / DuckPGQArrowLeft / DuckPGQArrowRight / DuckPGQArrowAny
+DuckPGQArrowBoth <- '<->' / ('<' '->') / ('<' '-' '>')
+DuckPGQArrowLeft <- '<' '-'
+DuckPGQArrowRight <- '->' / ('-' '>')
+DuckPGQArrowAny <- '-'
 
 # Vertex and edge element bodies. The variable and the label are both optional: an anonymous element gets a
 # generated variable, and an unlabeled element matches any label.

@@ -49,11 +49,12 @@ FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)-[e:E] /-> *(n2:N));
 ----
 Parser Error: syntax error at or near
 
-# Not yet supported
+# Abbreviated edges (an arrow without a body) parse as anonymous, unlabeled edges; MATCH does not bind
+# unlabeled elements yet.
 statement error
 FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)-> *(n2:N));
 ----
-Parser Error: syntax error at or near
+Not implemented Error: Unlabeled graph element '_anon_0' is parsed but not yet supported by MATCH
 
 # An anonymous, unlabeled edge parses; MATCH does not bind unlabeled elements yet.
 statement error
@@ -88,32 +89,32 @@ Parser Error: syntax error at or near
 statement error
 FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)<-> *(n2:N));
 ----
-Parser Error: syntax error at or near
+Not implemented Error: Unlabeled graph element '_anon_0' is parsed but not yet supported by MATCH
 
 statement error
 FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)< - > *(n2:N));
 ----
-Parser Error: syntax error at or near
+Not implemented Error: Unlabeled graph element '_anon_0' is parsed but not yet supported by MATCH
 
 statement error
 FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)<- *(n2:N));
 ----
-Parser Error: syntax error at or near
+Not implemented Error: Unlabeled graph element '_anon_0' is parsed but not yet supported by MATCH
 
 statement error
 FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)< - *(n2:N));
 ----
-Parser Error: syntax error at or near
+Not implemented Error: Unlabeled graph element '_anon_0' is parsed but not yet supported by MATCH
 
 statement error
 FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)< -*(n2:N));
 ----
-Parser Error: syntax error at or near
+Not implemented Error: Unlabeled graph element '_anon_0' is parsed but not yet supported by MATCH
 
 statement error
 FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)< -?(n2:N));
 ----
-Parser Error: syntax error at or near
+Not implemented Error: Unlabeled graph element '_anon_0' is parsed but not yet supported by MATCH
 
 statement ok
 FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)<-[e1:E]-?(n2:N));

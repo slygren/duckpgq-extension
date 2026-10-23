@@ -312,6 +312,37 @@ unique_ptr<PathReference> TransformQuantifiedEdge(PEGTransformer &transformer, P
 	return std::move(result);
 }
 
+// DuckPGQAbbreviatedFused / (DuckPGQAbbreviatedArrow DuckPGQQuantifier?)
+unique_ptr<PathReference> TransformAbbreviatedEdge(PEGTransformer &transformer, ParseResult &parse_result,
+                                                   AnonymousNames &anon_names) {
+	auto element = make_uniq<PathElement>(PGQPathReferenceType::PATH_ELEMENT);
+	element->variable_binding = anon_names.Next();
+	auto &edge = DuckPGQGetChoice(parse_result);
+	string arrow;
+	string fused_quantifier;
+	optional_ptr<ParseResult> quantifier;
+	if (edge.Name() == "DuckPGQAbbreviatedFused") {
+		auto fused = DuckPGQLiteralText(edge);
+		arrow = fused.substr(0, fused.size() - 1);
+		fused_quantifier = "*";
+	} else {
+		auto &edge_list = edge.Cast<ListParseResult>();
+		arrow = DuckPGQLiteralText(edge_list.GetChild(0));
+		auto &optional_quantifier = edge_list.Child<OptionalParseResult>(1);
+		if (optional_quantifier.HasResult()) {
+			quantifier = &optional_quantifier.GetResult();
+		}
+	}
+	element->match_type = EdgeDirection(arrow.substr(0, 2) == "<-" ? "<-" : "-", arrow.back() == '>' ? "->" : "-");
+	if (!quantifier && fused_quantifier.empty()) {
+		return std::move(element);
+	}
+	auto result = make_uniq<SubPath>(PGQPathReferenceType::SUBPATH);
+	result->path_list.push_back(std::move(element));
+	ApplyQuantifier(transformer, quantifier, fused_quantifier, *result);
+	return std::move(result);
+}
+
 // DuckPGQVertex DuckPGQEdgeVertex*
 unique_ptr<PathPattern> TransformPathSequence(PEGTransformer &transformer, ParseResult &parse_result,
                                               AnonymousNames &anon_names) {
@@ -325,7 +356,12 @@ unique_ptr<PathPattern> TransformPathSequence(PEGTransformer &transformer, Parse
 	}
 	for (auto &edge_vertex : repeat.GetResult().Cast<RepeatParseResult>().GetChildren()) {
 		auto &pair = edge_vertex.get().Cast<ListParseResult>();
-		pattern->path_elements.push_back(TransformQuantifiedEdge(transformer, pair.GetChild(0), anon_names));
+		auto &edge = DuckPGQGetChoice(pair.GetChild(0));
+		if (edge.Name() == "DuckPGQAbbreviatedEdge") {
+			pattern->path_elements.push_back(TransformAbbreviatedEdge(transformer, edge, anon_names));
+		} else {
+			pattern->path_elements.push_back(TransformQuantifiedEdge(transformer, edge, anon_names));
+		}
 		pattern->path_elements.push_back(
 		    TransformElement(transformer, pair.GetChild(1), PGQMatchType::MATCH_VERTEX, anon_names));
 	}
