@@ -3,7 +3,11 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
+#include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/peg/ast/table_alias.hpp"
 #include "duckdb/parser/peg/transformer/peg_transformer.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
@@ -86,6 +90,17 @@ PathElement &GetSinglePathElement(PathReference &path_reference) {
 	return static_cast<PathElement &>(*subpath.path_list[0]);
 }
 
+//! Names for anonymous elements: "<prefix><n>", numbered in pattern order within one scope.
+struct AnonymousNames {
+	explicit AnonymousNames(string prefix_p) : prefix(std::move(prefix_p)) {
+	}
+	string Next() {
+		return prefix + to_string(next++);
+	}
+	string prefix;
+	idx_t next = 0;
+};
+
 struct LabelText {
 	string text;
 	//! The top-level operator of the text, if any: '|', '&' or '!'.
@@ -163,10 +178,10 @@ LabelText TransformLabelExpression(PEGTransformer &transformer, ParseResult &par
 	return JoinLabels(operands, '|');
 }
 
-// '(' Identifier? DuckPGQElementLabel? WhereClause? ')' or '[' Identifier? DuckPGQElementLabel? WhereClause? ']'
-// An anonymous element binds a generated "_anon_<n>" variable; an unlabeled one keeps an empty label (any label).
+// '(' Identifier? DuckPGQElementLabel? WhereClause? DuckPGQCost? ')', or the same between '[' and ']'.
+// An anonymous element binds a generated variable; an unlabeled one keeps an empty label (any label).
 unique_ptr<PathReference> TransformElement(PEGTransformer &transformer, ParseResult &parse_result,
-                                           PGQMatchType match_type, idx_t &anon_counter) {
+                                           PGQMatchType match_type, AnonymousNames &anon_names) {
 	auto &list = parse_result.Cast<ListParseResult>();
 	auto element = make_uniq<PathElement>(PGQPathReferenceType::PATH_ELEMENT);
 	element->match_type = match_type;
@@ -174,7 +189,7 @@ unique_ptr<PathReference> TransformElement(PEGTransformer &transformer, ParseRes
 	if (variable.HasResult()) {
 		element->variable_binding = transformer.Transform<Identifier>(variable.GetResult()).GetIdentifierName();
 	} else {
-		element->variable_binding = "_anon_" + to_string(anon_counter++);
+		element->variable_binding = anon_names.Next();
 	}
 	auto &label = list.Child<OptionalParseResult>(2);
 	if (label.HasResult()) {
@@ -182,12 +197,27 @@ unique_ptr<PathReference> TransformElement(PEGTransformer &transformer, ParseRes
 		element->label = TransformLabelExpression(transformer, label_list.GetChild(1)).text;
 	}
 	auto &where_clause = list.Child<OptionalParseResult>(3);
-	if (!where_clause.HasResult()) {
+	auto &cost = list.Child<OptionalParseResult>(4);
+	if (!where_clause.HasResult() && !cost.HasResult()) {
 		return std::move(element);
 	}
-	// An element-local WHERE is represented as a single-element subpath carrying the condition.
+	// An element-local WHERE or COST is represented as a single-element subpath carrying it.
 	auto subpath = make_uniq<SubPath>(PGQPathReferenceType::SUBPATH);
-	subpath->where_clause = transformer.Transform<unique_ptr<ParsedExpression>>(where_clause.GetResult());
+	if (where_clause.HasResult()) {
+		subpath->where_clause = transformer.Transform<unique_ptr<ParsedExpression>>(where_clause.GetResult());
+	}
+	if (cost.HasResult()) {
+		// 'COST' Expression DuckPGQCostDefault?, with DuckPGQCostDefault <- 'DEFAULT' NumberLiteral
+		auto &cost_list = cost.GetResult().Cast<ListParseResult>();
+		subpath->cost_expr = transformer.Transform<unique_ptr<ParsedExpression>>(cost_list.GetChild(1));
+		auto &cost_default = cost_list.Child<OptionalParseResult>(2);
+		if (cost_default.HasResult()) {
+			auto default_value = transformer.Transform<unique_ptr<ParsedExpression>>(
+			    cost_default.GetResult().Cast<ListParseResult>().GetChild(1));
+			subpath->default_value =
+			    default_value->Cast<ConstantExpression>().GetLiteral().ToValue().GetValue<double>();
+		}
+	}
 	subpath->path_list.push_back(std::move(element));
 	return std::move(subpath);
 }
@@ -238,9 +268,9 @@ void ApplyQuantifier(PEGTransformer &transformer, optional_ptr<ParseResult> quan
 
 // DuckPGQEdgeLeft DuckPGQEdgeBody DuckPGQEdgeTail
 unique_ptr<PathReference> TransformQuantifiedEdge(PEGTransformer &transformer, ParseResult &parse_result,
-                                                  idx_t &anon_counter) {
+                                                  AnonymousNames &anon_names) {
 	auto &list = parse_result.Cast<ListParseResult>();
-	auto edge = TransformElement(transformer, list.GetChild(1), PGQMatchType::MATCH_EDGE_ANY, anon_counter);
+	auto edge = TransformElement(transformer, list.GetChild(1), PGQMatchType::MATCH_EDGE_ANY, anon_names);
 	auto left = DuckPGQLiteralText(list.GetChild(0));
 
 	// DuckPGQFusedTail / (DuckPGQEdgeRight DuckPGQQuantifier?)
@@ -269,9 +299,11 @@ unique_ptr<PathReference> TransformQuantifiedEdge(PEGTransformer &transformer, P
 	}
 	auto result = make_uniq<SubPath>(PGQPathReferenceType::SUBPATH);
 	if (edge->path_reference_type == PGQPathReferenceType::SUBPATH) {
-		// Fold an element-local WHERE into the quantified subpath instead of nesting two subpaths.
+		// Fold an element-local WHERE or COST into the quantified subpath instead of nesting two subpaths.
 		auto &nested = static_cast<SubPath &>(*edge);
 		result->where_clause = std::move(nested.where_clause);
+		result->cost_expr = std::move(nested.cost_expr);
+		result->default_value = nested.default_value;
 		result->path_list.push_back(std::move(nested.path_list[0]));
 	} else {
 		result->path_list.push_back(std::move(edge));
@@ -282,34 +314,36 @@ unique_ptr<PathReference> TransformQuantifiedEdge(PEGTransformer &transformer, P
 
 // DuckPGQVertex DuckPGQEdgeVertex*
 unique_ptr<PathPattern> TransformPathSequence(PEGTransformer &transformer, ParseResult &parse_result,
-                                              idx_t &anon_counter) {
+                                              AnonymousNames &anon_names) {
 	auto &list = parse_result.Cast<ListParseResult>();
 	auto pattern = make_uniq<PathPattern>();
 	pattern->path_elements.push_back(
-	    TransformElement(transformer, list.GetChild(0), PGQMatchType::MATCH_VERTEX, anon_counter));
+	    TransformElement(transformer, list.GetChild(0), PGQMatchType::MATCH_VERTEX, anon_names));
 	auto &repeat = list.Child<OptionalParseResult>(1);
 	if (!repeat.HasResult()) {
 		return pattern;
 	}
 	for (auto &edge_vertex : repeat.GetResult().Cast<RepeatParseResult>().GetChildren()) {
 		auto &pair = edge_vertex.get().Cast<ListParseResult>();
-		pattern->path_elements.push_back(TransformQuantifiedEdge(transformer, pair.GetChild(0), anon_counter));
+		pattern->path_elements.push_back(TransformQuantifiedEdge(transformer, pair.GetChild(0), anon_names));
 		pattern->path_elements.push_back(
-		    TransformElement(transformer, pair.GetChild(1), PGQMatchType::MATCH_VERTEX, anon_counter));
+		    TransformElement(transformer, pair.GetChild(1), PGQMatchType::MATCH_VERTEX, anon_names));
 	}
 	return pattern;
 }
 
 // DuckPGQPathVariable? DuckPGQSearchPrefix? DuckPGQPathMode? DuckPGQPathSequence
 unique_ptr<PathPattern> TransformPathPattern(PEGTransformer &transformer, ParseResult &parse_result,
-                                             idx_t &anon_counter) {
+                                             AnonymousNames &anon_names) {
 	auto &list = parse_result.Cast<ListParseResult>();
-	auto pattern = TransformPathSequence(transformer, list.GetChild(3), anon_counter);
+	auto pattern = TransformPathSequence(transformer, list.GetChild(3), anon_names);
 	auto &prefix = list.Child<OptionalParseResult>(1);
 	if (prefix.HasResult()) {
 		auto &choice = DuckPGQGetChoice(prefix.GetResult());
+		// CHEAPEST is a shortest path by cost rather than by hop count.
 		pattern->shortest = true;
-		pattern->all = choice.Name() == "DuckPGQAllShortest";
+		pattern->cheapest = choice.Name() == "DuckPGQAllCheapest" || choice.Name() == "DuckPGQAnyCheapest";
+		pattern->all = choice.Name() == "DuckPGQAllShortest" || choice.Name() == "DuckPGQAllCheapest";
 		if (choice.Name() == "DuckPGQTopKShortest") {
 			auto k = TransformNumber(transformer, choice.Cast<ListParseResult>().GetChild(1));
 			if (k <= 0) {
@@ -351,8 +385,58 @@ void CollectVertexStars(PathReference &path_reference, vector<unique_ptr<ParsedE
 	}
 }
 
-// DuckPGQGraphTableKeyword '(' QualifiedName 'MATCH' List(DuckPGQPathPattern) DuckPGQOptionalMatch* WhereClause?
-// DuckPGQColumns? ')' TableAlias?
+vector<unique_ptr<PathPattern>> TransformPatternList(PEGTransformer &transformer, ParseResult &parse_result,
+                                                     AnonymousNames &anon_names) {
+	vector<unique_ptr<PathPattern>> patterns;
+	for (auto &item : PEGTransformerFactory::ExtractParseResultsFromList(parse_result)) {
+		patterns.push_back(TransformPathPattern(transformer, item.get(), anon_names));
+	}
+	return patterns;
+}
+
+// 'ONE' 'ROW' 'PER' (DuckPGQOneRowPerVertex / DuckPGQOneRowPerEdge / DuckPGQOneRowPerStep)
+void TransformOneRowPer(PEGTransformer &transformer, ParseResult &parse_result, MatchExpression &match) {
+	auto &target = DuckPGQGetChoice(parse_result.Cast<ListParseResult>().GetChild(3));
+	auto &variables = PEGTransformerFactory::ExtractResultFromParens(target.Cast<ListParseResult>().GetChild(1));
+	if (target.Name() == "DuckPGQOneRowPerStep") {
+		match.one_row_per = OneRowPerMode::STEP;
+		for (auto &variable : PEGTransformerFactory::ExtractParseResultsFromList(variables)) {
+			match.one_row_per_vars.push_back(transformer.Transform<Identifier>(variable.get()).GetIdentifierName());
+		}
+		if (match.one_row_per_vars.size() != 3) {
+			throw ParserException("ONE ROW PER STEP takes three variables: (vertex, edge, vertex)");
+		}
+		return;
+	}
+	match.one_row_per = target.Name() == "DuckPGQOneRowPerVertex" ? OneRowPerMode::VERTEX : OneRowPerMode::EDGE;
+	match.one_row_per_vars.push_back(transformer.Transform<Identifier>(variables).GetIdentifierName());
+}
+
+// 'MATCH' List(DuckPGQPathPattern) DuckPGQOptionalMatch* DuckPGQOneRowPer? WhereClause?
+void TransformMatchBlock(PEGTransformer &transformer, ParseResult &parse_result, MatchExpression &match) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	// Generated variables are numbered across the mandatory and optional patterns of one MATCH block.
+	AnonymousNames anon_names("_anon_");
+	match.path_patterns = TransformPatternList(transformer, list.GetChild(1), anon_names);
+	auto &optional_matches = list.Child<OptionalParseResult>(2);
+	if (optional_matches.HasResult()) {
+		for (auto &optional_match : optional_matches.GetResult().Cast<RepeatParseResult>().GetChildren()) {
+			auto &optional_list = optional_match.get().Cast<ListParseResult>();
+			match.optional_match_patterns.push_back(
+			    TransformPatternList(transformer, optional_list.GetChild(2), anon_names));
+		}
+	}
+	auto &one_row_per = list.Child<OptionalParseResult>(3);
+	if (one_row_per.HasResult()) {
+		TransformOneRowPer(transformer, one_row_per.GetResult(), match);
+	}
+	auto &where_clause = list.Child<OptionalParseResult>(4);
+	if (where_clause.HasResult()) {
+		match.where_clause = transformer.Transform<unique_ptr<ParsedExpression>>(where_clause.GetResult());
+	}
+}
+
+// DuckPGQGraphTableKeyword '(' QualifiedName DuckPGQMatchBlock DuckPGQUnionBranch* DuckPGQColumns? ')' TableAlias?
 arena_ptr<TransformResultValue> TransformGraphTable(PEGTransformer &transformer, ParseResult &parse_result) {
 	auto &list = parse_result.Cast<ListParseResult>();
 	auto match = make_uniq<MatchExpression>();
@@ -360,27 +444,22 @@ arena_ptr<TransformResultValue> TransformGraphTable(PEGTransformer &transformer,
 	match->pg_name = graph_name.Name().GetIdentifierName();
 	match->pg_catalog = graph_name.Catalog().GetIdentifierName();
 	match->pg_schema = graph_name.Schema().GetIdentifierName();
-	// Generated variables are numbered across the mandatory and optional patterns of one MATCH.
-	idx_t anon_counter = 0;
-	for (auto &item : PEGTransformerFactory::ExtractParseResultsFromList(list.GetChild(4))) {
-		match->path_patterns.push_back(TransformPathPattern(transformer, item.get(), anon_counter));
-	}
-	auto &optional_matches = list.Child<OptionalParseResult>(5);
-	if (optional_matches.HasResult()) {
-		for (auto &optional_match : optional_matches.GetResult().Cast<RepeatParseResult>().GetChildren()) {
-			auto &optional_list = optional_match.get().Cast<ListParseResult>();
-			vector<unique_ptr<PathPattern>> group;
-			for (auto &item : PEGTransformerFactory::ExtractParseResultsFromList(optional_list.GetChild(2))) {
-				group.push_back(TransformPathPattern(transformer, item.get(), anon_counter));
-			}
-			match->optional_match_patterns.push_back(std::move(group));
+	TransformMatchBlock(transformer, list.GetChild(3), *match);
+	auto &union_branches = list.Child<OptionalParseResult>(4);
+	if (union_branches.HasResult()) {
+		// 'UNION' 'ALL'? DuckPGQMatchBlock
+		for (auto &branch : union_branches.GetResult().Cast<RepeatParseResult>().GetChildren()) {
+			auto &branch_list = branch.get().Cast<ListParseResult>();
+			auto branch_match = make_uniq<MatchExpression>();
+			branch_match->pg_name = match->pg_name;
+			branch_match->pg_catalog = match->pg_catalog;
+			branch_match->pg_schema = match->pg_schema;
+			TransformMatchBlock(transformer, branch_list.GetChild(2), *branch_match);
+			match->union_all_flags.push_back(branch_list.Child<OptionalParseResult>(1).HasResult());
+			match->union_matches.push_back(std::move(branch_match));
 		}
 	}
-	auto &where_clause = list.Child<OptionalParseResult>(6);
-	if (where_clause.HasResult()) {
-		match->where_clause = transformer.Transform<unique_ptr<ParsedExpression>>(where_clause.GetResult());
-	}
-	auto &columns = list.Child<OptionalParseResult>(7);
+	auto &columns = list.Child<OptionalParseResult>(5);
 	if (columns.HasResult()) {
 		auto &target_list =
 		    PEGTransformerFactory::ExtractResultFromParens(columns.GetResult().Cast<ListParseResult>().GetChild(1));
@@ -395,7 +474,7 @@ arena_ptr<TransformResultValue> TransformGraphTable(PEGTransformer &transformer,
 	}
 
 	auto result = make_uniq<TableFunctionRef>();
-	auto &alias = list.Child<OptionalParseResult>(9);
+	auto &alias = list.Child<OptionalParseResult>(7);
 	if (alias.HasResult()) {
 		auto table_alias = transformer.Transform<TableAlias>(alias.GetResult());
 		match->alias = table_alias.name.GetIdentifierName();
@@ -414,7 +493,96 @@ arena_ptr<TransformProcess> StartGraphTableTransform(PEGTransformer &transformer
 	return transformer.MakeProcess<FinalizeTransformProcess>(transformer, parse_result, TransformGraphTable);
 }
 
+// ColId 'IS' 'NOT'? 'LABELED' ColId
+arena_ptr<TransformResultValue> TransformIsLabeled(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	vector<unique_ptr<ParsedExpression>> children;
+	children.push_back(make_uniq<ColumnRefExpression>(transformer.Transform<Identifier>(list.GetChild(0))));
+	children.push_back(
+	    make_uniq<ConstantExpression>(
+	    Literal::String(transformer.Transform<Identifier>(list.GetChild(4)).GetIdentifierName())));
+	auto name = list.Child<OptionalParseResult>(2).HasResult() ? "not_labeled" : "is_labeled";
+	unique_ptr<ParsedExpression> result = make_uniq<FunctionExpression>(Identifier(name), std::move(children));
+	return transformer.MakeResult<unique_ptr<ParsedExpression>>(std::move(result));
+}
+
+// 'EXISTS' '{' List(DuckPGQPathPattern) WhereClause? '}'
+// Becomes EXISTS (SELECT 1 FROM duckpgq_exists_pattern()) carrying the pattern in bind_info. Inside a GRAPH_TABLE
+// the MATCH expansion rewrites it into a correlated subquery; anywhere else the table function rejects it.
+arena_ptr<TransformResultValue> TransformExistsPattern(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto match = make_uniq<MatchExpression>();
+	// A separate prefix, so an anonymous inner element is never taken for an outer variable of the same name.
+	AnonymousNames anon_names("_anon_exists_");
+	match->path_patterns = TransformPatternList(transformer, list.GetChild(2), anon_names);
+	auto &where_clause = list.Child<OptionalParseResult>(3);
+	if (where_clause.HasResult()) {
+		match->where_clause = transformer.Transform<unique_ptr<ParsedExpression>>(where_clause.GetResult());
+	}
+	auto pattern_ref = make_uniq<TableFunctionRef>();
+	pattern_ref->function = make_uniq<FunctionExpression>(Identifier(DUCKPGQ_EXISTS_PATTERN_FUNCTION),
+	                                                      vector<unique_ptr<ParsedExpression>>());
+	pattern_ref->bind_info = make_shared_ptr<DuckPGQMatchInfo>(std::move(match));
+	auto select_node = make_uniq<SelectNode>();
+	select_node->select_list.push_back(make_uniq<ConstantExpression>(Literal::Integer(1)));
+	select_node->from_table = std::move(pattern_ref);
+	auto select = make_uniq<SelectStatement>();
+	select->node = std::move(select_node);
+	auto exists = make_uniq<SubqueryExpression>();
+	exists->GetSubqueryTypeMutable() = SubqueryType::EXISTS;
+	exists->SubqueryMutable() = std::move(select);
+	unique_ptr<ParsedExpression> result = std::move(exists);
+	return transformer.MakeResult<unique_ptr<ParsedExpression>>(std::move(result));
+}
+
+// ColId DuckPGQProjectionLink? '.' '{' List(ColId) '}', with DuckPGQProjectionLink <- '.' ColId
+arena_ptr<TransformResultValue> TransformPropertyProjection(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	vector<Identifier> prefix;
+	prefix.push_back(transformer.Transform<Identifier>(list.GetChild(0)));
+	auto &link = list.Child<OptionalParseResult>(1);
+	if (link.HasResult()) {
+		prefix.push_back(transformer.Transform<Identifier>(link.GetResult().Cast<ListParseResult>().GetChild(1)));
+	}
+	vector<FunctionArgument> fields;
+	for (auto &item : PEGTransformerFactory::ExtractParseResultsFromList(list.GetChild(4))) {
+		auto property = transformer.Transform<Identifier>(item.get());
+		auto column_names = prefix;
+		column_names.push_back(property);
+		fields.emplace_back(property, make_uniq<ColumnRefExpression>(std::move(column_names)));
+	}
+	unique_ptr<ParsedExpression> result = make_uniq<FunctionExpression>(Identifier("struct_pack"), std::move(fields));
+	return transformer.MakeResult<unique_ptr<ParsedExpression>>(std::move(result));
+}
+
+template <arena_ptr<TransformResultValue> (*TRANSFORM)(PEGTransformer &, ParseResult &)>
+arena_ptr<TransformProcess> StartTransform(PEGTransformer &transformer, ParseResult &parse_result) {
+	return transformer.MakeProcess<FinalizeTransformProcess>(transformer, parse_result, TRANSFORM);
+}
+
 } // namespace
+
+optional_ptr<MatchExpression> DuckPGQGetExistsPattern(ParsedExpression &expression) {
+	if (expression.GetExpressionClass() != ExpressionClass::SUBQUERY) {
+		return nullptr;
+	}
+	auto &subquery = expression.Cast<SubqueryExpression>();
+	if (subquery.GetSubqueryType() != SubqueryType::EXISTS || !subquery.Subquery() ||
+	    subquery.Subquery()->node->type != QueryNodeType::SELECT_NODE) {
+		return nullptr;
+	}
+	auto &from_table = subquery.Subquery()->node->Cast<SelectNode>().from_table;
+	if (!from_table || from_table->type != TableReferenceType::TABLE_FUNCTION) {
+		return nullptr;
+	}
+	auto &function_ref = from_table->Cast<TableFunctionRef>();
+	auto match_info = dynamic_cast<DuckPGQMatchInfo *>(function_ref.bind_info.get());
+	auto &function_name = function_ref.function->Cast<FunctionExpression>().FunctionName();
+	if (!match_info || function_name != Identifier(DUCKPGQ_EXISTS_PATTERN_FUNCTION)) {
+		return nullptr;
+	}
+	return match_info->match.get();
+}
 
 void DuckPGQAddGraphTableGrammar(vector<GrammarChange> &changes) {
 	for (auto rule : DUCKPGQ_GRAPH_TABLE_RULES) {
@@ -423,6 +591,15 @@ void DuckPGQAddGraphTableGrammar(vector<GrammarChange> &changes) {
 	changes.push_back(GrammarChange::SetTransformProcess("DuckPGQGraphTable", StartGraphTableTransform));
 	// Tried before the native table references, so GRAPH_TABLE(...) is not read as a table-function call.
 	changes.push_back(GrammarChange::PrependChoice("InnerTableRef", "DuckPGQGraphTable"));
+	// Tried before the native expressions: each starts like a column reference or an EXISTS subquery.
+	changes.push_back(GrammarChange::SetTransformProcess("DuckPGQIsLabeled", StartTransform<TransformIsLabeled>));
+	changes.push_back(
+	    GrammarChange::SetTransformProcess("DuckPGQExistsPattern", StartTransform<TransformExistsPattern>));
+	changes.push_back(
+	    GrammarChange::SetTransformProcess("DuckPGQPropertyProjection", StartTransform<TransformPropertyProjection>));
+	changes.push_back(GrammarChange::PrependChoice("SingleExpression", "DuckPGQIsLabeled"));
+	changes.push_back(GrammarChange::PrependChoice("SingleExpression", "DuckPGQExistsPattern"));
+	changes.push_back(GrammarChange::PrependChoice("SingleExpression", "DuckPGQPropertyProjection"));
 }
 
 } // namespace duckdb

@@ -1,0 +1,87 @@
+# name: test/sql/grammar_extension/pgql_grammar_expressions.test
+# description: PGQL expression additions: IS [NOT] LABELED, EXISTS { pattern } and v.{a, b} property projection
+# group: [grammar_extension]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (net MATCH (x) WHERE x IS LABELED Person AND x IS NOT LABELED Admin COLUMNS (x.id))$$);
+----
+MATCH (x) WHERE (is_labeled(x, 'Person') AND not_labeled(x, 'Admin')) COLUMNS (x.id)
+
+# Anonymous elements inside EXISTS get their own names, so they never correlate with outer anonymous elements.
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (t:TAG)-[]->(x) WHERE EXISTS { (t)-[:HAS_WORKORDER]->(:WORK_ORDER) } AND NOT EXISTS { (t)-[:HAS_NOTIFICATION]->(n:NOTIFICATION) WHERE n.prio > 1 } COLUMNS (t.tagname))$$);
+----
+MATCH (t:TAG) -[_anon_0]-> (x) WHERE (EXISTS(SELECT 1 FROM duckpgq_exists_pattern()) AND (NOT EXISTS(SELECT 1 FROM duckpgq_exists_pattern()))) [EXISTS {MATCH (t) -[_anon_exists_0:HAS_WORKORDER]-> (_anon_exists_1:WORK_ORDER)}] [EXISTS {MATCH (t) -[_anon_exists_0:HAS_NOTIFICATION]-> (n:NOTIFICATION) WHERE (n.prio > 1)}] COLUMNS (t.tagname)
+
+# v.{a, b} and v.link.{a, b} are shorthand for struct_pack over the listed properties.
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (t:TAG)-[:HAS_WORKORDER]->(wo:WORK_ORDER) COLUMNS (t.{tagname, description}, wo.{id, title} AS workorder, wo.work_center.{code, description} AS wc))$$);
+----
+MATCH (t:TAG) -[_anon_0:HAS_WORKORDER]-> (wo:WORK_ORDER) COLUMNS (struct_pack(tagname := t.tagname, description := t.description), struct_pack(id := wo.id, title := wo.title) AS workorder, struct_pack(code := wo.work_center.code, description := wo.work_center.description) AS wc)
+
+# The shorthand also works on ordinary structs and table aliases.
+query I
+SELECT x.{a, b} AS s FROM (SELECT {'a': 1, 'b': 2, 'c': 3} AS x) t;
+----
+{'a': 1, 'b': 2}
+
+query I
+SELECT p.{a, b} AS s FROM (SELECT 1 AS a, 2 AS b) p;
+----
+{'a': 1, 'b': 2}
+
+# The native forms these rules sit beside are unaffected.
+query IIIII
+SELECT 5 IS NOT NULL, {'a': 1}, EXISTS (SELECT 1), 2 | 3, 2 & 3;
+----
+true	{'a': 1}	true	3	2
+
+# Outside a GRAPH_TABLE there is no graph variable for the predicates to test.
+statement error
+SELECT 1 WHERE EXISTS { (a:A) };
+----
+EXISTS { ... } graph pattern predicates are only allowed in the WHERE clause of a GRAPH_TABLE
+
+statement error
+SELECT x IS LABELED Foo FROM (SELECT 1 AS x);
+----
+IS [NOT] LABELED is only allowed in the WHERE clause of a GRAPH_TABLE
+
+# Binding: the projection runs today; the predicates are parsed but not yet bound.
+statement ok
+CREATE TABLE person(id INT, name VARCHAR);
+
+statement ok
+INSERT INTO person VALUES (1, 'a'), (2, 'b'), (3, 'c');
+
+statement ok
+CREATE TABLE knows(src INT, dst INT);
+
+statement ok
+INSERT INTO knows VALUES (1, 2), (2, 3);
+
+statement ok
+CREATE PROPERTY GRAPH g
+VERTEX TABLES (person)
+EDGE TABLES (knows SOURCE KEY (src) REFERENCES person (id) DESTINATION KEY (dst) REFERENCES person (id));
+
+query II
+FROM GRAPH_TABLE (g MATCH (a:person)-[k:knows]->(b:person) COLUMNS (a.{id, name} AS src, b.name AS dst)) ORDER BY dst;
+----
+{'id': 1, 'name': a}	b
+{'id': 2, 'name': b}	c
+
+statement error
+FROM GRAPH_TABLE (g MATCH (a:person) WHERE a IS LABELED person COLUMNS (a.name));
+----
+IS [NOT] LABELED is parsed but not yet supported by MATCH
+
+statement error
+FROM GRAPH_TABLE (g MATCH (a:person) WHERE NOT EXISTS { (a)-[:knows]->(:person) } COLUMNS (a.name));
+----
+EXISTS { ... } is parsed but not yet supported by MATCH

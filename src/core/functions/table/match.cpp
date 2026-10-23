@@ -1046,7 +1046,11 @@ void PGQMatchFunction::CheckColumnBinding(
 // The grammar already accepts these constructs; their binding arrives with the ported path-table planner.
 static void RejectUnportedLabel(const PathReference &reference) {
 	if (reference.path_reference_type == PGQPathReferenceType::SUBPATH) {
-		for (auto &child : static_cast<const SubPath &>(reference).path_list) {
+		auto &subpath = static_cast<const SubPath &>(reference);
+		if (subpath.cost_expr) {
+			throw NotImplementedException("COST is parsed but not yet supported by MATCH");
+		}
+		for (auto &child : subpath.path_list) {
 			RejectUnportedLabel(*child);
 		}
 		return;
@@ -1061,14 +1065,43 @@ static void RejectUnportedLabel(const PathReference &reference) {
 	}
 }
 
+static void RejectUnportedExpression(ParsedExpression &expression) {
+	if (DuckPGQGetExistsPattern(expression)) {
+		throw NotImplementedException("EXISTS { ... } is parsed but not yet supported by MATCH");
+	}
+	if (expression.GetExpressionClass() == ExpressionClass::FUNCTION) {
+		auto &name = expression.Cast<FunctionExpression>().FunctionName();
+		if (name == Identifier("is_labeled") || name == Identifier("not_labeled")) {
+			throw NotImplementedException("IS [NOT] LABELED is parsed but not yet supported by MATCH");
+		}
+	}
+	ParsedExpressionIterator::EnumerateChildren(expression,
+	                                            [](ParsedExpression &child) { RejectUnportedExpression(child); });
+}
+
 static void RejectUnportedFeatures(const MatchExpression &match) {
 	if (!match.optional_match_patterns.empty()) {
 		throw NotImplementedException("OPTIONAL MATCH is parsed but not yet supported by MATCH");
 	}
+	if (!match.union_matches.empty()) {
+		throw NotImplementedException("UNION between MATCH blocks is parsed but not yet supported by MATCH");
+	}
+	if (match.one_row_per != OneRowPerMode::NONE) {
+		throw NotImplementedException("ONE ROW PER is parsed but not yet supported by MATCH");
+	}
 	for (auto &pattern : match.path_patterns) {
+		if (pattern->cheapest) {
+			throw NotImplementedException("CHEAPEST paths are parsed but not yet supported by MATCH");
+		}
 		for (auto &reference : pattern->path_elements) {
 			RejectUnportedLabel(*reference);
 		}
+	}
+	if (match.where_clause) {
+		RejectUnportedExpression(*match.where_clause);
+	}
+	for (auto &column : match.column_list) {
+		RejectUnportedExpression(*column);
 	}
 }
 
@@ -1596,8 +1629,19 @@ void VertexEliminationPlanner::EmitJoinConditions(vector<unique_ptr<ParsedExpres
 //------------------------------------------------------------------------------
 // Register functions
 //------------------------------------------------------------------------------
+static unique_ptr<FunctionData> ExistsPatternBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &,
+                                                  vector<Identifier> &) {
+	throw BinderException(
+	    "EXISTS { ... } graph pattern predicates are only allowed in the WHERE clause of a GRAPH_TABLE");
+}
+
+static void ExistsPatternFunction(ClientContext &, TableFunctionInput &, DataChunk &) {
+}
+
 void CoreTableFunctions::RegisterMatchTableFunction(ExtensionLoader &loader) {
 	loader.RegisterFunction(PGQMatchFunction());
+	loader.RegisterFunction(
+	    TableFunction(DUCKPGQ_EXISTS_PATTERN_FUNCTION, {}, ExistsPatternFunction, ExistsPatternBind));
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	config.AddExtensionOption(Identifier(VertexEliminationPlanner::SETTING_NAME),
 	                          "Leave vertex tables out of the MATCH translation when the query only uses their key, "

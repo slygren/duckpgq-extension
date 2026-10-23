@@ -2,19 +2,31 @@
 # Built-in rules are referenced directly; no DuckDB grammar is copied here.
 # Keep each rule on one line; CMake embeds them in a header at configure time.
 
-DuckPGQGraphTable <- DuckPGQGraphTableKeyword '(' QualifiedName 'MATCH' List(DuckPGQPathPattern) DuckPGQOptionalMatch* WhereClause? DuckPGQColumns? ')' TableAlias?
-# Each OPTIONAL MATCH group left-joins onto the mandatory patterns; the graph-level WHERE follows all of them.
+DuckPGQGraphTable <- DuckPGQGraphTableKeyword '(' QualifiedName DuckPGQMatchBlock DuckPGQUnionBranch* DuckPGQColumns? ')' TableAlias?
+# One MATCH block. Each OPTIONAL MATCH group left-joins onto the mandatory patterns; the WHERE follows all of them.
+DuckPGQMatchBlock <- 'MATCH' List(DuckPGQPathPattern) DuckPGQOptionalMatch* DuckPGQOneRowPer? WhereClause?
 DuckPGQOptionalMatch <- 'OPTIONAL' 'MATCH' List(DuckPGQPathPattern)
+# Further MATCH blocks combined with the first; all branches share the final COLUMNS.
+DuckPGQUnionBranch <- 'UNION' 'ALL'? DuckPGQMatchBlock
+
+# ONE ROW PER VERTEX (v), ONE ROW PER EDGE (e) or ONE ROW PER STEP (v1, e, v2) unnests the matched paths.
+DuckPGQOneRowPer <- 'ONE' 'ROW' 'PER' DuckPGQOneRowPerTarget
+DuckPGQOneRowPerTarget <- DuckPGQOneRowPerVertex / DuckPGQOneRowPerEdge / DuckPGQOneRowPerStep
+DuckPGQOneRowPerVertex <- 'VERTEX' Parens(Identifier)
+DuckPGQOneRowPerEdge <- 'EDGE' Parens(Identifier)
+DuckPGQOneRowPerStep <- 'STEP' Parens(List(Identifier))
 DuckPGQGraphTableKeyword <- 'GRAPH_TABLE' / ('GRAPH' 'TABLE')
 DuckPGQColumns <- 'COLUMNS' Parens(TargetList)
 
 # A path pattern: optional path variable, search prefix and path mode, then the element sequence.
 DuckPGQPathPattern <- DuckPGQPathVariable? DuckPGQSearchPrefix? DuckPGQPathMode? DuckPGQPathSequence
 DuckPGQPathVariable <- Identifier '='
-DuckPGQSearchPrefix <- DuckPGQAllShortest / DuckPGQAnyShortest / DuckPGQTopKShortest
+DuckPGQSearchPrefix <- DuckPGQAllShortest / DuckPGQAnyShortest / DuckPGQTopKShortest / DuckPGQAllCheapest / DuckPGQAnyCheapest
 DuckPGQAllShortest <- 'ALL' 'SHORTEST'
 DuckPGQAnyShortest <- 'ANY' 'SHORTEST'
 DuckPGQTopKShortest <- 'SHORTEST' NumberLiteral
+DuckPGQAllCheapest <- 'ALL' 'CHEAPEST'
+DuckPGQAnyCheapest <- 'ANY' 'CHEAPEST'
 DuckPGQPathMode <- 'WALK' / 'TRAIL' / 'SIMPLE' / 'ACYCLIC'
 DuckPGQPathSequence <- DuckPGQVertex DuckPGQEdgeVertex*
 DuckPGQEdgeVertex <- DuckPGQQuantifiedEdge DuckPGQVertex
@@ -32,8 +44,11 @@ DuckPGQRangeQuantifier <- '{' NumberLiteral? ',' NumberLiteral? '}'
 
 # Vertex and edge element bodies. The variable and the label are both optional: an anonymous element gets a
 # generated variable, and an unlabeled element matches any label.
-DuckPGQVertex <- '(' Identifier? DuckPGQElementLabel? WhereClause? ')'
-DuckPGQEdgeBody <- '[' Identifier? DuckPGQElementLabel? WhereClause? ']'
+DuckPGQVertex <- '(' Identifier? DuckPGQElementLabel? WhereClause? DuckPGQCost? ')'
+DuckPGQEdgeBody <- '[' Identifier? DuckPGQElementLabel? WhereClause? DuckPGQCost? ']'
+# The cost of traversing an element in a CHEAPEST path, and the cost used where the expression is NULL.
+DuckPGQCost <- 'COST' Expression DuckPGQCostDefault?
+DuckPGQCostDefault <- 'DEFAULT' NumberLiteral
 DuckPGQElementLabel <- (':' / 'IS') DuckPGQLabelExpression
 
 # Label expressions: '!' binds tightest, then '&', then '|'. The tokenizer reads "|!" and "&!" as one operator token,
@@ -49,3 +64,10 @@ DuckPGQLabelAndNegated <- '&!' DuckPGQLabelFactor
 DuckPGQLabelFactor <- DuckPGQLabelNegation / DuckPGQLabelParens / ColId
 DuckPGQLabelNegation <- '!' DuckPGQLabelFactor
 DuckPGQLabelParens <- '(' DuckPGQLabelExpression ')'
+
+# Expressions, available wherever the grammar extension is active. IS LABELED and EXISTS { } are bound only inside a
+# GRAPH_TABLE; a property projection v.{a, b} or v.link.{a, b} is shorthand for struct_pack(a := v.a, b := v.b).
+DuckPGQIsLabeled <- ColId 'IS' 'NOT'? 'LABELED' ColId
+DuckPGQExistsPattern <- 'EXISTS' '{' List(DuckPGQPathPattern) WhereClause? '}'
+DuckPGQPropertyProjection <- ColId DuckPGQProjectionLink? '.' '{' List(ColId) '}'
+DuckPGQProjectionLink <- '.' ColId

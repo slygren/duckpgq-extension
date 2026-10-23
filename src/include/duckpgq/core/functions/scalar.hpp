@@ -17,10 +17,12 @@ struct CoreScalarFunctions {
 		RegisterShortestPathScalarFunction(loader);
 		RegisterWeaklyConnectedComponentScalarFunction(loader);
 		RegisterPageRankScalarFunction(loader);
+		RegisterGraphPredicateScalarFunctions(loader);
 	}
 
 private:
 	static void RegisterCheapestPathLengthScalarFunction(ExtensionLoader &loader);
+	static void RegisterGraphPredicateScalarFunctions(ExtensionLoader &loader);
 	static void RegisterCSRCreationScalarFunctions(ExtensionLoader &loader);
 	static void RegisterCSRDeletionScalarFunction(ExtensionLoader &loader);
 	static void RegisterGetCSRWTypeScalarFunction(ExtensionLoader &loader);

@@ -58,6 +58,10 @@ string DumpReference(const PathReference &reference) {
 	if (subpath.where_clause) {
 		result += " WHERE " + subpath.where_clause->ToString();
 	}
+	if (subpath.cost_expr) {
+		result += " COST " + subpath.cost_expr->ToString();
+		result += " DEFAULT " + Value::DOUBLE(subpath.default_value).ToString();
+	}
 	result += "}";
 	if (subpath.lower != 1 || subpath.upper != 1) {
 		auto upper = subpath.upper == NumericLimits<int64_t>::Maximum() ? string() : to_string(subpath.upper);
@@ -68,12 +72,11 @@ string DumpReference(const PathReference &reference) {
 
 string DumpPattern(const PathPattern &pattern) {
 	string result;
-	if (pattern.shortest) {
-		result += pattern.topk > 1 ? "SHORTEST " + to_string(pattern.topk) + " "
-		                           : (pattern.all ? "ALL SHORTEST " : "ANY SHORTEST ");
-	}
 	if (pattern.cheapest) {
 		result += pattern.all ? "ALL CHEAPEST " : "ANY CHEAPEST ";
+	} else if (pattern.shortest) {
+		result += pattern.topk > 1 ? "SHORTEST " + to_string(pattern.topk) + " "
+		                           : (pattern.all ? "ALL SHORTEST " : "ANY SHORTEST ");
 	}
 	for (idx_t i = 0; i < pattern.path_elements.size(); i++) {
 		result += (i > 0 ? " " : "") + DumpReference(*pattern.path_elements[i]);
@@ -89,14 +92,52 @@ string DumpPatternList(const vector<unique_ptr<PathPattern>> &patterns) {
 	return result;
 }
 
-//! A canonical, deterministic rendering of everything the grammar put into a MatchExpression.
-string DumpMatch(const MatchExpression &match) {
+string DumpOneRowPer(const MatchExpression &match) {
+	switch (match.one_row_per) {
+	case OneRowPerMode::NONE:
+		return "";
+	case OneRowPerMode::VERTEX:
+		return " ONE ROW PER VERTEX (" + StringUtil::Join(match.one_row_per_vars, ", ") + ")";
+	case OneRowPerMode::EDGE:
+		return " ONE ROW PER EDGE (" + StringUtil::Join(match.one_row_per_vars, ", ") + ")";
+	case OneRowPerMode::STEP:
+		return " ONE ROW PER STEP (" + StringUtil::Join(match.one_row_per_vars, ", ") + ")";
+	}
+	throw InternalException("Unknown ONE ROW PER mode");
+}
+
+string DumpMatchBlock(const MatchExpression &match);
+
+//! EXISTS { ... } patterns print as an opaque subquery; list them after the expression that holds them.
+void CollectExistsPatterns(ParsedExpression &expression, string &result) {
+	auto exists_pattern = DuckPGQGetExistsPattern(expression);
+	if (exists_pattern) {
+		result += " [EXISTS {" + DumpMatchBlock(*exists_pattern) + "}]";
+		return;
+	}
+	ParsedExpressionIterator::EnumerateChildren(expression,
+	                                            [&](ParsedExpression &child) { CollectExistsPatterns(child, result); });
+}
+
+string DumpMatchBlock(const MatchExpression &match) {
 	string result = "MATCH " + DumpPatternList(match.path_patterns);
 	for (auto &group : match.optional_match_patterns) {
 		result += " OPTIONAL MATCH " + DumpPatternList(group);
 	}
+	result += DumpOneRowPer(match);
 	if (match.where_clause) {
 		result += " WHERE " + match.where_clause->ToString();
+		CollectExistsPatterns(*match.where_clause, result);
+	}
+	return result;
+}
+
+//! A canonical, deterministic rendering of everything the grammar put into a MatchExpression.
+string DumpMatch(const MatchExpression &match) {
+	string result = DumpMatchBlock(match);
+	for (idx_t i = 0; i < match.union_matches.size(); i++) {
+		result += match.union_all_flags[i] ? " UNION ALL " : " UNION ";
+		result += DumpMatchBlock(*match.union_matches[i]);
 	}
 	result += " COLUMNS (";
 	for (idx_t i = 0; i < match.column_list.size(); i++) {

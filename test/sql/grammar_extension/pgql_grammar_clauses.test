@@ -1,0 +1,100 @@
+# name: test/sql/grammar_extension/pgql_grammar_clauses.test
+# description: PGQL grammar additions: UNION between MATCH blocks, ONE ROW PER, CHEAPEST and COST
+# group: [grammar_extension]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+# UNION [ALL] MATCH blocks share the final COLUMNS; each block has its own WHERE and anonymous-name numbering.
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (net MATCH (a:Person)-[:Knows]->(b:Person) UNION ALL MATCH (a:Person)-[:Likes]->(b:Person) WHERE b.name = 'Carol' UNION MATCH (a:Person)-[:Knows]->(b:Person) COLUMNS (a.name, b.name)) r$$);
+----
+MATCH (a:Person) -[_anon_0:Knows]-> (b:Person) UNION ALL MATCH (a:Person) -[_anon_0:Likes]-> (b:Person) WHERE (b."name" = 'Carol') UNION MATCH (a:Person) -[_anon_0:Knows]-> (b:Person) COLUMNS (a."name", b."name")
+
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (net MATCH (a:Person) OPTIONAL MATCH (a)-[:Knows]->(b) UNION MATCH (a:Person) WHERE a.id > 1 COLUMNS (a.id))$$);
+----
+MATCH (a:Person) OPTIONAL MATCH (a) -[_anon_0:Knows]-> (b) UNION MATCH (a:Person) WHERE (a.id > 1) COLUMNS (a.id)
+
+# ONE ROW PER sits between the patterns and the WHERE.
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (net MATCH (a:Person)-[e:Knows]->{1,3}(b:Person) ONE ROW PER STEP (v1, edge1, v2) WHERE a.name = 'Alice' COLUMNS (v1.name AS src))$$);
+----
+MATCH (a:Person) {-[e:Knows]->}{1,3} (b:Person) ONE ROW PER STEP (v1, edge1, v2) WHERE (a."name" = 'Alice') COLUMNS (v1."name" AS src)
+
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (net MATCH (a:Person)-[e:Knows]->{1,3}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (v.name))$$);
+----
+MATCH (a:Person) {-[e:Knows]->}{1,3} (b:Person) ONE ROW PER VERTEX (v) COLUMNS (v."name")
+
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (net MATCH (a:Person)-[e:Knows]->{1,3}(b:Person) ONE ROW PER EDGE (e2) COLUMNS (e2.since))$$);
+----
+MATCH (a:Person) {-[e:Knows]->}{1,3} (b:Person) ONE ROW PER EDGE (e2) COLUMNS (e2.since)
+
+statement error
+FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a:A) ONE ROW PER STEP (v1, v2) COLUMNS (a.id))$$);
+----
+ONE ROW PER STEP takes three variables: (vertex, edge, vertex)
+
+statement error
+FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a:A) ONE ROW PER VERTEX (v1, v2) COLUMNS (a.id))$$);
+----
+Parser Error
+
+# CHEAPEST is a shortest path by cost; COST and its DEFAULT sit after an element's label and WHERE.
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (wg MATCH s = ANY CHEAPEST (x:Person)-[g:Link COST g.weight]->+(y:Person) WHERE x.name = 'A' COLUMNS (COST(s) AS c))$$);
+----
+MATCH ANY CHEAPEST s = {(x:Person) {-[g:Link]-> COST g.weight DEFAULT 1.0}{1,} (y:Person)} WHERE (x."name" = 'A') COLUMNS ("cost"(s) AS c)
+
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (wg MATCH ALL CHEAPEST (x:Person)-[g:Link WHERE g.w > 0 COST g.weight * 2 DEFAULT 1.5]->(y:Person) COLUMNS (x.id))$$);
+----
+MATCH ALL CHEAPEST (x:Person) {-[g:Link]-> WHERE (g.w > 0) COST (g.weight * 2) DEFAULT 1.5} (y:Person) COLUMNS (x.id)
+
+# COST stays usable as an ordinary column name.
+query I
+SELECT cost FROM (SELECT 1 AS cost);
+----
+1
+
+# Binding: parsed, but not yet bound.
+statement ok
+CREATE TABLE person(id INT, name VARCHAR);
+
+statement ok
+INSERT INTO person VALUES (1, 'a'), (2, 'b'), (3, 'c');
+
+statement ok
+CREATE TABLE knows(src INT, dst INT, w DOUBLE);
+
+statement ok
+INSERT INTO knows VALUES (1, 2, 0.5), (2, 3, 1.5);
+
+statement ok
+CREATE PROPERTY GRAPH g
+VERTEX TABLES (person)
+EDGE TABLES (knows SOURCE KEY (src) REFERENCES person (id) DESTINATION KEY (dst) REFERENCES person (id));
+
+statement error
+FROM GRAPH_TABLE (g MATCH (a:person)-[k:knows]->(b:person) UNION ALL MATCH (a:person)-[k:knows]->(b:person) COLUMNS (a.name));
+----
+UNION between MATCH blocks is parsed but not yet supported by MATCH
+
+statement error
+FROM GRAPH_TABLE (g MATCH (a:person)-[k:knows]->{1,2}(b:person) ONE ROW PER VERTEX (v) COLUMNS (v.name));
+----
+ONE ROW PER is parsed but not yet supported by MATCH
+
+statement error
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:person)-[k:knows COST k.w]->+(b:person) COLUMNS (a.name));
+----
+CHEAPEST paths are parsed but not yet supported by MATCH
+
+statement error
+FROM GRAPH_TABLE (g MATCH (a:person)-[k:knows COST k.w]->(b:person) COLUMNS (a.name));
+----
+COST is parsed but not yet supported by MATCH

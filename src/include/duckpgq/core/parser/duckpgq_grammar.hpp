@@ -17,6 +17,12 @@ struct DuckPGQMatchInfo : TableFunctionInfo {
 	unique_ptr<MatchExpression> match;
 };
 
+//! The table function an EXISTS { ... } graph pattern predicate parses to; see TransformExistsPattern.
+static constexpr const char *DUCKPGQ_EXISTS_PATTERN_FUNCTION = "duckpgq_exists_pattern";
+
+//! The pattern of an EXISTS { ... } predicate, or nullptr when the expression is not one.
+optional_ptr<MatchExpression> DuckPGQGetExistsPattern(ParsedExpression &expression);
+
 //! Rules and transforms for CREATE PROPERTY GRAPH.
 void DuckPGQAddCreatePropertyGraphGrammar(vector<GrammarChange> &changes);
 //! Rules and transforms for GRAPH_TABLE path patterns.
