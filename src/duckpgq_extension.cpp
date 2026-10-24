@@ -6,8 +6,52 @@
 #include "duckdb/common/enums/set_scope.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/main/settings.hpp"
+#include "duckdb/planner/extension_callback.hpp"
 
 namespace duckdb {
+
+//! Add duckpgq to the connection's active grammar extensions, keeping any others that are active.
+static void ActivateDuckPGQGrammar(ClientContext &context) {
+	auto current = ActiveGrammarExtensionsSetting::GetSetting(context);
+	vector<Value> grammars;
+	if (!current.IsNull() && current.type().id() == LogicalTypeId::LIST) {
+		for (auto &grammar : ListValue::GetChildren(current)) {
+			if (StringUtil::CIEquals(grammar.ToString(), "duckpgq")) {
+				return;
+			}
+			grammars.push_back(grammar);
+		}
+	}
+	grammars.emplace_back("duckpgq");
+	ActiveGrammarExtensionsSetting::SetLocal(context, Value::LIST(LogicalType::VARCHAR, std::move(grammars)));
+}
+
+static bool DefaultGrammarEnabled(ClientContext &context) {
+	Value value;
+	return context.TryGetCurrentSetting("duckpgq_default_grammar", value) && !value.IsNull() &&
+	       value.GetValue<bool>();
+}
+
+//! duckpgq_default_grammar: every connection opened while it is on starts with the PGQ grammar active, so that
+//! connections nobody issues a SET on -- a Quack server's sessions, pooled or MCP connections -- accept GRAPH_TABLE.
+//! active_grammar_extensions itself cannot be set globally.
+class DuckPGQConnectionCallback : public ExtensionCallback {
+public:
+	void OnConnectionOpened(ClientContext &context) override {
+		if (DefaultGrammarEnabled(context)) {
+			ActivateDuckPGQGrammar(context);
+		}
+	}
+};
+
+//! Turning the setting on also activates the grammar on the connection that set it.
+static void SetDefaultGrammar(ClientContext &context, SetScope scope, Value &parameter) {
+	if (!parameter.IsNull() && parameter.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>()) {
+		ActivateDuckPGQGrammar(context);
+	}
+}
 
 static void LoadInternal(ExtensionLoader &loader) {
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
@@ -67,6 +111,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    "edge tables to each other instead. Only applies to graphs whose edges CREATE PROPERTY GRAPH verified "
 		    "(pgq_verify_edges_on_create).",
 		    LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::SESSION);
+	}
+	if (!config.HasExtensionOption("duckpgq_default_grammar")) {
+		config.AddExtensionOption(
+		    "duckpgq_default_grammar",
+		    "Activate the SQL/PGQ grammar on every new connection (active_grammar_extensions cannot be set globally). "
+		    "Meant for servers: a Quack server's sessions and pooled connections then accept GRAPH_TABLE without a SET.",
+		    LogicalType::BOOLEAN, Value::BOOLEAN(false), SetDefaultGrammar, SetScope::GLOBAL);
+		ExtensionCallback::Register(config, make_shared_ptr<DuckPGQConnectionCallback>());
 	}
 	CoreModule::Register(loader);
 }

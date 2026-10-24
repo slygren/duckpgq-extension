@@ -16,11 +16,13 @@ FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->(b:Person) COLUMNS (a.name, b.nam
 - **No `-` prefix:** queries no longer need one.
 - **Activate the grammar first:** the `SET` must have *executed* before a PGQ statement is parsed. If a single string holds both the `SET` and a PGQ statement, the whole string is parsed first and the PGQ statement fails. Send the `SET` as its own call.
 - **Each connection needs the `SET`,** including connections an application opens internally.
+- **On a server, use `SET GLOBAL duckpgq_default_grammar = true` instead:** every connection opened afterwards starts with the grammar active, including the sessions a Quack server (`quack_serve`) creates for its clients. A client can then send `FROM quack_query_by_name('<attached quack catalog>', 'FROM GRAPH_TABLE (...)')` with no duckpgq loaded on its side.
 
 ### Settings
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
+| `duckpgq_default_grammar` | false | Global. Activate the PGQ grammar on every new connection (`active_grammar_extensions` itself cannot be set globally). For servers: Quack sessions and pooled connections then accept GRAPH_TABLE without a `SET`. Turning it on also activates the grammar on the connection that set it. |
 | `pgq_require_abi_paths` | false | Fail a MATCH that cannot be answered from ABI path tables. |
 | `pgq_disable_abi_rewrite` | false | Use the fallback traversal only. `pgq_verify_abi_rewrite()` uses this to compare the two. |
 | `pgq_max_vl_fallback_rows` | 20000000 | Row budget for a variable-length fallback traversal. |

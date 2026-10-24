@@ -1,0 +1,66 @@
+# name: test/sql/grammar_extension/default_grammar.test
+# description: duckpgq_default_grammar activates the PGQ grammar on every new connection
+# group: [grammar_extension]
+
+require duckpgq
+
+statement ok
+CREATE TABLE Person(id BIGINT, name VARCHAR);
+
+statement ok
+CREATE TABLE knows(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO Person VALUES (1, 'A'), (2, 'B');
+
+statement ok
+INSERT INTO knows VALUES (1, 2);
+
+# Off (the default): a connection starts without the PGQ grammar
+query I
+SELECT current_setting('duckpgq_default_grammar');
+----
+false
+
+statement error
+FROM GRAPH_TABLE (g MATCH (a:Person) COLUMNS (a.id));
+----
+Parser Error
+
+# Turning it on also activates the grammar on this connection
+statement ok
+SET GLOBAL duckpgq_default_grammar = true;
+
+query I
+SELECT current_setting('active_grammar_extensions');
+----
+[duckpgq]
+
+statement ok
+CREATE PROPERTY GRAPH g VERTEX TABLES (Person) EDGE TABLES (
+    knows SOURCE KEY (src) REFERENCES Person (id) DESTINATION KEY (dst) REFERENCES Person (id) LABEL knows);
+
+# A new connection accepts GRAPH_TABLE without any SET
+query II con2
+FROM GRAPH_TABLE (g MATCH (a:Person)-[k:knows]->(b:Person) COLUMNS (a.id AS a, b.id AS b));
+----
+1	2
+
+query I con2
+SELECT current_setting('active_grammar_extensions');
+----
+[duckpgq]
+
+# Off again: connections opened from now on start without it; existing ones keep theirs
+statement ok
+SET GLOBAL duckpgq_default_grammar = false;
+
+statement error con3
+FROM GRAPH_TABLE (g MATCH (a:Person) COLUMNS (a.id));
+----
+Parser Error
+
+query I con2
+SELECT count(*) FROM GRAPH_TABLE (g MATCH (a:Person) COLUMNS (a.id));
+----
+2
