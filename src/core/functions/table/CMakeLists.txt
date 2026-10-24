@@ -11,6 +11,7 @@ set(EXTENSION_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/pgq_parse_match.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/pgq_scan.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/summarize_property_graph.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/vertex_elimination.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/weakly_connected_component.cpp
     ${EXTENSION_SOURCES}
     PARENT_SCOPE)

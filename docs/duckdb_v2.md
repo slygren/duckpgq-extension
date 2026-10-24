@@ -25,6 +25,7 @@ FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->(b:Person) COLUMNS (a.name, b.nam
 | `pgq_disable_abi_rewrite` | false | Use the fallback traversal only. `pgq_verify_abi_rewrite()` uses this to compare the two. |
 | `pgq_max_vl_fallback_rows` | 20000000 | Row budget for a variable-length fallback traversal. |
 | `pgq_verify_edges_on_create` | false | Have CREATE PROPERTY GRAPH reject incomplete edges. It scans every edge table, which takes about 15 s on `maintenance_graph`. |
+| `duckpgq_vertex_join_elimination` | true | Leave a vertex table out of a MATCH when the query only uses its key (see below). Only applies to graphs created with `pgq_verify_edges_on_create`. |
 
 ## Building
 
@@ -83,7 +84,18 @@ These were verified against the fork's build:
 - **Label case:** `label(x)` returns the lower-case label. DESCRIBE shows labels as declared.
 - **CHEAPEST costs** are BIGINT, so fractional weights are rounded.
 
+## Vertex-join elimination
+
+A vertex table that a MATCH only joins to prove that the edge endpoints exist is left out. The incident edges are joined to each other on their key columns instead, and references to the vertex key read the edge's key column. For `(p:Person)-[hi:hasInterest]->(t:Tag)-[hc:hasCategory]->(c:Category) WHERE c.name = 'Athlete' COLUMNS (p.id, t.id)`, only `hasInterest`, `hasCategory` and `Category` are scanned.
+
+- **When it applies:**
+  - The graph was created with `SET pgq_verify_edges_on_create = true`. That check is what makes the vertex join redundant, so unverified graphs keep every join.
+  - The vertex key has a PRIMARY KEY or UNIQUE constraint. DuckLake tables have none, so lake graphs keep their joins; the ABI rewrite already skips vertex joins it doesn't need there.
+  - The query uses the vertex only through its key, in the COLUMNS list or WHERE clause.
+- **When the join stays:** the vertex is kept if it is referenced any other way: a property, `rowid`, `v.*` or `*`, a label-inheritance check, a path-finding endpoint, or anything inside a subquery, lambda, EXISTS, OPTIONAL MATCH join condition or UNION branch.
+- **The limit:** edges inserted after CREATE PROPERTY GRAPH are not checked. An edge that references no vertex then survives when its vertex is eliminated, where the join would have dropped it. This is upstream's documented behaviour.
+- **Turning it off:** `SET duckpgq_vertex_join_elimination = false`.
+
 ## Not ported (yet)
 
-- **Vertex elimination:** upstream's vertex elimination (`VertexEliminationPlanner`) for the non-ABI path. The ABI rewrite already skips vertex joins it does not need. The plan assertions in `vertex_elimination.test` are skipped.
 - **Unused syntax:** bracketed sub-path groups `[ ... ]{n,m}` and path unions `|` / `|+|`. The fork never supported them either.

@@ -39,6 +39,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    "Scans every edge table, so it is off by default.",
 		    LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::SESSION);
 	}
+	if (!config.HasExtensionOption("duckpgq_vertex_join_elimination")) {
+		config.AddExtensionOption(
+		    "duckpgq_vertex_join_elimination",
+		    "Leave vertex tables out of the MATCH translation when the query only uses their key, joining the incident "
+		    "edge tables to each other instead. Only applies to graphs whose edges CREATE PROPERTY GRAPH verified "
+		    "(pgq_verify_edges_on_create).",
+		    LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::SESSION);
+	}
 	CoreModule::Register(loader);
 }
 

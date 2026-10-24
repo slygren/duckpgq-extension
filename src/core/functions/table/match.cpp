@@ -1,5 +1,6 @@
 #include <duckpgq_extension.hpp>
 #include "duckpgq/core/functions/table/match.hpp"
+#include "duckpgq/core/functions/table/vertex_elimination.hpp"
 #include "duckpgq/core/utils/duckpgq_identifier.hpp"
 #include "duckpgq/core/parser/duckpgq_grammar.hpp"
 
@@ -2484,6 +2485,10 @@ void PGQMatchFunction::EdgeTypeAny(const shared_ptr<PropertyGraphTable> &edge_ta
 	                                                           std::move(src_left_expr), std::move(dst_left_expr));
 
 	conditions.push_back(std::move(combined_left_expr));
+	PGQVertexJoinRecorder::Record(prev_binding, edge_table->source_pk, edge_binding, edge_table->source_fk, edge_table,
+	                              edge_table->source_pg_table, true);
+	PGQVertexJoinRecorder::Record(next_binding, edge_table->destination_pk, edge_binding, edge_table->destination_fk,
+	                              edge_table, edge_table->destination_pg_table, true);
 }
 
 void PGQMatchFunction::EdgeTypeLeft(const shared_ptr<PropertyGraphTable> &edge_table, const string &next_table_name,
@@ -2495,6 +2500,10 @@ void PGQMatchFunction::EdgeTypeLeft(const shared_ptr<PropertyGraphTable> &edge_t
 	    CreateMatchJoinExpression(PGQStrs(edge_table->source_pk), PGQStrs(edge_table->source_fk), next_binding, edge_binding));
 	conditions.push_back(
 	    CreateMatchJoinExpression(PGQStrs(edge_table->destination_pk), PGQStrs(edge_table->destination_fk), prev_binding, edge_binding));
+	PGQVertexJoinRecorder::Record(next_binding, edge_table->source_pk, edge_binding, edge_table->source_fk, edge_table,
+	                              edge_table->source_pg_table, false);
+	PGQVertexJoinRecorder::Record(prev_binding, edge_table->destination_pk, edge_binding, edge_table->destination_fk,
+	                              edge_table, edge_table->destination_pg_table, false);
 }
 
 void PGQMatchFunction::EdgeTypeRight(const shared_ptr<PropertyGraphTable> &edge_table, const string &next_table_name,
@@ -2506,6 +2515,10 @@ void PGQMatchFunction::EdgeTypeRight(const shared_ptr<PropertyGraphTable> &edge_
 	    CreateMatchJoinExpression(PGQStrs(edge_table->source_pk), PGQStrs(edge_table->source_fk), prev_binding, edge_binding));
 	conditions.push_back(
 	    CreateMatchJoinExpression(PGQStrs(edge_table->destination_pk), PGQStrs(edge_table->destination_fk), next_binding, edge_binding));
+	PGQVertexJoinRecorder::Record(prev_binding, edge_table->source_pk, edge_binding, edge_table->source_fk, edge_table,
+	                              edge_table->source_pg_table, false);
+	PGQVertexJoinRecorder::Record(next_binding, edge_table->destination_pk, edge_binding, edge_table->destination_fk,
+	                              edge_table, edge_table->destination_pg_table, false);
 }
 
 void PGQMatchFunction::EdgeTypeLeftRight(const shared_ptr<PropertyGraphTable> &edge_table, const string &edge_binding,
@@ -2536,6 +2549,16 @@ void PGQMatchFunction::EdgeTypeLeftRight(const shared_ptr<PropertyGraphTable> &e
 	auto combined_expr = make_uniq<ConjunctionExpression>(
 	    ExpressionType::CONJUNCTION_AND, std::move(combined_left_expr), std::move(combined_right_expr));
 	conditions.push_back(std::move(combined_expr));
+	// One copy of the edge table per direction: edge_binding points from next to prev, the additional alias from
+	// prev to next.
+	PGQVertexJoinRecorder::Record(next_binding, edge_table->source_pk, edge_binding, edge_table->source_fk, edge_table,
+	                              edge_table->source_pg_table, false);
+	PGQVertexJoinRecorder::Record(prev_binding, edge_table->destination_pk, edge_binding, edge_table->destination_fk,
+	                              edge_table, edge_table->destination_pg_table, false);
+	PGQVertexJoinRecorder::Record(prev_binding, edge_table->source_pk, additional_edge_alias, edge_table->source_fk,
+	                              edge_table, edge_table->source_pg_table, false);
+	PGQVertexJoinRecorder::Record(next_binding, edge_table->destination_pk, additional_edge_alias,
+	                              edge_table->destination_fk, edge_table, edge_table->destination_pg_table, false);
 }
 
 PathElement *PGQMatchFunction::HandleNestedSubPath(unique_ptr<PathReference> &path_reference,
@@ -8697,6 +8720,11 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	// and pointed iterativelength() at an empty registry entry -- while also cross-joining a
 	// second "__x". Same shape as the COST()/recursive-ProcessPathList slot bugs.
 	PGQCSRSlot cte1_slot;
+	// The vertex-edge joins of the head branch, for vertex-join elimination once the whole SELECT is built. Only
+	// the path patterns are recorded: joins emitted later (OPTIONAL MATCH, EXISTS, UNION branches) are never
+	// eliminated, and a vertex they reference keeps its join.
+	vector<PGQVertexEdgeJoin> vertex_joins;
+	auto vertex_join_recorder = make_uniq<PGQVertexJoinRecorder>(vertex_joins);
 	for (idx_t idx_i = 0; idx_i < ref->path_patterns.size(); idx_i++) {
 		auto &path_pattern = ref->path_patterns[idx_i];
 		// Check if the element is PathElement or a Subpath with potentially many
@@ -8734,6 +8762,8 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 			                DisableABIRewrite(context) ? nullptr : &path_table_cache, MaxVLFallbackRows(context));
 		}
 	}
+
+	vertex_join_recorder.reset();
 
 	// Go through all aliases encountered
 	RewriteCoveredPathColumns(ref->column_list, covered_columns);
@@ -8853,6 +8883,7 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	final_select_node->where_clause = CreateWhereClause(conditions);
 	final_select_node->select_list =
 	    BuildFinalColumnList(std::move(ref->column_list), alias_to_vertex_and_edge_tables, stub_bindings);
+	PGQEliminateVertexJoins(context, *final_select_node, vertex_joins, alias_map, pg_table->verified);
 
 	if (ref->union_matches.empty()) {
 		auto subquery = make_uniq<SelectStatement>();
