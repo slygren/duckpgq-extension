@@ -4009,16 +4009,25 @@ void PGQMatchFunction::CheckNamedSubpath(SubPath &subpath, MatchExpression &orig
 			                                std::move(list_slice));
 		} else if (parsed_ref->FunctionName().GetIdentifierName() == "cost") {
 			// Find edge subpath with cost_expr within this named subpath's path_list.
+			// A vertex with an element-local WHERE arrives wrapped in a single-element subpath.
+			auto vertex_element = [](const unique_ptr<PathReference> &reference) -> PathElement * {
+				auto element = GetPathElement(reference);
+				if (element) {
+					return element;
+				}
+				auto wrapper = GetSubPath(reference);
+				return wrapper && wrapper->path_list.size() == 1 ? GetPathElement(wrapper->path_list[0]) : nullptr;
+			};
 			SubPath *edge_sub = nullptr;
 			PathElement *edge_elem = nullptr;
-			PathElement *prev_elem = GetPathElement(subpath.path_list[0]);
+			PathElement *prev_elem = vertex_element(subpath.path_list[0]);
 			PathElement *next_elem = nullptr;
 			for (idx_t k = 1; k + 1 < subpath.path_list.size(); k += 2) {
 				auto *candidate = dynamic_cast<SubPath *>(subpath.path_list[k].get());
 				if (candidate && candidate->cost_expr) {
 					edge_sub = candidate;
 					edge_elem = GetPathElement(edge_sub->path_list[0]);
-					next_elem = GetPathElement(subpath.path_list[k + 1]);
+					next_elem = vertex_element(subpath.path_list[k + 1]);
 					break;
 				}
 			}

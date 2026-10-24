@@ -93,6 +93,17 @@ FROM GRAPH_TABLE (wg
 ----
 requires a COST expression
 
+# COST(p) with an element-local WHERE on the start vertex, which wraps the vertex in a single-element subpath.
+query TI
+FROM GRAPH_TABLE (wg
+    MATCH p = ANY CHEAPEST (a:Person WHERE a.name = 'A')-[e:Link COST e.weight]->+(b:Person)
+    COLUMNS (b.name, COST(p) AS c)
+) r ORDER BY ALL;
+----
+B	1
+C	2
+D	3
+
 statement ok
 DROP PROPERTY GRAPH wg;
 
