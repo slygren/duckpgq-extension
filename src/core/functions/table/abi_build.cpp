@@ -1258,15 +1258,18 @@ unique_ptr<FunctionData> AbiSqlBind(ClientContext &context, TableFunctionBindInp
                                     vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto &pg_info = BindGraph(context, input.inputs[0]);
 	auto plan = PGQPlanAbiBuild(context, pg_info, PGQAbiOptionsForGraph(context, pg_info, CallOptions(input)));
-	names = {Identifier("step"), Identifier("artifact"), Identifier("kind"), Identifier("sql")};
-	return_types = {LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR};
+	names = {Identifier("step"), Identifier("artifact"), Identifier("kind"), Identifier("sql"), Identifier("seq")};
+	return_types = {LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::INTEGER};
 	auto result = make_uniq<AbiSqlBindData>();
 	int32_t step_number = 0;
+	int32_t sequence = 0;
 	for (auto &step : plan.steps) {
 		step_number++;
 		for (auto &statement : step.statements) {
+			// seq orders the whole script: run the statements by it
 			result->rows.push_back({Value::INTEGER(step_number), Value(step.name), Value(step.kind),
-			                        Value(statement + ";")});
+			                        Value(statement + ";"), Value::INTEGER(++sequence)});
 		}
 	}
 	return std::move(result);
