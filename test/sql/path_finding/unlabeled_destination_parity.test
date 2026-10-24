@@ -83,16 +83,16 @@ query T rowsort
 FROM GRAPH_TABLE ( g MATCH (t:Tag)-[:HasWorkorder]->(x) WHERE t.id = 'T1'
     COLUMNS (label(x) AS lbl) );
 ----
-workorder
-workorder
+Workorder
+Workorder
 
 # Must equal the labeled form exactly -- that equality is the point of the file.
 query T rowsort
 FROM GRAPH_TABLE ( g MATCH (t:Tag)-[:HasWorkorder]->(x:Workorder) WHERE t.id = 'T1'
     COLUMNS (label(x) AS lbl) );
 ----
-workorder
-workorder
+Workorder
+Workorder
 
 # Properties must resolve against the real table too, not the placeholder.
 query T rowsort
@@ -108,8 +108,8 @@ query T rowsort
 FROM GRAPH_TABLE ( g MATCH (x)<-[:HasWorkorder]-(t:Tag) WHERE t.id = 'T1'
     COLUMNS (label(x) AS lbl) );
 ----
-workorder
-workorder
+Workorder
+Workorder
 
 # ── when it is genuinely ambiguous, refuse ──────────────────────────────────────
 # An unlabeled edge can reach Workorder, Note or Tag, so x has no single label. The

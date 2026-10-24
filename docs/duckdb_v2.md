@@ -127,7 +127,7 @@ Statically linking duckpgq into the bundle also works if loadable extensions are
 These were verified against the fork's build:
 
 - **Walk semantics:** a bounded pattern without a selector returns one row per walk. Walks that close back on the start vertex are excluded. The path variable reports a shortest witness, not the specific walk.
-- **Label case:** `label(x)` returns the lower-case label. DESCRIBE shows labels as declared.
+- **Label case:** `label(x)`, `vertex_labels(p)` and `edge_labels(p)` return labels as declared, like DESCRIBE, whichever route answers the pattern. The fork returned `label(x)` lower-cased when the pattern was traversed, so a `WHERE label(x) = 'person'` written against the fork needs the declared case now, or `x IS LABELED person`, which ignores case.
 - **CHEAPEST costs** are BIGINT, so fractional weights are rounded.
 
 ## Vertex-join elimination

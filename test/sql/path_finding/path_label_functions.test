@@ -1,0 +1,310 @@
+# name: test/sql/path_finding/path_label_functions.test
+# description: label(x), vertex_labels(p) and edge_labels(p) give the declared labels, traversed or answered by ABI artifacts
+# group: [path_finding]
+
+# The three label functions used to depend on the route: label(x) came back lower-case when
+# the pattern was traversed and as declared from an artifact, and vertex_labels/edge_labels
+# only existed when an artifact answered the pattern. Each query below is run first on a
+# graph without artifacts and then again, unchanged, with artifacts built, and must give the
+# same answer both times.
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE Person(id BIGINT PRIMARY KEY, name VARCHAR);
+
+statement ok
+CREATE TABLE Tag(id BIGINT PRIMARY KEY, name VARCHAR);
+
+statement ok
+CREATE TABLE Org(id BIGINT PRIMARY KEY, kind BIGINT);
+
+statement ok
+CREATE TABLE knows(src BIGINT, dst BIGINT);
+
+statement ok
+CREATE TABLE hasInterest(personId BIGINT, tagId BIGINT);
+
+statement ok
+CREATE TABLE worksAt(personId BIGINT, orgId BIGINT);
+
+statement ok
+INSERT INTO Person VALUES (1, 'A'), (2, 'B'), (3, 'C'), (4, 'D');
+
+statement ok
+INSERT INTO Tag VALUES (10, 't1'), (11, 't2');
+
+# kind is the sub-label bitmask: 1 = Company, 2 = University
+statement ok
+INSERT INTO Org VALUES (100, 1), (101, 2);
+
+statement ok
+INSERT INTO knows VALUES (1, 2), (2, 3), (3, 4);
+
+statement ok
+INSERT INTO hasInterest VALUES (1, 10), (2, 10), (3, 11);
+
+statement ok
+INSERT INTO worksAt VALUES (4, 100), (3, 101);
+
+statement ok
+CREATE PROPERTY GRAPH g
+VERTEX TABLES (
+    Person LABEL Person,
+    Tag LABEL Tag,
+    Org LABEL Org IN kind(Company, University)
+)
+EDGE TABLES (
+    knows SOURCE KEY (src) REFERENCES Person (id) DESTINATION KEY (dst) REFERENCES Person (id) LABEL Knows,
+    hasInterest SOURCE KEY (personId) REFERENCES Person (id) DESTINATION KEY (tagId) REFERENCES Tag (id)
+        LABEL HasInterest,
+    worksAt SOURCE KEY (personId) REFERENCES Person (id) DESTINATION KEY (orgId) REFERENCES Org (id) LABEL WorksAt
+);
+
+# =====================================================================================================================
+# Traversed: no artifacts exist
+# =====================================================================================================================
+
+# ── label(x) is the declared label ──────────────────────────────────────────────────────────────────────────────────
+
+query IIII rowsort
+FROM GRAPH_TABLE (g MATCH (a:Person)-[k:Knows]->(b:Person) COLUMNS (a.id AS a, label(a), label(k), label(b)));
+----
+1	Person	Knows	Person
+2	Person	Knows	Person
+3	Person	Knows	Person
+
+# The label in the query need not match the declared case; the answer is the declared label
+query II rowsort
+FROM GRAPH_TABLE (g MATCH (a:person)-[h:hasinterest]->(t:tag) COLUMNS (label(h), label(t)));
+----
+HasInterest	Tag
+HasInterest	Tag
+HasInterest	Tag
+
+# A comparison with label() is a string comparison, so it is case-sensitive; IS LABELED is not
+query I rowsort
+FROM GRAPH_TABLE (g MATCH (a:Person)-[k:Knows]->(b:Person) WHERE label(a) = 'Person' AND a IS LABELED person
+    COLUMNS (a.id));
+----
+1
+2
+3
+
+query I
+FROM GRAPH_TABLE (g MATCH (a:Person)-[k:Knows]->(b:Person) WHERE label(a) = 'person' COLUMNS (a.id));
+----
+
+# A table with sub-labels is reported by its main label, whichever label the pattern names
+query III rowsort
+FROM GRAPH_TABLE (g MATCH (p:Person)-[w:WorksAt]->(o:Company) COLUMNS (p.id, o.id, label(o)));
+----
+4	100	Org
+
+# ── variable length ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+query IIIII rowsort
+FROM GRAPH_TABLE (g MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person)
+    COLUMNS (a.id AS a, b.id AS b, path_length(p), vertex_labels(p), edge_labels(p)));
+----
+1	2	1	[Person, Person]	[Knows]
+1	3	2	[Person, Person, Person]	[Knows, Knows]
+2	3	1	[Person, Person]	[Knows]
+2	4	2	[Person, Person, Person]	[Knows, Knows]
+3	4	1	[Person, Person]	[Knows]
+
+# The destination's label follows from the edge
+query IIII rowsort
+FROM GRAPH_TABLE (g MATCH p = (a:Person)-[:Knows]->{1,2}(b)
+    COLUMNS (a.id AS a, path_length(p), vertex_labels(p), edge_labels(p)));
+----
+1	1	[Person, Person]	[Knows]
+1	2	[Person, Person, Person]	[Knows, Knows]
+2	1	[Person, Person]	[Knows]
+2	2	[Person, Person, Person]	[Knows, Knows]
+3	1	[Person, Person]	[Knows]
+
+query IIII rowsort
+FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Person)-[:Knows]->{1,3}(b:Person) WHERE a.id = 1
+    COLUMNS (b.id AS b, path_length(p), vertex_labels(p), edge_labels(p)));
+----
+2	1	[Person, Person]	[Knows]
+3	2	[Person, Person, Person]	[Knows, Knows]
+4	3	[Person, Person, Person, Person]	[Knows, Knows, Knows]
+
+# The two lists line up with vertices(p) and edges(p), element for element
+query I
+SELECT DISTINCT len(v) = len(vl) AND len(e) = len(el)
+FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Person)-[:Knows]->{1,3}(b:Person)
+    COLUMNS (vertices(p) AS v, vertex_labels(p) AS vl, edges(p) AS e, edge_labels(p) AS el));
+----
+true
+
+# A variable-length segment followed by a fixed-length one
+query IIII rowsort
+FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Person)-[:Knows]->{1,2}(b:Person)-[:HasInterest]->(t:Tag)
+    COLUMNS (a.id AS a, t.id AS t, vertex_labels(p), edge_labels(p)));
+----
+1	10	[Person, Person, Tag]	[Knows, HasInterest]
+1	11	[Person, Person, Person, Tag]	[Knows, Knows, HasInterest]
+2	11	[Person, Person, Tag]	[Knows, HasInterest]
+
+# ── fixed length: constant lists, in path order ─────────────────────────────────────────────────────────────────────
+
+query IIIIII rowsort
+FROM GRAPH_TABLE (g MATCH p = (a:Person)-[:Knows]->(b:Person)-[:HasInterest]->(t:Tag)
+    COLUMNS (a.id AS a, t.id AS t, path_length(p), vertex_labels(p), edge_labels(p), label(t)));
+----
+1	10	2	[Person, Person, Tag]	[Knows, HasInterest]	Tag
+2	11	2	[Person, Person, Tag]	[Knows, HasInterest]	Tag
+
+# A vertex without a label takes the table its edge implies
+query II rowsort
+FROM GRAPH_TABLE (g MATCH p = (a:Person)-[:Knows]->(b)-[:HasInterest]->(t)
+    COLUMNS (vertex_labels(p), edge_labels(p)));
+----
+[Person, Person, Tag]	[Knows, HasInterest]
+[Person, Person, Tag]	[Knows, HasInterest]
+
+# Path order follows the pattern, not the edge's direction
+query III rowsort
+FROM GRAPH_TABLE (g MATCH p = (t:Tag)<-[:HasInterest]-(b) COLUMNS (t.id AS t, vertex_labels(p), edge_labels(p)));
+----
+10	[Tag, Person]	[HasInterest]
+10	[Tag, Person]	[HasInterest]
+11	[Tag, Person]	[HasInterest]
+
+query II
+FROM GRAPH_TABLE (g MATCH p = (a:Person)-[:WorksAt]->(o:University) COLUMNS (a.id AS a, vertex_labels(p)));
+----
+3	[Person, Org]
+
+# Inside an expression, and in WHERE
+query II rowsort
+FROM GRAPH_TABLE (g MATCH p = (a:Person)-[:Knows]->(b:Person)-[:HasInterest]->(t:Tag) WHERE path_length(p) = 2
+    COLUMNS (a.id AS a, list_extract(vertex_labels(p), -1) AS last_label));
+----
+1	Tag
+2	Tag
+
+# An edge that could be any of three tables has no single label: refuse rather than guess
+statement error
+FROM GRAPH_TABLE (g MATCH p = (a:Person)-[]->(x) COLUMNS (vertex_labels(p)));
+----
+ambiguous
+
+# =====================================================================================================================
+# The same queries answered by ABI artifacts
+# =====================================================================================================================
+
+statement ok
+FROM pgq_abi_build('g', exclude_self_referential := false);
+
+query IIII rowsort
+FROM GRAPH_TABLE (g MATCH (a:Person)-[k:Knows]->(b:Person) COLUMNS (a.id AS a, label(a), label(k), label(b)));
+----
+1	Person	Knows	Person
+2	Person	Knows	Person
+3	Person	Knows	Person
+
+query I
+SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+edge
+
+# Context expansion over the 1-hop artifacts. (With (b:Person), or with b's properties projected, the
+# pattern is left to the traversal until a closure is built.)
+query IIII rowsort
+FROM GRAPH_TABLE (g MATCH p = (a:Person)-[:Knows]->{1,2}(b)
+    COLUMNS (a.id AS a, path_length(p), vertex_labels(p), edge_labels(p)));
+----
+1	1	[Person, Person]	[Knows]
+1	2	[Person, Person, Person]	[Knows, Knows]
+2	1	[Person, Person]	[Knows]
+2	2	[Person, Person, Person]	[Knows, Knows]
+3	1	[Person, Person]	[Knows]
+
+query I
+SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+abi_context_expansion
+
+# The 2-hop fixed_path artifact: it carries no length or label columns, the folded constants answer
+query IIIIII rowsort
+FROM GRAPH_TABLE (g MATCH p = (a:Person)-[:Knows]->(b:Person)-[:HasInterest]->(t:Tag)
+    COLUMNS (a.id AS a, t.id AS t, path_length(p), vertex_labels(p), edge_labels(p), label(t)));
+----
+1	10	2	[Person, Person, Tag]	[Knows, HasInterest]	Tag
+2	11	2	[Person, Person, Tag]	[Knows, HasInterest]	Tag
+
+query I
+SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+fixed_path
+
+query II rowsort
+FROM GRAPH_TABLE (g MATCH p = (a:Person)-[:Knows]->(b:Person)-[:HasInterest]->(t:Tag) WHERE path_length(p) = 2
+    COLUMNS (a.id AS a, list_extract(vertex_labels(p), -1) AS last_label));
+----
+1	Tag
+2	Tag
+
+# vertices(p) on a fixed-length path has no artifact column: the traversal answers it (row ids)
+# instead of the query failing
+query III rowsort
+FROM GRAPH_TABLE (g MATCH p = (a:Person)-[:Knows]->(b:Person)-[:HasInterest]->(t:Tag)
+    COLUMNS (a.id AS a, t.id AS t, vertices(p)));
+----
+1	10	[0, 1, 0]
+2	11	[1, 2, 1]
+
+query I
+SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+0
+
+# pgq_verify_abi_rewrite runs each query both ways and compares
+query TT
+SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH (a:Person)-[k:Knows]->(b:Person)
+    COLUMNS (a.id AS a, label(a), label(k), label(b)))');
+----
+match	true
+
+query TT
+SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH p = (a:Person)-[:Knows]->{1,2}(b)
+    COLUMNS (a.id AS a, path_length(p), vertex_labels(p), edge_labels(p)))');
+----
+match	true
+
+query TT
+SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH p = (a:Person)-[:Knows]->(b:Person)-[:HasInterest]->(t:Tag)
+    COLUMNS (a.id AS a, t.id AS t, path_length(p), vertex_labels(p), edge_labels(p), label(t)))');
+----
+match	true
+
+# ── transitive-closure witness artifact ─────────────────────────────────────────────────────────────────────────────
+
+statement ok
+FROM pgq_abi_build('g', exclude_self_referential := false, closures := ['Knows']);
+
+query IIII rowsort
+FROM GRAPH_TABLE (g MATCH p = (a:Person)-[:Knows]->{1,3}(b:Person) WHERE b.id = 4
+    COLUMNS (a.id AS a, path_length(p), vertex_labels(p), edge_labels(p)));
+----
+1	3	[Person, Person, Person, Person]	[Knows, Knows, Knows]
+2	2	[Person, Person, Person]	[Knows, Knows]
+3	1	[Person, Person]	[Knows]
+
+query I
+SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+tc_witness_named_path
+
+query TT
+SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH p = (a:Person)-[:Knows]->{1,3}(b:Person)
+    WHERE b.id = 4 COLUMNS (a.id AS a, path_length(p), vertex_labels(p), edge_labels(p)))');
+----
+match	true

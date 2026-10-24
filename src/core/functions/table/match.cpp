@@ -2211,7 +2211,7 @@ RewriteGraphFunctions(unique_ptr<ParsedExpression> expr,
 			if (col != nullptr && !col->ColumnNames().empty()) {
 				auto tbl_iter = alias_map.find(PGQStr(col->ColumnNames().back()));
 				if (tbl_iter != alias_map.end()) {
-					auto label_const = ConstantExpression::FromValue(Value(StringUtil::Lower(PGQStr(tbl_iter->second->main_label))));
+					auto label_const = ConstantExpression::FromValue(Value(PGQStr(tbl_iter->second->main_label)));
 					label_const->SetAlias(Identifier(func->GetAlias().GetIdentifierName()));
 					return label_const;
 				}
@@ -4021,6 +4021,289 @@ void PGQMatchFunction::AddTraversalPathFinding(
 	    ConstantExpression::FromValue(Value::INTEGER(static_cast<int32_t>(upper)))));
 }
 
+// The declared labels along a named path, resolved from the pattern alone. Every route that
+// traverses a path -- CSR path-finding, the recursive walk, a fixed-length join -- reaches only
+// the tables the pattern names: a variable-length segment is a single edge table walked over
+// one vertex table (RejectCrossTableCSR refuses the rest), and a fixed-length element names its
+// table. So the labels are known at bind time, and an ABI artifact reports the same main labels.
+// As with label(x), a table is reported by its main label, also when the pattern names one of
+// its sub-labels.
+struct PGQPathLabelSegment {
+	string edge_label;
+	//! Variable-length segments: the label of the vertices a hop passes through on the way to
+	//! the segment's end vertex (the edge's destination table).
+	string through_vertex_label;
+	string next_vertex_label;
+	bool variable_length = false;
+};
+
+struct PGQPathLabels {
+	string first_vertex_label;
+	vector<PGQPathLabelSegment> segments;
+	//! Hops contributed by the fixed-length segments; the rest belong to the variable-length one.
+	int64_t fixed_hops = 0;
+
+	bool HasVariableLength() const {
+		for (const auto &segment : segments) {
+			if (segment.variable_length) {
+				return true;
+			}
+		}
+		return false;
+	}
+};
+
+// A vertex position of a path list: a bare element, or one wrapped with an element WHERE.
+static PathElement *PathListVertex(const unique_ptr<PathReference> &reference) {
+	auto *element = PGQMatchFunction::GetPathElement(reference);
+	if (element) {
+		return element;
+	}
+	auto *wrapper = PGQMatchFunction::GetSubPath(reference);
+	return wrapper && wrapper->path_list.size() == 1 ? PGQMatchFunction::GetPathElement(wrapper->path_list[0])
+	                                                 : nullptr;
+}
+
+// The vertex table an edge implies for its near or far end in the direction it is matched, or
+// null when an undirected edge between two different tables leaves it open.
+static shared_ptr<PropertyGraphTable> EdgeEndTable(const PropertyGraphTable &edge_table, PGQMatchType match_type,
+                                                   bool far_end) {
+	switch (match_type) {
+	case PGQMatchType::MATCH_EDGE_RIGHT:
+		return far_end ? edge_table.destination_pg_table : edge_table.source_pg_table;
+	case PGQMatchType::MATCH_EDGE_LEFT:
+		return far_end ? edge_table.source_pg_table : edge_table.destination_pg_table;
+	default:
+		return edge_table.source_reference == edge_table.destination_reference ? edge_table.source_pg_table
+		                                                                       : nullptr;
+	}
+}
+
+static PGQPathLabels ResolvePathLabels(vector<unique_ptr<PathReference>> &path_list,
+                                       CreatePropertyGraphInfo &pg_table, const string &function_call) {
+	if (path_list.size() < 3 || path_list.size() % 2 == 0) {
+		throw BinderException("%s cannot be answered: the path is not an alternating vertex/edge pattern",
+		                      function_call);
+	}
+	auto vertex_label = [&](PathElement *vertex, const shared_ptr<PropertyGraphTable> &implied) -> string {
+		if (!vertex->label.empty()) {
+			return PGQStr(ResolveTable(vertex->label, PGQMatchType::MATCH_VERTEX, pg_table)->main_label);
+		}
+		if (implied) {
+			return PGQStr(implied->main_label);
+		}
+		throw BinderException("%s cannot be answered: vertex '%s' has no label and the edge next to it does not "
+		                      "imply one. Give the vertex a label.",
+		                      function_call, vertex->variable_binding);
+	};
+
+	PGQPathLabels result;
+	PathElement *previous = PathListVertex(path_list[0]);
+	for (idx_t idx = 1; idx + 1 < path_list.size(); idx += 2) {
+		PathElement *edge = PGQMatchFunction::GetPathElement(path_list[idx]);
+		SubPath *edge_subpath = nullptr;
+		if (!edge) {
+			edge_subpath = PGQMatchFunction::GetSubPath(path_list[idx]);
+			if (edge_subpath->path_list.size() == 1) {
+				edge = PGQMatchFunction::GetPathElement(edge_subpath->path_list[0]);
+			}
+		}
+		PathElement *next = PathListVertex(path_list[idx + 1]);
+		if (!previous || !edge || !next) {
+			throw BinderException("%s cannot be answered for a path with nested sub-paths", function_call);
+		}
+		const auto edge_table = ResolveTable(edge->label, edge->match_type, pg_table);
+		if (idx == 1) {
+			result.first_vertex_label = vertex_label(previous, EdgeEndTable(*edge_table, edge->match_type, false));
+		}
+		PGQPathLabelSegment segment;
+		segment.edge_label = PGQStr(edge_table->main_label);
+		segment.next_vertex_label = vertex_label(next, EdgeEndTable(*edge_table, edge->match_type, true));
+		segment.variable_length = edge_subpath && (edge_subpath->lower != 1 || edge_subpath->upper != 1);
+		if (segment.variable_length) {
+			const auto through = EdgeEndTable(*edge_table, edge->match_type, true);
+			segment.through_vertex_label = through ? PGQStr(through->main_label) : segment.next_vertex_label;
+		} else {
+			result.fixed_hops++;
+		}
+		result.segments.push_back(std::move(segment));
+		previous = next;
+	}
+	return result;
+}
+
+static unique_ptr<ParsedExpression> MakeLabelList(const vector<string> &labels) {
+	vector<Value> values;
+	for (const auto &label : labels) {
+		values.emplace_back(label);
+	}
+	return ConstantExpression::FromValue(Value::LIST(LogicalType::VARCHAR, std::move(values)));
+}
+
+// list_resize(list, n, label): the list cut or padded to n entries with label.
+static unique_ptr<ParsedExpression> ResizeLabelList(unique_ptr<ParsedExpression> list,
+                                                    unique_ptr<ParsedExpression> size, const string &label) {
+	vector<unique_ptr<ParsedExpression>> children;
+	children.push_back(std::move(list));
+	children.push_back(std::move(size));
+	children.push_back(ConstantExpression::FromValue(Value(label)));
+	return make_uniq<FunctionExpression>("list_resize", std::move(children));
+}
+
+// vertex_labels(p) / edge_labels(p) as one expression: constant lists for the fixed-length
+// segments, and for the variable-length one, its label repeated once per hop. variable_hops is
+// the number of hops of that segment; it is only read when the path has one.
+static unique_ptr<ParsedExpression> BuildPathLabelList(const PGQPathLabels &labels, bool vertex_list,
+                                                       const ParsedExpression *variable_hops) {
+	unique_ptr<ParsedExpression> result;
+	vector<string> pending;
+	auto append = [&](unique_ptr<ParsedExpression> part) {
+		if (!result) {
+			result = std::move(part);
+			return;
+		}
+		vector<unique_ptr<ParsedExpression>> children;
+		children.push_back(std::move(result));
+		children.push_back(std::move(part));
+		result = make_uniq<FunctionExpression>("list_concat", std::move(children));
+	};
+	auto flush = [&]() {
+		if (!pending.empty()) {
+			append(MakeLabelList(pending));
+			pending.clear();
+		}
+	};
+	if (vertex_list) {
+		pending.push_back(labels.first_vertex_label);
+	}
+	for (const auto &segment : labels.segments) {
+		if (!segment.variable_length) {
+			pending.push_back(vertex_list ? segment.next_vertex_label : segment.edge_label);
+			continue;
+		}
+		D_ASSERT(variable_hops);
+		flush();
+		auto empty = MakeLabelList({});
+		if (!vertex_list) {
+			append(ResizeLabelList(std::move(empty), variable_hops->Copy(), segment.edge_label));
+			continue;
+		}
+		// hops - 1 vertices passed through, then the segment's end vertex; none for zero hops.
+		vector<unique_ptr<ParsedExpression>> minus_children;
+		minus_children.push_back(variable_hops->Copy());
+		minus_children.push_back(ConstantExpression::FromValue(Value::BIGINT(1)));
+		vector<unique_ptr<ParsedExpression>> greatest_children;
+		greatest_children.push_back(make_uniq<FunctionExpression>("-", std::move(minus_children)));
+		greatest_children.push_back(ConstantExpression::FromValue(Value::BIGINT(0)));
+		auto through = ResizeLabelList(std::move(empty),
+		                               make_uniq<FunctionExpression>("greatest", std::move(greatest_children)),
+		                               segment.through_vertex_label);
+		append(ResizeLabelList(std::move(through), variable_hops->Copy(), segment.next_vertex_label));
+	}
+	flush();
+	if (!result) {
+		result = MakeLabelList({});
+	}
+	return result;
+}
+
+static bool IsPathFunctionOn(const ParsedExpression &expression, const string &path_variable, const char *name) {
+	auto *function_ref = dynamic_cast<const FunctionExpression *>(&expression);
+	if (!function_ref || function_ref->GetArguments().size() != 1 ||
+	    !StringUtil::CIEquals(function_ref->FunctionName().GetIdentifierName(), name)) {
+		return false;
+	}
+	auto *column_ref = dynamic_cast<const ColumnRefExpression *>(&function_ref->GetArguments()[0].GetExpression());
+	return column_ref && column_ref->ColumnNames().size() == 1 &&
+	       StringUtil::CIEquals(PGQStr(column_ref->ColumnNames()[0]), path_variable);
+}
+
+// Fixed-length named paths: path_length(p), vertex_labels(p) and edge_labels(p) do not depend on
+// the row, so they become constants before any route is chosen. That gives the fixed-length
+// artifacts (which carry no such columns) and the traversal one answer, in declared label case.
+static void FoldStaticPathFunctions(MatchExpression &match_ref, vector<unique_ptr<PathReference>> &path_elements,
+                                    CreatePropertyGraphInfo &pg_table) {
+	if (path_elements.size() != 1 || path_elements[0]->path_reference_type != PGQPathReferenceType::SUBPATH) {
+		return;
+	}
+	auto &named_path = *reinterpret_cast<SubPath *>(path_elements[0].get());
+	const string &path_variable = named_path.path_variable;
+	if (path_variable.empty() || named_path.path_list.size() < 3) {
+		return;
+	}
+	for (idx_t idx = 1; idx < named_path.path_list.size(); idx += 2) {
+		auto *edge_subpath = PGQMatchFunction::GetSubPath(named_path.path_list[idx]);
+		if (edge_subpath && (edge_subpath->lower != 1 || edge_subpath->upper != 1)) {
+			return;
+		}
+	}
+	const auto hops = static_cast<int64_t>(named_path.path_list.size() / 2);
+	unique_ptr<PGQPathLabels> labels;
+	bool labels_unresolved = false;
+
+	std::function<void(unique_ptr<ParsedExpression> &, bool)> fold = [&](unique_ptr<ParsedExpression> &expression,
+	                                                                     bool top_level) {
+		if (!expression) {
+			return;
+		}
+		const char *name = nullptr;
+		for (const char *candidate : {"path_length", "vertex_labels", "edge_labels"}) {
+			if (IsPathFunctionOn(*expression, path_variable, candidate)) {
+				name = candidate;
+			}
+		}
+		if (!name) {
+			ParsedExpressionIterator::EnumerateChildren(
+			    *expression, [&](unique_ptr<ParsedExpression> &child) { fold(child, false); });
+			return;
+		}
+		const string call = string(name) + "(" + path_variable + ")";
+		unique_ptr<ParsedExpression> replacement;
+		if (StringUtil::CIEquals(name, "path_length")) {
+			replacement = ConstantExpression::FromValue(Value::BIGINT(hops));
+		} else {
+			if (!labels) {
+				try {
+					labels = make_uniq<PGQPathLabels>(ResolvePathLabels(named_path.path_list, pg_table, call));
+				} catch (std::exception &) {
+					// Not determined by the pattern (an unlabeled edge over several tables): an
+					// ABI expansion may still answer it per row, and the traversal refuses it
+					// with the reason.
+					labels_unresolved = true;
+				}
+			}
+			if (labels_unresolved) {
+				return;
+			}
+			replacement = BuildPathLabelList(*labels, StringUtil::CIEquals(name, "vertex_labels"), nullptr);
+		}
+		auto alias = expression->GetAlias().GetIdentifierName();
+		if (alias.empty() && top_level) {
+			alias = call;
+		}
+		replacement->SetAlias(Identifier(alias));
+		expression = std::move(replacement);
+	};
+	for (auto &expression : match_ref.column_list) {
+		fold(expression, true);
+	}
+	fold(match_ref.where_clause, false);
+}
+
+// True when an expression still reads the named path itself: p, or a function of p.
+static bool ReferencesPathVariable(const ParsedExpression &expression, const string &path_variable) {
+	auto *column_ref = dynamic_cast<const ColumnRefExpression *>(&expression);
+	if (column_ref) {
+		return column_ref->ColumnNames().size() == 1 &&
+		       StringUtil::CIEquals(PGQStr(column_ref->ColumnNames()[0]), path_variable);
+	}
+	bool found = false;
+	ParsedExpressionIterator::EnumerateChildren(expression, [&](const ParsedExpression &child) {
+		found = found || ReferencesPathVariable(child, path_variable);
+	});
+	return found;
+}
+
 void PGQMatchFunction::CheckNamedSubpath(SubPath &subpath, MatchExpression &original_ref,
                                          CreatePropertyGraphInfo &pg_table, unique_ptr<SelectNode> &final_select_node,
                                          vector<unique_ptr<ParsedExpression>> &conditions, int32_t &csr_id_counter,
@@ -4098,6 +4381,30 @@ void PGQMatchFunction::CheckNamedSubpath(SubPath &subpath, MatchExpression &orig
 			original_ref.column_list.erase(original_ref.column_list.begin() + static_cast<int64_t>(idx_i));
 			original_ref.column_list.insert(original_ref.column_list.begin() + static_cast<int64_t>(idx_i),
 			                                std::move(list_slice));
+		} else if (parsed_ref->FunctionName().GetIdentifierName() == "vertex_labels" ||
+		           parsed_ref->FunctionName().GetIdentifierName() == "edge_labels") {
+			const string function_name = PGQStr(parsed_ref->FunctionName().GetIdentifierName());
+			const string call = function_name + "(" + subpath.path_variable + ")";
+			const auto labels = ResolvePathLabels(subpath.path_list, pg_table, call);
+			// The variable-length segment's hops: the whole path's, less the fixed-length ones.
+			unique_ptr<ParsedExpression> variable_hops;
+			if (labels.HasVariableLength()) {
+				auto shortest_path_function = CreatePathFindingFunction(subpath.path_list, pg_table, subpath.path_variable,
+				                                                        final_select_node, conditions, csr_id_counter,
+				                                                        csr_slot, all_shortest);
+				vector<unique_ptr<ParsedExpression>> len_children;
+				len_children.push_back(std::move(shortest_path_function));
+				vector<unique_ptr<ParsedExpression>> div_children;
+				div_children.push_back(make_uniq<FunctionExpression>("len", std::move(len_children)));
+				div_children.push_back(ConstantExpression::FromValue(Value::BIGINT(2)));
+				vector<unique_ptr<ParsedExpression>> minus_children;
+				minus_children.push_back(make_uniq<FunctionExpression>("//", std::move(div_children)));
+				minus_children.push_back(ConstantExpression::FromValue(Value::BIGINT(labels.fixed_hops)));
+				variable_hops = make_uniq<FunctionExpression>("-", std::move(minus_children));
+			}
+			auto label_list = BuildPathLabelList(labels, function_name == "vertex_labels", variable_hops.get());
+			label_list->SetAlias(Identifier(column_alias.empty() ? call : column_alias));
+			original_ref.column_list[idx_i] = std::move(label_list);
 		} else if (parsed_ref->FunctionName().GetIdentifierName() == "cost") {
 			// Find edge subpath with cost_expr within this named subpath's path_list.
 			// A vertex with an element-local WHERE arrives wrapped in a single-element subpath.
@@ -5366,9 +5673,19 @@ static string BuildSQLFilter(const string &base_filter, const vector<string> &en
 	return filter;
 }
 
+// vertex_labels(p) / edge_labels(p) over a closure of one self-referential edge: the vertex
+// table's label once per vertex, the edge's once per hop, as the traversal reports them.
+static string TCNamedPathLabelColumns(const string &hops_expr, const string &vertex_label, const string &edge_label) {
+	return StringUtil::Format("list_resize([]::VARCHAR[], (%s) + 1, %s) AS __pgq_vertex_labels, "
+	                          "list_resize([]::VARCHAR[], %s, %s) AS __pgq_edge_labels",
+	                          hops_expr, KeywordHelper::WriteQuoted(vertex_label, '\''), hops_expr,
+	                          KeywordHelper::WriteQuoted(edge_label, '\''));
+}
+
 static unique_ptr<TableRef> BuildTCChainNamedPathRef(const PGQPathTableInfo &chain_info, const string &path_alias,
                                                      idx_t lower, idx_t upper,
-                                                     const vector<string> &endpoint_filters) {
+                                                     const vector<string> &endpoint_filters,
+                                                     const string &vertex_label, const string &edge_label) {
 	const string chain_table = QualifiedTableName(chain_info.catalog_name, chain_info.schema_name,
 	                                              chain_info.table_name);
 	const idx_t step_lower = std::max<idx_t>(1, lower);
@@ -5383,17 +5700,19 @@ static unique_ptr<TableRef> BuildTCChainNamedPathRef(const PGQPathTableInfo &cha
 	const string query = StringUtil::Format(
 	    "SELECT c.v0, list_extract(c.path_vertices, %s) AS v1, "
 	    "       %s AS __pgq_path_length, "
-	    "       list_slice(c.path_vertices, 1, %s) AS __pgq_path_vertices "
+	    "       list_slice(c.path_vertices, 1, %s) AS __pgq_path_vertices, %s "
 	    "FROM %s c "
 	    "WHERE %s",
-	    vertex_upper_expr, selected_depth_expr, vertex_upper_expr, chain_table, base_filter);
+	    vertex_upper_expr, selected_depth_expr, vertex_upper_expr,
+	    TCNamedPathLabelColumns(selected_depth_expr, vertex_label, edge_label), chain_table, base_filter);
 
 	return make_uniq<SubqueryRef>(ParseSelectStatement(query), PGQId(path_alias));
 }
 
 static unique_ptr<TableRef> BuildTCWitnessNamedPathRef(const PGQPathTableInfo &witness_info, const string &path_alias,
                                                        idx_t lower, idx_t upper,
-                                                       const vector<string> &endpoint_filters) {
+                                                       const vector<string> &endpoint_filters,
+                                                       const string &vertex_label, const string &edge_label) {
 	const string witness_table = QualifiedTableName(witness_info.catalog_name, witness_info.schema_name,
 	                                                witness_info.table_name);
 	string base_filter = "w.depth >= " + std::to_string(static_cast<int64_t>(std::max<idx_t>(1, lower)));
@@ -5403,10 +5722,10 @@ static unique_ptr<TableRef> BuildTCWitnessNamedPathRef(const PGQPathTableInfo &w
 	const string filter = BuildSQLFilter(base_filter, endpoint_filters);
 	const string query = StringUtil::Format(
 	    "SELECT w.v0, w.v1, w.depth AS __pgq_path_length, "
-	    "       w.path_vertices AS __pgq_path_vertices "
+	    "       w.path_vertices AS __pgq_path_vertices, %s "
 	    "FROM %s w "
 	    "WHERE %s",
-	    witness_table, filter);
+	    TCNamedPathLabelColumns("w.depth", vertex_label, edge_label), witness_table, filter);
 
 	return make_uniq<SubqueryRef>(ParseSelectStatement(query), PGQId(path_alias));
 }
@@ -7454,39 +7773,33 @@ BuildFinalColumnList(vector<unique_ptr<ParsedExpression>> col_list,
                      const case_insensitive_set_t &stub_bindings) {
 	vector<unique_ptr<ParsedExpression>> final_column_list;
 	for (auto &expression : col_list) {
-		unordered_set<string> named_subpaths;
-
 		auto *column_ref = dynamic_cast<ColumnRefExpression *>(expression.get());
 		if (column_ref != nullptr) {
-			if (named_subpaths.count(PGQStr(column_ref->ColumnNames()[0])) && column_ref->ColumnNames().size() == 1) {
-				final_column_list.emplace_back(PGQColRef("path", PGQStr(column_ref->ColumnNames()[0])));
-			} else {
-				final_column_list.push_back(std::move(expression));
-			}
+			final_column_list.push_back(std::move(expression));
 			continue;
 		}
 
 		auto *function_ref = dynamic_cast<FunctionExpression *>(expression.get());
 		if (function_ref != nullptr) {
-			if (function_ref->FunctionName().GetIdentifierName() == "path_length") {
-				column_ref = dynamic_cast<ColumnRefExpression *>(function_ref->GetArgumentsMutable()[0].GetExpressionMutable().get());
-				if (column_ref == nullptr) {
+			// path_length(p) used to have a branch here that only emitted a column for a name in a
+			// set that was always empty, so a path_length(p) reaching this point vanished from the
+			// output. Named-path functions are answered before this (CheckNamedSubpath,
+			// FoldStaticPathFunctions, the ABI rewrites); anything left falls through and fails
+			// to bind instead of disappearing.
+			for (const char *path_function : {"path_length", "vertices", "edges", "vertex_labels", "edge_labels"}) {
+				if (!StringUtil::CIEquals(function_ref->FunctionName().GetIdentifierName(), path_function) ||
+				    function_ref->GetArgumentsMutable().size() != 1) {
 					continue;
 				}
-				if (named_subpaths.count(PGQStr(column_ref->ColumnNames()[0])) && column_ref->ColumnNames().size() == 1) {
-					auto path_ref = PGQColRef("path", PGQStr(column_ref->ColumnNames()[0]));
-					vector<unique_ptr<ParsedExpression>> path_children;
-					path_children.push_back(std::move(path_ref));
-					auto path_len = make_uniq<FunctionExpression>("len", std::move(path_children));
-					auto constant_two = ConstantExpression::FromValue(Value::INTEGER(2));
-					vector<unique_ptr<ParsedExpression>> div_children;
-					div_children.push_back(std::move(path_len));
-					div_children.push_back(std::move(constant_two));
-					auto div_expression = make_uniq<FunctionExpression>("//", std::move(div_children));
-					div_expression->SetAlias(Identifier("path_length_" + column_ref->ColumnNames()[0]));
-					final_column_list.emplace_back(std::move(div_expression));
-				}
-			} else if (function_ref->FunctionName().GetIdentifierName() == "element_id" && function_ref->GetArgumentsMutable().size() == 1) {
+				auto *argument = dynamic_cast<ColumnRefExpression *>(
+				    function_ref->GetArgumentsMutable()[0].GetExpressionMutable().get());
+				const string argument_name =
+				    argument && argument->ColumnNames().size() == 1 ? PGQStr(argument->ColumnNames()[0]) : "...";
+				throw BinderException("%s(%s) cannot be answered: '%s' is not a named path of this MATCH (MATCH %s = "
+				                      "...), or the route chosen for the pattern does not provide %s()",
+				                      path_function, argument_name, argument_name, argument_name, path_function);
+			}
+			if (function_ref->FunctionName().GetIdentifierName() == "element_id" && function_ref->GetArgumentsMutable().size() == 1) {
 				column_ref = dynamic_cast<ColumnRefExpression *>(function_ref->GetArgumentsMutable()[0].GetExpressionMutable().get());
 				if (column_ref != nullptr && !column_ref->ColumnNames().empty()) {
 					string var = PGQStr(column_ref->ColumnNames().back());
@@ -7516,7 +7829,7 @@ BuildFinalColumnList(vector<unique_ptr<ParsedExpression>> col_list,
 						    var.c_str(), var.c_str(), var.c_str());
 					}
 					if (tbl_iter != alias_to_vertex_and_edge_tables.end()) {
-						auto label_const = ConstantExpression::FromValue(Value(StringUtil::Lower(PGQStr(tbl_iter->second->main_label))));
+						auto label_const = ConstantExpression::FromValue(Value(PGQStr(tbl_iter->second->main_label)));
 						label_const->SetAlias(Identifier(function_ref->GetAlias().GetIdentifierName().empty() ? "label(" + var + ")" : function_ref->GetAlias().GetIdentifierName()));
 						final_column_list.emplace_back(std::move(label_const));
 					} else {
@@ -7788,10 +8101,12 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 					unique_ptr<TableRef> path_ref;
 					if (use_witness) {
 						path_ref = BuildTCWitnessNamedPathRef(*tc_witness_info, path_alias, tc_sp->lower, tc_sp->upper,
-						                                      endpoint_filters);
+						                                      endpoint_filters, PGQStr(vtable->main_label),
+						                                      PGQStr(etbl->main_label));
 					} else {
 						path_ref = BuildTCChainNamedPathRef(*tc_chain_info, path_alias, tc_sp->lower, tc_sp->upper,
-						                                    endpoint_filters);
+						                                    endpoint_filters, PGQStr(vtable->main_label),
+						                                    PGQStr(etbl->main_label));
 					}
 
 					if (select_node->from_table) {
@@ -8057,6 +8372,19 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 		bool reversed;   // true when edge is MATCH_EDGE_LEFT
 		bool undirected; // true when edge is MATCH_EDGE_ANY or MATCH_EDGE_LEFT_RIGHT
 	};
+	// A fixed-length artifact has no column for what is left of a named path once
+	// FoldStaticPathFunctions has run (p itself, vertices(p), edges(p), element_id(p)). Leave the
+	// pattern to the traversal, which answers them, rather than failing or dropping them.
+	if (!named_path_variable.empty()) {
+		for (const auto &expression : match_ref.column_list) {
+			if (ReferencesPathVariable(*expression, named_path_variable)) {
+				return false;
+			}
+		}
+		if (match_ref.where_clause && ReferencesPathVariable(*match_ref.where_clause, named_path_variable)) {
+			return false;
+		}
+	}
 	vector<ElemSpec> specs;
 	specs.reserve(n_hops);
 	for (size_t i = 0; i < n_hops; i++) {
@@ -8806,6 +9134,7 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 			    "ANY CHEAPEST / ALL CHEAPEST requires a COST expression on the edge pattern "
 			    "(e.g. -[e:Label COST e.weight]->). Without a cost the request is undefined; use SHORTEST.");
 		}
+		FoldStaticPathFunctions(*ref, path_pattern->path_elements, *pg_table);
 		// Tier 1: if a pre-computed path table covers this entire pattern, use it.
 		// Falls through to Tier 2/3 (ProcessPathList) when not applicable.
 		// Pass the MATCH WHERE clause for predicate pushdown (v0/v1 = constant).
@@ -8981,6 +9310,7 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 				    "ANY CHEAPEST / ALL CHEAPEST requires a COST expression on the edge pattern "
 				    "(e.g. -[e:Label COST e.weight]->). Without a cost the request is undefined; use SHORTEST.");
 			}
+			FoldStaticPathFunctions(branch, path_pattern->path_elements, *pg_table);
 			if (!TryPathTableRewrite(context, *pg_table, path_pattern->path_elements, branch, branch_conditions,
 			                         branch_select, branch_alias_map, branch_counter,
 			                         path_table_cache, branch_referenced_bindings,

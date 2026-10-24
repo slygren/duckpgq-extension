@@ -42,20 +42,20 @@ FROM GRAPH_TABLE (pg
 0	2	2
 1	2	1
 
-# label() returns the label of the element as a lowercase string
+# label() returns the label of the element as declared in CREATE PROPERTY GRAPH
 query I
 FROM GRAPH_TABLE (pg
     MATCH (a:Person)-[:Knows]->(:Person)
     COLUMNS (label(a) AS lbl)
 ) t LIMIT 1;
 ----
-person
+Person
 
 # label() in WHERE clause for filtering
 query I
 FROM GRAPH_TABLE (pg
     MATCH (a:Person)-[:Knows]->(b:Person)
-    WHERE label(a) = 'person' AND a.name = 'Alice'
+    WHERE label(a) = 'Person' AND a.name = 'Alice'
     COLUMNS (b.name AS friend)
 ) t ORDER BY friend;
 ----

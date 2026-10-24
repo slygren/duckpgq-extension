@@ -154,7 +154,7 @@ FROM GRAPH_TABLE (
     COLUMNS (label(x) AS lbl)
 );
 ----
-device
+Device
 
 # ...and identically to the labeled form.
 query T rowsort
@@ -165,4 +165,4 @@ FROM GRAPH_TABLE (
     COLUMNS (label(x) AS lbl)
 );
 ----
-device
+Device
