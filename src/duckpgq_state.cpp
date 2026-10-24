@@ -83,14 +83,15 @@ void DuckPGQState::CreateInternalTable(Connection &connection) {
 	                              "column_aliases varchar[], "
 	                              "graph_catalog varchar, "
 	                              "graph_schema varchar, "
-	                              "verified boolean"
+	                              "verified boolean, "
+	                              "abi_options varchar"
 	                              ")");
 	if (query->HasError()) {
 		throw TransactionException(query->GetError());
 	}
 	// Databases written before graphs recorded their qualification only have the first 20 columns, and databases
 	// written before the incomplete-edge check have no verified column (NULL: not verified).
-	for (auto column : {"graph_catalog VARCHAR", "graph_schema VARCHAR", "verified BOOLEAN"}) {
+	for (auto column : {"graph_catalog VARCHAR", "graph_schema VARCHAR", "verified BOOLEAN", "abi_options VARCHAR"}) {
 		auto alter =
 		    connection.Query(StringUtil::Format("ALTER TABLE __duckpgq_internal ADD COLUMN IF NOT EXISTS %s", column));
 		if (alter->HasError()) {
@@ -191,7 +192,13 @@ void DuckPGQState::ProcessPropertyGraphs(ClientContext &context, unique_ptr<Quer
 				verified = !verified_value.IsNull() && verified_value.GetValue<bool>();
 			}
 			QualifiedName graph_name(graph_catalog, graph_schema, Identifier(chunk->GetValue(0, i).GetValue<string>()));
-			RegisterPropertyGraph(table, ResolvePropertyGraphName(context, graph_name), is_vertex, verified);
+			auto resolved_name = ResolvePropertyGraphName(context, graph_name);
+			RegisterPropertyGraph(table, resolved_name, is_vertex, verified);
+			if (chunk->ColumnCount() > 23 && !chunk->GetValue(23, i).IsNull()) {
+				auto &info = registered_property_graphs[resolved_name.Name().GetIdentifierName()]
+				                 ->Cast<CreatePropertyGraphInfo>();
+				info.abi_options = chunk->GetValue(23, i).ToString();
+			}
 		}
 	}
 }

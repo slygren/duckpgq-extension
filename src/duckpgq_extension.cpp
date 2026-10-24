@@ -39,6 +39,20 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    "Scans every edge table, so it is off by default.",
 		    LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::SESSION);
 	}
+	if (!config.HasExtensionOption("pgq_abi_mode")) {
+		config.AddExtensionOption(
+		    "pgq_abi_mode",
+		    "How this session treats ABI path artifacts. 'consume' (default): use artifacts that exist, never build "
+		    "any. 'auto': also build a graph's artifacts at CREATE PROPERTY GRAPH when it has none and its database is "
+		    "writable. 'off': ignore artifacts.",
+		    LogicalType::VARCHAR, Value("consume"), nullptr, SetScope::SESSION);
+	}
+	if (!config.HasExtensionOption("pgq_abi_auto_max_rows")) {
+		config.AddExtensionOption(
+		    "pgq_abi_auto_max_rows",
+		    "In pgq_abi_mode = 'auto', leave out fixed-path artifacts whose chain holds more rows than this.",
+		    LogicalType::BIGINT, Value::BIGINT(10000000), nullptr, SetScope::SESSION);
+	}
 	if (!config.HasExtensionOption("duckpgq_vertex_join_elimination")) {
 		config.AddExtensionOption(
 		    "duckpgq_vertex_join_elimination",

@@ -18,6 +18,7 @@ struct CoreTableFunctions {
 		RegisterExplainABIPathTableFunction(loader);
 		RegisterLastRewriteDiagnosticsTableFunction(loader);
 		RegisterVerifyABIRewriteTableFunction(loader);
+		RegisterAbiBuildTableFunctions(loader);
 	}
 
 private:
@@ -34,6 +35,7 @@ private:
 	static void RegisterExplainABIPathTableFunction(ExtensionLoader &loader);
 	static void RegisterLastRewriteDiagnosticsTableFunction(ExtensionLoader &loader);
 	static void RegisterVerifyABIRewriteTableFunction(ExtensionLoader &loader);
+	static void RegisterAbiBuildTableFunctions(ExtensionLoader &loader);
 };
 
 } // namespace duckdb

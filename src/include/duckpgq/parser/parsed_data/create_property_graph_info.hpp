@@ -42,6 +42,10 @@ struct CreatePropertyGraphInfo : public CreateInfo {
 	//! joins in MATCH (see VertexEliminationPlanner).
 	bool verified = false;
 
+	//! The WITH ABI (...) clause: what pgq_abi_build builds for this graph, as a STRUCT literal in SQL text
+	//! ({'max_hops': 3, ...}). Empty when the statement has none.
+	string abi_options;
+
 public:
 	unique_ptr<CreateInfo> Copy() const override;
 

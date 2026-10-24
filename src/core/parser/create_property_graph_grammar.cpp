@@ -3,6 +3,7 @@
 
 #include "duckdb/parser/peg/transformer/peg_transformer.hpp"
 #include "duckdb/parser/statement/extension_statement.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckpgq/parser/parsed_data/create_property_graph_info.hpp"
 #include "duckpgq_create_property_graph_grammar.hpp"
 
@@ -186,6 +187,21 @@ static arena_ptr<TransformResultValue> TransformCreateGraph(PEGTransformer &tran
 	auto &edges = list.Child<OptionalParseResult>(7);
 	if (edges.HasResult()) {
 		info->edge_tables = TransformGraphTables(transformer, edges.GetResult().Cast<ListParseResult>().GetChild(2));
+	}
+	auto &abi_clause = list.Child<OptionalParseResult>(8);
+	if (abi_clause.HasResult()) {
+		vector<string> options;
+		auto &clause = abi_clause.GetResult().Cast<ListParseResult>();
+		auto &option_list = PEGTransformerFactory::ExtractResultFromParens(clause.GetChild(2));
+		for (auto &item : PEGTransformerFactory::ExtractParseResultsFromList(option_list)) {
+			auto &option = item.get().Cast<ListParseResult>();
+			auto name = transformer.Transform<Identifier>(option.GetChild(0));
+			auto value = transformer.Transform<unique_ptr<ParsedExpression>>(option.GetChild(2));
+			options.push_back(KeywordHelper::WriteQuoted(StringUtil::Lower(name.GetIdentifierName()), '\'') + ": " +
+			                  value->ToString());
+		}
+		// Kept as one STRUCT literal: SELECT of it gives the option values back without re-parsing the clause.
+		info->abi_options = "{" + StringUtil::Join(options, ", ") + "}";
 	}
 	for (auto &table : info->vertex_tables) {
 		RegisterLabels(*info, table);

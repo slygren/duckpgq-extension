@@ -1,0 +1,419 @@
+# name: test/sql/abi/abi_build.test
+# description: pgq_abi_build / pgq_abi_sql / pgq_abi_status / pgq_abi_drop, WITH ABI and pgq_abi_mode
+# group: [abi]
+
+require duckpgq
+
+load __TEST_DIR__/abi_build.db
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE Person(id BIGINT PRIMARY KEY, name VARCHAR);
+
+statement ok
+CREATE TABLE Tag(id BIGINT PRIMARY KEY, name VARCHAR, category VARCHAR);
+
+statement ok
+CREATE TABLE City(id BIGINT PRIMARY KEY, name VARCHAR);
+
+statement ok
+CREATE TABLE knows(src BIGINT, dst BIGINT);
+
+statement ok
+CREATE TABLE hasInterest(personId BIGINT, tagId BIGINT);
+
+statement ok
+CREATE TABLE livesIn(personId BIGINT, cityId BIGINT);
+
+statement ok
+CREATE TABLE parentOf(child BIGINT, parent BIGINT);
+
+statement ok
+INSERT INTO Person VALUES (1, 'A'), (2, 'B'), (3, 'C'), (4, 'D');
+
+statement ok
+INSERT INTO Tag VALUES (10, 't1', 'sport'), (11, 't2', 'art');
+
+statement ok
+INSERT INTO City VALUES (100, 'Oslo'), (101, 'Bergen');
+
+statement ok
+INSERT INTO knows VALUES (1, 2), (2, 3), (3, 4);
+
+statement ok
+INSERT INTO hasInterest VALUES (1, 10), (2, 10), (3, 11);
+
+statement ok
+INSERT INTO livesIn VALUES (1, 100), (2, 100), (3, 101), (4, 101);
+
+statement ok
+INSERT INTO parentOf VALUES (1, 2), (2, 3), (3, 4);
+
+statement ok
+CREATE PROPERTY GRAPH g
+VERTEX TABLES (Person LABEL Person, Tag LABEL Tag, City LABEL City)
+EDGE TABLES (
+    knows SOURCE KEY (src) REFERENCES Person (id) DESTINATION KEY (dst) REFERENCES Person (id) LABEL knows,
+    hasInterest SOURCE KEY (personId) REFERENCES Person (id) DESTINATION KEY (tagId) REFERENCES Tag (id) LABEL hasInterest,
+    livesIn SOURCE KEY (personId) REFERENCES Person (id) DESTINATION KEY (cityId) REFERENCES City (id) LABEL livesIn,
+    parentOf SOURCE KEY (child) REFERENCES Person (id) DESTINATION KEY (parent) REFERENCES Person (id) LABEL parentOf
+);
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Nothing exists until it is built; consume mode (the default) never builds
+# ---------------------------------------------------------------------------------------------------------------------
+
+query I
+SELECT count(*) FROM pgq_abi_status('g');
+----
+0
+
+# Generating the script executes nothing, and DESCRIBE of the build does not build either
+query I
+SELECT count(*) > 0 FROM pgq_abi_sql('g');
+----
+true
+
+statement ok
+DESCRIBE SELECT * FROM pgq_abi_build('g');
+
+query I
+SELECT count(*) FROM information_schema.tables WHERE table_name LIKE '__pg_g__%';
+----
+0
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Default build: every 1-hop edge, and the 2-hop chains without a self-referential edge (there are none here)
+# ---------------------------------------------------------------------------------------------------------------------
+
+query IIII
+SELECT artifact, kind, status, row_count FROM pgq_abi_build('g') ORDER BY ALL;
+----
+__pg_g__Person__hasInterest__Tag	edge	built	3
+__pg_g__Person__knows__Person	edge	built	3
+__pg_g__Person__livesIn__City	edge	built	4
+__pg_g__Person__parentOf__Person	edge	built	3
+__pgq_path_catalog	catalog	built	4
+
+query IIIIII
+SELECT schema, artifact, kind, hop_count, estimated_rows, table_exists FROM pgq_abi_status('g') ORDER BY artifact;
+----
+graph	__pg_g__Person__hasInterest__Tag	edge	1	3	true
+graph	__pg_g__Person__knows__Person	edge	1	3	true
+graph	__pg_g__Person__livesIn__City	edge	1	4	true
+graph	__pg_g__Person__parentOf__Person	edge	1	3	true
+
+# The artifacts answer the query, and the answer is the traversal's
+statement ok
+SET pgq_require_abi_paths = true;
+
+query II
+FROM GRAPH_TABLE (g MATCH (a:Person)-[h:hasInterest]->(t:Tag) COLUMNS (a.id AS a, t.id AS t)) ORDER BY ALL;
+----
+1	10
+2	10
+3	11
+
+query I
+SELECT status FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected' LIMIT 1;
+----
+selected
+
+query I
+SELECT status FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH (a:Person)-[h:hasInterest]->(t:Tag) COLUMNS (a.id AS a, t.id AS t))');
+----
+match
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Every artifact kind
+# ---------------------------------------------------------------------------------------------------------------------
+
+statement ok
+SET pgq_require_abi_paths = false;
+
+query IIII
+SELECT artifact, kind, status, row_count FROM pgq_abi_build('g',
+    exclude_self_referential := false,
+    closures := ['parentOf'],
+    reverse_twins := ['hasInterest'],
+    cover := MAP {'hasInterest': ['name', 'category']},
+    branch_summaries := [{'anchor': 'Person', 'branches': ['hasInterest', 'livesIn']}],
+    exclude_paths := [['knows', 'knows']])
+WHERE kind <> 'catalog' ORDER BY ALL;
+----
+__pg_g__Person__hasInterest__Tag	edge	built	3
+__pg_g__Person__hasInterest__Tag__rev	edge	built	3
+__pg_g__Person__knows__Person	edge	built	3
+__pg_g__Person__knows__Person__hasInterest__Tag	fixed_path	built	2
+__pg_g__Person__knows__Person__livesIn__City	fixed_path	built	3
+__pg_g__Person__knows__Person__parentOf__Person	fixed_path	built	2
+__pg_g__Person__livesIn__City	edge	built	4
+__pg_g__Person__parentOf__Person	edge	built	3
+__pg_g__Person__parentOf__Person__hasInterest__Tag	fixed_path	built	2
+__pg_g__Person__parentOf__Person__knows__Person	fixed_path	built	2
+__pg_g__Person__parentOf__Person__livesIn__City	fixed_path	built	3
+__pg_g__Person__parentOf__Person__parentOf__Person	fixed_path	built	2
+__pg_g__branch__Person__hasInterest__livesIn	branch_summary	built	4
+__pg_g__tc__Person__parentOf	transitive_closure	built	6
+__pg_g__tc_chain__Person__parentOf	tc_chain	built	3
+__pg_g__tc_witness__Person__parentOf	tc_witness	built	6
+
+# Covered properties are stored on the 1-hop artifact, and the catalog says so
+query IIII
+SELECT v0, v1, v1_name, v1_category FROM graph.__pg_g__Person__hasInterest__Tag ORDER BY ALL;
+----
+1	10	t1	sport
+2	10	t1	sport
+3	11	t2	art
+
+query II
+SELECT covered_target_properties, property_support FROM graph.__pgq_path_catalog
+WHERE path_table_name = '__pg_g__Person__hasInterest__Tag';
+----
+v1:name|category	covering_path
+
+# Edge identity: hash(label || '|' || src || '|' || dst), the same in every artifact that contains the edge
+query I
+SELECT count(*) FROM graph.__pg_g__Person__knows__Person__hasInterest__Tag p
+JOIN graph.__pg_g__Person__knows__Person k ON k.e1 = p.e1 AND k.v0 = p.v0 AND k.v1 = p.v1;
+----
+2
+
+query IIII
+SELECT v0, v1, depth, path_vertices FROM graph.__pg_g__tc_witness__Person__parentOf ORDER BY ALL;
+----
+1	2	1	[1, 2]
+1	3	2	[1, 2, 3]
+1	4	3	[1, 2, 3, 4]
+2	3	1	[2, 3]
+2	4	2	[2, 3, 4]
+3	4	1	[3, 4]
+
+query IIII
+SELECT v0, hasinterest_count, hasinterest_exists, livesin_count FROM graph.__pg_g__branch__Person__hasInterest__livesIn ORDER BY ALL;
+----
+1	1	true	1
+2	1	true	1
+3	1	true	1
+4	0	false	1
+
+query IIII
+SELECT path_table_name, is_sorted_by_v0, is_sorted_by_v1, preserves_multiplicity FROM graph.__pgq_path_catalog
+WHERE path_table_name LIKE '%hasInterest__Tag%' AND hop_count = 1 ORDER BY ALL;
+----
+__pg_g__Person__hasInterest__Tag	true	false	true
+__pg_g__Person__hasInterest__Tag__rev	false	true	true
+
+query IIII
+SELECT path_kind, min_depth, max_depth, abi_version FROM graph.__pgq_path_catalog
+WHERE path_kind IN ('transitive_closure', 'tc_witness', 'tc_chain') ORDER BY ALL;
+----
+tc_chain	1	3	1
+tc_witness	1	3	1
+transitive_closure	1	3	1
+
+statement ok
+SET pgq_require_abi_paths = true;
+
+query I
+FROM GRAPH_TABLE (g MATCH (a:Person)-[:parentOf]->{1,3}(b:Person) WHERE a.id = 1 COLUMNS (b.id AS b)) ORDER BY ALL;
+----
+2
+3
+4
+
+query II
+FROM GRAPH_TABLE (g MATCH (a:Person)-[k:knows]->(b:Person)-[l:livesIn]->(c:City) COLUMNS (a.id AS a, c.id AS c)) ORDER BY ALL;
+----
+1	100
+2	101
+3	101
+
+statement ok
+SET pgq_require_abi_paths = false;
+
+# ---------------------------------------------------------------------------------------------------------------------
+# A narrower build drops what it no longer produces; max_rows leaves oversized chains out instead of trimming them
+# ---------------------------------------------------------------------------------------------------------------------
+
+query III
+SELECT artifact, status, detail FROM pgq_abi_build('g', max_hops := 2, exclude_self_referential := false, max_rows := 2)
+WHERE status = 'skipped' OR kind = 'cleanup' ORDER BY ALL;
+----
+__pg_g__Person__hasInterest__Tag	skipped	estimated 3 rows > max_rows 2
+__pg_g__Person__knows__Person	skipped	estimated 3 rows > max_rows 2
+__pg_g__Person__knows__Person__livesIn__City	skipped	estimated 3 rows > max_rows 2
+__pg_g__Person__livesIn__City	skipped	estimated 4 rows > max_rows 2
+__pg_g__Person__parentOf__Person	skipped	estimated 3 rows > max_rows 2
+__pg_g__Person__parentOf__Person__livesIn__City	skipped	estimated 3 rows > max_rows 2
+obsolete artifacts	built	NULL
+
+query I
+SELECT count(*) FROM information_schema.tables WHERE table_name IN (
+    '__pg_g__tc__Person__parentOf', '__pg_g__branch__Person__hasInterest__livesIn', '__pg_g__Person__livesIn__City',
+    '__pg_g__Person__hasInterest__Tag__rev');
+----
+0
+
+query I
+SELECT count(*) FROM pgq_abi_status('g') WHERE NOT table_exists;
+----
+0
+
+# ---------------------------------------------------------------------------------------------------------------------
+# pgq_abi_drop, then a failing build: the graph is unregistered, never left pointing at a missing table
+# ---------------------------------------------------------------------------------------------------------------------
+
+query I
+SELECT count(*) > 0 FROM pgq_abi_drop('g') WHERE status = 'dropped';
+----
+true
+
+query I
+SELECT count(*) FROM pgq_abi_status('g');
+----
+0
+
+query I
+SELECT count(*) FROM information_schema.tables WHERE table_name LIKE '__pg_g__%';
+----
+0
+
+statement ok
+FROM pgq_abi_build('g');
+
+statement error
+FROM pgq_abi_build('g', cover := MAP {'hasInterest': ['no_such_column']});
+----
+ABI build of g failed
+
+query I
+SELECT count(*) FROM pgq_abi_status('g');
+----
+0
+
+statement ok
+SET pgq_require_abi_paths = true;
+
+statement error
+FROM GRAPH_TABLE (g MATCH (a:Person)-[h:hasInterest]->(t:Tag) COLUMNS (a.id AS a));
+----
+pgq_abi_build
+
+statement ok
+SET pgq_require_abi_paths = false;
+
+statement error
+FROM pgq_abi_build('g', closures := ['hasInterest']);
+----
+needs a self-referential edge
+
+statement error
+FROM pgq_abi_build('g', no_such_option := 1);
+----
+<REGEX>:.*no_such_option.*
+
+# ---------------------------------------------------------------------------------------------------------------------
+# WITH ABI declares what to build; declaring builds nothing. It survives a restart, and a call overrides it.
+# ---------------------------------------------------------------------------------------------------------------------
+
+statement ok
+CREATE PROPERTY GRAPH h
+VERTEX TABLES (Person LABEL Person, City LABEL City)
+EDGE TABLES (
+    livesIn SOURCE KEY (personId) REFERENCES Person (id) DESTINATION KEY (cityId) REFERENCES City (id) LABEL livesIn,
+    parentOf SOURCE KEY (child) REFERENCES Person (id) DESTINATION KEY (parent) REFERENCES Person (id) LABEL parentOf
+)
+WITH ABI (schema := 'abi_h', closures := ['parentOf'], closure_witness := false);
+
+query I
+SELECT count(*) FROM pgq_abi_status('h');
+----
+0
+
+restart
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+query II
+SELECT artifact, kind FROM pgq_abi_build('h') WHERE kind <> 'catalog' ORDER BY ALL;
+----
+__pg_h__Person__livesIn__City	edge
+__pg_h__Person__parentOf__Person	edge
+__pg_h__tc__Person__parentOf	transitive_closure
+
+query I
+SELECT DISTINCT schema FROM pgq_abi_status('h');
+----
+abi_h
+
+query II
+SELECT artifact, kind FROM pgq_abi_build('h', closures := []) WHERE kind <> 'catalog' ORDER BY ALL;
+----
+__pg_h__Person__livesIn__City	edge
+__pg_h__Person__parentOf__Person	edge
+obsolete artifacts	cleanup
+
+# ---------------------------------------------------------------------------------------------------------------------
+# pgq_abi_mode
+# ---------------------------------------------------------------------------------------------------------------------
+
+# 'auto' builds at CREATE when the graph has no artifacts, within pgq_abi_auto_max_rows per artifact
+statement ok
+SET pgq_abi_mode = 'auto';
+
+statement ok
+SET pgq_abi_auto_max_rows = 3;
+
+statement ok
+CREATE PROPERTY GRAPH a
+VERTEX TABLES (Person LABEL Person, City LABEL City)
+EDGE TABLES (
+    livesIn SOURCE KEY (personId) REFERENCES Person (id) DESTINATION KEY (cityId) REFERENCES City (id) LABEL livesIn,
+    knows SOURCE KEY (src) REFERENCES Person (id) DESTINATION KEY (dst) REFERENCES Person (id) LABEL knows
+);
+
+query I
+SELECT artifact FROM pgq_abi_status('a') ORDER BY ALL;
+----
+__pg_a__Person__knows__Person
+
+# A graph that already has artifacts is consumed as it is
+statement ok
+SET pgq_abi_auto_max_rows = 100;
+
+statement ok
+CREATE OR REPLACE PROPERTY GRAPH a
+VERTEX TABLES (Person LABEL Person, City LABEL City)
+EDGE TABLES (
+    livesIn SOURCE KEY (personId) REFERENCES Person (id) DESTINATION KEY (cityId) REFERENCES City (id) LABEL livesIn,
+    knows SOURCE KEY (src) REFERENCES Person (id) DESTINATION KEY (dst) REFERENCES Person (id) LABEL knows
+);
+
+query I
+SELECT count(*) FROM pgq_abi_status('a');
+----
+1
+
+# 'off' ignores artifacts
+statement ok
+SET pgq_abi_mode = 'off';
+
+statement ok
+SET pgq_require_abi_paths = true;
+
+statement error
+FROM GRAPH_TABLE (a MATCH (p:Person)-[k:knows]->(q:Person) COLUMNS (p.id));
+----
+pgq_require_abi_paths
+
+statement ok
+SET pgq_abi_mode = 'consume';
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (a MATCH (p:Person)-[k:knows]->(q:Person) COLUMNS (p.id));
+----
+3

@@ -1,3 +1,5 @@
+#include "duckpgq/core/functions/table/abi_build.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckpgq/core/functions/table/create_property_graph.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
@@ -482,6 +484,8 @@ void CreatePropertyGraphFunction::CreatePropertyGraphFunc(ClientContext &context
 
 	auto graph_catalog = pg_info->GetQualifiedName().Catalog().GetIdentifierName();
 	auto graph_schema = pg_info->GetQualifiedName().Schema().GetIdentifierName();
+	const string abi_options_sql =
+	    pg_info->abi_options.empty() ? string("NULL") : KeywordHelper::WriteQuoted(pg_info->abi_options, '\'');
 	string insert_info = "INSERT INTO __duckpgq_internal VALUES ";
 	for (const auto &v_table : pg_info->vertex_tables) {
 		insert_info += "(";
@@ -523,6 +527,7 @@ void CreatePropertyGraphFunction::CreatePropertyGraphFunc(ClientContext &context
 		insert_info += "], "; // End of column aliases
 		insert_info += "'" + graph_catalog + "', '" + graph_schema + "', ";
 		insert_info += pg_info->verified ? "true" : "false";
+		insert_info += ", " + abi_options_sql;
 		insert_info += "), ";
 	}
 
@@ -585,12 +590,15 @@ void CreatePropertyGraphFunction::CreatePropertyGraphFunc(ClientContext &context
 		insert_info += "], "; // End of column aliases
 		insert_info += "'" + graph_catalog + "', '" + graph_schema + "', ";
 		insert_info += pg_info->verified ? "true" : "false";
+		insert_info += ", " + abi_options_sql;
 		insert_info += "), ";
 	}
 	auto insert_query = new_conn->Query(insert_info);
 	if (insert_query->HasError()) {
 		throw TransactionException(insert_query->GetError());
 	}
+	// pgq_abi_mode = 'auto' builds the graph's artifacts now, when that is safe; other modes leave it to pgq_abi_build.
+	PGQAutoBuildAbi(context, *pg_info);
 }
 
 //------------------------------------------------------------------------------

@@ -1897,8 +1897,13 @@ static bool RequireABIPaths(ClientContext &context) {
 // a query both ways and confirm the fast path equals the reference traversal.
 static bool DisableABIRewrite(ClientContext &context) {
 	Value value;
-	auto result = context.TryGetCurrentSetting("pgq_disable_abi_rewrite", value);
-	return result && !value.IsNull() && value.GetValue<bool>();
+	if (context.TryGetCurrentSetting("pgq_disable_abi_rewrite", value) && !value.IsNull() && value.GetValue<bool>()) {
+		return true;
+	}
+	// pgq_abi_mode = 'off': artifacts are ignored altogether.
+	Value mode;
+	return context.TryGetCurrentSetting("pgq_abi_mode", mode) && !mode.IsNull() &&
+	       StringUtil::CIEquals(mode.ToString(), "off");
 }
 
 //! Refuse a rowid-addressed traversal whose edge spans two different vertex tables.
@@ -1946,7 +1951,8 @@ static void RejectCrossTableCSR(const shared_ptr<PropertyGraphTable> &edge_table
 static void ThrowABIPathRequired() {
 	throw BinderException(
 	    "DuckPGQ ABI path required by pgq_require_abi_paths, but no matching ABI path table rewrite was available. "
-	    "Generate the required ABI path metadata/table or SET pgq_require_abi_paths=false to allow fallback traversal.");
+	    "Build the graph's ABI artifacts (FROM pgq_abi_build('<graph>')), or SET pgq_require_abi_paths=false to "
+	    "allow fallback traversal.");
 }
 
 //! The connection's CSR id allocator. Returned by reference: the state object is owned by

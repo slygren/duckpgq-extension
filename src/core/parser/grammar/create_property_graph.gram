@@ -2,7 +2,11 @@
 # Built-in rules are referenced directly; no DuckDB grammar is copied here.
 # Keep each rule on one line; CMake embeds them in a header at configure time.
 
-DuckPGQCreatePropertyGraph <- 'CREATE' OrReplace? 'PROPERTY' 'GRAPH' IfNotExists? QualifiedName DuckPGQVertexTables DuckPGQEdgeTables?
+DuckPGQCreatePropertyGraph <- 'CREATE' OrReplace? 'PROPERTY' 'GRAPH' IfNotExists? QualifiedName DuckPGQVertexTables DuckPGQEdgeTables? DuckPGQAbiClause?
+
+# What pgq_abi_build builds for the graph, with the option names of pgq_abi_build. Declaring it builds nothing.
+DuckPGQAbiClause <- 'WITH' 'ABI' Parens(List(DuckPGQAbiOption))
+DuckPGQAbiOption <- ColId NamedParameterAssignment Expression
 
 # Vertex and edge tables.
 DuckPGQVertexTables <- 'VERTEX' 'TABLES' Parens(List(DuckPGQVertexTable))
