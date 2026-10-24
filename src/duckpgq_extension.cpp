@@ -47,6 +47,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    "writable. 'off': ignore artifacts.",
 		    LogicalType::VARCHAR, Value("consume"), nullptr, SetScope::SESSION);
 	}
+	if (!config.HasExtensionOption("pgq_abi_on_stale")) {
+		config.AddExtensionOption(
+		    "pgq_abi_on_stale",
+		    "An ABI artifact built from DuckLake tables that changed afterwards is stale. 'skip' (default): leave it out "
+		    "and traverse. 'use': use it anyway.",
+		    LogicalType::VARCHAR, Value("skip"), nullptr, SetScope::SESSION);
+	}
 	if (!config.HasExtensionOption("pgq_abi_auto_max_rows")) {
 		config.AddExtensionOption(
 		    "pgq_abi_auto_max_rows",

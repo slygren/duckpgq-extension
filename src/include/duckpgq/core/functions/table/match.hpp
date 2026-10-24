@@ -60,6 +60,9 @@ struct PGQPathTableInfo {
 	//! false for artifacts predating the probe, which keeps walk mode on the bridge.
 	bool preserves_multiplicity = false;
 	bool from_metadata = false;
+	//! Provenance recorded by pgq_abi_build for artifacts computed from DuckLake tables (see abi_build.hpp)
+	string source_snapshot;
+	string source_tables;
 };
 
 using PGQPathTableCatalog = case_insensitive_map_t<PGQPathTableInfo>;
@@ -136,6 +139,11 @@ struct PGQPathTableCache {
 	//! Catalog-derived and therefore safe to share via the ObjectCache; the session-scoped
 	//! budget it is compared against is threaded in separately, never cached here.
 	case_insensitive_map_t<int64_t> edge_label_rows;
+	//! The lakes some artifact's freshness depends on, at the snapshot this cache was built against. When one has
+	//! moved on, the cache is rebuilt so that artifacts whose sources changed are left out again.
+	case_insensitive_map_t<int64_t> tracked_snapshots;
+	//! Artifacts left out because their sources changed after they were built
+	vector<string> stale_artifacts;
 };
 
 //! A resolved ABI artifact reference. For an `edge` artifact the vertex keys live in

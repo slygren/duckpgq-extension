@@ -88,6 +88,25 @@ PGQAbiOptions PGQAbiOptionsForGraph(ClientContext &context, const CreateProperty
 //! Generate the build for `pg_info`. Reads catalog metadata only; executes nothing.
 PGQAbiPlan PGQPlanAbiBuild(ClientContext &context, const CreatePropertyGraphInfo &pg_info, const PGQAbiOptions &options);
 
+//! Provenance of one artifact, as __pgq_path_catalog records it for artifacts built from DuckLake tables:
+//! source_snapshot "catalog=snapshot_id;..." and source_tables "catalog.schema.table,...". Both empty for
+//! artifacts built elsewhere (plain DuckDB tables, or by an older generator), whose freshness cannot be judged.
+struct PGQArtifactProvenance {
+	string name;
+	string source_snapshot;
+	string source_tables;
+};
+
+//! The artifacts whose DuckLake source tables changed after they were built. One metadata query per lake.
+case_insensitive_set_t PGQFindStaleArtifacts(ClientContext &context, const vector<PGQArtifactProvenance> &artifacts);
+
+//! The lakes the artifacts' provenance refers to, with their current snapshot (-1 when it cannot be read).
+case_insensitive_map_t<int64_t> PGQProvenanceSnapshots(ClientContext &context,
+                                                      const vector<PGQArtifactProvenance> &artifacts);
+
+//! Current snapshot of each named DuckLake catalog (-1 when it cannot be read).
+case_insensitive_map_t<int64_t> PGQCurrentSnapshots(ClientContext &context, const case_insensitive_set_t &catalogs);
+
 //! pgq_abi_mode = 'auto': build the graph's artifacts right after CREATE PROPERTY GRAPH when that is safe -- the graph
 //! has no artifacts yet and its target database is writable -- within pgq_abi_auto_max_rows per artifact. Returns
 //! a one-line summary of what happened, or an empty string when nothing was attempted.

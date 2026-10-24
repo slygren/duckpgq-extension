@@ -1,6 +1,7 @@
 #include <duckpgq_extension.hpp>
 #include "duckpgq/core/functions/table/match.hpp"
 #include "duckpgq/core/functions/table/vertex_elimination.hpp"
+#include "duckpgq/core/functions/table/abi_build.hpp"
 #include "duckpgq/core/utils/duckpgq_identifier.hpp"
 #include "duckpgq/core/parser/duckpgq_grammar.hpp"
 
@@ -207,6 +208,8 @@ static case_insensitive_set_t LatestPathCatalogColumns() {
 	columns.insert("covered_target_properties");
 	columns.insert("is_sorted_by_v1");
 	columns.insert("preserves_multiplicity");
+	columns.insert("source_snapshot");
+	columns.insert("source_tables");
 	return columns;
 }
 
@@ -418,35 +421,45 @@ static void LoadPathTableCatalogMetadata(Connection &connection, const string &c
                                          const string &graph_name, PGQPathTableCatalog &path_table_catalog,
                                          bool assume_latest_columns = false) {
 	const string catalog_table = QualifiedPathTableName(catalog_name, schema_name, "__pgq_path_catalog");
-	const auto columns = assume_latest_columns ? LatestPathCatalogColumns()
-	                                           : LoadCatalogTableColumns(connection, catalog_name, schema_name,
-	                                                                     "__pgq_path_catalog");
-	const string query = StringUtil::Format(
-	    "SELECT path_table_name, path_kind, "
-	    "       CAST(hop_count AS BIGINT) AS hop_count, "
-	    "       src_label, dst_label, vertex_label_sequence, edge_label_sequence, "
-	    "       supports_one_row_per_step, is_deduplicated, "
-	    "       CAST(estimated_rows AS BIGINT) AS estimated_rows, "
-	    "       is_sorted_by_v0, "
-	    "       CAST(min_depth AS BIGINT) AS min_depth, "
-	    "       CAST(max_depth AS BIGINT) AS max_depth, "
-	    "       bridge_table_names, "
-	    "       %s, %s, %s, %s, %s, %s, %s, %s "
-	    "FROM %s WHERE lower(graph_name) = lower(%s)",
-	    OptionalStringCatalogColumn(columns, "semantic_grain", "identity"),
-	    OptionalStringCatalogColumn(columns, "temporal_mode", "snapshot"),
-	    OptionalStringCatalogColumn(columns, "multiplicity_mode", "unknown"),
-	    OptionalStringCatalogColumn(columns, "property_support", "unknown"),
-	    OptionalStringCatalogColumn(columns, "freshness_policy", "unknown"),
-	    OptionalStringCatalogColumn(columns, "covered_target_properties", ""),
-	    OptionalBoolCatalogColumn(columns, "is_sorted_by_v1", false),
-	    // Absent column defaults to FALSE: an artifact that has not been *proven* to
-	    // preserve edge multiplicity must not be substituted into walk-mode traversal.
-	    // Erring to false costs performance; erring to true would change answers.
-	    OptionalBoolCatalogColumn(columns, "preserves_multiplicity", false),
-	    catalog_table, KeywordHelper::WriteQuoted(graph_name, '\''));
+	auto columns = assume_latest_columns ? LatestPathCatalogColumns()
+	                                     : LoadCatalogTableColumns(connection, catalog_name, schema_name,
+	                                                               "__pgq_path_catalog");
+	auto build_query = [&](const case_insensitive_set_t &columns) {
+		return StringUtil::Format(
+		    "SELECT path_table_name, path_kind, "
+		    "       CAST(hop_count AS BIGINT) AS hop_count, "
+		    "       src_label, dst_label, vertex_label_sequence, edge_label_sequence, "
+		    "       supports_one_row_per_step, is_deduplicated, "
+		    "       CAST(estimated_rows AS BIGINT) AS estimated_rows, "
+		    "       is_sorted_by_v0, "
+		    "       CAST(min_depth AS BIGINT) AS min_depth, "
+		    "       CAST(max_depth AS BIGINT) AS max_depth, "
+		    "       bridge_table_names, "
+		    "       %s, %s, %s, %s, %s, %s, %s, %s, %s, %s "
+		    "FROM %s WHERE lower(graph_name) = lower(%s)",
+		    OptionalStringCatalogColumn(columns, "semantic_grain", "identity"),
+		    OptionalStringCatalogColumn(columns, "temporal_mode", "snapshot"),
+		    OptionalStringCatalogColumn(columns, "multiplicity_mode", "unknown"),
+		    OptionalStringCatalogColumn(columns, "property_support", "unknown"),
+		    OptionalStringCatalogColumn(columns, "freshness_policy", "unknown"),
+		    OptionalStringCatalogColumn(columns, "covered_target_properties", ""),
+		    OptionalBoolCatalogColumn(columns, "is_sorted_by_v1", false),
+		    // Absent column defaults to FALSE: an artifact that has not been *proven* to
+		    // preserve edge multiplicity must not be substituted into walk-mode traversal.
+		    // Erring to false costs performance; erring to true would change answers.
+		    OptionalBoolCatalogColumn(columns, "preserves_multiplicity", false),
+		    OptionalStringCatalogColumn(columns, "source_snapshot", ""),
+		    OptionalStringCatalogColumn(columns, "source_tables", ""), catalog_table,
+		    KeywordHelper::WriteQuoted(graph_name, '\''));
+	};
 
-	auto query_result = connection.Query(query);
+	auto query_result = connection.Query(build_query(columns));
+	if (assume_latest_columns && (!query_result || query_result->HasError())) {
+		// A catalog written by the layout compiler or an older pgq_abi_build has no provenance columns.
+		columns.erase("source_snapshot");
+		columns.erase("source_tables");
+		query_result = connection.Query(build_query(columns));
+	}
 	if (!query_result || query_result->HasError()) {
 		return;
 	}
@@ -478,6 +491,8 @@ static void LoadPathTableCatalogMetadata(Connection &connection, const string &c
 		info.covered_target_properties = GetOptionalString(materialized_result, 19, row_idx);
 		info.is_sorted_by_v1 = GetOptionalBool(materialized_result, 20, row_idx);
 		info.preserves_multiplicity = GetOptionalBool(materialized_result, 21, row_idx);
+		info.source_snapshot = GetOptionalString(materialized_result, 22, row_idx);
+		info.source_tables = GetOptionalString(materialized_result, 23, row_idx);
 		info.from_metadata = true;
 		AddPathTableInfo(path_table_catalog, std::move(info));
 	}
@@ -719,6 +734,29 @@ static shared_ptr<PGQPathTableCache> BuildPathTableCache(ClientContext &context,
 		                                       pg_table ? GraphDatabaseNames(context, *pg_table) : case_insensitive_set_t());
 	}
 
+	// Artifacts whose DuckLake sources changed after they were built answer differently from the tables they were
+	// built from. Leave them out (the query traverses instead) unless pgq_abi_on_stale = 'use'.
+	{
+		vector<PGQArtifactProvenance> tracked;
+		for (const auto &entry : cache->catalog) {
+			if (!entry.second.source_snapshot.empty()) {
+				tracked.push_back({entry.first, entry.second.source_snapshot, entry.second.source_tables});
+			}
+		}
+		if (!tracked.empty()) {
+			cache->tracked_snapshots = PGQProvenanceSnapshots(context, tracked);
+			Value on_stale;
+			const bool use_stale = context.TryGetCurrentSetting("pgq_abi_on_stale", on_stale) && !on_stale.IsNull() &&
+			                       StringUtil::CIEquals(on_stale.ToString(), "use");
+			if (!use_stale) {
+				for (const auto &name : PGQFindStaleArtifacts(context, tracked)) {
+					cache->catalog.erase(name);
+					cache->stale_artifacts.push_back(name);
+				}
+			}
+		}
+	}
+
 	// Bare artifact names seen more than once, across different databases. Two attached
 	// snapshots carry the same names, and neither is the right answer for a lookup that only
 	// knows the name -- so such a name resolves to nothing and the bridge is used instead.
@@ -869,6 +907,26 @@ static string ComputePathCatalogFingerprint(ClientContext &context, const string
 	return fingerprint;
 }
 
+//! A cache that depends on lakes' snapshots is valid while none of them has moved on. One cheap metadata query per
+//! lake, and none at all for artifacts without provenance (frozen lakes built by the layout compiler).
+static bool TrackedSnapshotsUnchanged(ClientContext &context, const PGQPathTableCache &cache) {
+	if (cache.tracked_snapshots.empty()) {
+		return true;
+	}
+	case_insensitive_set_t catalogs;
+	for (auto &entry : cache.tracked_snapshots) {
+		catalogs.insert(entry.first);
+	}
+	auto current = PGQCurrentSnapshots(context, catalogs);
+	for (auto &entry : cache.tracked_snapshots) {
+		auto now = current.find(entry.first);
+		if (now == current.end() || now->second != entry.second) {
+			return false;
+		}
+	}
+	return true;
+}
+
 static shared_ptr<PGQPathTableCache> GetPathTableCache(ClientContext &context, DuckPGQState &duckpgq_state,
                                                        const string &graph_name,
                                                        const CreatePropertyGraphInfo *pg_table = nullptr) {
@@ -878,7 +936,10 @@ static shared_ptr<PGQPathTableCache> GetPathTableCache(ClientContext &context, D
 	// repeated queries on the same connection.
 	auto entry = duckpgq_state.path_table_caches.find(graph_name);
 	if (entry != duckpgq_state.path_table_caches.end()) {
-		return entry->second;
+		if (TrackedSnapshotsUnchanged(context, *entry->second)) {
+			return entry->second;
+		}
+		duckpgq_state.path_table_caches.erase(entry);
 	}
 
 	// L2: database-instance ObjectCache, shared across connections. A fresh connection
@@ -890,7 +951,7 @@ static shared_ptr<PGQPathTableCache> GetPathTableCache(ClientContext &context, D
 	const string object_key = "duckpgq_ptc:" + graph_name;
 	if (!fingerprint.empty()) {
 		auto shared = object_cache.Get<PGQPathTableCacheEntry>(object_key);
-		if (shared && shared->fingerprint == fingerprint) {
+		if (shared && shared->fingerprint == fingerprint && TrackedSnapshotsUnchanged(context, *shared->cache)) {
 			duckpgq_state.path_table_caches[graph_name] = shared->cache;
 			return shared->cache;
 		}

@@ -86,7 +86,9 @@ const vector<pair<string, string>> &PathCatalogColumns() {
 	                                                   {"preserves_multiplicity", "BOOLEAN"},
 	                                                   {"abi_version", "INTEGER"},
 	                                                   {"graph_fingerprint", "VARCHAR"},
-	                                                   {"built_by", "VARCHAR"}};
+	                                                   {"built_by", "VARCHAR"},
+	                                                   {"source_snapshot", "VARCHAR"},
+	                                                   {"source_tables", "VARCHAR"}};
 	return columns;
 }
 
@@ -150,6 +152,8 @@ struct CatalogRow {
 	string covered_target_properties;
 	//! Row-level metadata; wins over every default
 	case_insensitive_map_t<string> metadata;
+	//! The tables the artifact is computed from
+	vector<shared_ptr<PropertyGraphTable>> sources;
 	string multiplicity_probe = "false";
 };
 
@@ -527,6 +531,12 @@ private:
 		row.bridge_table_names = JoinStrings(bridges, ",");
 		row.metadata["domain"] = JoinStrings(domains, ",");
 		row.covered_target_properties = JoinStrings(covered_groups, ";");
+		for (auto index : sequence) {
+			row.sources.push_back(edges[index].table);
+		}
+		if (!covered_groups.empty()) {
+			row.sources.push_back(FindVertex(first.dst_label)->table);
+		}
 		if (!covered_groups.empty()) {
 			row.metadata["property_support"] = "covering_path";
 		}
@@ -568,6 +578,7 @@ private:
 		for (auto &entry : closure.metadata) {
 			row.metadata[entry.first] = entry.second;
 		}
+		row.sources.push_back(edge.table);
 		return row;
 	}
 
@@ -682,6 +693,10 @@ private:
 		for (auto &entry : branch.metadata) {
 			row.metadata[entry.first] = entry.second;
 		}
+		row.sources.push_back(anchor->table);
+		for (auto &label : branch.branches) {
+			row.sources.push_back(RequireEdge(label, "a branch summary").table);
+		}
 		rows.push_back(std::move(row));
 	}
 
@@ -741,6 +756,52 @@ private:
 		return StringUtil::Format("%016llx", static_cast<unsigned long long>(Hash(text.c_str(), text.size())));
 	}
 
+	string SourceCatalog(const PropertyGraphTable &table) const {
+		return PGQStr(table.catalog_name).empty() ? PGQStr(DatabaseManager::GetDefaultDatabase(context))
+		                                          : PGQStr(table.catalog_name);
+	}
+
+	//! Provenance is recorded only for artifacts computed from DuckLake tables: a lake's snapshots say what changed
+	//! since, nothing else does. The snapshot is the one before the build reads anything.
+	void Provenance(const CatalogRow &row, string &source_snapshot, string &source_tables) {
+		vector<string> snapshots;
+		vector<string> tables;
+		case_insensitive_set_t seen_catalogs;
+		for (auto &table : row.sources) {
+			auto catalog = SourceCatalog(*table);
+			auto database = DatabaseManager::Get(context).GetDatabase(context, Identifier(catalog));
+			if (!database || !StringUtil::CIEquals(database->GetCatalog().GetCatalogType(), "ducklake")) {
+				// One source outside a lake makes the artifact's freshness unknowable.
+				source_snapshot.clear();
+				source_tables.clear();
+				return;
+			}
+			auto schema = PGQStr(table->schema_name).empty() ? string("main") : PGQStr(table->schema_name);
+			tables.push_back(catalog + "." + schema + "." + PGQStr(table->table_name));
+			if (seen_catalogs.insert(catalog).second) {
+				auto snapshot = SnapshotOf(catalog);
+				if (snapshot < 0) {
+					return;
+				}
+				snapshots.push_back(catalog + "=" + to_string(snapshot));
+			}
+		}
+		source_snapshot = JoinStrings(snapshots, ";");
+		source_tables = JoinStrings(tables, ",");
+	}
+
+	int64_t SnapshotOf(const string &catalog) {
+		auto entry = snapshot_cache.find(catalog);
+		if (entry != snapshot_cache.end()) {
+			return entry->second;
+		}
+		case_insensitive_set_t catalogs {catalog};
+		auto snapshots = PGQCurrentSnapshots(context, catalogs);
+		auto snapshot = snapshots.count(catalog) ? snapshots[catalog] : -1;
+		snapshot_cache[catalog] = snapshot;
+		return snapshot;
+	}
+
 	optional_ptr<TableCatalogEntry> ExistingCatalogTable() {
 		return Catalog::GetEntry<TableCatalogEntry>(
 		    context, QualifiedName(Identifier(plan.target_catalog), Identifier(plan.target_schema),
@@ -776,6 +837,9 @@ private:
 		const auto fingerprint = GraphFingerprint();
 		vector<string> selects;
 		for (auto &row : rows) {
+			string source_snapshot;
+			string source_tables;
+			Provenance(row, source_snapshot, source_tables);
 			auto boolean = [](bool value) {
 				return string(value ? "true" : "false");
 			};
@@ -798,7 +862,9 @@ private:
 			    Literal(row.metadata["domain"]) + " AS domain, " + Literal(row.covered_target_properties) +
 			    " AS covered_target_properties, " + row.multiplicity_probe + " AS preserves_multiplicity, " +
 			    to_string(PGQ_ABI_VERSION) + " AS abi_version, " + Literal(fingerprint) +
-			    " AS graph_fingerprint, 'pgq_abi_build' AS built_by");
+			    " AS graph_fingerprint, 'pgq_abi_build' AS built_by, " +
+			    (source_snapshot.empty() ? string("NULL") : Literal(source_snapshot)) + " AS source_snapshot, " +
+			    (source_tables.empty() ? string("NULL") : Literal(source_tables)) + " AS source_tables");
 		}
 		step.statements.push_back("INSERT INTO " + catalog_table + " BY NAME\n" + JoinStrings(selects, "\nUNION ALL\n"));
 	}
@@ -849,6 +915,7 @@ private:
 	bool is_ducklake = false;
 	PGQAbiPlan plan;
 	unique_ptr<Connection> estimate_connection;
+	case_insensitive_map_t<int64_t> snapshot_cache;
 };
 
 //------------------------------------------------------------------------------
@@ -1365,25 +1432,30 @@ unique_ptr<FunctionData> AbiStatusBind(ClientContext &context, TableFunctionBind
                                        vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto &pg_info = BindGraph(context, input.inputs[0]);
 	auto result = make_uniq<AbiSqlBindData>();
-	names = {Identifier("catalog"),        Identifier("schema"),          Identifier("artifact"),
-	         Identifier("kind"),           Identifier("hop_count"),       Identifier("estimated_rows"),
-	         Identifier("last_refreshed_at"), Identifier("built_by"),     Identifier("table_exists")};
-	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                LogicalType::VARCHAR, LogicalType::BIGINT,  LogicalType::BIGINT,
-	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN};
+	names = {Identifier("catalog"),           Identifier("schema"),   Identifier("artifact"),
+	         Identifier("kind"),              Identifier("hop_count"), Identifier("estimated_rows"),
+	         Identifier("last_refreshed_at"), Identifier("built_by"),  Identifier("table_exists"),
+	         Identifier("fresh")};
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::BOOLEAN, LogicalType::BOOLEAN};
 	Connection connection(*context.db);
+	vector<PGQArtifactProvenance> tracked;
 	for (auto &location : GraphArtifactCatalogs(context, connection, pg_info)) {
 		auto catalog_table = TableSql(location.catalog, location.schema, "__pgq_path_catalog");
 		auto existing = Catalog::GetEntry<TableCatalogEntry>(
 		    context, QualifiedName(Identifier(location.catalog), Identifier(location.schema),
 		                          Identifier("__pgq_path_catalog")),
 		    OnEntryNotFound::RETURN_NULL);
-		const string built_by =
-		    existing && existing->ColumnExists(Identifier("built_by")) ? "CAST(built_by AS VARCHAR)" : "NULL";
+		auto optional_column = [&](const string &column) {
+			return existing && existing->ColumnExists(Identifier(column)) ? "CAST(" + column + " AS VARCHAR)"
+			                                                              : string("NULL");
+		};
 		auto listed = connection.Query(
 		    "SELECT path_table_name, path_kind, CAST(hop_count AS BIGINT), CAST(estimated_rows AS BIGINT), "
 		    "CAST(last_refreshed_at AS VARCHAR), " +
-		    built_by + " FROM " + catalog_table + " WHERE lower(graph_name) = lower(" +
+		    optional_column("built_by") + ", " + optional_column("source_snapshot") + ", " +
+		    optional_column("source_tables") + " FROM " + catalog_table + " WHERE lower(graph_name) = lower(" +
 		    Literal(pg_info.property_graph_name) + ") ORDER BY path_kind, path_table_name");
 		if (!listed || listed->HasError()) {
 			continue;
@@ -1394,15 +1466,170 @@ unique_ptr<FunctionData> AbiStatusBind(ClientContext &context, TableFunctionBind
 			auto table = Catalog::GetEntry<TableCatalogEntry>(
 			    context, QualifiedName(Identifier(location.catalog), Identifier(location.schema), Identifier(name)),
 			    OnEntryNotFound::RETURN_NULL);
+			auto snapshot = rows.GetValue(6, i);
+			// fresh stays NULL where freshness cannot be judged: no provenance
+			Value fresh;
+			if (!snapshot.IsNull() && !snapshot.ToString().empty()) {
+				tracked.push_back({name, snapshot.ToString(), rows.GetValue(7, i).ToString()});
+				fresh = Value::BOOLEAN(true);
+			}
 			result->rows.push_back({Value(location.catalog), Value(location.schema), Value(name), rows.GetValue(1, i),
 			                        rows.GetValue(2, i), rows.GetValue(3, i), rows.GetValue(4, i),
-			                        rows.GetValue(5, i), Value::BOOLEAN(table != nullptr)});
+			                        rows.GetValue(5, i), Value::BOOLEAN(table != nullptr), fresh});
+		}
+	}
+	if (!tracked.empty()) {
+		auto stale = PGQFindStaleArtifacts(context, tracked);
+		for (auto &row : result->rows) {
+			if (!row[9].IsNull() && stale.count(row[2].ToString())) {
+				row[9] = Value::BOOLEAN(false);
+			}
 		}
 	}
 	return std::move(result);
 }
 
 } // namespace
+
+//------------------------------------------------------------------------------
+// Freshness
+//------------------------------------------------------------------------------
+namespace {
+
+//! "f001=12;f002=7" -> {f001: 12, f002: 7}
+case_insensitive_map_t<int64_t> ParseSnapshots(const string &text) {
+	case_insensitive_map_t<int64_t> result;
+	for (auto &part : StringUtil::Split(text, ';')) {
+		auto position = part.rfind('=');
+		if (position == string::npos) {
+			continue;
+		}
+		try {
+			result[part.substr(0, position)] = std::stoll(part.substr(position + 1));
+		} catch (...) {
+		}
+	}
+	return result;
+}
+
+//! "f001.bridge.t1,f001.dim.t2" -> catalog -> lower-case table names
+case_insensitive_map_t<case_insensitive_set_t> ParseSourceTables(const string &text) {
+	case_insensitive_map_t<case_insensitive_set_t> result;
+	for (auto &part : StringUtil::Split(text, ',')) {
+		auto names = StringUtil::Split(part, '.');
+		if (names.size() == 3) {
+			result[names[0]].insert(names[2]);
+		}
+	}
+	return result;
+}
+
+} // namespace
+
+case_insensitive_map_t<int64_t> PGQCurrentSnapshots(ClientContext &context, const case_insensitive_set_t &catalogs) {
+	case_insensitive_map_t<int64_t> result;
+	if (catalogs.empty()) {
+		return result;
+	}
+	Connection connection(*context.db);
+	for (auto &catalog : catalogs) {
+		result[catalog] = -1;
+		auto query = connection.Query("SELECT id FROM ducklake_current_snapshot(" + Literal(catalog) + ")");
+		if (!query || query->HasError()) {
+			continue;
+		}
+		PGQMaterializedResult rows(*query);
+		if (rows.RowCount() > 0 && !rows.GetValue(0, 0).IsNull()) {
+			result[catalog] = rows.GetValue(0, 0).GetValue<int64_t>();
+		}
+	}
+	return result;
+}
+
+case_insensitive_map_t<int64_t> PGQProvenanceSnapshots(ClientContext &context,
+                                                      const vector<PGQArtifactProvenance> &artifacts) {
+	case_insensitive_set_t catalogs;
+	for (auto &artifact : artifacts) {
+		for (auto &entry : ParseSnapshots(artifact.source_snapshot)) {
+			catalogs.insert(entry.first);
+		}
+	}
+	return PGQCurrentSnapshots(context, catalogs);
+}
+
+case_insensitive_set_t PGQFindStaleArtifacts(ClientContext &context, const vector<PGQArtifactProvenance> &artifacts) {
+	case_insensitive_set_t stale;
+	// Per lake: the oldest snapshot any artifact was built at; every change after it is read once.
+	case_insensitive_map_t<int64_t> oldest;
+	for (auto &artifact : artifacts) {
+		for (auto &entry : ParseSnapshots(artifact.source_snapshot)) {
+			auto existing = oldest.find(entry.first);
+			if (existing == oldest.end() || entry.second < existing->second) {
+				oldest[entry.first] = entry.second;
+			}
+		}
+	}
+	if (oldest.empty()) {
+		return stale;
+	}
+	Connection connection(*context.db);
+	// lake -> table name -> the snapshots that touched it
+	case_insensitive_map_t<case_insensitive_map_t<vector<int64_t>>> touched;
+	for (auto &lake : oldest) {
+		// Data changes and DDL name a table by id; a table created (again) is named. Ids of tables that no longer
+		// exist cannot be named and are skipped: a dropped source table breaks the graph itself, not just the ABI.
+		const auto catalog = Literal(lake.first);
+		auto query = connection.Query(
+		    "WITH changes AS (SELECT snapshot_id, unnest(map_keys(changes)) AS kind, unnest(map_values(changes)) AS "
+		    "refs FROM ducklake_snapshots(" +
+		    catalog + ") WHERE snapshot_id > " + to_string(lake.second) +
+		    "), flat AS (SELECT snapshot_id, kind, unnest(refs) AS ref FROM changes) "
+		    "SELECT f.snapshot_id, CASE WHEN f.kind = 'tables_created' THEN split_part(f.ref, '.', -1) "
+		    "ELSE ti.table_name END FROM flat f LEFT JOIN ducklake_table_info(" +
+		    catalog +
+		    ") ti ON f.kind <> 'tables_created' AND f.ref = CAST(ti.table_id AS VARCHAR) "
+		    "WHERE f.kind LIKE 'tables_%' OR f.kind LIKE 'inlined_%'");
+		if (!query || query->HasError()) {
+			// The lake cannot say what changed: treat everything built from it as stale.
+			for (auto &artifact : artifacts) {
+				if (ParseSnapshots(artifact.source_snapshot).count(lake.first)) {
+					stale.insert(artifact.name);
+				}
+			}
+			continue;
+		}
+		PGQMaterializedResult rows(*query);
+		for (idx_t i = 0; i < rows.RowCount(); i++) {
+			auto table = rows.GetValue(1, i);
+			if (table.IsNull()) {
+				continue;
+			}
+			touched[lake.first][table.ToString()].push_back(rows.GetValue(0, i).GetValue<int64_t>());
+		}
+	}
+	for (auto &artifact : artifacts) {
+		auto snapshots = ParseSnapshots(artifact.source_snapshot);
+		for (auto &lake_tables : ParseSourceTables(artifact.source_tables)) {
+			auto built_at = snapshots.find(lake_tables.first);
+			auto lake_touched = touched.find(lake_tables.first);
+			if (built_at == snapshots.end() || lake_touched == touched.end()) {
+				continue;
+			}
+			for (auto &table : lake_tables.second) {
+				auto changes = lake_touched->second.find(table);
+				if (changes == lake_touched->second.end()) {
+					continue;
+				}
+				for (auto snapshot : changes->second) {
+					if (snapshot > built_at->second) {
+						stale.insert(artifact.name);
+					}
+				}
+			}
+		}
+	}
+	return stale;
+}
 
 string PGQAutoBuildAbi(ClientContext &context, const CreatePropertyGraphInfo &pg_info) {
 	Value mode;
