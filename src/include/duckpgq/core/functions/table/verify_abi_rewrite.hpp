@@ -20,14 +20,23 @@ namespace duckdb {
 // whether the fast path is equivalent to the reference. This is the
 // differential-testing keystone that lets ABI rewrites be added aggressively: a
 // divergence is a caught bug, not a shipped one.
+//
+// A 'match' asserts BOTH that the two results agree AND that a rewrite actually
+// fired (see rewrite_fired). Agreement on its own is not evidence: when no
+// artifact covers the query, both runs execute the identical fallback plan and
+// would agree even if every artifact in the catalogue were wrong.
 struct VerifyABIRewriteRow {
-	//! 'match'       -- the two paths agree as multisets
+	//! 'match'       -- the two paths agree as multisets AND a rewrite actually fired
 	//! 'MISMATCH'    -- they disagree; the rewrite is wrong (or the fallback is)
 	//! 'abi_error'   -- the REWRITE produced a query that will not run
-	//! 'unverified'  -- the ORACLE could not run this shape, so nothing was checked.
-	//!                 Not a verdict on the rewrite: abi_rows still reports what it
-	//!                 returned. A sweep must count these as coverage gaps, never as
-	//!                 passes and never as failures.
+	//! 'unverified'  -- nothing was checked. Two distinct causes, both coverage gaps:
+	//!                 (a) the ORACLE could not run this shape, so there is no reference
+	//!                     answer (abi_rows still reports what the rewrite returned); or
+	//!                 (b) NO REWRITE FIRED, so both runs executed the same fallback plan
+	//!                     and agreement was guaranteed regardless of correctness.
+	//!                 Not a verdict on the rewrite. A sweep must count these as coverage
+	//!                 gaps, never as passes and never as failures. Read rewrite_fired to
+	//!                 tell (a) from (b).
 	//! 'error'       -- the harness itself failed
 	string status;
 	int64_t abi_rows = -1;       // rows produced with the rewrite
@@ -35,6 +44,12 @@ struct VerifyABIRewriteRow {
 	int64_t only_in_abi = -1;    // multiset rows in ABI but not fallback
 	int64_t only_in_fallback = -1;
 	string detail;               // error text, if any
+	//! Did the ABI rewrite actually fire on the fast-path run? Without this, a query
+	//! with no artifact coverage runs the SAME fallback plan twice, agrees with itself,
+	//! and reports 'match' -- a guaranteed pass that verifies nothing. That is exactly
+	//! the "two runs through one harness" failure this function exists to prevent, so
+	//! agreement is only reported as 'match' when a rewrite was genuinely substituted.
+	bool rewrite_fired = false;
 };
 
 class VerifyABIRewriteFunction : public TableFunction {

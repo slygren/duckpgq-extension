@@ -59,26 +59,36 @@ FROM GRAPH_TABLE (good_graph MATCH (a:Person)-[:Knows]->(b:Person) COLUMNS (a.id
 2	3
 
 # The verify function confirms the good ABI table equals the fallback: match, no diffs.
-query TIIII
-SELECT status, abi_rows, fallback_rows, only_in_abi, only_in_fallback
+# rewrite_fired must be true for 'match' to mean anything -- see the block at the end.
+query TIIIIT
+SELECT status, abi_rows, fallback_rows, only_in_abi, only_in_fallback, rewrite_fired
 FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (good_graph MATCH (a:Person)-[:Knows]->(b:Person) COLUMNS (a.id AS aid, b.id AS bid))');
 ----
-match	2	2	0	0
+match	2	2	0	0	true
 
 # The verify function CATCHES the divergent bad ABI table: MISMATCH.
 # ABI says 1->3 (1 row); fallback bridge says 1->2, 2->3 (2 rows).
-query TIIII
-SELECT status, abi_rows, fallback_rows, only_in_abi, only_in_fallback
+query TIIIIT
+SELECT status, abi_rows, fallback_rows, only_in_abi, only_in_fallback, rewrite_fired
 FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (bad_graph MATCH (a:Person)-[:Knows]->(b:Person) COLUMNS (a.id AS aid, b.id AS bid))');
 ----
-MISMATCH	1	2	1	2
+MISMATCH	1	2	1	2	true
 
-# A query with no ABI coverage runs the fallback both ways: trivially matches.
-query TIIII
-SELECT status, abi_rows, fallback_rows, only_in_abi, only_in_fallback
+# A query with no ABI coverage runs the SAME fallback plan both ways, so the two
+# results agree no matter what. That used to be reported as 'match' -- a guaranteed
+# pass, from the one function whose entire job is to not hand out guaranteed passes.
+# It is now 'unverified' with rewrite_fired=false.
+query TIIIIT
+SELECT status, abi_rows, fallback_rows, only_in_abi, only_in_fallback, rewrite_fired
 FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (good_graph MATCH (a:Person)-[:Knows]->{1,2}(b:Person) COLUMNS (a.id AS aid, b.id AS bid))');
 ----
-match	3	3	0	0
+unverified	3	3	0	0	false
+
+query T
+SELECT detail LIKE 'no ABI rewrite fired%'
+FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (good_graph MATCH (a:Person)-[:Knows]->{1,2}(b:Person) COLUMNS (a.id AS aid, b.id AS bid))');
+----
+true
 
 # ── The two failures that are not a verdict, and the one that is ───────────────
 # These used to be a single status, 'error', which meant a sweep could not tell
@@ -130,11 +140,14 @@ EDGE TABLES (lonely SOURCE KEY (src) REFERENCES person(id)
 statement ok
 DROP TABLE lonely;
 
-query TII
-SELECT status, abi_rows, fallback_rows
+# Both no-oracle and no-rewrite report 'unverified'; rewrite_fired is what tells them
+# apart. Here the rewrite DID fire and only the reference answer is missing, so
+# fired=true -- the opposite of the no-coverage case above.
+query TIIT
+SELECT status, abi_rows, fallback_rows, rewrite_fired
 FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (lonely_graph MATCH (a:Person)-[:Lonely]->(b:Person) COLUMNS (a.id AS aid, b.id AS bid))');
 ----
-unverified	2	NULL
+unverified	2	NULL	true
 
 # abi_rows is carried deliberately: the reader can see the rewrite DID run and
 # what it returned, so 'unverified' reads as "unchecked", not as "broken".
@@ -146,11 +159,49 @@ true
 
 # The other direction: the artifact has no v1, so the REWRITE emits a query that
 # will not bind. That IS a verdict on the thing under test, and keeps its own status.
-query T
-SELECT status
+query TT
+SELECT status, rewrite_fired
 FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (broken_graph MATCH (a:Person)-[:Lonely]->(b:Person) COLUMNS (a.id AS aid, b.id AS bid))');
 ----
-abi_error
+abi_error	true
+
+# ── REGRESSION: a graph with NO catalogue row at all ──────────────────────────
+# This is the shape that was reported from the field: a property graph over data
+# whose ABI artifacts had never been generated. The function returned
+# status='match', abi_rows=fallback_rows, only_in_*=0 -- indistinguishable from a
+# genuine verification -- while pgq_require_abi_paths=true on the same graph said
+# "no matching ABI path table rewrite was available". Anyone using this function to
+# sign off such a graph got a meaningless green.
+
+statement ok
+CREATE TABLE uncovered(src INTEGER, dst INTEGER);
+
+statement ok
+INSERT INTO uncovered VALUES (1,2),(2,3);
+
+statement ok
+CREATE PROPERTY GRAPH uncovered_graph
+VERTEX TABLES (person PROPERTIES (id, name) LABEL Person)
+EDGE TABLES (uncovered SOURCE KEY (src) REFERENCES person(id)
+                       DESTINATION KEY (dst) REFERENCES person(id) LABEL Uncovered);
+
+query TIIIIT
+SELECT status, abi_rows, fallback_rows, only_in_abi, only_in_fallback, rewrite_fired
+FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (uncovered_graph MATCH (a:Person)-[:Uncovered]->(b:Person) COLUMNS (a.id AS aid, b.id AS bid))');
+----
+unverified	2	2	0	0	false
+
+# DISCRIMINATION: the guard must not simply report 'unverified' for everything.
+# good_graph, verified in the same session, still reaches 'match' with fired=true --
+# so a green is still reachable and this test would catch a guard stuck on.
+query TT
+SELECT status, rewrite_fired
+FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (good_graph MATCH (a:Person)-[:Knows]->(b:Person) COLUMNS (a.id AS aid, b.id AS bid))');
+----
+match	true
+
+statement ok
+DROP PROPERTY GRAPH uncovered_graph;
 
 statement ok
 DROP PROPERTY GRAPH lonely_graph;

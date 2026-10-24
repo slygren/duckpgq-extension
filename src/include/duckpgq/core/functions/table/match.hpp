@@ -293,9 +293,12 @@ public:
 	// path_table_cache (optional) lets the recursive-CTE fallback still scan ABI edge
 	// artifacts for its traversal steps when no whole-pattern ABI rewrite applied --
 	// i.e. ABI coverage is graded, not all-or-nothing.
-	// vl_fallback_budget is pgq_max_vl_fallback_rows, read where a ClientContext exists and
-	// passed down because this call chain carries none. 0 disables the guard.
-	static void ProcessPathList(vector<unique_ptr<PathReference>> &path_pattern,
+	// vl_fallback_budget is pgq_max_vl_fallback_rows, read at the call site and passed down.
+	// 0 disables the guard.
+	// context is needed to record a rewrite diagnostic when graded ABI coverage backs the
+	// variable-length fallback: without it those rewrites fire invisibly, which makes
+	// pgq_verify_abi_rewrite unable to tell "verified" from "nothing was substituted".
+	static void ProcessPathList(ClientContext &context, vector<unique_ptr<PathReference>> &path_pattern,
 	                            vector<unique_ptr<ParsedExpression>> &conditions, unique_ptr<SelectNode> &select_node,
 	                            case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map,
 	                            CreatePropertyGraphInfo &pg_table, int32_t &extra_alias_counter,

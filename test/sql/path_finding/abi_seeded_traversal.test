@@ -83,19 +83,25 @@ FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:Person)-[:Knows]->{1,3}(b:Person)
 2	4
 3	4
 
-# A faithful artifact is equivalent to the bridge traversal.
-query TIIII
-SELECT status, abi_rows, fallback_rows, only_in_abi, only_in_fallback
+# A faithful artifact is equivalent to the bridge traversal. rewrite_fired proves the
+# per-step artifact really was substituted, so 'match' is a verification and not just
+# two runs of one plan agreeing with themselves.
+query TIIIIT
+SELECT status, abi_rows, fallback_rows, only_in_abi, only_in_fallback, rewrite_fired
 FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:Person)-[:Knows]->{1,3}(b:Person) COLUMNS (a.id AS aid, b.id AS bid))');
 ----
-match	6	6	0	0
+match	6	6	0	0	true
 
 # Left-directed ANY SHORTEST walks the same artifact in reverse (steps v1 -> v0).
-query TIIII
-SELECT status, abi_rows, fallback_rows, only_in_abi, only_in_fallback
+# This direction used to substitute the artifact while recording NO diagnostic, which
+# made it indistinguishable from an unrewritten query. Graph `d`'s reverse traversal
+# returning person 5 -- reachable only through the artifact's extra 4->5 edge, never
+# through the bridge chain 1->2->3->4 -- is what proved the rewrite was firing invisibly.
+query TIIIIT
+SELECT status, abi_rows, fallback_rows, only_in_abi, only_in_fallback, rewrite_fired
 FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:Person)<-[:Knows]-{1,3}(b:Person) COLUMNS (a.id AS aid, b.id AS bid))');
 ----
-match	6	6	0	0
+match	6	6	0	0	true
 
 # Proof the step artifact is scanned: graph `d`'s extra 4->5 edge makes person 5
 # reachable, which the bridge alone cannot do.
@@ -125,12 +131,16 @@ FROM GRAPH_TABLE (d MATCH (a:Person)-[:Knows]->{1,3}(b:Person)
 2	4
 3	4
 
-# With both sides on the bridge, the checker sees no divergence at all.
-query TIIII
-SELECT status, abi_rows, fallback_rows, only_in_abi, only_in_fallback
+# Walk mode keeps the bridge (graded coverage is ANY SHORTEST only), so BOTH sides run
+# the same bridge plan. The comment below used to say "the checker sees no divergence at
+# all" and assert 'match' -- but with both sides on the bridge there is nothing that
+# COULD diverge, and a pass there certified nothing. It is now 'unverified' with
+# rewrite_fired=false, which is what "both sides on the bridge" actually means.
+query TIIIIT
+SELECT status, abi_rows, fallback_rows, only_in_abi, only_in_fallback, rewrite_fired
 FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (d MATCH (a:Person)-[:Knows]->{1,3}(b:Person) COLUMNS (a.id AS aid, b.id AS bid))');
 ----
-match	6	6	0	0
+unverified	6	6	0	0	false
 
 # ── 7b: exact length {k,k} answered from the k-hop artifact ──────────────────────
 # Graph `d`'s 2-hop artifact contributes 1 ->(2)-> 5, impossible via the bridge chain.
@@ -143,11 +153,11 @@ FROM GRAPH_TABLE (d MATCH ANY SHORTEST (a:Person)-[:Knows]->{2,2}(b:Person)
 2	4
 
 # The checker isolates exactly the one extra pair the artifact contributes.
-query TIIII
-SELECT status, abi_rows, fallback_rows, only_in_abi, only_in_fallback
+query TIIIIT
+SELECT status, abi_rows, fallback_rows, only_in_abi, only_in_fallback, rewrite_fired
 FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (d MATCH ANY SHORTEST (a:Person)-[:Knows]->{2,2}(b:Person) COLUMNS (a.id AS aid, b.id AS bid))');
 ----
-MISMATCH	3	2	1	0
+MISMATCH	3	2	1	0	true
 
 # Left-directed {2,2} reads the same artifact from the far end (v2 -> v0).
 query II rowsort

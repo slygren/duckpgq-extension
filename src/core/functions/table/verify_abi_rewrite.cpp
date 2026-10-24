@@ -1,8 +1,10 @@
 #include "duckpgq/core/functions/table/verify_abi_rewrite.hpp"
 
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckpgq/core/utils/materialized_result.hpp"
+#include "duckpgq_state.hpp"
 #include <duckpgq/core/functions/table.hpp>
 
 #include <unordered_map>
@@ -24,6 +26,8 @@ static void AddOutputColumns(vector<LogicalType> &return_types, vector<Identifie
 	return_types.emplace_back(LogicalType::BIGINT);
 	names.emplace_back("detail");
 	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("rewrite_fired");
+	return_types.emplace_back(LogicalType::BOOLEAN);
 }
 
 // Canonical string for one result row, used to compare two result sets as
@@ -41,6 +45,42 @@ static string RowKey(PGQMaterializedResult &res, idx_t row) {
 		}
 	}
 	return key;
+}
+
+// Did the ABI rewrite actually substitute an artifact on the run that just
+// finished? DuckPGQState is a ClientContextState, so the diagnostics belong to
+// THIS connection's run and nobody else's. Read them with a plain registered_state
+// lookup rather than GetDuckPGQState(), which creates and initialises a state as a
+// side effect when none exists.
+//
+// Must be called after the fast-path run and BEFORE the fallback run: binding the
+// next GRAPH_TABLE statement clears rewrite_diagnostics (duckpgq_bind.cpp).
+//
+// 'selected' is the only status the rewriter records when it substitutes an
+// artifact -- for exact edges, k-hop chains, closures and direct links alike. A
+// considered-but-rejected artifact records 'missing', and a query the rewriter
+// never looked at records nothing at all; neither changes the plan, so neither
+// counts as fired.
+static bool RewriteFired(Connection &conn, int64_t &decisions_recorded, string &first_reason) {
+	decisions_recorded = 0;
+	if (!conn.context) {
+		return false;
+	}
+	auto state = conn.context->registered_state->Get<DuckPGQState>("duckpgq");
+	if (!state) {
+		return false;
+	}
+	bool fired = false;
+	for (auto &diagnostic : state->rewrite_diagnostics) {
+		decisions_recorded++;
+		if (diagnostic.status == "selected") {
+			if (!fired) {
+				first_reason = diagnostic.reason;
+			}
+			fired = true;
+		}
+	}
+	return fired;
 }
 
 // Run the graph query both ways on an internal connection and multiset-compare
@@ -88,6 +128,17 @@ static void ComputeVerify(ClientContext &context, const string &query, VerifyABI
 		// ── Fast path (ABI rewrite on) ────────────────────────────────────────
 		conn->Query("SET pgq_disable_abi_rewrite=false;");
 		auto abi = conn->Query(query);
+
+		// ── Did the thing under test actually happen? ─────────────────────────
+		// Read before anything else re-binds a GRAPH_TABLE statement, which clears
+		// rewrite_diagnostics. Read on the error path too: when the rewrite emits a
+		// query that will not run, the decision to substitute was still made and
+		// recorded, and reporting rewrite_fired=false there would be a lie about the
+		// one case that IS a verdict on the rewrite.
+		int64_t decisions_recorded = 0;
+		string fired_reason;
+		row.rewrite_fired = RewriteFired(*conn, decisions_recorded, fired_reason);
+
 		if (!abi || abi->HasError()) {
 			// The REWRITE produced something that will not run. A defect, and the one
 			// failure here that is genuinely about the thing under test.
@@ -145,7 +196,36 @@ static void ComputeVerify(ClientContext &context, const string &query, VerifyABI
 		}
 		row.only_in_abi = only_abi;
 		row.only_in_fallback = only_fb;
-		row.status = (only_abi == 0 && only_fb == 0) ? "match" : "MISMATCH";
+
+		const bool agree = (only_abi == 0 && only_fb == 0);
+		if (!agree) {
+			row.status = "MISMATCH";
+			if (!row.rewrite_fired) {
+				// Two runs of the SAME plan disagreed. Still a real defect -- but not one
+				// of the ABI rewrite, so say so rather than sending someone to audit an
+				// artifact that was never used.
+				row.detail = "results disagree although NO ABI rewrite fired -- both runs used the "
+				             "same fallback plan, so this is nondeterminism in the fallback, not a "
+				             "rewrite defect";
+			}
+			return;
+		}
+		if (!row.rewrite_fired) {
+			// Agreement with no rewrite is self-agreement. Reporting it as 'match' is how
+			// a function whose whole job is differential testing comes to certify queries
+			// it never tested -- and it reads as a pass to every sweep and dashboard.
+			row.status = "unverified";
+			row.detail = "no ABI rewrite fired -- both runs executed the same fallback plan, so "
+			             "agreement was guaranteed and nothing was verified (" +
+			             std::to_string(decisions_recorded) +
+			             " rewrite decision(s) recorded, none selected). Give the query artifact "
+			             "coverage, or check pgq_last_rewrite_diagnostics() for why it declined.";
+			return;
+		}
+		row.status = "match";
+		if (!fired_reason.empty()) {
+			row.detail = "rewrite fired: " + fired_reason;
+		}
 	};
 
 	try {
@@ -200,6 +280,7 @@ void VerifyABIRewriteFunction::VerifyABIRewriteFunc(ClientContext &context, Tabl
 	output.SetValue(3, 0, row.only_in_abi < 0 ? Value() : Value::BIGINT(row.only_in_abi));
 	output.SetValue(4, 0, row.only_in_fallback < 0 ? Value() : Value::BIGINT(row.only_in_fallback));
 	output.SetValue(5, 0, row.detail.empty() ? Value() : Value(row.detail));
+	output.SetValue(6, 0, Value::BOOLEAN(row.rewrite_fired));
 	output.SetCardinality(1);
 }
 

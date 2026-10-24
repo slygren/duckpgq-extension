@@ -4058,7 +4058,7 @@ void PGQMatchFunction::CheckNamedSubpath(SubPath &subpath, MatchExpression &orig
 	}
 }
 
-void PGQMatchFunction::ProcessPathList(vector<unique_ptr<PathReference>> &path_list,
+void PGQMatchFunction::ProcessPathList(ClientContext &context, vector<unique_ptr<PathReference>> &path_list,
                                        vector<unique_ptr<ParsedExpression>> &conditions,
                                        unique_ptr<SelectNode> &final_select_node,
                                        case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map,
@@ -4080,9 +4080,9 @@ void PGQMatchFunction::ProcessPathList(vector<unique_ptr<PathReference>> &path_l
 			previous_vertex_element = GetPathElement(previous_vertex_subpath->path_list[0]);
 		} else {
 			// Add the shortest path if the name is found in the column_list
-			ProcessPathList(previous_vertex_subpath->path_list, conditions, final_select_node, alias_map, pg_table,
-			                extra_alias_counter, original_ref, csr_id_counter, csr_slot, all_shortest, any_shortest,
-			                path_table_cache, vl_fallback_budget);
+			ProcessPathList(context, previous_vertex_subpath->path_list, conditions, final_select_node, alias_map,
+			                pg_table, extra_alias_counter, original_ref, csr_id_counter, csr_slot, all_shortest,
+			                any_shortest, path_table_cache, vl_fallback_budget);
 			return;
 		}
 	}
@@ -4299,6 +4299,40 @@ void PGQMatchFunction::ProcessPathList(vector<unique_ptr<PathReference>> &path_l
 					    ((edge_element->match_type == PGQMatchType::MATCH_EDGE_RIGHT ||
 					      edge_element->match_type == PGQMatchType::MATCH_EDGE_LEFT) &&
 					     edge_subpath->upper < static_cast<idx_t>(1 << 30));
+
+					// Graded coverage substitutes an artifact WITHOUT any whole-pattern rewrite, so
+					// it used to fire completely invisibly: pgq_last_rewrite_diagnostics() showed
+					// nothing, and pgq_verify_abi_rewrite could not tell a real verification from
+					// two runs of the same bridge plan. Proven on a seeded artifact carrying an edge
+					// the bridge cannot produce: the reverse traversal returned it (so the artifact
+					// WAS scanned) while recording no diagnostic at all.
+					//
+					// Gated on used_recursive_cte because that is exactly the route that consults
+					// the plan -- the CSR fallback below ignores it, and claiming "selected" there
+					// would trade a silent miss for a false positive.
+					if (used_recursive_cte && (abi_plan.exact.valid || abi_plan.step.valid)) {
+						const bool exact = abi_plan.exact.valid;
+						const auto &scan = exact ? abi_plan.exact : abi_plan.step;
+						PGQRewriteDiagnostic diagnostic;
+						diagnostic.graph_name = pg_table.property_graph_name;
+						diagnostic.rewrite_type = exact ? "abi_exact_length_scan" : "abi_step_scan";
+						diagnostic.status = "selected";
+						diagnostic.reason = exact ? "answered exact-length quantifier from the k-hop artifact"
+						                         : "recursive step scans the edge artifact in place of the bridge";
+						diagnostic.path_kind = exact ? "fixed_path" : "edge";
+						diagnostic.catalog_name = scan.catalog_name;
+						diagnostic.schema_name = scan.schema_name;
+						diagnostic.path_table_name = scan.table_name;
+						diagnostic.edge_label_sequence =
+						    edge_element->label.empty() ? "*" : edge_element->label;
+						diagnostic.table_alias = edge_element->variable_binding;
+						diagnostic.one_row_per_mode = OneRowPerModeToString(original_ref.one_row_per);
+						diagnostic.min_depth = static_cast<int64_t>(exact ? abi_plan.exact_hops
+						                                                  : edge_subpath->lower);
+						diagnostic.max_depth = static_cast<int64_t>(exact ? abi_plan.exact_hops
+						                                                  : edge_subpath->upper);
+						RecordRewriteDiagnostic(context, std::move(diagnostic));
+					}
 					if (!used_recursive_cte && edge_subpath->path_mode != PGQPathMode::NONE &&
 					    edge_subpath->path_mode != PGQPathMode::WALK) {
 						AddPathModeFilter(edge_subpath->path_mode, "shortest_path_cte", conditions);
@@ -6892,7 +6926,8 @@ static unique_ptr<ParsedExpression> BuildExistsSubquery(
 			// pgq_disable_abi_rewrite forces a fully bridge-based traversal -- which is what
 			// makes pgq_verify_abi_rewrite able to verify this rewrite.
 			PGQCSRSlot inner_cte1_slot;
-			PGQMatchFunction::ProcessPathList(path_pattern->path_elements, conditions, inner_select, inner_alias_map,
+			PGQMatchFunction::ProcessPathList(context, path_pattern->path_elements, conditions, inner_select,
+			                                  inner_alias_map,
 			                                  pg_table, extra_alias_counter, inner_match, CSRIdCounter(context),
 			                                  inner_cte1_slot, all_shortest, any_shortest,
 			                                  DisableABIRewrite(context) ? nullptr : &path_table_cache,
@@ -8674,7 +8709,7 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 				RecordRewriteDiagnostic(context, std::move(diagnostic));
 				ThrowABIPathRequired();
 			}
-			ProcessPathList(path_pattern->path_elements, conditions, final_select_node, alias_map, *pg_table,
+			ProcessPathList(context, path_pattern->path_elements, conditions, final_select_node, alias_map, *pg_table,
 			                extra_alias_counter, *ref, CSRIdCounter(context), cte1_slot, all_shortest, any_shortest,
 			                DisableABIRewrite(context) ? nullptr : &path_table_cache, MaxVLFallbackRows(context));
 		}
@@ -8844,7 +8879,7 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 					ThrowABIPathRequired();
 				}
 				PGQCSRSlot branch_cte1_slot;
-				ProcessPathList(path_pattern->path_elements, branch_conditions, branch_select,
+				ProcessPathList(context, path_pattern->path_elements, branch_conditions, branch_select,
 				                branch_alias_map, *pg_table, branch_counter, branch, CSRIdCounter(context),
 				                branch_cte1_slot, all_shortest, any_shortest,
 				                DisableABIRewrite(context) ? nullptr : &path_table_cache,

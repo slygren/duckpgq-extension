@@ -33,3 +33,12 @@ duckdb_extension_load(duckpgq
 
 # Any extra extensions that should be built
 # e.g.: duckdb_extension_load(json)
+
+# json: required to ADOPT (ducklake_add_data_files) any table carrying a JSON-typed column.
+# Reading JSON out of an existing DuckLake catalog works without it -- DuckLake reconstructs the
+# type from its own stored metadata -- but WRITING a table definition that contains JSON fails at
+# commit with 'Type with name "JSON" is not in the catalog'. That blocked exactly 6 of 374 tables
+# (19,633,212 rows), including three __pg_maintenance_graph__*_ATTRIBUTES ABI artifacts. There is
+# no DDL workaround: CREATE TABLE AS SELECT ... LIMIT 0 fails at the same commit.
+# In-tree extension, so this costs a source dir, not a download.
+duckdb_extension_load(json)
