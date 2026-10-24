@@ -780,24 +780,33 @@ private:
 			tables.push_back(catalog + "." + schema + "." + PGQStr(table->table_name));
 			if (seen_catalogs.insert(catalog).second) {
 				auto snapshot = SnapshotOf(catalog);
-				if (snapshot < 0) {
+				if (snapshot.empty()) {
 					return;
 				}
-				snapshots.push_back(catalog + "=" + to_string(snapshot));
+				snapshots.push_back(catalog + "=" + snapshot);
 			}
 		}
 		source_snapshot = JoinStrings(snapshots, ";");
 		source_tables = JoinStrings(tables, ",");
 	}
 
-	int64_t SnapshotOf(const string &catalog) {
+	//! "id@commit_epoch_us" of the lake's latest snapshot, or "" when it cannot be read. The commit time makes the
+	//! reference specific to this lake: a copy rebuilds the history with other times.
+	string SnapshotOf(const string &catalog) {
 		auto entry = snapshot_cache.find(catalog);
 		if (entry != snapshot_cache.end()) {
 			return entry->second;
 		}
-		case_insensitive_set_t catalogs {catalog};
-		auto snapshots = PGQCurrentSnapshots(context, catalogs);
-		auto snapshot = snapshots.count(catalog) ? snapshots[catalog] : -1;
+		string snapshot;
+		Connection connection(*context.db);
+		auto query = connection.Query("SELECT snapshot_id, epoch_us(snapshot_time) FROM ducklake_snapshots(" +
+		                              Literal(catalog) + ") ORDER BY snapshot_id DESC LIMIT 1");
+		if (query && !query->HasError()) {
+			PGQMaterializedResult rows(*query);
+			if (rows.RowCount() > 0 && !rows.GetValue(0, 0).IsNull() && !rows.GetValue(1, 0).IsNull()) {
+				snapshot = rows.GetValue(0, 0).ToString() + "@" + rows.GetValue(1, 0).ToString();
+			}
+		}
 		snapshot_cache[catalog] = snapshot;
 		return snapshot;
 	}
@@ -915,7 +924,7 @@ private:
 	bool is_ducklake = false;
 	PGQAbiPlan plan;
 	unique_ptr<Connection> estimate_connection;
-	case_insensitive_map_t<int64_t> snapshot_cache;
+	case_insensitive_map_t<string> snapshot_cache;
 };
 
 //------------------------------------------------------------------------------
@@ -1471,7 +1480,6 @@ unique_ptr<FunctionData> AbiStatusBind(ClientContext &context, TableFunctionBind
 			Value fresh;
 			if (!snapshot.IsNull() && !snapshot.ToString().empty()) {
 				tracked.push_back({name, snapshot.ToString(), rows.GetValue(7, i).ToString()});
-				fresh = Value::BOOLEAN(true);
 			}
 			result->rows.push_back({Value(location.catalog), Value(location.schema), Value(name), rows.GetValue(1, i),
 			                        rows.GetValue(2, i), rows.GetValue(3, i), rows.GetValue(4, i),
@@ -1479,10 +1487,17 @@ unique_ptr<FunctionData> AbiStatusBind(ClientContext &context, TableFunctionBind
 		}
 	}
 	if (!tracked.empty()) {
-		auto stale = PGQFindStaleArtifacts(context, tracked);
+		auto freshness = PGQEvaluateFreshness(context, tracked);
+		case_insensitive_set_t judged;
+		for (auto &artifact : tracked) {
+			if (!freshness.untracked.count(artifact.name)) {
+				judged.insert(artifact.name);
+			}
+		}
 		for (auto &row : result->rows) {
-			if (!row[9].IsNull() && stale.count(row[2].ToString())) {
-				row[9] = Value::BOOLEAN(false);
+			auto name = row[2].ToString();
+			if (judged.count(name)) {
+				row[9] = Value::BOOLEAN(!freshness.stale.count(name));
 			}
 		}
 	}
@@ -1496,23 +1511,32 @@ unique_ptr<FunctionData> AbiStatusBind(ClientContext &context, TableFunctionBind
 //------------------------------------------------------------------------------
 namespace {
 
-//! "f001=12;f002=7" -> {f001: 12, f002: 7}
-case_insensitive_map_t<int64_t> ParseSnapshots(const string &text) {
-	case_insensitive_map_t<int64_t> result;
+struct SnapshotRef {
+	int64_t id = -1;
+	int64_t commit_epoch_us = -1;
+};
+
+//! "f001=12@1792834210386403;f002=7@..." -> {f001: (12, ...), ...}. Malformed entries are dropped.
+case_insensitive_map_t<SnapshotRef> ParseSnapshots(const string &text) {
+	case_insensitive_map_t<SnapshotRef> result;
 	for (auto &part : StringUtil::Split(text, ';')) {
-		auto position = part.rfind('=');
-		if (position == string::npos) {
+		auto equals = part.rfind('=');
+		auto at = part.rfind('@');
+		if (equals == string::npos || at == string::npos || at < equals) {
 			continue;
 		}
 		try {
-			result[part.substr(0, position)] = std::stoll(part.substr(position + 1));
+			SnapshotRef ref;
+			ref.id = std::stoll(part.substr(equals + 1, at - equals - 1));
+			ref.commit_epoch_us = std::stoll(part.substr(at + 1));
+			result[part.substr(0, equals)] = ref;
 		} catch (...) {
 		}
 	}
 	return result;
 }
 
-//! "f001.bridge.t1,f001.dim.t2" -> catalog -> lower-case table names
+//! "f001.bridge.t1,f001.dim.t2" -> catalog -> table names
 case_insensitive_map_t<case_insensitive_set_t> ParseSourceTables(const string &text) {
 	case_insensitive_map_t<case_insensitive_set_t> result;
 	for (auto &part : StringUtil::Split(text, ',')) {
@@ -1546,69 +1570,95 @@ case_insensitive_map_t<int64_t> PGQCurrentSnapshots(ClientContext &context, cons
 	return result;
 }
 
-case_insensitive_map_t<int64_t> PGQProvenanceSnapshots(ClientContext &context,
-                                                      const vector<PGQArtifactProvenance> &artifacts) {
-	case_insensitive_set_t catalogs;
+PGQFreshness PGQEvaluateFreshness(ClientContext &context, const vector<PGQArtifactProvenance> &artifacts) {
+	PGQFreshness result;
+	// lake -> the snapshots artifacts claim to be built at
+	case_insensitive_map_t<vector<SnapshotRef>> claimed;
 	for (auto &artifact : artifacts) {
-		for (auto &entry : ParseSnapshots(artifact.source_snapshot)) {
-			catalogs.insert(entry.first);
+		auto snapshots = ParseSnapshots(artifact.source_snapshot);
+		if (snapshots.empty()) {
+			result.untracked.insert(artifact.name);
+			continue;
 		}
-	}
-	return PGQCurrentSnapshots(context, catalogs);
-}
-
-case_insensitive_set_t PGQFindStaleArtifacts(ClientContext &context, const vector<PGQArtifactProvenance> &artifacts) {
-	case_insensitive_set_t stale;
-	// Per lake: the oldest snapshot any artifact was built at; every change after it is read once.
-	case_insensitive_map_t<int64_t> oldest;
-	for (auto &artifact : artifacts) {
-		for (auto &entry : ParseSnapshots(artifact.source_snapshot)) {
-			auto existing = oldest.find(entry.first);
-			if (existing == oldest.end() || entry.second < existing->second) {
-				oldest[entry.first] = entry.second;
-			}
+		for (auto &entry : snapshots) {
+			claimed[entry.first].push_back(entry.second);
 		}
-	}
-	if (oldest.empty()) {
-		return stale;
 	}
 	Connection connection(*context.db);
+	// lake -> the claimed snapshot ids that exist there with the claimed commit time
+	case_insensitive_map_t<unordered_map<int64_t, int64_t>> verified;
 	// lake -> table name -> the snapshots that touched it
 	case_insensitive_map_t<case_insensitive_map_t<vector<int64_t>>> touched;
-	for (auto &lake : oldest) {
+	for (auto &lake : claimed) {
+		const auto catalog = Literal(lake.first);
+		vector<string> ids;
+		int64_t oldest = -1;
+		for (auto &ref : lake.second) {
+			ids.push_back(to_string(ref.id));
+			oldest = oldest < 0 ? ref.id : MinValue(oldest, ref.id);
+		}
+		auto known = connection.Query("SELECT snapshot_id, epoch_us(snapshot_time) FROM ducklake_snapshots(" + catalog +
+		                              ") WHERE snapshot_id IN (" + StringUtil::Join(ids, ", ") + ")");
+		if (!known || known->HasError()) {
+			continue;
+		}
+		PGQMaterializedResult known_rows(*known);
+		for (idx_t i = 0; i < known_rows.RowCount(); i++) {
+			verified[lake.first][known_rows.GetValue(0, i).GetValue<int64_t>()] =
+			    known_rows.GetValue(1, i).GetValue<int64_t>();
+		}
 		// Data changes and DDL name a table by id; a table created (again) is named. Ids of tables that no longer
 		// exist cannot be named and are skipped: a dropped source table breaks the graph itself, not just the ABI.
-		const auto catalog = Literal(lake.first);
-		auto query = connection.Query(
+		auto changes = connection.Query(
 		    "WITH changes AS (SELECT snapshot_id, unnest(map_keys(changes)) AS kind, unnest(map_values(changes)) AS "
 		    "refs FROM ducklake_snapshots(" +
-		    catalog + ") WHERE snapshot_id > " + to_string(lake.second) +
+		    catalog + ") WHERE snapshot_id > " + to_string(oldest) +
 		    "), flat AS (SELECT snapshot_id, kind, unnest(refs) AS ref FROM changes) "
 		    "SELECT f.snapshot_id, CASE WHEN f.kind = 'tables_created' THEN split_part(f.ref, '.', -1) "
 		    "ELSE ti.table_name END FROM flat f LEFT JOIN ducklake_table_info(" +
 		    catalog +
 		    ") ti ON f.kind <> 'tables_created' AND f.ref = CAST(ti.table_id AS VARCHAR) "
 		    "WHERE f.kind LIKE 'tables_%' OR f.kind LIKE 'inlined_%'");
-		if (!query || query->HasError()) {
-			// The lake cannot say what changed: treat everything built from it as stale.
+		if (!changes || changes->HasError()) {
+			// The lake cannot say what changed since: nothing built from it can be trusted to be current.
+			verified[lake.first].clear();
 			for (auto &artifact : artifacts) {
 				if (ParseSnapshots(artifact.source_snapshot).count(lake.first)) {
-					stale.insert(artifact.name);
+					result.stale.insert(artifact.name);
 				}
 			}
 			continue;
 		}
-		PGQMaterializedResult rows(*query);
-		for (idx_t i = 0; i < rows.RowCount(); i++) {
-			auto table = rows.GetValue(1, i);
-			if (table.IsNull()) {
-				continue;
+		PGQMaterializedResult change_rows(*changes);
+		for (idx_t i = 0; i < change_rows.RowCount(); i++) {
+			auto table = change_rows.GetValue(1, i);
+			if (!table.IsNull()) {
+				touched[lake.first][table.ToString()].push_back(change_rows.GetValue(0, i).GetValue<int64_t>());
 			}
-			touched[lake.first][table.ToString()].push_back(rows.GetValue(0, i).GetValue<int64_t>());
 		}
 	}
+	case_insensitive_set_t judged_lakes;
 	for (auto &artifact : artifacts) {
+		if (result.untracked.count(artifact.name) || result.stale.count(artifact.name)) {
+			continue;
+		}
 		auto snapshots = ParseSnapshots(artifact.source_snapshot);
+		bool foreign = false;
+		for (auto &entry : snapshots) {
+			auto lake = verified.find(entry.first);
+			auto known = lake == verified.end() ? nullptr : &lake->second;
+			auto commit = known ? known->find(entry.second.id) : unordered_map<int64_t, int64_t>::iterator();
+			if (!known || commit == known->end() || commit->second != entry.second.commit_epoch_us) {
+				foreign = true;
+			}
+		}
+		if (foreign) {
+			result.untracked.insert(artifact.name);
+			continue;
+		}
+		for (auto &entry : snapshots) {
+			judged_lakes.insert(entry.first);
+		}
 		for (auto &lake_tables : ParseSourceTables(artifact.source_tables)) {
 			auto built_at = snapshots.find(lake_tables.first);
 			auto lake_touched = touched.find(lake_tables.first);
@@ -1616,19 +1666,20 @@ case_insensitive_set_t PGQFindStaleArtifacts(ClientContext &context, const vecto
 				continue;
 			}
 			for (auto &table : lake_tables.second) {
-				auto changes = lake_touched->second.find(table);
-				if (changes == lake_touched->second.end()) {
+				auto table_changes = lake_touched->second.find(table);
+				if (table_changes == lake_touched->second.end()) {
 					continue;
 				}
-				for (auto snapshot : changes->second) {
-					if (snapshot > built_at->second) {
-						stale.insert(artifact.name);
+				for (auto snapshot : table_changes->second) {
+					if (snapshot > built_at->second.id) {
+						result.stale.insert(artifact.name);
 					}
 				}
 			}
 		}
 	}
-	return stale;
+	result.lake_snapshots = PGQCurrentSnapshots(context, judged_lakes);
+	return result;
 }
 
 string PGQAutoBuildAbi(ClientContext &context, const CreatePropertyGraphInfo &pg_info) {

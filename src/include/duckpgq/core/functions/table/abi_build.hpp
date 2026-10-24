@@ -89,20 +89,26 @@ PGQAbiOptions PGQAbiOptionsForGraph(ClientContext &context, const CreateProperty
 PGQAbiPlan PGQPlanAbiBuild(ClientContext &context, const CreatePropertyGraphInfo &pg_info, const PGQAbiOptions &options);
 
 //! Provenance of one artifact, as __pgq_path_catalog records it for artifacts built from DuckLake tables:
-//! source_snapshot "catalog=snapshot_id;..." and source_tables "catalog.schema.table,...". Both empty for
-//! artifacts built elsewhere (plain DuckDB tables, or by an older generator), whose freshness cannot be judged.
+//! source_snapshot "catalog=snapshot_id@commit_epoch_us;..." and source_tables "catalog.schema.table,...". Both
+//! empty for artifacts built elsewhere (plain DuckDB tables, or by an older generator).
 struct PGQArtifactProvenance {
 	string name;
 	string source_snapshot;
 	string source_tables;
 };
 
-//! The artifacts whose DuckLake source tables changed after they were built. One metadata query per lake.
-case_insensitive_set_t PGQFindStaleArtifacts(ClientContext &context, const vector<PGQArtifactProvenance> &artifacts);
+struct PGQFreshness {
+	//! Built from lake tables that changed afterwards
+	case_insensitive_set_t stale;
+	//! Freshness cannot be judged: no provenance, or provenance naming a snapshot the lake does not have with that
+	//! commit time -- a copy of the lake (a frozen snapshot rebuilds the history), not the lake it was built in.
+	case_insensitive_set_t untracked;
+	//! Current snapshot of every lake some artifact's freshness was judged against
+	case_insensitive_map_t<int64_t> lake_snapshots;
+};
 
-//! The lakes the artifacts' provenance refers to, with their current snapshot (-1 when it cannot be read).
-case_insensitive_map_t<int64_t> PGQProvenanceSnapshots(ClientContext &context,
-                                                      const vector<PGQArtifactProvenance> &artifacts);
+//! Judge the freshness of artifacts. One metadata query per lake (plus one for its current snapshot).
+PGQFreshness PGQEvaluateFreshness(ClientContext &context, const vector<PGQArtifactProvenance> &artifacts);
 
 //! Current snapshot of each named DuckLake catalog (-1 when it cannot be read).
 case_insensitive_map_t<int64_t> PGQCurrentSnapshots(ClientContext &context, const case_insensitive_set_t &catalogs);

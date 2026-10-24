@@ -744,12 +744,13 @@ static shared_ptr<PGQPathTableCache> BuildPathTableCache(ClientContext &context,
 			}
 		}
 		if (!tracked.empty()) {
-			cache->tracked_snapshots = PGQProvenanceSnapshots(context, tracked);
+			auto freshness = PGQEvaluateFreshness(context, tracked);
+			cache->tracked_snapshots = std::move(freshness.lake_snapshots);
 			Value on_stale;
 			const bool use_stale = context.TryGetCurrentSetting("pgq_abi_on_stale", on_stale) && !on_stale.IsNull() &&
 			                       StringUtil::CIEquals(on_stale.ToString(), "use");
 			if (!use_stale) {
-				for (const auto &name : PGQFindStaleArtifacts(context, tracked)) {
+				for (const auto &name : freshness.stale) {
 					cache->catalog.erase(name);
 					cache->stale_artifacts.push_back(name);
 				}
