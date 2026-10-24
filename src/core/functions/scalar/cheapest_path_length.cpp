@@ -1,3 +1,4 @@
+#include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckpgq/common.hpp"
@@ -160,8 +161,11 @@ static void CheapestPathLengthFunction(DataChunk &args, ExpressionState &state, 
 	target.ToUnifiedFormat(vdata_target);
 	auto target_data = reinterpret_cast<const int64_t *>(vdata_target.data);
 	if (csr->w.empty()) {
-		TemplatedBellmanFord<double>(csr, args, input_size, result, vdata_src, src_data, vdata_target, target_data,
-		                             csr->w_double);
+		// The CSR is built after bind, so the weight type is unknown there: compute in double, return BIGINT.
+		Vector double_result(LogicalType::DOUBLE, args.size());
+		TemplatedBellmanFord<double>(csr, args, input_size, double_result, vdata_src, src_data, vdata_target,
+		                             target_data, csr->w_double);
+		VectorOperations::Cast(info.context, double_result, result, args.size());
 	} else {
 		TemplatedBellmanFord<int64_t>(csr, args, input_size, result, vdata_src, src_data, vdata_target, target_data,
 		                              csr->w);
@@ -174,7 +178,7 @@ static void CheapestPathLengthFunction(DataChunk &args, ExpressionState &state, 
 void CoreScalarFunctions::RegisterCheapestPathLengthScalarFunction(ExtensionLoader &loader) {
 	loader.RegisterFunction(ScalarFunction(
 	    "cheapest_path_length", {LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT},
-	    LogicalType::ANY, CheapestPathLengthFunction, CheapestPathLengthFunctionData::CheapestPathLengthBind));
+	    LogicalType::BIGINT, CheapestPathLengthFunction, CheapestPathLengthFunctionData::CheapestPathLengthBind));
 }
 
 } // namespace duckdb

@@ -152,7 +152,7 @@ SELECT match_index, pattern FROM pgq_parse_match($$SELECT * FROM (FROM GRAPH_TAB
 0	MATCH (a:A) COLUMNS (a.id)
 1	MATCH (b:B) COLUMNS (b.id)
 
-# Binding: anonymous labeled elements run today; the rest is parsed but not yet bound.
+# Binding.
 statement ok
 CREATE TABLE person(id INT, name VARCHAR);
 
@@ -182,17 +182,29 @@ FROM GRAPH_TABLE (g MATCH (:Person)-[k:Knows]->(b:Person) COLUMNS (b.name)) ORDE
 b
 c
 
-statement error
-FROM GRAPH_TABLE (g MATCH (a:person) OPTIONAL MATCH (a)-[k:knows]->(b:person) COLUMNS (a.name));
+query TT
+FROM GRAPH_TABLE (g MATCH (a:person) OPTIONAL MATCH (a)-[k:knows]->(b:person) COLUMNS (a.name AS a, b.name AS b)) ORDER BY ALL;
 ----
-OPTIONAL MATCH is parsed but not yet supported by MATCH
+a	b
+b	c
+c	NULL
 
-statement error
-FROM GRAPH_TABLE (g MATCH (a:person|person) COLUMNS (a.name));
+query T
+FROM GRAPH_TABLE (g MATCH (a:person|person) COLUMNS (a.name)) ORDER BY ALL;
 ----
-Label expression 'person|person' is parsed but not yet supported by MATCH
+a
+b
+c
 
-statement error
-FROM GRAPH_TABLE (g MATCH (a)-[k:knows]->(b:person) COLUMNS (a.name));
+# An unlabeled vertex matches any label; an abbreviated edge any edge.
+query TT
+FROM GRAPH_TABLE (g MATCH (a)-[k:knows]->(b:person) COLUMNS (a.name AS a, b.name AS b)) ORDER BY ALL;
 ----
-Unlabeled graph element 'a' is parsed but not yet supported by MATCH
+a	b
+b	c
+
+query TT
+FROM GRAPH_TABLE (g MATCH (a:person)->(b) COLUMNS (a.name AS a, b.name AS b)) ORDER BY ALL;
+----
+a	b
+b	c

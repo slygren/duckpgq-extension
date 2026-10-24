@@ -21,7 +21,7 @@ shared_ptr<PropertyGraphTable> ValidateSourceNodeAndEdgeTable(CreatePropertyGrap
                                                               const std::string &node_table,
                                                               const std::string &edge_table);
 unique_ptr<SelectNode> CreateSelectNode(const shared_ptr<PropertyGraphTable> &edge_pg_entry,
-                                        const string &function_name, const string &function_alias);
+                                        const string &function_name, const string &function_alias, int32_t csr_id);
 unique_ptr<TableRef> CreateTableFunctionSubquery(unique_ptr<SelectNode> select_node,
                                                  unique_ptr<CommonTableExpressionInfo> cte, const string &cte_name,
                                                  const string &alias);

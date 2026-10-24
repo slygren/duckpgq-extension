@@ -1,6 +1,7 @@
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/common/vector/list_vector.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/common/vector/list_vector.hpp"
 #include "duckpgq/common.hpp"
 #include "duckpgq/core/functions/function_data/iterative_length_function_data.hpp"
 

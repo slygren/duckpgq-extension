@@ -1,6 +1,7 @@
 #include "duckpgq_state.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/transaction/transaction_context.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/planner/binder.hpp"
 
@@ -215,6 +216,10 @@ void DuckPGQState::ExtractListValues(const Value &list_value, vector<Identifier>
 void DuckPGQState::RegisterPropertyGraph(const shared_ptr<PropertyGraphTable> &table, const QualifiedName &graph_name,
                                          bool is_vertex, bool verified) {
 	auto name = graph_name.Name().GetIdentifierName();
+	{
+		lock_guard<mutex> guard(path_table_cache_lock);
+		path_table_caches.erase(name);
+	}
 	// Ensure the property graph exists in the registry
 	if (registered_property_graphs.find(name) == registered_property_graphs.end()) {
 		auto info = make_uniq<CreatePropertyGraphInfo>(name);
@@ -249,12 +254,28 @@ void DuckPGQState::RegisterPropertyGraph(const shared_ptr<PropertyGraphTable> &t
 	}
 }
 
+void DuckPGQState::BeginRewriteDiagnostics(ClientContext &context) {
+	auto query = context.transaction.GetActiveQuery();
+	if (query == rewrite_diagnostics_query) {
+		return;
+	}
+	rewrite_diagnostics.clear();
+	rewrite_diagnostic_sequence = 0;
+	rewrite_diagnostics_query = query;
+}
+
 void DuckPGQState::QueryEnd() {
 	parse_data.reset();
 	for (const auto &csr_id : csr_to_delete) {
 		csr_list.erase(csr_id);
 	}
 	csr_to_delete.clear();
+	// Only safe to restart numbering when nothing is left holding a slot; if a CSR was
+	// built but never consumed (so never marked for deletion) it keeps its id and the
+	// counter keeps climbing past it rather than handing the same slot out twice.
+	if (csr_list.empty()) {
+		csr_id_counter = 0;
+	}
 }
 
 QualifiedName DuckPGQState::ResolvePropertyGraphName(ClientContext &context, const QualifiedName &pg_name) {

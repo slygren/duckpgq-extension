@@ -1,0 +1,96 @@
+# name: test/sql/path_finding/abi_property_filter_pushdown.test
+# description: ABI path-table rewrites remain active when WHERE filters reference vertex and edge properties
+# group: [path_finding]
+
+require duckpgq
+
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE person(id INTEGER, name VARCHAR, kind VARCHAR);
+
+statement ok
+INSERT INTO person VALUES
+    (1, 'Alice', 'engineer'),
+    (2, 'Bob', 'vip'),
+    (3, 'Carol', 'vip'),
+    (4, 'Dave', 'guest');
+
+statement ok
+CREATE TABLE knows(src INTEGER, dst INTEGER, since INTEGER, strength VARCHAR);
+
+statement ok
+INSERT INTO knows VALUES
+    (1, 2, 2020, 'weak'),
+    (1, 3, 2021, 'strong'),
+    (1, 4, 2022, 'weak'),
+    (2, 3, 2023, 'strong');
+
+statement ok
+CREATE SCHEMA graph;
+
+statement ok
+CREATE TABLE graph.__pg_test_graph__Person__Knows__Person AS
+SELECT src AS v0, hash('Knows' || '|' || src || '|' || dst) AS e1, dst AS v1
+FROM knows
+ORDER BY v0;
+
+statement ok
+CREATE TABLE graph.__pgq_path_catalog AS
+SELECT
+    'test_graph' AS graph_name,
+    '__pg_test_graph__Person__Knows__Person' AS path_table_name,
+    'edge' AS path_kind,
+    1 AS hop_count,
+    'Person' AS src_label,
+    'Person' AS dst_label,
+    'Person,Person' AS vertex_label_sequence,
+    'Knows' AS edge_label_sequence,
+    true AS supports_one_row_per_step,
+    true AS is_deduplicated,
+    (SELECT count(*) FROM graph.__pg_test_graph__Person__Knows__Person) AS estimated_rows,
+    current_timestamp AS last_refreshed_at,
+    true AS is_sorted_by_v0,
+    1 AS min_depth,
+    1 AS max_depth,
+    'knows' AS bridge_table_names;
+
+statement ok
+CREATE PROPERTY GRAPH test_graph
+VERTEX TABLES (
+    person PROPERTIES (id, name, kind) LABEL Person
+)
+EDGE TABLES (
+    knows SOURCE KEY (src) REFERENCES person(id)
+          DESTINATION KEY (dst) REFERENCES person(id)
+          PROPERTIES (src, dst, since, strength)
+          LABEL Knows
+);
+
+statement ok
+SET pgq_require_abi_paths = true;
+
+query III
+FROM GRAPH_TABLE (
+    test_graph
+    MATCH (a:Person)-[:Knows]->(b:Person)
+    WHERE a.name = 'Alice' AND b.kind = 'vip'
+    COLUMNS (a.name AS src, b.name AS dst, b.kind AS dst_kind)
+)
+ORDER BY dst;
+----
+Alice	Bob	vip
+Alice	Carol	vip
+
+query III
+FROM GRAPH_TABLE (
+    test_graph
+    MATCH (a:Person)-[e:Knows]->(b:Person)
+    WHERE a.name = 'Alice' AND e.strength = 'strong'
+    COLUMNS (a.name AS src, e.since AS since, b.name AS dst)
+)
+ORDER BY since;
+----
+Alice	2021	Carol

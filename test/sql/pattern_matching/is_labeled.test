@@ -1,0 +1,76 @@
+# name: test/sql/pattern_matching/is_labeled.test
+# description: IS LABELED and IS NOT LABELED predicates (PGQL 2.1)
+# group: [pattern_matching]
+
+require duckpgq
+
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE Person(id BIGINT, name VARCHAR);
+
+statement ok
+CREATE TABLE knows(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO Person VALUES (0, 'Alice'), (1, 'Bob'), (2, 'Carol');
+
+statement ok
+INSERT INTO knows VALUES (0, 1), (1, 2), (0, 2);
+
+statement ok
+CREATE PROPERTY GRAPH pg
+VERTEX TABLES (
+    Person PROPERTIES (id, name) LABEL Person
+)
+EDGE TABLES (
+    knows SOURCE KEY (src) REFERENCES Person (id)
+          DESTINATION KEY (dst) REFERENCES Person (id)
+          LABEL Knows
+);
+
+# IS LABELED: all vertices match label Person — all rows returned
+query II
+FROM GRAPH_TABLE (pg
+    MATCH (a:Person)-[:Knows]->(b:Person)
+    WHERE a IS LABELED Person
+    COLUMNS (a.name AS src, b.name AS dst)
+) t ORDER BY src, dst;
+----
+Alice	Bob
+Alice	Carol
+Bob	Carol
+
+# IS NOT LABELED: no vertices match a label other than Person — 0 rows
+query II
+FROM GRAPH_TABLE (pg
+    MATCH (a:Person)-[:Knows]->(b:Person)
+    WHERE a IS NOT LABELED Person
+    COLUMNS (a.name AS src, b.name AS dst)
+) t ORDER BY src, dst;
+----
+
+# IS LABELED combined with other WHERE conditions
+query I
+FROM GRAPH_TABLE (pg
+    MATCH (a:Person)-[:Knows]->(b:Person)
+    WHERE a IS LABELED Person AND a.name = 'Alice'
+    COLUMNS (b.name AS friend)
+) t ORDER BY friend;
+----
+Bob
+Carol
+
+# IS NOT LABELED combined with other conditions
+query II
+FROM GRAPH_TABLE (pg
+    MATCH (a:Person)-[:Knows]->(b:Person)
+    WHERE a IS NOT LABELED Knows
+    COLUMNS (a.name AS src, b.name AS dst)
+) t ORDER BY src, dst;
+----
+Alice	Bob
+Alice	Carol
+Bob	Carol

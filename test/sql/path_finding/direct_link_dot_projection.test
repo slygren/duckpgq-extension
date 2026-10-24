@@ -1,0 +1,145 @@
+# name: test/sql/path_finding/direct_link_dot_projection.test
+# description: Object projection shorthand and catalog-driven direct-link dot dereference
+# group: [path_finding]
+
+require duckpgq
+
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE tag(id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO tag VALUES (1, 'Pump A'), (2, 'Pump B');
+
+statement ok
+CREATE TABLE work_order(id INTEGER, title VARCHAR);
+
+statement ok
+INSERT INTO work_order VALUES (10, 'Inspect'), (20, 'Repair');
+
+statement ok
+CREATE TABLE work_center(code VARCHAR, description VARCHAR);
+
+statement ok
+INSERT INTO work_center VALUES ('M1', 'Mechanical'), ('E1', 'Electrical');
+
+statement ok
+CREATE TABLE has_workorder(src INTEGER, dst INTEGER);
+
+statement ok
+INSERT INTO has_workorder VALUES (1, 10), (2, 20);
+
+statement ok
+CREATE TABLE work_order__work_center(work_order_id INTEGER, work_center_code VARCHAR);
+
+statement ok
+INSERT INTO work_order__work_center VALUES (10, 'M1'), (20, 'E1');
+
+statement ok
+CREATE SCHEMA graph;
+
+statement ok
+CREATE TABLE graph.__pgq_direct_link_catalog AS
+SELECT
+    'direct_graph' AS graph_name,
+    'WORK_CENTER' AS link_name,
+    'WORK_ORDER' AS src_label,
+    'WORK_CENTER' AS dst_label,
+    'HAS_WORK_CENTER' AS relationship_label,
+    'many_to_one' AS cardinality,
+    'lookup' AS mode,
+    'memory.main.work_order__work_center' AS link_table,
+    'work_order_id' AS src_col,
+    'work_center_code' AS dst_col,
+    'memory.main.work_order' AS src_vertex_table,
+    'id' AS src_vertex_key,
+    'memory.main.work_center' AS dst_vertex_table,
+    'code' AS dst_vertex_key,
+    2::BIGINT AS estimated_rows,
+    current_timestamp AS last_refreshed_at;
+
+statement ok
+CREATE PROPERTY GRAPH direct_graph
+VERTEX TABLES (
+    tag PROPERTIES (id, name) LABEL TAG,
+    work_order PROPERTIES (id, title) LABEL WORK_ORDER,
+    work_center PROPERTIES (code, description) LABEL WORK_CENTER
+)
+EDGE TABLES (
+    has_workorder SOURCE KEY (src) REFERENCES tag(id)
+                  DESTINATION KEY (dst) REFERENCES work_order(id)
+                  LABEL HAS_WORKORDER
+);
+
+query IT
+SELECT workorder.id, workorder.title
+FROM (
+    FROM GRAPH_TABLE (
+        direct_graph
+        MATCH (t:TAG)-[:HAS_WORKORDER]->(wo:WORK_ORDER)
+        WHERE t.id = 1
+        COLUMNS (
+            wo.{id, title} AS workorder
+        )
+    )
+);
+----
+10	Inspect
+
+query TT
+SELECT wc_code, wc.description
+FROM (
+    FROM GRAPH_TABLE (
+        direct_graph
+        MATCH (t:TAG)-[:HAS_WORKORDER]->(wo:WORK_ORDER)
+        WHERE t.id = 1
+        COLUMNS (
+            wo.work_center.code AS wc_code,
+            wo.work_center.{code, description} AS wc
+        )
+    )
+);
+----
+M1	Mechanical
+
+query ITT
+FROM GRAPH_TABLE (
+    direct_graph
+    MATCH (t:TAG)-[:HAS_WORKORDER]->(wo:WORK_ORDER)
+    WHERE wo.work_center.code = 'E1'
+    COLUMNS (
+        t.id AS tag_id,
+        wo.title AS title,
+        wo.work_center.description AS work_center_description
+    )
+);
+----
+2	Repair	Electrical
+
+query ITT
+FROM GRAPH_TABLE (
+    direct_graph
+    MATCH (t:TAG)-[:HAS_WORKORDER]->(wo:WORK_ORDER)
+    WHERE wo.work_center.code = (
+        SELECT wc_code
+        FROM (
+            FROM GRAPH_TABLE (
+                direct_graph
+                MATCH (seed:TAG)-[:HAS_WORKORDER]->(seed_wo:WORK_ORDER)
+                WHERE seed.id = 2
+                COLUMNS (seed_wo.work_center.code AS wc_code)
+            )
+        )
+        LIMIT 1
+    )
+    COLUMNS (
+        t.id AS tag_id,
+        wo.title AS title,
+        wo.work_center.code AS work_center_code
+    )
+);
+----
+2	Repair	E1

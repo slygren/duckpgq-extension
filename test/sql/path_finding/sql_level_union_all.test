@@ -1,0 +1,179 @@
+# name: test/sql/path_finding/sql_level_union_all.test
+# description: SQL-level UNION ALL over separate GRAPH_TABLE subqueries
+# group: [path_finding]
+
+require duckpgq
+
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE Person (id BIGINT, name VARCHAR);
+
+statement ok
+CREATE TABLE Knows (src BIGINT, dst BIGINT);
+
+statement ok
+CREATE TABLE Likes (src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO Person VALUES (0,'Alice'),(1,'Bob'),(2,'Carol');
+
+statement ok
+INSERT INTO Knows VALUES (0,1);
+
+statement ok
+INSERT INTO Likes VALUES (0,2),(1,2);
+
+statement ok
+CREATE TABLE Samples (seed VARCHAR);
+
+statement ok
+INSERT INTO Samples VALUES ('Alice');
+
+statement ok
+CREATE SCHEMA graph;
+
+statement ok
+CREATE TABLE graph.__pg_net__Person__Knows__Person AS
+SELECT 0 AS v0, hash('Knows:0:1') AS e1, 1 AS v1;
+
+statement ok
+CREATE TABLE graph.__pg_net__Person__Likes__Person AS
+SELECT 0 AS v0, hash('Likes:0:2') AS e1, 2 AS v1
+UNION ALL
+SELECT 1 AS v0, hash('Likes:1:2') AS e1, 2 AS v1;
+
+statement ok
+CREATE TABLE graph.__pgq_path_catalog AS
+SELECT
+    'net' AS graph_name,
+    '__pg_net__Person__Knows__Person' AS path_table_name,
+    'edge' AS path_kind,
+    1 AS hop_count,
+    'Person' AS src_label,
+    'Person' AS dst_label,
+    'Person,Person' AS vertex_label_sequence,
+    'Knows' AS edge_label_sequence,
+    true AS supports_one_row_per_step,
+    true AS is_deduplicated,
+    (SELECT count(*) FROM graph.__pg_net__Person__Knows__Person) AS estimated_rows,
+    current_timestamp AS last_refreshed_at,
+    true AS is_sorted_by_v0,
+    1 AS min_depth,
+    1 AS max_depth,
+    'Knows' AS bridge_table_names
+UNION ALL
+SELECT
+    'net' AS graph_name,
+    '__pg_net__Person__Likes__Person' AS path_table_name,
+    'edge' AS path_kind,
+    1 AS hop_count,
+    'Person' AS src_label,
+    'Person' AS dst_label,
+    'Person,Person' AS vertex_label_sequence,
+    'Likes' AS edge_label_sequence,
+    true AS supports_one_row_per_step,
+    true AS is_deduplicated,
+    (SELECT count(*) FROM graph.__pg_net__Person__Likes__Person) AS estimated_rows,
+    current_timestamp AS last_refreshed_at,
+    true AS is_sorted_by_v0,
+    1 AS min_depth,
+    1 AS max_depth,
+    'Likes' AS bridge_table_names;
+
+statement ok
+CREATE PROPERTY GRAPH net
+VERTEX TABLES (Person PROPERTIES (id, name) LABEL Person)
+EDGE TABLES (
+    Knows SOURCE KEY (src) REFERENCES Person (id)
+          DESTINATION KEY (dst) REFERENCES Person (id)
+          PROPERTIES (src, dst) LABEL Knows,
+    Likes SOURCE KEY (src) REFERENCES Person (id)
+          DESTINATION KEY (dst) REFERENCES Person (id)
+          PROPERTIES (src, dst) LABEL Likes
+);
+
+statement ok
+SET pgq_require_abi_paths = true;
+
+query TTT rowsort
+SELECT *
+FROM (
+  FROM GRAPH_TABLE (net
+      MATCH (a:Person)-[:Knows]->(b:Person)
+      COLUMNS (a.name AS src, b.name AS dst, 'Knows' AS rel)
+  )
+  UNION ALL
+  FROM GRAPH_TABLE (net
+      MATCH (a:Person)-[:Likes]->(b:Person)
+      COLUMNS (a.name AS src, b.name AS dst, 'Likes' AS rel)
+  )
+) q
+ORDER BY src, dst, rel;
+----
+Alice	Bob	Knows
+Alice	Carol	Likes
+Bob	Carol	Likes
+
+query TTT rowsort
+SELECT *
+FROM (
+  FROM GRAPH_TABLE (net
+      MATCH (a:Person)-[:Knows]->(b:Person)
+      WHERE a.name = 'Alice'
+      COLUMNS (a.name AS src, b.name AS dst, 'Knows' AS rel)
+  )
+  UNION ALL
+  FROM GRAPH_TABLE (net
+      MATCH (a:Person)-[:Likes]->(b:Person)
+      WHERE a.name = 'Alice'
+      COLUMNS (a.name AS src, b.name AS dst, 'Likes' AS rel)
+  )
+) q
+ORDER BY src, dst, rel;
+----
+Alice	Bob	Knows
+Alice	Carol	Likes
+
+query TTT rowsort
+SELECT *
+FROM (
+  FROM GRAPH_TABLE (net
+      MATCH (a:Person)-[:Knows]->(b:Person)
+      WHERE a.name = (SELECT seed FROM Samples)
+      COLUMNS (a.name AS src, b.name AS dst, 'Knows' AS rel)
+  )
+  UNION ALL
+  FROM GRAPH_TABLE (net
+      MATCH (a:Person)-[:Likes]->(b:Person)
+      WHERE a.name = (SELECT seed FROM Samples)
+      COLUMNS (a.name AS src, b.name AS dst, 'Likes' AS rel)
+  )
+) q
+ORDER BY src, dst, rel;
+----
+Alice	Bob	Knows
+Alice	Carol	Likes
+
+statement ok
+DROP PROPERTY GRAPH net;
+
+statement ok
+SET pgq_require_abi_paths = false;
+
+statement ok
+DROP TABLE Likes;
+
+statement ok
+DROP TABLE Knows;
+
+statement ok
+DROP TABLE Samples;
+
+statement ok
+DROP TABLE Person;
+
+statement ok
+DROP SCHEMA graph CASCADE;

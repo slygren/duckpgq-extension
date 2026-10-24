@@ -1,0 +1,102 @@
+# name: test/sql/path_finding/abi_branch_summary_exists.test
+# description: Correlated EXISTS predicates can use ABI branch_summary metadata
+# group: [path_finding]
+
+require duckpgq
+
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE tag(id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO tag VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol');
+
+statement ok
+CREATE TABLE workorder(id INTEGER, title VARCHAR);
+
+statement ok
+CREATE TABLE notification(id INTEGER, title VARCHAR);
+
+statement ok
+CREATE TABLE has_workorder(tag_id INTEGER, wo_id INTEGER);
+
+statement ok
+CREATE TABLE has_notification(tag_id INTEGER, notification_id INTEGER);
+
+statement ok
+CREATE SCHEMA graph;
+
+statement ok
+CREATE TABLE graph.__pg_test_graph__branch__Tag__HasWorkorder__HasNotification(
+    v0 INTEGER,
+    hasworkorder_count INTEGER,
+    hasworkorder_exists BOOLEAN,
+    hasnotification_count INTEGER,
+    hasnotification_exists BOOLEAN
+);
+
+statement ok
+INSERT INTO graph.__pg_test_graph__branch__Tag__HasWorkorder__HasNotification VALUES
+    (1, 1, true, 0, false),
+    (2, 0, false, 1, true),
+    (3, 0, false, 0, false);
+
+statement ok
+CREATE TABLE graph.__pgq_path_catalog AS
+SELECT
+    'test_graph' AS graph_name,
+    '__pg_test_graph__branch__Tag__HasWorkorder__HasNotification' AS path_table_name,
+    'branch_summary' AS path_kind,
+    NULL AS hop_count,
+    'Tag' AS src_label,
+    'Workorder,Notification' AS dst_label,
+    'Tag,Workorder,Notification' AS vertex_label_sequence,
+    'HasWorkorder,HasNotification' AS edge_label_sequence,
+    false AS supports_one_row_per_step,
+    true AS is_deduplicated,
+    (SELECT count(*) FROM graph.__pg_test_graph__branch__Tag__HasWorkorder__HasNotification) AS estimated_rows,
+    current_timestamp AS last_refreshed_at,
+    true AS is_sorted_by_v0,
+    NULL AS min_depth,
+    NULL AS max_depth,
+    'has_workorder,has_notification' AS bridge_table_names;
+
+statement ok
+CREATE PROPERTY GRAPH test_graph
+VERTEX TABLES (
+    tag PROPERTIES (id, name) LABEL Tag,
+    workorder PROPERTIES (id, title) LABEL Workorder,
+    notification PROPERTIES (id, title) LABEL Notification
+)
+EDGE TABLES (
+    has_workorder SOURCE KEY (tag_id) REFERENCES tag(id)
+                  DESTINATION KEY (wo_id) REFERENCES workorder(id)
+                  LABEL HasWorkorder,
+    has_notification SOURCE KEY (tag_id) REFERENCES tag(id)
+                     DESTINATION KEY (notification_id) REFERENCES notification(id)
+                     LABEL HasNotification
+);
+
+query I
+FROM GRAPH_TABLE (
+    test_graph
+    MATCH (t:Tag)
+    WHERE EXISTS { (t)-[:HasWorkorder]->(:Workorder) }
+    COLUMNS (t.name AS tag_name)
+);
+----
+Alice
+
+query I rowsort
+FROM GRAPH_TABLE (
+    test_graph
+    MATCH (t:Tag)
+    WHERE NOT EXISTS { (t)-[:HasNotification]->(:Notification) }
+    COLUMNS (t.name AS tag_name)
+);
+----
+Alice
+Carol

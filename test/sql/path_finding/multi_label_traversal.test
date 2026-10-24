@@ -1,0 +1,106 @@
+# name: test/sql/path_finding/multi_label_traversal.test
+# description: Multi-label VL-path traversal via recursive CTE: [e:A|B]{lower,upper}
+# group: [path_finding]
+
+require duckpgq
+
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+# ---------------------------------------------------------------
+# Graph: Person nodes connected by two edge types (Knows, Likes)
+# Knows: A->B, C->D
+# Likes: B->C, A->C
+# ---------------------------------------------------------------
+statement ok
+CREATE TABLE Person(id BIGINT, name VARCHAR);
+
+statement ok
+CREATE TABLE Knows(src BIGINT, dst BIGINT);
+
+statement ok
+CREATE TABLE Likes(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO Person VALUES (0,'A'),(1,'B'),(2,'C'),(3,'D');
+
+statement ok
+INSERT INTO Knows VALUES (0,1),(2,3);
+
+statement ok
+INSERT INTO Likes VALUES (1,2),(0,2);
+
+statement ok
+CREATE PROPERTY GRAPH social
+VERTEX TABLES (Person PROPERTIES (id, name) LABEL Person)
+EDGE TABLES (
+    Knows SOURCE KEY (src) REFERENCES Person (id)
+          DESTINATION KEY (dst) REFERENCES Person (id)
+          LABEL Knows,
+    Likes SOURCE KEY (src) REFERENCES Person (id)
+          DESTINATION KEY (dst) REFERENCES Person (id)
+          LABEL Likes
+);
+
+# 1-hop only (depth=1): A can reach B (via Knows) and C (via Likes)
+query T
+FROM GRAPH_TABLE (social
+    MATCH (a:Person)-[e:Knows|Likes]->{1,1}(b:Person)
+    WHERE a.name = 'A'
+    COLUMNS (b.name AS bname)
+    ) t ORDER BY 1;
+----
+B
+C
+
+# Depth 1 or 2 from A:
+# depth 1: B, C
+# depth 2: A->B->C (Likes), A->C->D (Knows)  => C, D
+query T
+FROM GRAPH_TABLE (social
+    MATCH (a:Person)-[e:Knows|Likes]->{1,2}(b:Person)
+    WHERE a.name = 'A'
+    COLUMNS (b.name AS bname)
+    ) t ORDER BY 1;
+----
+B
+C
+C
+D
+
+# Exactly depth 2 from A: B->C and C->D
+query T
+FROM GRAPH_TABLE (social
+    MATCH (a:Person)-[e:Knows|Likes]->{2,2}(b:Person)
+    WHERE a.name = 'A'
+    COLUMNS (b.name AS bname)
+    ) t ORDER BY 1;
+----
+C
+D
+
+# Multi-hop across both edge types using src.name and dst.name in COLUMNS
+query TT
+FROM GRAPH_TABLE (social
+    MATCH (a:Person)-[e:Knows|Likes]->{1,2}(b:Person)
+    WHERE a.name = 'A'
+    COLUMNS (a.name AS aname, b.name AS bname)
+    ) t ORDER BY 2, 1;
+----
+A	B
+A	C
+A	C
+A	D
+
+statement ok
+DROP PROPERTY GRAPH social;
+
+statement ok
+DROP TABLE Likes;
+
+statement ok
+DROP TABLE Knows;
+
+statement ok
+DROP TABLE Person;

@@ -1,0 +1,187 @@
+# name: test/sql/path_finding/abi_seeded_traversal.test
+# description: graded ABI coverage for quantified variable-length patterns - ANY SHORTEST steps scan the ABI edge artifact, and an exact length {k,k} is answered from the k-hop artifact outright; walk mode keeps the bridge because it is multiplicity-sensitive
+# group: [path_finding]
+
+require duckpgq
+
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE person(id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO person VALUES (1,'Alice'),(2,'Bob'),(3,'Carol'),(4,'Dan'),(5,'Eve');
+
+statement ok
+CREATE TABLE knows(src INTEGER, dst INTEGER);
+
+# Bridge is a simple chain 1->2->3->4. Person 5 is NOT reachable through the bridge.
+statement ok
+INSERT INTO knows VALUES (1,2),(2,3),(3,4);
+
+statement ok
+CREATE SCHEMA graph;
+
+# ── Graph `g`: artifacts faithfully mirror the bridge ────────────────────────────
+statement ok
+CREATE TABLE graph.__pg_g__Person__Knows__Person AS
+SELECT src AS v0, hash('e' || src || dst) AS e1, dst AS v1 FROM knows ORDER BY src;
+
+statement ok
+CREATE TABLE graph.__pg_g__Person__Knows__Person__Knows__Person AS
+SELECT k1.src AS v0, hash('a') AS e1, k1.dst AS v1, hash('b') AS e2, k2.dst AS v2
+FROM knows k1 JOIN knows k2 ON k2.src = k1.dst;
+
+# ── Graph `d`: artifacts deliberately diverge from the bridge ────────────────────
+# The 1-hop artifact carries an extra edge 4->5, and the 2-hop artifact an extra pair
+# 1 ->(2 hops)-> 5. Neither is producible from the bridge, so reaching person 5 proves
+# the artifact was scanned. (Intermediate vertex 2 is a real person, so the 2-hop
+# rewrite's vertex joins keep the row.)
+statement ok
+CREATE TABLE graph.__pg_d__Person__Knows__Person AS
+SELECT src AS v0, hash('e' || src || dst) AS e1, dst AS v1 FROM knows
+UNION ALL SELECT 4, hash('e45'), 5;
+
+statement ok
+CREATE TABLE graph.__pg_d__Person__Knows__Person__Knows__Person AS
+SELECT 1 AS v0, hash('a') AS e1, 2 AS v1, hash('b') AS e2, 3 AS v2
+UNION ALL SELECT 2, hash('c'), 3, hash('d'), 4
+UNION ALL SELECT 1, hash('x'), 2, hash('y'), 5;
+
+statement ok
+CREATE TABLE graph.__pgq_path_catalog AS
+SELECT * FROM (VALUES
+  ('g','__pg_g__Person__Knows__Person','edge',1,'Person','Person','Person,Person','Knows',true,true,3,now(),true,1,1,'knows'),
+  ('d','__pg_d__Person__Knows__Person','edge',1,'Person','Person','Person,Person','Knows',true,true,4,now(),true,1,1,'knows'),
+  ('g','__pg_g__Person__Knows__Person__Knows__Person','fixed_path',2,'Person','Person','Person,Person,Person','Knows,Knows',true,true,2,now(),true,2,2,'knows'),
+  ('d','__pg_d__Person__Knows__Person__Knows__Person','fixed_path',2,'Person','Person','Person,Person,Person','Knows,Knows',true,true,3,now(),true,2,2,'knows')
+) t(graph_name,path_table_name,path_kind,hop_count,src_label,dst_label,vertex_label_sequence,edge_label_sequence,
+    supports_one_row_per_step,is_deduplicated,estimated_rows,last_refreshed_at,is_sorted_by_v0,min_depth,max_depth,bridge_table_names);
+
+statement ok
+CREATE PROPERTY GRAPH g
+VERTEX TABLES (person PROPERTIES (id, name) LABEL Person)
+EDGE TABLES (knows SOURCE KEY (src) REFERENCES person(id) DESTINATION KEY (dst) REFERENCES person(id) LABEL Knows);
+
+statement ok
+CREATE PROPERTY GRAPH d
+VERTEX TABLES (person PROPERTIES (id, name) LABEL Person)
+EDGE TABLES (knows SOURCE KEY (src) REFERENCES person(id) DESTINATION KEY (dst) REFERENCES person(id) LABEL Knows);
+
+# ── 7a: per-step edge artifact ───────────────────────────────────────────────────
+# Correctness over a range quantifier on the faithful artifact.
+query II rowsort
+FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:Person)-[:Knows]->{1,3}(b:Person)
+   COLUMNS (a.id AS aid, b.id AS bid));
+----
+1	2
+1	3
+1	4
+2	3
+2	4
+3	4
+
+# A faithful artifact is equivalent to the bridge traversal.
+query TIIII
+SELECT status, abi_rows, fallback_rows, only_in_abi, only_in_fallback
+FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:Person)-[:Knows]->{1,3}(b:Person) COLUMNS (a.id AS aid, b.id AS bid))');
+----
+match	6	6	0	0
+
+# Left-directed ANY SHORTEST walks the same artifact in reverse (steps v1 -> v0).
+query TIIII
+SELECT status, abi_rows, fallback_rows, only_in_abi, only_in_fallback
+FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:Person)<-[:Knows]-{1,3}(b:Person) COLUMNS (a.id AS aid, b.id AS bid))');
+----
+match	6	6	0	0
+
+# Proof the step artifact is scanned: graph `d`'s extra 4->5 edge makes person 5
+# reachable, which the bridge alone cannot do.
+query II rowsort
+FROM GRAPH_TABLE (d MATCH ANY SHORTEST (a:Person)-[:Knows]->{1,3}(b:Person)
+   COLUMNS (a.id AS aid, b.id AS bid));
+----
+1	2
+1	3
+1	4
+2	3
+2	4
+2	5
+3	4
+3	5
+4	5
+
+# Walk mode is multiplicity-sensitive, so it keeps the bridge: person 5 stays unreachable.
+query II rowsort
+FROM GRAPH_TABLE (d MATCH (a:Person)-[:Knows]->{1,3}(b:Person)
+   COLUMNS (a.id AS aid, b.id AS bid));
+----
+1	2
+1	3
+1	4
+2	3
+2	4
+3	4
+
+# With both sides on the bridge, the checker sees no divergence at all.
+query TIIII
+SELECT status, abi_rows, fallback_rows, only_in_abi, only_in_fallback
+FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (d MATCH (a:Person)-[:Knows]->{1,3}(b:Person) COLUMNS (a.id AS aid, b.id AS bid))');
+----
+match	6	6	0	0
+
+# ── 7b: exact length {k,k} answered from the k-hop artifact ──────────────────────
+# Graph `d`'s 2-hop artifact contributes 1 ->(2)-> 5, impossible via the bridge chain.
+query II rowsort
+FROM GRAPH_TABLE (d MATCH ANY SHORTEST (a:Person)-[:Knows]->{2,2}(b:Person)
+   COLUMNS (a.id AS aid, b.id AS bid));
+----
+1	3
+1	5
+2	4
+
+# The checker isolates exactly the one extra pair the artifact contributes.
+query TIIII
+SELECT status, abi_rows, fallback_rows, only_in_abi, only_in_fallback
+FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (d MATCH ANY SHORTEST (a:Person)-[:Knows]->{2,2}(b:Person) COLUMNS (a.id AS aid, b.id AS bid))');
+----
+MISMATCH	3	2	1	0
+
+# Left-directed {2,2} reads the same artifact from the far end (v2 -> v0).
+query II rowsort
+FROM GRAPH_TABLE (d MATCH ANY SHORTEST (a:Person)<-[:Knows]-{2,2}(b:Person)
+   COLUMNS (a.id AS aid, b.id AS bid));
+----
+3	1
+4	2
+5	1
+
+# A faithful k-hop artifact stays equivalent to walking the bridge.
+query TIIII
+SELECT status, abi_rows, fallback_rows, only_in_abi, only_in_fallback
+FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:Person)-[:Knows]->{2,2}(b:Person) COLUMNS (a.id AS aid, b.id AS bid))');
+----
+match	2	2	0	0
+
+# Walk mode {2,2} is multiplicity-sensitive, so it keeps the bridge.
+query II rowsort
+FROM GRAPH_TABLE (d MATCH (a:Person)-[:Knows]->{2,2}(b:Person)
+   COLUMNS (a.id AS aid, b.id AS bid));
+----
+1	3
+2	4
+
+# A range quantifier is not an exact length, so it still walks (using 7a step artifacts).
+query TIIII
+SELECT status, abi_rows, fallback_rows, only_in_abi, only_in_fallback
+FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:Person)-[:Knows]->{2,3}(b:Person) COLUMNS (a.id AS aid, b.id AS bid))');
+----
+match	3	3	0	0
+
+statement ok
+DROP PROPERTY GRAPH g;
+
+statement ok
+DROP PROPERTY GRAPH d;

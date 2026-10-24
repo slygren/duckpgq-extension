@@ -1,0 +1,220 @@
+# name: test/sql/path_finding/rowid_id_space_collision.test
+# description: Generic traversal must refuse cross-vertex-table edges rather than leak rows between vertices
+# group: [path_finding]
+
+# THE DEFECT (found 2026-07-28, inherited from upstream):
+#
+# Both generic traversal routes address vertices by `rowid` in ONE id space:
+#   * the CSR -- create_csr_edge() inserts src and dst rowids into the same array;
+#   * the bounded recursive CTE -- its recursive step joins `mid.rowid = r.dst_rowid`,
+#     reading a DESTINATION-table rowid as a SOURCE-table rowid.
+#
+# That is sound only when an edge's two ends reference the SAME vertex table. When they
+# differ the rowid spaces collide: below, tag rowid 0 (T1) and workorder rowid 0 (WO-10)
+# are literally the same CSR vertex. The traversal then walks out of the destination
+# table as if it were a source.
+#
+# The observable was not "fewer rows". Measured before containment, T1 -- which owns
+# WO-10, WO-11, WO-12 -- returned WO-11, WO-12 and **WO-13**: it dropped one of its own
+# and claimed a work order belonging to T2. Adding path_length(p) read past the end of
+# the CSR arrays and killed the database ("Attempted to access index 2 within vector of
+# size 2", connection invalidated).
+#
+# FIXED for the bounded route: BuildBoundedVLReachabilityCTE now carries vertex KEYS
+# (src_key/dst_key, VARCHAR-normalised; the visited set qualified as '<table>:<key>' so
+# two tables sharing a key value stay distinct vertices). A cross-table edge then simply
+# yields nothing past depth 1 -- the correct answer, since there is no second hop over
+# the same edge table -- instead of fabricating one.
+#
+# STILL REFUSED: the CSR route (GenerateShortestPathCTE), reached by a named path with a
+# path function. That one remains rowid-addressed, so it is contained rather than fixed.
+#
+# The ABI context expansion was always key-based and always correct here, which is what
+# masked the defect on the artifact-backed graph.
+
+require duckpgq
+
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE tag(id VARCHAR, name VARCHAR);
+
+statement ok
+INSERT INTO tag VALUES ('T1', 'A'), ('T2', 'B');
+
+statement ok
+CREATE TABLE wo(id BIGINT, title VARCHAR);
+
+statement ok
+INSERT INTO wo VALUES (10, 'WO-10'), (11, 'WO-11'), (12, 'WO-12'), (13, 'WO-13');
+
+statement ok
+CREATE TABLE has_wo(src VARCHAR, dst BIGINT);
+
+# T1 owns three, T2 owns one. The rowid spaces overlap on 0,1 -- which is the trap.
+statement ok
+INSERT INTO has_wo VALUES ('T1', 10), ('T1', 11), ('T1', 12), ('T2', 13);
+
+statement ok
+CREATE PROPERTY GRAPH g
+VERTEX TABLES (
+    tag PROPERTIES (id, name) LABEL Tag,
+    wo PROPERTIES (id, title) LABEL Wo
+)
+EDGE TABLES (
+    has_wo SOURCE KEY (src) REFERENCES tag(id)
+           DESTINATION KEY (dst) REFERENCES wo(id)
+           LABEL HasWo
+);
+
+# ── every bounded shape must return T1's OWN work orders, and only those ────────
+# Each of these previously returned [WO-11, WO-12, WO-13]: one of T1's dropped, one of
+# T2's fabricated. Depth 2+ adds nothing because has_wo has no wo->wo hop.
+
+query T
+SELECT list_sort(list(title)) AS got FROM GRAPH_TABLE ( g MATCH (t:Tag)-[:HasWo]->(x:Wo)
+    WHERE t.id = 'T1' COLUMNS (x.title AS title) );
+----
+[WO-10, WO-11, WO-12]
+
+query T
+SELECT list_sort(list(title)) AS got FROM GRAPH_TABLE ( g MATCH (t:Tag)-[:HasWo]->{1,1}(x:Wo)
+    WHERE t.id = 'T1' COLUMNS (x.title AS title) );
+----
+[WO-10, WO-11, WO-12]
+
+query T
+SELECT list_sort(list(title)) AS got FROM GRAPH_TABLE ( g MATCH (t:Tag)-[:HasWo]->{1,2}(x:Wo)
+    WHERE t.id = 'T1' COLUMNS (x.title AS title) );
+----
+[WO-10, WO-11, WO-12]
+
+query T
+SELECT list_sort(list(title)) AS got FROM GRAPH_TABLE ( g MATCH (t:Tag)-[:HasWo]->{1,3}(x:Wo)
+    WHERE t.id = 'T1' COLUMNS (x.title AS title) );
+----
+[WO-10, WO-11, WO-12]
+
+query T
+SELECT list_sort(list(title)) AS got FROM GRAPH_TABLE ( g MATCH ANY SHORTEST (t:Tag)-[:HasWo]->{1,2}(x:Wo)
+    WHERE t.id = 'T1' COLUMNS (x.title AS title) );
+----
+[WO-10, WO-11, WO-12]
+
+# T2 must keep its own single work order -- the other half of "no leakage".
+query T
+SELECT list_sort(list(title)) AS got FROM GRAPH_TABLE ( g MATCH (t:Tag)-[:HasWo]->{1,3}(x:Wo)
+    WHERE t.id = 'T2' COLUMNS (x.title AS title) );
+----
+[WO-13]
+
+# ── the CSR route is contained, not fixed ───────────────────────────────────────
+# A named path with a path function routes to GenerateShortestPathCTE, which is still
+# rowid-addressed. This shape used to take the database down with an out-of-bounds read
+# ("Attempted to access index 2 within vector of size 2"); it must refuse instead.
+
+statement error
+FROM GRAPH_TABLE ( g MATCH p = (t:Tag)-[:HasWo]->{1,2}(x:Wo) WHERE t.id = 'T1'
+    COLUMNS (x.title AS title, path_length(p) AS d) );
+----
+connects two different vertex tables
+
+# ── a same-table edge is sound and must NOT be blocked ──────────────────────────
+# One vertex table means one id space, so the generic routes are correct here. This is
+# the assertion that fails if containment is ever widened into "refuse all traversal".
+
+statement ok
+CREATE TABLE person(id BIGINT, name VARCHAR);
+
+statement ok
+INSERT INTO person VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd');
+
+statement ok
+CREATE TABLE knows(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO knows VALUES (1, 2), (2, 3), (3, 4);
+
+statement ok
+CREATE PROPERTY GRAPH sg
+VERTEX TABLES ( person PROPERTIES (id, name) LABEL P )
+EDGE TABLES (
+    knows SOURCE KEY (src) REFERENCES person(id)
+          DESTINATION KEY (dst) REFERENCES person(id)
+          LABEL Knows
+);
+
+query T
+SELECT list_sort(list(name)) AS got FROM GRAPH_TABLE ( sg MATCH (s:P)-[:Knows]->{1,2}(t:P)
+    WHERE s.name = 'a' COLUMNS (t.name AS name) );
+----
+[b, c]
+
+query T
+SELECT list_sort(list(name)) AS got FROM GRAPH_TABLE ( sg MATCH (s:P)-[:Knows]->{1,3}(t:P)
+    WHERE s.name = 'a' COLUMNS (t.name AS name) );
+----
+[b, c, d]
+
+# ── ONE ROW PER over a cross-table edge is refused ──────────────────────────────
+# Not fixable the way the reachability CTE was: ONE ROW PER's `path` is an interleaved
+# list of ROWIDS that BuildORPStepsCTE unnests and rejoins to the vertex and edge tables
+# by rowid, and for a cross-table edge the v1 and v2 of ONE ROW PER STEP are not even the
+# same vertex table -- there is no single table to rejoin against.
+#
+# Measured before this guard: ONE ROW PER STEP reported 4 steps where 3 is the truth, and
+# ONE ROW PER VERTEX 5 vertices where 4 is (T1 plus its three work orders). Silently
+# wrong, like every other symptom of the shared rowid space.
+
+statement error
+FROM GRAPH_TABLE ( g MATCH (t:Tag)-[:HasWo]->{1,2}(x:Wo) ONE ROW PER STEP (v1, e, v2)
+    WHERE t.id = 'T1' COLUMNS (element_id(v1) AS a) );
+----
+ONE ROW PER over edge
+
+statement error
+FROM GRAPH_TABLE ( g MATCH (t:Tag)-[:HasWo]->{1,2}(x:Wo) ONE ROW PER VERTEX (v)
+    WHERE t.id = 'T1' COLUMNS (element_id(v) AS a) );
+----
+ONE ROW PER over edge
+
+# Same-table ONE ROW PER is sound and must keep working. Three step rows: the depth-1
+# path a->b contributes one, the depth-2 path a->b->c contributes two.
+query I
+SELECT count(*) AS n FROM GRAPH_TABLE ( sg MATCH (s:P)-[:Knows]->{1,2}(t:P) ONE ROW PER STEP (v1, e, v2)
+    WHERE s.name = 'a' COLUMNS (element_id(v1) AS a) );
+----
+3
+
+# ── multi-label traversal is key-based too ──────────────────────────────────────
+# AddTraversalPathFinding already carried cur_pk (a key) for the walk itself, but its
+# src_rowid / cur_rowid / visited were positions -- and cur_rowid held a PREV-table
+# position at depth 0 and a NEXT-table position afterwards. Now keys throughout.
+# An alternation over same-table edges must give the union of both relations.
+
+statement ok
+CREATE TABLE likes(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO likes VALUES (1, 4);
+
+statement ok
+CREATE PROPERTY GRAPH mg
+VERTEX TABLES ( person PROPERTIES (id, name) LABEL P )
+EDGE TABLES (
+    knows SOURCE KEY (src) REFERENCES person(id)
+          DESTINATION KEY (dst) REFERENCES person(id)
+          LABEL Knows,
+    likes SOURCE KEY (src) REFERENCES person(id)
+          DESTINATION KEY (dst) REFERENCES person(id)
+          LABEL Likes
+);
+
+# a knows b knows c, and a likes d. Depth <= 2 from a reaches b, c and d.
+query T
+SELECT list_sort(list(name)) AS got FROM GRAPH_TABLE ( mg MATCH (s:P)-[:Knows|Likes]->{1,2}(t:P)
+    WHERE s.name = 'a' COLUMNS (t.name AS name) );
+----
+[b, c, d]

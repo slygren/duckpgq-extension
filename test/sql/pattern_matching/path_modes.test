@@ -1,5 +1,5 @@
 # name: test/sql/pattern_matching/path_modes.test
-# description: Testing the path modes, most have not been implemented yet
+# description: Testing path modes: TRAIL, ACYCLIC, SIMPLE are now implemented
 # group: [pattern_matching]
 
 #statement ok
@@ -7,7 +7,7 @@
 
 require duckpgq
 
-# The SQL/PGQ grammar is connection-local and must be activated explicitly.
+
 statement ok
 SET active_grammar_extensions = ['duckpgq'];
 
@@ -66,57 +66,65 @@ EDGE TABLES (
 #    COLUMNS (p, a.name as name, b.name as school)
 #    ) study;
 
-statement error
-FROM GRAPH_TABLE (pg
+query II
+SELECT name, school FROM GRAPH_TABLE (pg
     MATCH
     p = ALL SHORTEST (a:Person)-[k:knows]-> *(b:Person)
     WHERE a.name = 'Daniel'
-    COLUMNS (p, a.name as name, b.name as school)
-    ) study;
+    COLUMNS (a.name as name, b.name as school)
+    ) study ORDER BY school;
 ----
-Not implemented Error: ALL SHORTEST has not been implemented yet.
+Daniel	Daniel
+Daniel	Gabor
+Daniel	Peter
+Daniel	Tavneet
 
+query II
+SELECT name, school FROM GRAPH_TABLE (pg
+    MATCH
+    p = ANY SHORTEST TRAIL (a:Person)-[k:knows]->{1,4}(b:Person)
+    WHERE a.name = 'Daniel'
+    COLUMNS (a.name as name, b.name as school)
+    ) study ORDER BY school;
+----
+Daniel	Gabor
+Daniel	Peter
+Daniel	Tavneet
+
+query II
+SELECT name, school FROM GRAPH_TABLE (pg
+    MATCH
+    p = ANY SHORTEST ACYCLIC (a:Person)-[k:knows]->{1,4}(b:Person)
+    WHERE a.name = 'Daniel'
+    COLUMNS (a.name as name, b.name as school)
+    ) study ORDER BY school;
+----
+Daniel	Gabor
+Daniel	Peter
+Daniel	Tavneet
+
+query II
+SELECT name, school FROM GRAPH_TABLE (pg
+    MATCH
+    p = ANY SHORTEST SIMPLE (a:Person)-[k:knows]->{1,4}(b:Person)
+    WHERE a.name = 'Daniel'
+    COLUMNS (a.name as name, b.name as school)
+    ) study ORDER BY school;
+----
+Daniel	Gabor
+Daniel	Peter
+Daniel	Tavneet
+
+## https://github.com/cwida/duckpgq-extension/issues/46 - TopK still pending
 statement error
 FROM GRAPH_TABLE (pg
     MATCH
-    p = ANY SHORTEST TRAIL (a:Person)-[k:knows]-> *(b:Person)
+    p = SHORTEST 5 (a:Person)-[k:knows]->{1,4}(b:Person)
     WHERE a.name = 'Daniel'
-    COLUMNS (p, a.name as name, b.name as school)
+    COLUMNS (a.name as name, b.name as school)
     ) study;
 ----
-Not implemented Error: Path modes other than WALK have not been implemented yet.
-
-statement error
-FROM GRAPH_TABLE (pg
-    MATCH
-    p = ANY SHORTEST ACYCLIC (a:Person)-[k:knows]-> *(b:Person)
-    WHERE a.name = 'Daniel'
-    COLUMNS (p, a.name as name, b.name as school)
-    ) study;
-----
-Not implemented Error: Path modes other than WALK have not been implemented yet.
-
-## https://github.com/cwida/duckpgq-extension/issues/46
-##statement error
-##-FROM GRAPH_TABLE (pg
-##    MATCH
-##    p = ANY SHORTEST 5 WALK (a:Person)-[k:knows]-> *(b:Person)
-##    WHERE a.name = 'Daniel'
-##    COLUMNS (p, a.name as name, b.name as school)
-##    ) study;
-##----
-##Not implemented Error: TopK has not been implemented yet.
-
-
-statement error
-FROM GRAPH_TABLE (pg
-    MATCH
-    p = ANY SHORTEST SIMPLE (a:Person)-[k:knows]-> *(b:Person)
-    WHERE a.name = 'Daniel'
-    COLUMNS (p, a.name as name, b.name as school)
-    ) study;
-----
-Not implemented Error: Path modes other than WALK have not been implemented yet.
+Not implemented Error: TopK has not been implemented yet.
 
 
 

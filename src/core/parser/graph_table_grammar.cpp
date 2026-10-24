@@ -598,6 +598,28 @@ arena_ptr<TransformProcess> StartTransform(PEGTransformer &transformer, ParseRes
 
 } // namespace
 
+optional_ptr<const MatchExpression> DuckPGQGetExistsPattern(const ParsedExpression &expression) {
+	if (expression.GetExpressionClass() != ExpressionClass::SUBQUERY) {
+		return nullptr;
+	}
+	auto &subquery = expression.Cast<SubqueryExpression>();
+	if (subquery.GetSubqueryType() != SubqueryType::EXISTS || !subquery.Subquery() ||
+	    subquery.Subquery()->node->type != QueryNodeType::SELECT_NODE) {
+		return nullptr;
+	}
+	auto &from_table = subquery.Subquery()->node->Cast<SelectNode>().from_table;
+	if (!from_table || from_table->type != TableReferenceType::TABLE_FUNCTION) {
+		return nullptr;
+	}
+	auto &function_ref = from_table->Cast<TableFunctionRef>();
+	auto match_info = dynamic_cast<const DuckPGQMatchInfo *>(function_ref.bind_info.get());
+	auto &function_name = function_ref.function->Cast<FunctionExpression>().FunctionName();
+	if (!match_info || function_name != Identifier(DUCKPGQ_EXISTS_PATTERN_FUNCTION)) {
+		return nullptr;
+	}
+	return match_info->match.get();
+}
+
 optional_ptr<MatchExpression> DuckPGQGetExistsPattern(ParsedExpression &expression) {
 	if (expression.GetExpressionClass() != ExpressionClass::SUBQUERY) {
 		return nullptr;

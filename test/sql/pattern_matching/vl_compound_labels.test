@@ -1,0 +1,208 @@
+# name: test/sql/pattern_matching/vl_compound_labels.test
+# group: [pattern_matching]
+
+require duckpgq
+
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE Person(id BIGINT, name VARCHAR, mask BIGINT);
+
+statement ok
+CREATE TABLE knows(src BIGINT, dst BIGINT, emask BIGINT);
+
+statement ok
+INSERT INTO Person VALUES (0, 'Alice', 1), (1, 'Bob', 2), (2, 'Carol', 2);
+
+statement ok
+INSERT INTO knows VALUES (0, 1, 1), (1, 2, 2);
+
+statement ok
+CREATE PROPERTY GRAPH pg
+VERTEX TABLES (
+    Person PROPERTIES (id, name) LABEL Person IN mask (Admin, User)
+)
+EDGE TABLES (
+    knows SOURCE KEY (src) REFERENCES Person (id)
+          DESTINATION KEY (dst) REFERENCES Person (id)
+          LABEL Knows IN emask (Colleague, Friend)
+);
+
+# Variable-length path with compound edge label — Colleague|Friend spans both sub-labels
+query II
+FROM GRAPH_TABLE (pg
+    MATCH ANY SHORTEST (a:Person)-[e:Colleague|Friend]->*(b:Person)
+    COLUMNS (a.name, b.name)
+) t ORDER BY 1, 2;
+----
+Alice	Alice
+Alice	Bob
+Alice	Carol
+Bob	Bob
+Bob	Carol
+Carol	Carol
+
+# ── A label restriction survives the quantifier ────────────────────────────────
+# The case above passes whether or not the expression is applied, because
+# Colleague|Friend covers every row of `knows`. A restriction that excludes rows
+# does not: ResolveTable() finds the backing table by stripping the expression
+# down to a leaf, and the quantified branch used to hand that table straight to
+# the traversal without ever building the predicate -- so the walk ran over every
+# label in the table. The unquantified form of the same pattern was always right,
+# which is what makes this a silent wrong answer rather than a visible one.
+#
+# knows holds exactly two rows: (0,1) is Colleague, (1,2) is Friend.
+
+query II
+FROM GRAPH_TABLE (pg
+    MATCH (a:Person)-[e:Colleague]->{1,1}(b:Person)
+    COLUMNS (a.name, b.name)
+) t ORDER BY 1, 2;
+----
+Alice	Bob
+
+query II
+FROM GRAPH_TABLE (pg
+    MATCH (a:Person)-[e:Friend]->{1,1}(b:Person)
+    COLUMNS (a.name, b.name)
+) t ORDER BY 1, 2;
+----
+Bob	Carol
+
+# Negation, which is the form that reads most wrongly when it is dropped: it
+# resolves to the very table it excludes and traverses exactly those rows.
+query II
+FROM GRAPH_TABLE (pg
+    MATCH (a:Person)-[e:!Colleague]->{1,1}(b:Person)
+    COLUMNS (a.name, b.name)
+) t ORDER BY 1, 2;
+----
+Bob	Carol
+
+# And the unquantified form still agrees, which is the invariant that was broken.
+query II
+FROM GRAPH_TABLE (pg
+    MATCH (a:Person)-[e:Colleague]->(b:Person)
+    COLUMNS (a.name, b.name)
+) t ORDER BY 1, 2;
+----
+Alice	Bob
+
+# ── The same restriction, past one hop ─────────────────────────────────────────
+# {1,2} used to return the SAME rows for all four forms below, because the label
+# expression was discarded and the walk ran over every row of `knows`. The tell was
+# that a restriction produced byte-identical output to no restriction at all.
+#
+# Only Alice-[Colleague]->Bob and Bob-[Friend]->Carol exist, so:
+#   Colleague only        -> Alice/Bob            (no 2-hop Colleague walk exists)
+#   Colleague|Friend      -> all three            (admits every row)
+#   no label              -> all three
+#   NOT Colleague         -> Bob/Carol            (the Friend edge alone)
+#
+# The second case is why this went unnoticed for so long: it is correct whether or
+# not the expression is applied. A label test has to EXCLUDE something.
+
+query II
+FROM GRAPH_TABLE (pg MATCH (a:Person)-[e:Colleague]->{1,2}(b:Person)
+                   COLUMNS (a.name, b.name)) t ORDER BY 1, 2;
+----
+Alice	Bob
+
+query II
+FROM GRAPH_TABLE (pg MATCH (a:Person)-[e:Colleague|Friend]->{1,2}(b:Person)
+                   COLUMNS (a.name, b.name)) t ORDER BY 1, 2;
+----
+Alice	Bob
+Alice	Carol
+Bob	Carol
+
+query II
+FROM GRAPH_TABLE (pg MATCH (a:Person)-[e]->{1,2}(b:Person)
+                   COLUMNS (a.name, b.name)) t ORDER BY 1, 2;
+----
+Alice	Bob
+Alice	Carol
+Bob	Carol
+
+query II
+FROM GRAPH_TABLE (pg MATCH (a:Person)-[e:!Colleague]->{1,2}(b:Person)
+                   COLUMNS (a.name, b.name)) t ORDER BY 1, 2;
+----
+Bob	Carol
+
+# Deeper bound, same restriction: still only the one Colleague edge.
+query II
+FROM GRAPH_TABLE (pg MATCH (a:Person)-[e:Colleague]->{1,5}(b:Person)
+                   COLUMNS (a.name, b.name)) t ORDER BY 1, 2;
+----
+Alice	Bob
+
+# ── Unbounded and undirected: the CSR routes ───────────────────────────────────
+# These do not use the recursive CTE. The CSR is built from a scan of the edge
+# table, a COUNT that sizes its arrays, and a per-vertex degree subquery -- all
+# three have to agree about which rows exist. Filtering only the scan produced
+# "Non-existent/non-unique vertices detected", which is the CSR reporting its own
+# inconsistency; filtering all three is what makes these right.
+
+# `*` includes the zero-length walk, so every vertex reaches itself.
+query II rowsort
+FROM GRAPH_TABLE (pg MATCH ANY SHORTEST (a:Person)-[e:Colleague]->*(b:Person)
+                   COLUMNS (a.name, b.name)) t;
+----
+Alice	Alice
+Alice	Bob
+Bob	Bob
+Carol	Carol
+
+query II rowsort
+FROM GRAPH_TABLE (pg MATCH ANY SHORTEST (a:Person)-[e:Colleague]->{1,}(b:Person)
+                   COLUMNS (a.name, b.name)) t;
+----
+Alice	Bob
+
+query II rowsort
+FROM GRAPH_TABLE (pg MATCH ANY SHORTEST (a:Person)-[e:!Colleague]->{1,}(b:Person)
+                   COLUMNS (a.name, b.name)) t;
+----
+Bob	Carol
+
+# Undirected walks both ways over the admitted edges only.
+query II rowsort
+FROM GRAPH_TABLE (pg MATCH (a:Person)-[e:Colleague]-{1,2}(b:Person)
+                   COLUMNS (a.name, b.name)) t;
+----
+Alice	Bob
+Bob	Alice
+
+query II rowsort
+FROM GRAPH_TABLE (pg MATCH (a:Person)-[e:!Colleague]-{1,2}(b:Person)
+                   COLUMNS (a.name, b.name)) t;
+----
+Bob	Carol
+Carol	Bob
+
+# ── An expression that admits nothing ──────────────────────────────────────────
+# `Knows` IS the table's main label, so `!Knows` matches no edge at all. At a lower
+# bound of 1 the answer is empty and no CSR is built -- asking one to exist without
+# edges is what fails with "Invalid ID", since every part of its construction hangs
+# off a scan of the edge table. An empty edge table does the same, so this is not new;
+# a label filter is just the first thing that made it reachable.
+query II
+FROM GRAPH_TABLE (pg MATCH (a:Person)-[e:!Knows]->{1,2}(b:Person)
+                   COLUMNS (a.name, b.name)) t ORDER BY 1, 2;
+----
+
+query II
+FROM GRAPH_TABLE (pg MATCH (a:Person)-[e:!Knows]->(b:Person)
+                   COLUMNS (a.name, b.name)) t ORDER BY 1, 2;
+----
+
+# A lower bound of 0 would leave exactly the zero-length walks to produce, which this
+# route does not build. Refused rather than guessed at.
+statement error
+FROM GRAPH_TABLE (pg MATCH ANY SHORTEST (a:Person)-[e:!Knows]->*(b:Person)
+                   COLUMNS (a.name, b.name)) t;
+----
+admits no edge of table knows

@@ -1,0 +1,134 @@
+# name: test/sql/path_finding/optional_match.test
+# description: OPTIONAL MATCH generates LEFT JOINs so unmatched mandatory rows still appear with NULLs
+# group: [path_finding]
+
+require duckpgq
+
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+# ---------------------------------------------------------------
+# Graph: Tag hierarchy + optional workorder / objecttype links
+# Tags: A(root), B(child of A), C(child of A)
+# Workorders: W1 (attached to B), W2 (attached to B)
+# ObjectTypes: T1 (attached to A)
+# ---------------------------------------------------------------
+statement ok
+CREATE TABLE Tag(id BIGINT, name VARCHAR);
+
+statement ok
+CREATE TABLE Workorder(id BIGINT, title VARCHAR);
+
+statement ok
+CREATE TABLE ObjectType(id BIGINT, typename VARCHAR);
+
+statement ok
+CREATE TABLE HasWorkorder(src BIGINT, dst BIGINT);
+
+statement ok
+CREATE TABLE IsObjecttype(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO Tag VALUES (0,'A'),(1,'B'),(2,'C');
+
+statement ok
+INSERT INTO Workorder VALUES (10,'W1'),(11,'W2');
+
+statement ok
+INSERT INTO ObjectType VALUES (20,'T1');
+
+statement ok
+INSERT INTO HasWorkorder VALUES (1,10),(1,11);
+
+statement ok
+INSERT INTO IsObjecttype VALUES (0,20);
+
+statement ok
+CREATE PROPERTY GRAPH tagweb
+VERTEX TABLES (
+    Tag        PROPERTIES (id, name)     LABEL Tag,
+    Workorder  PROPERTIES (id, title)    LABEL Workorder,
+    ObjectType PROPERTIES (id, typename) LABEL ObjectType
+)
+EDGE TABLES (
+    HasWorkorder SOURCE KEY (src) REFERENCES Tag (id)
+                 DESTINATION KEY (dst) REFERENCES Workorder (id)
+                 LABEL HasWorkorder,
+    IsObjecttype SOURCE KEY (src) REFERENCES Tag (id)
+                 DESTINATION KEY (dst) REFERENCES ObjectType (id)
+                 LABEL IsObjecttype
+);
+
+# B has workorders (W1, W2); A has objecttype (T1); C has neither.
+# OPTIONAL MATCH for workorders: A and C get NULL, B gets two rows.
+query TT
+FROM GRAPH_TABLE (tagweb
+    MATCH (t:Tag)
+    OPTIONAL MATCH (t)-[hw:HasWorkorder]->(wo:Workorder)
+    COLUMNS (t.name AS tag, wo.title AS workorder)
+    ) r ORDER BY 1, 2;
+----
+A	NULL
+B	W1
+B	W2
+C	NULL
+
+# OPTIONAL MATCH for objecttype: only A has T1; B and C get NULL.
+query TT
+FROM GRAPH_TABLE (tagweb
+    MATCH (t:Tag)
+    OPTIONAL MATCH (t)-[io:IsObjecttype]->(ot:ObjectType)
+    COLUMNS (t.name AS tag, ot.typename AS objtype)
+    ) r ORDER BY 1, 2;
+----
+A	T1
+B	NULL
+C	NULL
+
+# Two independent OPTIONAL MATCH clauses: combine workorder and objecttype.
+# B gets two rows (two workorders), both with NULL objecttype.
+# A gets one row with objecttype T1 and NULL workorder.
+# C gets one row with both NULLs.
+query TTT
+FROM GRAPH_TABLE (tagweb
+    MATCH (t:Tag)
+    OPTIONAL MATCH (t)-[hw:HasWorkorder]->(wo:Workorder)
+    OPTIONAL MATCH (t)-[io:IsObjecttype]->(ot:ObjectType)
+    COLUMNS (t.name AS tag, wo.title AS workorder, ot.typename AS objtype)
+    ) r ORDER BY 1, 2, 3;
+----
+A	NULL	T1
+B	W1	NULL
+B	W2	NULL
+C	NULL	NULL
+
+# WHERE clause on mandatory vertex still works.
+query TT
+FROM GRAPH_TABLE (tagweb
+    MATCH (t:Tag)
+    OPTIONAL MATCH (t)-[hw:HasWorkorder]->(wo:Workorder)
+    WHERE t.name = 'B'
+    COLUMNS (t.name AS tag, wo.title AS workorder)
+    ) r ORDER BY 2;
+----
+B	W1
+B	W2
+
+statement ok
+DROP PROPERTY GRAPH tagweb;
+
+statement ok
+DROP TABLE IsObjecttype;
+
+statement ok
+DROP TABLE HasWorkorder;
+
+statement ok
+DROP TABLE ObjectType;
+
+statement ok
+DROP TABLE Workorder;
+
+statement ok
+DROP TABLE Tag;

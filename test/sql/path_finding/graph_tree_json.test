@@ -1,0 +1,50 @@
+# name: test/sql/path_finding/graph_tree_json.test
+# description: Nested tree JSON projection for single-path and multi-path graph results
+# group: [path_finding]
+
+require duckpgq
+
+query T
+SELECT path_tree_json(
+    [1, 10, 100],
+    ['TAG', 'WORK_ORDER', 'OPERATION'],
+    ['HAS_WORKORDER', 'HAS_OPERATION']
+);
+----
+{"label":"TAG","key":"1","relationships":{"HAS_WORKORDER":[{"label":"WORK_ORDER","key":"10","relationships":{"HAS_OPERATION":[{"label":"OPERATION","key":"100"}]}}]}}
+
+query T
+SELECT graph_tree_json(
+    [[1, 10], [1, 10, 100], [1, 20]],
+    [['TAG', 'WORK_ORDER'], ['TAG', 'WORK_ORDER', 'OPERATION'], ['TAG', 'NOTIFICATION']],
+    [['HAS_WORKORDER'], ['HAS_WORKORDER', 'HAS_OPERATION'], ['HAS_NOTIFICATION']]
+);
+----
+{"label":"TAG","key":"1","relationships":{"HAS_NOTIFICATION":[{"label":"NOTIFICATION","key":"20"}],"HAS_WORKORDER":[{"label":"WORK_ORDER","key":"10","relationships":{"HAS_OPERATION":[{"label":"OPERATION","key":"100"}]}}]}}
+
+query T
+SELECT graph_tree_json(
+    [1, 10],
+    ['TAG', 'WORK_ORDER'],
+    ['HAS_WORKORDER'],
+    ['{"id":"1","name":"Pump A"}', '{"id":"10","title":"WO-10"}']
+);
+----
+{"label":"TAG","key":"1","properties":{"id":"1","name":"Pump A"},"relationships":{"HAS_WORKORDER":[{"label":"WORK_ORDER","key":"10","properties":{"id":"10","title":"WO-10"}}]}}
+
+query T
+WITH paths AS (
+    SELECT 1 AS depth, [1, 10] AS vertex_ids, ['TAG', 'WORK_ORDER'] AS vertex_labels, ['HAS_WORKORDER'] AS edge_labels
+    UNION ALL
+    SELECT 2 AS depth, [1, 10, 100] AS vertex_ids, ['TAG', 'WORK_ORDER', 'OPERATION'] AS vertex_labels, ['HAS_WORKORDER', 'HAS_OPERATION'] AS edge_labels
+    UNION ALL
+    SELECT 1 AS depth, [1, 20] AS vertex_ids, ['TAG', 'NOTIFICATION'] AS vertex_labels, ['HAS_NOTIFICATION'] AS edge_labels
+)
+SELECT graph_tree_json(
+    list(vertex_ids ORDER BY depth),
+    list(vertex_labels ORDER BY depth),
+    list(edge_labels ORDER BY depth)
+)
+FROM paths;
+----
+{"label":"TAG","key":"1","relationships":{"HAS_NOTIFICATION":[{"label":"NOTIFICATION","key":"20"}],"HAS_WORKORDER":[{"label":"WORK_ORDER","key":"10","relationships":{"HAS_OPERATION":[{"label":"OPERATION","key":"100"}]}}]}}

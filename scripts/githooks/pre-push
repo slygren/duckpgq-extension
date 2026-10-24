@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+#
+# pre-push — build the extension and run the full sqllogictest suite before anything leaves.
+#
+# .github/workflows/Tests.yml is manual-trigger-only (private repo, hosted runners were not
+# picking up queued jobs), so nothing runs these tests automatically. Until that changes this
+# hook IS the gate, and every "the suite passes" claim in a commit message rests on it.
+#
+# It builds first, deliberately. `make test` does NOT depend on `release` -- it runs whatever
+# binary happens to sit in build/release -- so testing alone can report 5684 green assertions
+# against a binary that predates the change being pushed. That is the exact shape of failure
+# this repository keeps meeting: a plausible pass rather than a crash.
+#
+# Install:  git config core.hooksPath scripts/githooks
+# Bypass:   git push --no-verify        (for a docs-only push, or when you have just run it)
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+# Honour an explicit setting; otherwise adopt the documented local layout. Building WITHOUT this
+# produces duckpgq alone -- no httpfs, no ducklake -- which still passes the suite but silently
+# replaces build/release with a binary that cannot open the frozen lake. A hook that quietly
+# breaks the developer's ability to query real data is worse than no hook.
+if [[ -z "${DUCKPGQ_LOCAL_EXT_DIR:-}" ]]; then
+	PARENT="$(dirname "$ROOT")"
+	if [[ -d "$PARENT/duckdb-httpfs" && -d "$PARENT/ducklake" ]]; then
+		export DUCKPGQ_LOCAL_EXT_DIR="$PARENT"
+	fi
+fi
+
+echo "pre-push: building (DUCKPGQ_LOCAL_EXT_DIR=${DUCKPGQ_LOCAL_EXT_DIR:-<unset>})"
+if ! make release; then
+	echo "pre-push: BUILD FAILED — nothing pushed." >&2
+	exit 1
+fi
+
+echo "pre-push: running the suite"
+if ! make test; then
+	echo "pre-push: TESTS FAILED — nothing pushed. Use --no-verify only if you know why." >&2
+	exit 1
+fi
+
+echo "pre-push: green."

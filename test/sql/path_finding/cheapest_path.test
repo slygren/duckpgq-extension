@@ -1,0 +1,103 @@
+# name: test/sql/path_finding/cheapest_path.test
+# description: CHEAPEST path finding using COST expression (Bellman-Ford on weighted CSR)
+# group: [path_finding]
+
+require duckpgq
+
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE Person (id BIGINT, name VARCHAR);
+
+statement ok
+CREATE TABLE Link (src BIGINT, dst BIGINT, weight INT);
+
+# Diamond graph: A->B (weight 1), A->C (weight 2), B->D (weight 3), C->D (weight 1)
+# Shortest by hops: A->B->D or A->C->D (both 2 hops)
+# Cheapest path: A->C->D (cost 3) beats A->B->D (cost 4)
+statement ok
+INSERT INTO Person VALUES (0,'A'),(1,'B'),(2,'C'),(3,'D');
+
+statement ok
+INSERT INTO Link VALUES (0,1,1),(0,2,2),(1,3,3),(2,3,1);
+
+statement ok
+CREATE PROPERTY GRAPH wg
+VERTEX TABLES (Person PROPERTIES (id, name) LABEL Person)
+EDGE TABLES (
+    Link SOURCE KEY (src) REFERENCES Person (id)
+         DESTINATION KEY (dst) REFERENCES Person (id)
+         PROPERTIES (src, dst, weight) LABEL Link
+);
+
+# ANY CHEAPEST: cost of cheapest path from A to D = 3 (A->C->D)
+query TT
+FROM GRAPH_TABLE (wg
+    MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.weight]->+(b:Person)
+    WHERE a.name = 'A' AND b.name = 'D'
+    COLUMNS (a.name, b.name)
+) r;
+----
+A	D
+
+# COST(p) column: cheapest path cost from A to D is 3
+query TTI
+FROM GRAPH_TABLE (wg
+    MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.weight]->+(b:Person)
+    WHERE a.name = 'A' AND b.name = 'D'
+    COLUMNS (a.name, b.name, COST(p))
+) r;
+----
+A	D	3
+
+# Cheapest from A to B is 1 (direct edge)
+query TTI
+FROM GRAPH_TABLE (wg
+    MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.weight]->+(b:Person)
+    WHERE a.name = 'A' AND b.name = 'B'
+    COLUMNS (a.name, b.name, COST(p))
+) r;
+----
+A	B	1
+
+# Cheapest from A to C is 2 (direct edge)
+query TTI
+FROM GRAPH_TABLE (wg
+    MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.weight]->+(b:Person)
+    WHERE a.name = 'A' AND b.name = 'C'
+    COLUMNS (a.name, b.name, COST(p))
+) r;
+----
+A	C	2
+
+# ANY CHEAPEST without a COST expression is undefined and must fail loudly,
+# not silently fall through to shortest-path results.
+statement error
+FROM GRAPH_TABLE (wg
+    MATCH p = ANY CHEAPEST (a:Person)-[e:Link]->+(b:Person)
+    WHERE a.name = 'A' AND b.name = 'D'
+    COLUMNS (a.name, b.name)
+) r;
+----
+requires a COST expression
+
+# ALL CHEAPEST without a COST expression must also fail.
+statement error
+FROM GRAPH_TABLE (wg
+    MATCH p = ALL CHEAPEST (a:Person)-[e:Link]->+(b:Person)
+    WHERE a.name = 'A' AND b.name = 'D'
+    COLUMNS (a.name, b.name)
+) r;
+----
+requires a COST expression
+
+statement ok
+DROP PROPERTY GRAPH wg;
+
+statement ok
+DROP TABLE Link;
+
+statement ok
+DROP TABLE Person;

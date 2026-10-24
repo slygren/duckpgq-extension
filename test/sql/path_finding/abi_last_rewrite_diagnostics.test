@@ -1,0 +1,160 @@
+# name: test/sql/path_finding/abi_last_rewrite_diagnostics.test
+# description: pgq_last_rewrite_diagnostics reports the actual last GRAPH_TABLE rewrite decisions
+# group: [path_finding]
+
+require duckpgq
+
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE person(id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO person VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol');
+
+statement ok
+CREATE TABLE knows(src INTEGER, dst INTEGER);
+
+statement ok
+INSERT INTO knows VALUES (1, 2), (2, 3);
+
+statement ok
+CREATE SCHEMA graph;
+
+statement ok
+CREATE TABLE graph.__pg_test_graph__custom_edge AS
+SELECT 1 AS v0, hash('synthetic') AS e1, 3 AS v1;
+
+statement ok
+CREATE TABLE graph.__pgq_path_catalog AS
+SELECT
+    'test_graph' AS graph_name,
+    '__pg_test_graph__custom_edge' AS path_table_name,
+    'edge' AS path_kind,
+    1 AS hop_count,
+    'Person' AS src_label,
+    'Person' AS dst_label,
+    'Person,Person' AS vertex_label_sequence,
+    'Knows' AS edge_label_sequence,
+    true AS supports_one_row_per_step,
+    true AS is_deduplicated,
+    42::BIGINT AS estimated_rows,
+    current_timestamp AS last_refreshed_at,
+    true AS is_sorted_by_v0,
+    1 AS min_depth,
+    1 AS max_depth,
+    'knows' AS bridge_table_names,
+    'identity' AS semantic_grain,
+    'snapshot' AS temporal_mode,
+    'distinct_edges' AS multiplicity_mode,
+    'late_vertex_property_fetch' AS property_support,
+    'dbt_build' AS freshness_policy;
+
+statement ok
+CREATE PROPERTY GRAPH test_graph
+VERTEX TABLES (
+    person PROPERTIES (id, name) LABEL Person
+)
+EDGE TABLES (
+    knows SOURCE KEY (src) REFERENCES person(id)
+          DESTINATION KEY (dst) REFERENCES person(id)
+          LABEL Knows
+);
+
+statement ok
+SET pgq_require_abi_paths = true;
+
+query TT
+FROM GRAPH_TABLE (
+    test_graph
+    MATCH (a:Person)-[:Knows]->(b:Person)
+    WHERE a.id = 1
+    COLUMNS (a.name AS src, b.name AS dst)
+);
+----
+Alice	Carol
+
+query TTTTTTTTTTTII
+SELECT
+    rewrite_type,
+    status,
+    reason,
+    path_table_name,
+    path_kind,
+    semantic_grain,
+    temporal_mode,
+    multiplicity_mode,
+    property_support,
+    freshness_policy,
+    table_alias,
+    endpoint_filter_count,
+    estimated_rows
+FROM pgq_last_rewrite_diagnostics();
+----
+edge	selected	selected exact edge artifact	__pg_test_graph__custom_edge	edge	identity	snapshot	distinct_edges	late_vertex_property_fetch	dbt_build	_pgq_pt_0	1	42
+
+statement ok
+SET pgq_require_abi_paths = false;
+
+# ── The caller's own filter form anchors the artifact ───────────────────────────
+# The scalar pushdown matches a bare `binding.key = <constant>` and nothing else.
+# The workbench compiler writes every node filter as `CAST(binding.col AS VARCHAR)
+# IN (...)`, which matched neither that nor the non-key subquery push, so it was
+# never pushed at all. Measured on the deployed lake before this: 82.3ms against
+# 37.4ms for the same traversal written with a bare equality.
+#
+# `person.id` is INTEGER, so `CAST(a.id AS VARCHAR)` is a REAL type change. That is
+# deliberate: it proves what fires is the semi-join against the vertex table, not a
+# cast re-addressed at the artifact's own v0 column -- which would be comparing
+# `CAST(v0 AS VARCHAR)` against `CAST(key AS VARCHAR)` and would part company with
+# the answer the moment those two columns differed in type.
+
+statement ok
+SET pgq_require_abi_paths = true;
+
+query TT
+FROM GRAPH_TABLE (
+    test_graph
+    MATCH (a:Person)-[:Knows]->(b:Person)
+    WHERE CAST(a.id AS VARCHAR) IN ('1')
+    COLUMNS (a.name AS src, b.name AS dst)
+);
+----
+Alice	Carol
+
+query TI
+SELECT rewrite_type, endpoint_filter_count FROM pgq_last_rewrite_diagnostics();
+----
+edge	1
+
+# Several values, and a filter on a non-key column, go the same way.
+query TT
+FROM GRAPH_TABLE (
+    test_graph
+    MATCH (a:Person)-[:Knows]->(b:Person)
+    WHERE CAST(a.id AS VARCHAR) IN ('1', '99')
+    COLUMNS (a.name AS src, b.name AS dst)
+);
+----
+Alice	Carol
+
+query TI
+SELECT rewrite_type, endpoint_filter_count FROM pgq_last_rewrite_diagnostics();
+----
+edge	1
+
+# A value the filter excludes must still be excluded: the push narrows, it never
+# widens, and an over-restrictive push would drop the Alice row above instead.
+query I
+FROM GRAPH_TABLE (
+    test_graph
+    MATCH (a:Person)-[:Knows]->(b:Person)
+    WHERE CAST(a.id AS VARCHAR) IN ('99')
+    COLUMNS (a.name AS src)
+);
+----
+
+statement ok
+SET pgq_require_abi_paths = false;

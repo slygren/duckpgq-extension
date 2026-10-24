@@ -11,6 +11,7 @@ namespace duckdb {
 
 void CoreModule::Register(ExtensionLoader &loader) {
 	CoreTableFunctions::Register(loader);
+	// Scalar registration includes path export helpers such as graph_tree_json().
 	CoreScalarFunctions::Register(loader);
 	CorePGQParser::Register(loader);
 	CorePGQPragma::Register(loader);

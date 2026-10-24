@@ -1,0 +1,82 @@
+# name: test/sql/pattern_matching/anonymous_patterns.test
+# description: Anonymous node and edge patterns (no variable binding, no label constraint)
+# group: [pattern_matching]
+
+require duckpgq
+
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE Student(id BIGINT, name VARCHAR);
+
+statement ok
+CREATE TABLE know(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO Student VALUES (0, 'Alice'), (1, 'Bob'), (2, 'Carol');
+
+statement ok
+INSERT INTO know VALUES (0, 1), (1, 2);
+
+statement ok
+CREATE PROPERTY GRAPH pg
+VERTEX TABLES (
+    Student PROPERTIES (id, name) LABEL Person
+)
+EDGE TABLES (
+    know SOURCE KEY (src) REFERENCES Student (id)
+         DESTINATION KEY (dst) REFERENCES Student (id)
+         LABEL Knows
+);
+
+# Anonymous edge: labeled edge with no variable binding
+query II
+FROM GRAPH_TABLE (pg
+    MATCH (a:Person)-[:Knows]->(b:Person)
+    COLUMNS (a.name AS src_name, b.name AS dst_name)
+) t ORDER BY src_name;
+----
+Alice	Bob
+Bob	Carol
+
+# Anonymous destination vertex: no label, no variable (sole vertex table resolves automatically)
+query I
+FROM GRAPH_TABLE (pg
+    MATCH (a:Person)-[k:Knows]->()
+    COLUMNS (a.name AS src_name)
+) t ORDER BY src_name;
+----
+Alice
+Bob
+
+# Anonymous source vertex: no label, no variable
+query I
+FROM GRAPH_TABLE (pg
+    MATCH ()-[:Knows]->(b:Person)
+    COLUMNS (b.name AS dst_name)
+) t ORDER BY dst_name;
+----
+Bob
+Carol
+
+# Anonymous source vertex and anonymous edge: no variables, no labels except destination
+query I
+FROM GRAPH_TABLE (pg
+    MATCH ()-[]->(b:Person)
+    COLUMNS (b.name AS dst_name)
+) t ORDER BY dst_name;
+----
+Bob
+Carol
+
+# Anonymous edge with label only: labeled vertex on both sides, unlabeled edge element
+query I
+FROM GRAPH_TABLE (pg
+    MATCH (:Person)-[]->(b:Person)
+    COLUMNS (b.name AS dst_name)
+) t ORDER BY dst_name;
+----
+Bob
+Carol

@@ -144,11 +144,11 @@ SELECT * FROM GRAPH_TABLE (pg MATCH (a:Person)-[k:Knows]*(b:Person));
 ----
 Parser Error
 
-# An abbreviated edge parses as an anonymous, unlabeled edge; MATCH does not bind unlabeled elements yet.
+# An abbreviated edge parses as an anonymous edge; without a selector, an unbounded walk has no finite answer.
 statement error
 SELECT * FROM GRAPH_TABLE (pg MATCH (a:Person)-> *(b:Person));
 ----
-Not implemented Error: Unlabeled graph element '_anon_0' is parsed but not yet supported by MATCH
+Constraint Error: ALL unbounded with path mode WALK is not possible
 
 # Multiple path patterns.
 query I

@@ -1,0 +1,100 @@
+#
+# Fast signal loop: build the extension once on linux and run the full
+# sqllogictest suite. This is the workflow to watch while developing.
+#
+# The heavy multi-platform matrix lives in MainDistributionPipeline.yml and is
+# only worth running for releases.
+#
+name: Tests
+
+# Manual trigger only. This repo is private, and hosted runners were not
+# picking up queued jobs (a run sat 29 min with no runner assigned), so
+# push-triggered runs just accumulate in the queue forever. The local loop is
+# the real signal here:
+#
+#     make release && make test_release
+#
+# Because nothing here runs automatically, the real gate is the pre-push hook at
+# scripts/githooks/pre-push. Install it once with:
+#
+#     git config core.hooksPath scripts/githooks
+#
+# It builds AND tests, in that order, because `make test` does not depend on
+# `release`: on its own it runs whatever binary is already in build/release and
+# will happily report a full green suite against a source tree it never compiled.
+#
+# To go back to automatic runs -- once minutes are available, or if this repo
+# is made public, where Actions is free and unlimited -- restore:
+#
+#   push:
+#   pull_request:
+#
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-test:
+    name: Build and test (linux amd64)
+    runs-on: ubuntu-latest
+    env:
+      VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+      VCPKG_TARGET_TRIPLET: 'x64-linux'
+      GEN: ninja
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: 'recursive'
+
+      # NOTE: there is deliberately no "Checkout DuckDB to version" step here.
+      # The duckdb submodule pins slygren/duckdb @ pgq-abi-grammar, which carries
+      # the PGQL 2.1 grammar this extension is built on (OPTIONAL MATCH, ONE ROW
+      # PER, IS LABELED, EXISTS {}, in-GRAPH_TABLE UNION, label expressions).
+      # Checking out an upstream tag over it silently drops the grammar, and the
+      # build fails in ways that look like extension bugs. The guard below exists
+      # to catch exactly that if anyone reintroduces such a step.
+      - name: Verify the PGQL grammar is present
+        run: |
+          KW=duckdb/third_party/libpg_query/grammar/keywords/pgq_unreserved_keywords.list
+          if [ ! -f "$KW" ]; then
+            echo "::error::$KW is missing -- the duckdb submodule is not the PGQ fork."
+            exit 1
+          fi
+          for kw in LABELED ONE PER STEP OPTIONAL CHEAPEST; do
+            if ! grep -qx "$kw" "$KW"; then
+              echo "::error::Keyword '$kw' missing from $KW -- submodule is not on pgq-abi-grammar."
+              exit 1
+            fi
+          done
+          echo "PGQL grammar present; submodule at $(git -C duckdb rev-parse --short HEAD)"
+
+      - name: Install Ninja
+        run: sudo apt-get update -y -qq && sudo apt-get install -y -qq ninja-build
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@main
+        with:
+          key: ${{ github.job }}
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11.1
+        with:
+          vcpkgGitCommitId: 84bab45d415d22042bd0b9081aea57f362da3f35
+
+      - name: Build
+        run: make release
+
+      - name: Test
+        run: make test_release

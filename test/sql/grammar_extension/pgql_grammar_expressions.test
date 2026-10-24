@@ -52,7 +52,7 @@ SELECT x IS LABELED Foo FROM (SELECT 1 AS x);
 ----
 IS [NOT] LABELED is only allowed in the WHERE clause of a GRAPH_TABLE
 
-# Binding: the projection runs today; the predicates are parsed but not yet bound.
+# Binding.
 statement ok
 CREATE TABLE person(id INT, name VARCHAR);
 
@@ -76,12 +76,30 @@ FROM GRAPH_TABLE (g MATCH (a:person)-[k:knows]->(b:person) COLUMNS (a.{id, name}
 {'id': 1, 'name': a}	b
 {'id': 2, 'name': b}	c
 
-statement error
-FROM GRAPH_TABLE (g MATCH (a:person) WHERE a IS LABELED person COLUMNS (a.name));
+query T
+FROM GRAPH_TABLE (g MATCH (a:person) WHERE a IS LABELED person COLUMNS (a.name)) ORDER BY ALL;
 ----
-IS [NOT] LABELED is parsed but not yet supported by MATCH
+a
+b
+c
 
-statement error
+query T
+FROM GRAPH_TABLE (g MATCH (a:person) WHERE a IS NOT LABELED person COLUMNS (a.name));
+----
+
+query T
+FROM GRAPH_TABLE (g MATCH (a:person) WHERE EXISTS { (a)-[:knows]->(:person) } COLUMNS (a.name)) ORDER BY ALL;
+----
+a
+b
+
+query T
 FROM GRAPH_TABLE (g MATCH (a:person) WHERE NOT EXISTS { (a)-[:knows]->(:person) } COLUMNS (a.name));
 ----
-EXISTS { ... } is parsed but not yet supported by MATCH
+c
+
+# The anonymous edge inside EXISTS is not the outer anonymous edge: only b has an outgoing edge.
+query TT
+FROM GRAPH_TABLE (g MATCH (a:person)-[]->(b:person) WHERE EXISTS { (b)-[]->(:person) } COLUMNS (a.name AS a, b.name AS b));
+----
+a	b

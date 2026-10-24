@@ -1,0 +1,128 @@
+# name: test/sql/pattern_matching/label_expressions.test
+# description: Label disjunctions (A|B), conjunctions (A&B), negations (!A) on sub-labels
+# group: [pattern_matching]
+
+require duckpgq
+
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE Person(id BIGINT, name VARCHAR, mask BIGINT);
+
+statement ok
+CREATE TABLE knows(src BIGINT, dst BIGINT, emask BIGINT);
+
+statement ok
+INSERT INTO Person VALUES (0, 'Alice', 1), (1, 'Bob', 2), (2, 'Carol', 2), (3, 'Dave', 3);
+
+statement ok
+INSERT INTO knows VALUES (0, 1, 1), (1, 2, 2), (3, 2, 1);
+
+statement ok
+CREATE PROPERTY GRAPH pg
+VERTEX TABLES (
+    Person PROPERTIES (id, name) LABEL Person IN mask (Admin, User)
+)
+EDGE TABLES (
+    knows SOURCE KEY (src) REFERENCES Person (id)
+          DESTINATION KEY (dst) REFERENCES Person (id)
+          LABEL Knows IN emask (Colleague, Friend)
+);
+
+# Vertex disjunction — Admin|User matches everything (all rows have at least one bit set)
+query I
+FROM GRAPH_TABLE (pg
+    MATCH (a:Admin|User)
+    COLUMNS (a.name AS name)
+) t ORDER BY name;
+----
+Alice
+Bob
+Carol
+Dave
+
+# Vertex negation — !Admin matches non-admin vertices (Bob and Carol only; Dave has Admin bit set)
+query I
+FROM GRAPH_TABLE (pg
+    MATCH (a:!Admin)
+    COLUMNS (a.name AS name)
+) t ORDER BY name;
+----
+Bob
+Carol
+
+# Vertex negation — !Person matches nothing (main label always present)
+query I
+FROM GRAPH_TABLE (pg
+    MATCH (a:!Person)
+    COLUMNS (a.name AS name)
+) t ORDER BY name;
+----
+
+# Vertex conjunction — Person&Admin means must have Admin bit set (Alice and Dave)
+query I
+FROM GRAPH_TABLE (pg
+    MATCH (a:Person&Admin)
+    COLUMNS (a.name AS name)
+) t ORDER BY name;
+----
+Alice
+Dave
+
+# Vertex conjunction — Admin&User matches only Dave (mask=3, both bits set)
+query I
+FROM GRAPH_TABLE (pg
+    MATCH (a:Admin&User)
+    COLUMNS (a.name AS name)
+) t ORDER BY name;
+----
+Dave
+
+# Edge OR disjunction — Colleague|Friend matches all edges
+query II
+FROM GRAPH_TABLE (pg
+    MATCH (a:Person)-[e:Colleague|Friend]->(b:Person)
+    COLUMNS (a.name AS src, b.name AS dst)
+) t ORDER BY src, dst;
+----
+Alice	Bob
+Bob	Carol
+Dave	Carol
+
+# Edge negation — !Colleague matches only Friend edges
+query II
+FROM GRAPH_TABLE (pg
+    MATCH (a:Person)-[e:!Colleague]->(b:Person)
+    COLUMNS (a.name AS src, b.name AS dst)
+) t ORDER BY src, dst;
+----
+Bob	Carol
+
+# Grouped edge negation — !(Colleague|Friend) excludes both edge sub-labels
+query II
+FROM GRAPH_TABLE (pg
+    MATCH (a:Person)-[e:!(Colleague|Friend)]->(b:Person)
+    COLUMNS (a.name AS src, b.name AS dst)
+) t ORDER BY src, dst;
+----
+
+# Grouped vertex negation — !(Admin|User) excludes all vertices with either sub-label
+query I
+FROM GRAPH_TABLE (pg
+    MATCH (a:!(Admin|User))
+    COLUMNS (a.name AS name)
+) t ORDER BY name;
+----
+
+# Compound vertex filter in WHERE with label disjunction in pattern
+query I
+FROM GRAPH_TABLE (pg
+    MATCH (a:Admin|User)-[:Knows]->(b:Person)
+    WHERE a.name <> 'Dave'
+    COLUMNS (b.name AS friend)
+) t ORDER BY friend;
+----
+Bob
+Carol

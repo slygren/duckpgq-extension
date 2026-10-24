@@ -10,6 +10,9 @@
 #include "duckdb/function/function.hpp"
 #include "duckdb/function/scalar_function.hpp"
 
+#include <functional>
+
+#include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
@@ -59,23 +62,51 @@ struct CSRFunctionData : FunctionData {
 	const LogicalType weight_type;
 };
 
+//! Builds a predicate over the edge rows a CSR is to be built from, for whichever alias the
+//! call site scans the edge table under -- or nullptr when the label expression admits every
+//! row (the common case: the label IS the table's main label).
+//!
+//! It has to be alias-parameterised rather than a ready-made expression because a directed CSR
+//! reads the edge table twice under two different names: once to scan it and once to COUNT it,
+//! sizing the CSR arrays. Both must carry the same predicate or the arrays are sized for a row
+//! set the scan does not produce.
+using PGQEdgeRowFilter = std::function<unique_ptr<ParsedExpression>(const string &alias)>;
+
 // CSR BindReplace functions
 unique_ptr<CommonTableExpressionInfo> CreateUndirectedCSRCTE(const shared_ptr<PropertyGraphTable> &edge_table,
-                                                             const unique_ptr<SelectNode> &select_node);
+                                                             const unique_ptr<SelectNode> &select_node, int32_t csr_id,
+                                                             const PGQEdgeRowFilter &edge_filter = {});
 unique_ptr<CommonTableExpressionInfo> CreateDirectedCSRCTE(const shared_ptr<PropertyGraphTable> &edge_table,
                                                            const string &prev_binding, const string &edge_binding,
-                                                           const string &next_binding);
+                                                           const string &next_binding, int32_t csr_id,
+                                                           const PGQEdgeRowFilter &edge_filter = {});
+unique_ptr<CommonTableExpressionInfo> CreateWeightedDirectedCSRCTE(const shared_ptr<PropertyGraphTable> &edge_table,
+                                                                   const string &prev_binding,
+                                                                   const string &edge_binding,
+                                                                   const string &next_binding,
+                                                                   unique_ptr<ParsedExpression> weight_expr, int32_t csr_id,
+                                                                   const PGQEdgeRowFilter &edge_filter = {});
 
 // Helper functions
-unique_ptr<CommonTableExpressionInfo> MakeEdgesCTE(const shared_ptr<PropertyGraphTable> &edge_table);
+unique_ptr<CommonTableExpressionInfo> MakeEdgesCTE(const shared_ptr<PropertyGraphTable> &edge_table,
+                                                   const PGQEdgeRowFilter &edge_filter = {});
 unique_ptr<SubqueryExpression> CreateDirectedCSRVertexSubquery(const shared_ptr<PropertyGraphTable> &edge_table,
                                                                const string &binding);
 unique_ptr<SubqueryExpression> CreateUndirectedCSRVertexSubquery(const shared_ptr<PropertyGraphTable> &edge_table,
-                                                                 const string &binding);
+                                                                 const string &binding, int32_t csr_id,
+                                                                 const PGQEdgeRowFilter &edge_filter = {});
+unique_ptr<SelectNode> CreateOuterSelectEdgesNode();
+unique_ptr<SelectNode> CreateOuterSelectNode(unique_ptr<FunctionExpression> create_csr_edge_function);
+unique_ptr<JoinRef> GetJoinRef(const shared_ptr<PropertyGraphTable> &edge_table, const string &edge_binding,
+                               const PGQEdgeRowFilter &edge_filter,
+                               const string &prev_binding, const string &next_binding);
 unique_ptr<SubqueryExpression> GetCountTable(const shared_ptr<PropertyGraphTable> &table, const string &table_alias,
-                                             const Identifier &primary_key);
+                                             const string &primary_key);
+void SetupSelectNode(unique_ptr<SelectNode> &select_node, const shared_ptr<PropertyGraphTable> &edge_table,
+                     bool reverse = false, const PGQEdgeRowFilter &edge_filter = {});
 unique_ptr<SubqueryRef> CreateCountCTESubquery();
 unique_ptr<SubqueryExpression> GetCountUndirectedEdgeTable();
-unique_ptr<SubqueryExpression> GetCountEdgeTable(const shared_ptr<PropertyGraphTable> &edge_table);
+unique_ptr<SubqueryExpression> GetCountEdgeTable(const shared_ptr<PropertyGraphTable> &edge_table,
+                                                 const PGQEdgeRowFilter &edge_filter = {});
 
 } // namespace duckdb

@@ -1,0 +1,91 @@
+# name: test/sql/path_finding/optional_match_varlen.test
+# description: OPTIONAL MATCH with a bounded variable-length edge -> LEFT-JOINed reachability, NULLs kept for dead-ends
+# group: [path_finding]
+
+require duckpgq
+
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE Tag(id BIGINT, name VARCHAR);
+
+statement ok
+CREATE TABLE Chain(src BIGINT, dst BIGINT);
+
+# A -> B -> C -> D ; X is isolated
+statement ok
+INSERT INTO Tag VALUES (0,'A'),(1,'B'),(2,'C'),(3,'D'),(4,'X');
+
+statement ok
+INSERT INTO Chain VALUES (0,1),(1,2),(2,3);
+
+statement ok
+CREATE PROPERTY GRAPH vg
+VERTEX TABLES (
+    Tag PROPERTIES (id, name) LABEL Tag
+)
+EDGE TABLES (
+    Chain SOURCE KEY (src) REFERENCES Tag (id)
+          DESTINATION KEY (dst) REFERENCES Tag (id)
+          LABEL Chain
+);
+
+# {1,2}: A reaches B,C (not D at depth 3); D and X reach nothing -> NULL kept.
+query TT
+FROM GRAPH_TABLE (vg
+    MATCH (t:Tag)
+    OPTIONAL MATCH (t)-[e:Chain]->{1,2}(o:Tag)
+    COLUMNS (t.name AS t, o.name AS o)
+    ) r ORDER BY 1, 2;
+----
+A	B
+A	C
+B	C
+B	D
+C	D
+D	NULL
+X	NULL
+
+# {2,2}: exactly depth 2. A->C, B->D; C,D,X have no depth-2 target -> NULL.
+query TT
+FROM GRAPH_TABLE (vg
+    MATCH (t:Tag)
+    OPTIONAL MATCH (t)-[e:Chain]->{2,2}(o:Tag)
+    COLUMNS (t.name AS t, o.name AS o)
+    ) r ORDER BY 1, 2;
+----
+A	C
+B	D
+C	NULL
+D	NULL
+X	NULL
+
+# A WHERE predicate on the mandatory (prev) binding is pushed into the
+# reachability anchor. The result must be identical to filtering after the join:
+# only t=A survives, and A reaches B,C within {1,2}.
+query TT
+FROM GRAPH_TABLE (vg
+    MATCH (t:Tag)
+    OPTIONAL MATCH (t)-[e:Chain]->{1,2}(o:Tag)
+    WHERE t.name = 'A'
+    COLUMNS (t.name AS t, o.name AS o)
+    ) r ORDER BY 1, 2;
+----
+A	B
+A	C
+
+# A prev with no reachable target still survives the pushed filter (NULL kept).
+query TT
+FROM GRAPH_TABLE (vg
+    MATCH (t:Tag)
+    OPTIONAL MATCH (t)-[e:Chain]->{1,2}(o:Tag)
+    WHERE t.name = 'X'
+    COLUMNS (t.name AS t, o.name AS o)
+    ) r ORDER BY 1, 2;
+----
+X	NULL
+
+statement ok
+DROP PROPERTY GRAPH vg;

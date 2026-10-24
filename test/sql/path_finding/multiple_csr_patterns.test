@@ -1,0 +1,216 @@
+# name: test/sql/path_finding/multiple_csr_patterns.test
+# description: Several CSR-route path patterns in one query -- across GRAPH_TABLEs and within one MATCH
+# group: [path_finding]
+
+# Only *unbounded* (->+), *undirected* and COST() traversals reach the CSR. A bounded directed
+# quantifier like ->{1,3} takes the key-addressed recursive CTE and never builds one, so tests
+# meaning to exercise the CSR must use the shapes below or they silently prove nothing.
+#
+# Two things are covered here:
+#
+#  1. Separate GRAPH_TABLE subqueries in one query. Each binds into its own select node with its
+#     own cte_map, so each gets its own "cte1" and its own CSR. This already worked; it is pinned
+#     because it is the shape a cross-snapshot comparison uses (one GRAPH_TABLE per attached
+#     frozen lake, joined in SQL), and that must not regress.
+#
+#  2. Two patterns inside ONE MATCH. These share a select node and therefore share "cte1". That
+#     used to fail with `Ambiguous reference to table "__x"`: the count-anchor subquery
+#     `(SELECT 0 * count(cte1.temp) AS temp FROM cte1) __x` was cross-joined once per pattern
+#     under the same alias. The anchor is a constant zero over the shared CTE, so one per select
+#     node is both sufficient and necessary.
+#
+#     The slot state behind it (PGQCSRSlot) was also being declared *inside* the per-pattern loop
+#     while final_select_node was shared, so the second pattern reset it, allocated a fresh
+#     registry id, found "cte1" already present, skipped building a CSR for that id, and pointed
+#     iterativelength() at an empty entry. Same shape as the COST() and recursive-ProcessPathList
+#     slot bugs in csr_keyed_registry.test.
+
+require duckpgq
+
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE Person (id BIGINT, name VARCHAR);
+
+statement ok
+INSERT INTO Person VALUES (0,'A'),(1,'B'),(2,'C'),(3,'D');
+
+# Weighted diamond: A->B (1), A->C (2), B->D (3), C->D (1).
+# Cheapest A..D is A->C->D = 3, beating A->B->D = 4.
+statement ok
+CREATE TABLE Link (src BIGINT, dst BIGINT, weight INT);
+
+statement ok
+INSERT INTO Link VALUES (0,1,1),(0,2,2),(1,3,3),(2,3,1);
+
+# A second, deliberately different edge relation: only A->D. Any query that traversed Link when
+# it asked for Other (or the reverse) changes the answer rather than happening to agree.
+statement ok
+CREATE TABLE Other (src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO Other VALUES (0,3);
+
+statement ok
+CREATE PROPERTY GRAPH wg
+VERTEX TABLES (Person PROPERTIES (id, name) LABEL Person)
+EDGE TABLES (
+    Link  SOURCE KEY (src) REFERENCES Person (id)
+          DESTINATION KEY (dst) REFERENCES Person (id)
+          PROPERTIES (src, dst, weight) LABEL Link,
+    Other SOURCE KEY (src) REFERENCES Person (id)
+          DESTINATION KEY (dst) REFERENCES Person (id) LABEL Other
+);
+
+# ── baselines ───────────────────────────────────────────────────────────────────────────────
+# Each of the joined queries below must reproduce these exactly.
+
+# Unbounded reachability from A.
+query T
+FROM GRAPH_TABLE (wg MATCH p = ANY SHORTEST (a:Person)-[e:Link]->+(b:Person)
+    WHERE a.name = 'A' COLUMNS (b.name AS bn)) r ORDER BY bn;
+----
+B
+C
+D
+
+# Unbounded reachability from B.
+query T
+FROM GRAPH_TABLE (wg MATCH p = ANY SHORTEST (a:Person)-[e:Link]->+(b:Person)
+    WHERE a.name = 'B' COLUMNS (b.name AS bn)) r ORDER BY bn;
+----
+D
+
+# ── 1. separate GRAPH_TABLE subqueries ──────────────────────────────────────────────────────
+
+# Comma join: {B,C,D} x {D}.
+query TT
+SELECT r1.bn AS b1, r2.bn AS b2
+FROM GRAPH_TABLE (wg MATCH p = ANY SHORTEST (a:Person)-[e:Link]->+(b:Person)
+       WHERE a.name = 'A' COLUMNS (b.name AS bn)) r1,
+     GRAPH_TABLE (wg MATCH q = ANY SHORTEST (c:Person)-[f:Link]->+(d:Person)
+       WHERE c.name = 'B' COLUMNS (d.name AS bn)) r2
+ORDER BY b1, b2;
+----
+B	D
+C	D
+D	D
+
+# UNION ALL: the two baselines concatenated.
+query T
+SELECT bn FROM GRAPH_TABLE (wg MATCH p = ANY SHORTEST (a:Person)-[e:Link]->+(b:Person)
+       WHERE a.name = 'A' COLUMNS (b.name AS bn)) r1
+UNION ALL
+SELECT bn FROM GRAPH_TABLE (wg MATCH q = ANY SHORTEST (c:Person)-[f:Link]->+(d:Person)
+       WHERE c.name = 'B' COLUMNS (d.name AS bn)) r2
+ORDER BY bn;
+----
+B
+C
+D
+D
+
+# Different edge tables are fine across subqueries -- separate select nodes, separate CSRs.
+# Other holds only A->D, so r2 must be exactly D and never B or C.
+query TT
+SELECT r1.bn AS b1, r2.bn AS b2
+FROM GRAPH_TABLE (wg MATCH p = ANY SHORTEST (a:Person)-[e:Link]->+(b:Person)
+       WHERE a.name = 'A' COLUMNS (b.name AS bn)) r1,
+     GRAPH_TABLE (wg MATCH q = ANY SHORTEST (c:Person)-[f:Other]->+(d:Person)
+       WHERE c.name = 'A' COLUMNS (d.name AS bn)) r2
+ORDER BY b1, b2;
+----
+B	D
+C	D
+D	D
+
+# Three CSR patterns, one of them weighted.
+query TTI
+SELECT r1.bn AS b1, r2.bn AS b2, r3.c AS c3
+FROM GRAPH_TABLE (wg MATCH p = ANY SHORTEST (a:Person)-[e:Link]->+(b:Person)
+       WHERE a.name = 'A' COLUMNS (b.name AS bn)) r1,
+     GRAPH_TABLE (wg MATCH q = ANY SHORTEST (c:Person)-[f:Link]->+(d:Person)
+       WHERE c.name = 'B' COLUMNS (d.name AS bn)) r2,
+     GRAPH_TABLE (wg MATCH s = ANY CHEAPEST (x:Person)-[g:Link COST g.weight]->+(y:Person)
+       WHERE x.name = 'A' AND y.name = 'D' COLUMNS (COST(s) AS c)) r3
+ORDER BY b1, b2;
+----
+B	D	3
+C	D	3
+D	D	3
+
+# ── 2. two patterns inside ONE MATCH ────────────────────────────────────────────────────────
+
+# Same edge table. Previously `Ambiguous reference to table "__x"`.
+query TT
+FROM GRAPH_TABLE (wg MATCH
+    p = ANY SHORTEST (a:Person)-[e:Link]->+(b:Person),
+    q = ANY SHORTEST (c:Person)-[f:Link]->+(d:Person)
+    WHERE a.name = 'A' AND c.name = 'B'
+    COLUMNS (b.name AS bn, d.name AS dn)) r
+ORDER BY bn, dn;
+----
+B	D
+C	D
+D	D
+
+# Two COST() patterns in one MATCH. Cheapest A..D is 3, A..B is 1 -- distinct values, so a
+# shared or misdirected CSR cannot produce this row by coincidence.
+query II
+FROM GRAPH_TABLE (wg MATCH
+    p = ANY CHEAPEST (a:Person)-[e:Link COST e.weight]->+(b:Person),
+    q = ANY CHEAPEST (c:Person)-[f:Link COST f.weight]->+(d:Person)
+    WHERE a.name = 'A' AND b.name = 'D' AND c.name = 'A' AND d.name = 'B'
+    COLUMNS (COST(p) AS cp, COST(q) AS cq)) r;
+----
+3	1
+
+# Undirected, both patterns.
+query TT
+FROM GRAPH_TABLE (wg MATCH
+    p = ANY SHORTEST (a:Person)-[e:Link]-{1,2}(b:Person),
+    q = ANY SHORTEST (c:Person)-[f:Link]-{1,2}(d:Person)
+    WHERE a.name = 'A' AND c.name = 'D'
+    COLUMNS (b.name AS bn, d.name AS dn)) r
+ORDER BY bn, dn;
+----
+B	A
+B	B
+B	C
+C	A
+C	B
+C	C
+D	A
+D	B
+D	C
+
+# ── 3. different edge tables in one MATCH are refused, not answered ──────────────────────────
+#
+# One MATCH builds one CSR, so the second pattern would traverse Link while asking for Other.
+# That is a wrong answer, not an error, which is why it is refused explicitly. Lifting this
+# needs a CSR CTE per traversal rather than one "cte1" per select node.
+statement error
+FROM GRAPH_TABLE (wg MATCH
+    p = ANY SHORTEST (a:Person)-[e:Link]->+(b:Person),
+    q = ANY SHORTEST (c:Person)-[f:Other]->+(d:Person)
+    WHERE a.name = 'A' AND c.name = 'A'
+    COLUMNS (b.name AS bn, d.name AS dn)) r;
+----
+both need a CSR traversal but over different edges
+
+# Bounded directed patterns never build a CSR, so mixing edge tables is fine there -- the
+# refusal must not over-fire on the key-addressed recursive route.
+query TT
+FROM GRAPH_TABLE (wg MATCH
+    (a:Person)-[e:Link]->{1,2}(b:Person),
+    (c:Person)-[f:Other]->{1,1}(d:Person)
+    WHERE a.name = 'A' AND c.name = 'A'
+    COLUMNS (b.name AS bn, d.name AS dn)) r
+ORDER BY bn, dn;
+----
+B	D
+C	D
+D	D
+D	D

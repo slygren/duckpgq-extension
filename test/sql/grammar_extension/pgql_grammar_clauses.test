@@ -61,7 +61,7 @@ SELECT cost FROM (SELECT 1 AS cost);
 ----
 1
 
-# Binding: parsed, but not yet bound.
+# Binding.
 statement ok
 CREATE TABLE person(id INT, name VARCHAR);
 
@@ -72,29 +72,48 @@ statement ok
 CREATE TABLE knows(src INT, dst INT, w DOUBLE);
 
 statement ok
-INSERT INTO knows VALUES (1, 2, 0.5), (2, 3, 1.5);
+INSERT INTO knows VALUES (1, 2, 5), (2, 3, 2);
 
 statement ok
 CREATE PROPERTY GRAPH g
 VERTEX TABLES (person)
 EDGE TABLES (knows SOURCE KEY (src) REFERENCES person (id) DESTINATION KEY (dst) REFERENCES person (id));
 
-statement error
-FROM GRAPH_TABLE (g MATCH (a:person)-[k:knows]->(b:person) UNION ALL MATCH (a:person)-[k:knows]->(b:person) COLUMNS (a.name));
+query T
+FROM GRAPH_TABLE (g MATCH (a:person)-[k:knows]->(b:person) UNION ALL MATCH (a:person)-[k:knows]->(b:person) COLUMNS (a.name)) ORDER BY ALL;
 ----
-UNION between MATCH blocks is parsed but not yet supported by MATCH
+a
+a
+b
+b
 
-statement error
-FROM GRAPH_TABLE (g MATCH (a:person)-[k:knows]->{1,2}(b:person) ONE ROW PER VERTEX (v) COLUMNS (v.name));
+query T
+FROM GRAPH_TABLE (g MATCH (a:person)-[k:knows]->(b:person) UNION MATCH (a:person)-[k:knows]->(b:person) COLUMNS (a.name)) ORDER BY ALL;
 ----
-ONE ROW PER is parsed but not yet supported by MATCH
+a
+b
 
-statement error
-FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:person)-[k:knows COST k.w]->+(b:person) COLUMNS (a.name));
+# Paths a-b, b-c and a-b-c, one row per vertex on each.
+query T
+FROM GRAPH_TABLE (g MATCH (a:person)-[k:knows]->{1,2}(b:person) ONE ROW PER VERTEX (v) COLUMNS (v.name)) ORDER BY ALL;
 ----
-CHEAPEST paths are parsed but not yet supported by MATCH
+a
+a
+b
+b
+b
+c
+c
 
-statement error
-FROM GRAPH_TABLE (g MATCH (a:person)-[k:knows COST k.w]->(b:person) COLUMNS (a.name));
+query TTI
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:person)-[k:knows COST k.w]->+(b:person) COLUMNS (a.name AS a, b.name AS b, COST(p) AS cost)) ORDER BY ALL;
 ----
-COST is parsed but not yet supported by MATCH
+a	b	5
+a	c	7
+b	c	2
+
+# CHEAPEST needs a COST to be defined by.
+statement error
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:person)-[k:knows]->+(b:person) COLUMNS (a.name));
+----
+CHEAPEST

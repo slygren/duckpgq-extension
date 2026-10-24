@@ -1,0 +1,84 @@
+# name: test/sql/path_finding/exists.test
+# description: EXISTS / NOT EXISTS path predicate in GRAPH_TABLE WHERE clause
+# group: [path_finding]
+
+require duckpgq
+
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE Person (id BIGINT, name VARCHAR);
+
+statement ok
+CREATE TABLE Knows (src BIGINT, dst BIGINT, weight INT);
+
+statement ok
+INSERT INTO Person VALUES (0,'Alice'),(1,'Bob'),(2,'Carol'),(3,'Dave');
+
+statement ok
+INSERT INTO Knows VALUES (0,1,1),(1,2,1),(0,3,1);
+
+statement ok
+CREATE PROPERTY GRAPH net
+VERTEX TABLES (Person PROPERTIES (id, name) LABEL Person)
+EDGE TABLES (
+    Knows SOURCE KEY (src) REFERENCES Person (id)
+          DESTINATION KEY (dst) REFERENCES Person (id)
+          PROPERTIES (src, dst, weight) LABEL Knows
+);
+
+# Basic EXISTS: persons who have at least one outgoing Knows edge.
+# Syntax: EXISTS { path_pattern [WHERE ...] }
+query I rowsort
+FROM GRAPH_TABLE (net
+    MATCH (a:Person)
+    WHERE EXISTS {(a)-[:Knows]->(b:Person)}
+    COLUMNS (a.name)
+) r;
+----
+Alice
+Bob
+
+# NOT EXISTS: persons with NO outgoing Knows edges
+query I rowsort
+FROM GRAPH_TABLE (net
+    MATCH (a:Person)
+    WHERE NOT EXISTS {(a)-[:Knows]->(b:Person)}
+    COLUMNS (a.name)
+) r;
+----
+Carol
+Dave
+
+# EXISTS with inner WHERE: only Alice has a Knows edge to Dave
+query I rowsort
+FROM GRAPH_TABLE (net
+    MATCH (a:Person)
+    WHERE EXISTS {(a)-[e:Knows]->(b:Person) WHERE b.name = 'Dave'}
+    COLUMNS (a.name)
+) r;
+----
+Alice
+
+# NOT EXISTS with inner WHERE: persons who have NO Knows edge to Dave
+query I rowsort
+FROM GRAPH_TABLE (net
+    MATCH (a:Person)
+    WHERE NOT EXISTS {(a)-[:Knows]->(b:Person) WHERE b.name = 'Dave'}
+    COLUMNS (a.name)
+) r;
+----
+Bob
+Carol
+Dave
+
+statement ok
+DROP PROPERTY GRAPH net;
+
+statement ok
+DROP TABLE Knows;
+
+statement ok
+DROP TABLE Person;

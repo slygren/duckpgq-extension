@@ -22,6 +22,7 @@ static constexpr const char *DUCKPGQ_EXISTS_PATTERN_FUNCTION = "duckpgq_exists_p
 
 //! The pattern of an EXISTS { ... } predicate, or nullptr when the expression is not one.
 optional_ptr<MatchExpression> DuckPGQGetExistsPattern(ParsedExpression &expression);
+optional_ptr<const MatchExpression> DuckPGQGetExistsPattern(const ParsedExpression &expression);
 
 //! Rules and transforms for CREATE PROPERTY GRAPH.
 void DuckPGQAddCreatePropertyGraphGrammar(vector<GrammarChange> &changes);

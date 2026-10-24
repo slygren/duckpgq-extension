@@ -1,0 +1,68 @@
+# name: test/sql/path_finding/abi_path_catalog.test
+# description: MATCH uses __pgq_path_catalog metadata to resolve ABI path tables by semantic sequence
+# group: [path_finding]
+
+require duckpgq
+
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE person(id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO person VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol');
+
+statement ok
+CREATE TABLE knows(src INTEGER, dst INTEGER);
+
+statement ok
+INSERT INTO knows VALUES (1, 2), (2, 3);
+
+statement ok
+CREATE SCHEMA graph;
+
+statement ok
+CREATE TABLE graph.__pg_test_graph__custom_edge AS
+SELECT 1 AS v0, hash('synthetic') AS e1, 3 AS v1;
+
+statement ok
+CREATE TABLE graph.__pgq_path_catalog AS
+SELECT
+    'test_graph' AS graph_name,
+    '__pg_test_graph__custom_edge' AS path_table_name,
+    'edge' AS path_kind,
+    1 AS hop_count,
+    'Person' AS src_label,
+    'Person' AS dst_label,
+    'Person,Person' AS vertex_label_sequence,
+    'Knows' AS edge_label_sequence,
+    true AS supports_one_row_per_step,
+    true AS is_deduplicated,
+    (SELECT count(*) FROM graph.__pg_test_graph__custom_edge) AS estimated_rows,
+    current_timestamp AS last_refreshed_at,
+    true AS is_sorted_by_v0,
+    1 AS min_depth,
+    1 AS max_depth,
+    'knows' AS bridge_table_names;
+
+statement ok
+CREATE PROPERTY GRAPH test_graph
+VERTEX TABLES (
+    person PROPERTIES (id, name) LABEL Person
+)
+EDGE TABLES (
+    knows SOURCE KEY (src) REFERENCES person(id)
+          DESTINATION KEY (dst) REFERENCES person(id)
+          LABEL Knows
+);
+
+query II
+FROM GRAPH_TABLE (
+    test_graph
+    MATCH (a:Person)-[:Knows]->(b:Person)
+    COLUMNS (a.name AS src, b.name AS dst)
+);
+----
+Alice	Carol

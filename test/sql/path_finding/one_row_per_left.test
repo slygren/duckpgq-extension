@@ -1,0 +1,117 @@
+# name: test/sql/path_finding/one_row_per_left.test
+# description: Bounded left-directed variable-length: plain, ANY SHORTEST, ONE ROW PER, OPTIONAL — all walk the recursive CTE in reverse
+# group: [path_finding]
+
+require duckpgq
+
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE Person (id BIGINT, name VARCHAR);
+
+statement ok
+CREATE TABLE Knows (src BIGINT, dst BIGINT, since INT);
+
+statement ok
+INSERT INTO Person VALUES (0,'Alice'),(1,'Bob'),(2,'Carol'),(3,'Dave');
+
+# Alice->Bob->Carol->Dave chain, plus Alice->Dave shortcut.
+statement ok
+INSERT INTO Knows VALUES (0,1,2020),(1,2,2021),(2,3,2022),(0,3,2019);
+
+statement ok
+CREATE PROPERTY GRAPH net
+VERTEX TABLES (Person PROPERTIES (id, name) LABEL Person)
+EDGE TABLES (
+    Knows SOURCE KEY (src) REFERENCES Person (id)
+          DESTINATION KEY (dst) REFERENCES Person (id)
+          PROPERTIES (src, dst, since) LABEL Knows
+);
+
+# Plain left VL, mode-less = all walks. Who reaches Dave within 3 hops:
+# Carol (d1), Alice (d1 shortcut), Bob (d2 via Carol), Alice again (d3 via Carol,Bob).
+query II rowsort
+FROM GRAPH_TABLE (net
+    MATCH (t:Person)<-[e:Knows]-{1,3}(o:Person)
+    WHERE t.name = 'Dave'
+    COLUMNS (t.name AS t, o.name AS o)
+) r;
+----
+Dave	Alice
+Dave	Alice
+Dave	Bob
+Dave	Carol
+
+# ANY SHORTEST left VL: one row per endpoint at min depth (Alice d1, Bob d2, Carol d1).
+query II rowsort
+FROM GRAPH_TABLE (net
+    MATCH p = ANY SHORTEST (t:Person)<-[e:Knows]-{1,3}(o:Person)
+    WHERE t.name = 'Dave'
+    COLUMNS (t.name AS t, o.name AS o)
+) r;
+----
+Dave	Alice
+Dave	Bob
+Dave	Carol
+
+# ONE ROW PER STEP, left-directed. Mirror of the forward test: the only path
+# Carol<-Bob<-Alice yields steps in TRAVERSAL order (anchor -> far end), so
+# v1/v2 are traversal source/target, not physical edge direction. The edge
+# variable still resolves the physical edge row (since values prove it).
+query III rowsort
+FROM GRAPH_TABLE (net
+    MATCH (b:Person)<-[e:Knows]-{1,3}(a:Person)
+    ONE ROW PER STEP (v1, edge1, v2)
+    WHERE b.name = 'Carol' AND a.name = 'Alice'
+    COLUMNS (v1.name AS src, edge1.since AS weight, v2.name AS dst)
+) r;
+----
+Bob	2020	Alice
+Carol	2021	Bob
+
+# ONE ROW PER VERTEX, left-directed: Carol, Bob, Alice.
+query I rowsort
+FROM GRAPH_TABLE (net
+    MATCH (b:Person)<-[e:Knows]-{1,3}(a:Person)
+    ONE ROW PER VERTEX (v)
+    WHERE b.name = 'Carol' AND a.name = 'Alice'
+    COLUMNS (v.name AS vname)
+) r;
+----
+Alice
+Bob
+Carol
+
+# ONE ROW PER EDGE, left-directed: the two physical edges on the path.
+query I rowsort
+FROM GRAPH_TABLE (net
+    MATCH (b:Person)<-[e:Knows]-{1,3}(a:Person)
+    ONE ROW PER EDGE (edge1)
+    WHERE b.name = 'Carol' AND a.name = 'Alice'
+    COLUMNS (edge1.since AS weight)
+) r;
+----
+2020
+2021
+
+# OPTIONAL MATCH left VL: who reaches each person within 2 hops; Alice has no
+# inbound edges and keeps her NULL row.
+query II rowsort
+FROM GRAPH_TABLE (net
+    MATCH (t:Person)
+    OPTIONAL MATCH (t)<-[e:Knows]-{1,2}(o:Person)
+    COLUMNS (t.name AS t, o.name AS o)
+) r;
+----
+Alice	NULL
+Bob	Alice
+Carol	Alice
+Carol	Bob
+Dave	Alice
+Dave	Bob
+Dave	Carol
+
+statement ok
+DROP PROPERTY GRAPH net;

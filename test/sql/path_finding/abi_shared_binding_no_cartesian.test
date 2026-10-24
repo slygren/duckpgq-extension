@@ -1,0 +1,135 @@
+# name: test/sql/path_finding/abi_shared_binding_no_cartesian.test
+# description: A binding shared across comma-separated patterns keeps its vertex join; eliding it is a cartesian product
+# group: [path_finding]
+
+# The ABI rewrite drops a vertex join when a binding references nothing but covered columns.
+# That is safe while the binding is local to ONE pattern. Shared between two, the table being
+# dropped IS the correlation between them, and both path tables end up cross-joined.
+#
+# Measured on the real frozen lake before the guard: a tag's area and notifications returned
+# 3,753,784 rows where the truth is 4 -- exactly 938,446 TAG->AREA edges times 4 notifications.
+# count(DISTINCT n) was 4 either way, so every DISTINCT query looked correct and every
+# count/sum/avg was wrong by six orders of magnitude.
+
+require duckpgq
+
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE person(id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO person VALUES (1, 'Alice'), (2, 'Bob');
+
+statement ok
+CREATE TABLE city(id INTEGER, code VARCHAR);
+
+statement ok
+INSERT INTO city VALUES (10, 'AMS'), (20, 'OSL');
+
+statement ok
+CREATE TABLE pet(id INTEGER, tag VARCHAR);
+
+statement ok
+INSERT INTO pet VALUES (100, 'cat'), (200, 'dog');
+
+# Alice -> AMS, Bob -> OSL.  Alice -> cat, Bob -> dog.
+# The correct answer for Alice is ONE row (AMS, cat). Uncorrelated it is 2 x 2 = 4.
+statement ok
+CREATE TABLE lives(src INTEGER, dst INTEGER);
+
+statement ok
+INSERT INTO lives VALUES (1, 10), (2, 20);
+
+statement ok
+CREATE TABLE owns(src INTEGER, dst INTEGER);
+
+statement ok
+INSERT INTO owns VALUES (1, 100), (2, 200);
+
+statement ok
+CREATE SCHEMA graph;
+
+statement ok
+CREATE TABLE graph.__pg_g__Person__Lives__City AS
+SELECT src AS v0, hash('Lives' || '|' || src || '|' || dst) AS e1, dst AS v1 FROM lives ORDER BY v0;
+
+statement ok
+CREATE TABLE graph.__pg_g__Person__Owns__Pet AS
+SELECT src AS v0, hash('Owns' || '|' || src || '|' || dst) AS e1, dst AS v1 FROM owns ORDER BY v0;
+
+statement ok
+CREATE TABLE graph.__pgq_path_catalog AS
+SELECT 'g' AS graph_name, '__pg_g__Person__Lives__City' AS path_table_name, 'edge' AS path_kind,
+       1 AS hop_count, 'Person' AS src_label, 'City' AS dst_label,
+       'Person,City' AS vertex_label_sequence, 'Lives' AS edge_label_sequence,
+       true AS supports_one_row_per_step, true AS is_deduplicated,
+       (SELECT count(*) FROM graph.__pg_g__Person__Lives__City) AS estimated_rows,
+       current_timestamp AS last_refreshed_at, true AS is_sorted_by_v0,
+       1 AS min_depth, 1 AS max_depth, 'lives' AS bridge_table_names
+UNION ALL
+SELECT 'g', '__pg_g__Person__Owns__Pet', 'edge', 1, 'Person', 'Pet',
+       'Person,Pet', 'Owns', true, true,
+       (SELECT count(*) FROM graph.__pg_g__Person__Owns__Pet),
+       current_timestamp, true, 1, 1, 'owns';
+
+statement ok
+CREATE PROPERTY GRAPH g
+VERTEX TABLES (
+    person PROPERTIES (id, name) LABEL Person,
+    city PROPERTIES (id, code) LABEL City,
+    pet PROPERTIES (id, tag) LABEL Pet
+)
+EDGE TABLES (
+    lives SOURCE KEY (src) REFERENCES person(id)
+          DESTINATION KEY (dst) REFERENCES city(id)
+          PROPERTIES (src, dst) LABEL Lives,
+    owns SOURCE KEY (src) REFERENCES person(id)
+         DESTINATION KEY (dst) REFERENCES pet(id)
+         PROPERTIES (src, dst) LABEL Owns
+);
+
+# The shape that regressed: `p` reused with its LABEL repeated, and referenced ONLY BY ITS KEY
+# (`p.id`, which the artifact carries as v0), wrapped in the CAST the compiler emits.
+#
+# BOTH halves are load-bearing and were each got wrong once while writing this. Filter on a
+# NON-key property and the binding is not "fully covered", so the join is never elided. Drop the
+# CAST and the predicate reaches both legs, so the answer is right by accident. Either way the
+# test passes with and without the fix and proves nothing.
+# so both legs judged it "fully covered" and dropped the person table that joined them.
+query II
+FROM GRAPH_TABLE (
+    g
+    MATCH (p:Person)-[:Lives]->(c:City), (p:Person)-[:Owns]->(a:Pet)
+    WHERE CAST(p.id AS VARCHAR) = '1'
+    COLUMNS (c.code AS city, a.tag AS pet)
+)
+ORDER BY city, pet;
+----
+AMS	cat
+
+# Same query, label omitted on the reuse. Was already correct; must stay correct.
+query II
+FROM GRAPH_TABLE (
+    g
+    MATCH (p:Person)-[:Lives]->(c:City), (p)-[:Owns]->(a:Pet)
+    WHERE CAST(p.id AS VARCHAR) = '1'
+    COLUMNS (c.code AS city, a.tag AS pet)
+)
+ORDER BY city, pet;
+----
+AMS	cat
+
+# Unanchored: one row per person, never the 2x2 product.
+query II
+FROM GRAPH_TABLE (
+    g
+    MATCH (p:Person)-[:Lives]->(c:City), (p:Person)-[:Owns]->(a:Pet)
+    COLUMNS (c.code AS city, a.tag AS pet)
+)
+ORDER BY city, pet;
+----
+AMS	cat
+OSL	dog

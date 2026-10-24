@@ -12,7 +12,7 @@
 #include <duckdb/parser/parsed_data/create_pragma_function_info.hpp>
 
 #include "duckdb/function/table_function.hpp"
-#include <duckpgq/parser/parsed_data/create_property_graph_info.hpp>
+#include "duckpgq/parser/parsed_data/create_property_graph_info.hpp"
 #include "duckpgq/parser/path_element.hpp"
 #include "duckpgq/parser/path_pattern.hpp"
 #include "duckpgq/parser/subpath_element.hpp"
@@ -26,113 +26,139 @@
 
 namespace duckdb {
 
-class ClientContext;
-class TableCatalogEntry;
-
-//! One join between a vertex variable and an edge variable:
-//! vertex.vertex_keys[i] = edge_alias.edge_keys[i] for every i.
-struct VertexEdgeKeyReference {
-	//! Alias of the edge relation in the FROM clause: the edge table itself, or the UNION ALL subquery that an
-	//! undirected edge is rewritten into.
-	string edge_alias;
-	shared_ptr<PropertyGraphTable> edge_table;
-	//! The vertex table this end of the edge is declared to reference; the pattern's vertex must be that table
-	shared_ptr<PropertyGraphTable> referenced_vertex_table;
-	//! Columns of edge_alias that reference the vertex key
-	vector<Identifier> edge_keys;
-	//! The vertex key columns, aligned with edge_keys
-	vector<Identifier> vertex_keys;
-	//! The column tuples of edge_table that feed edge_keys. A directed edge has one (edge_keys itself); the UNION ALL
-	//! of an undirected edge has two, the source and the destination key, so constraints must hold for both.
-	vector<vector<Identifier>> backing_keys;
+struct PGQPathTableInfo {
+	string catalog_name;
+	string schema_name;
+	string table_name;
+	string path_kind;
+	string src_label;
+	string dst_label;
+	string vertex_label_sequence;
+	string edge_label_sequence;
+	string bridge_table_names;
+	int64_t hop_count = -1;
+	int64_t estimated_rows = -1;
+	int64_t min_depth = -1;
+	int64_t max_depth = -1;
+	string semantic_grain;
+	string temporal_mode;
+	string multiplicity_mode;
+	string property_support;
+	string freshness_policy;
+	string covered_target_properties;
+	bool supports_one_row_per_step = false;
+	bool is_deduplicated = false;
+	bool is_sorted_by_v0 = false;
+	//! Reverse-sorted twin: same rows as the forward artifact but physically ordered by
+	//! the destination key, so a destination-anchored lookup prunes row groups instead of
+	//! scanning the whole family. Selected by the binder when only the destination
+	//! endpoint is bound.
+	bool is_sorted_by_v1 = false;
+	//! Verified at generation time (artifact row count == bridge row count), not declared:
+	//! true means the artifact's DISTINCT collapsed nothing, so it holds one row per edge
+	//! and can stand in for the bridge in multiplicity-sensitive walk traversal. Defaults
+	//! false for artifacts predating the probe, which keeps walk mode on the bridge.
+	bool preserves_multiplicity = false;
+	bool from_metadata = false;
 };
 
-//! Everything the translation knows about the joins of one vertex variable
-struct VertexJoinInfo {
-	vector<VertexEdgeKeyReference> edge_references;
-	//! The translation needs the vertex table for more than its key (path-finding endpoint); never eliminate it.
-	bool required = false;
+using PGQPathTableCatalog = case_insensitive_map_t<PGQPathTableInfo>;
+
+struct PGQBranchSummaryLookup {
+	//! Qualified catalog key (catalog.schema.table), not the bare artifact name -- see
+	//! PathTableKey in match.cpp.
+	string table_key;
+	string branch_edge_label;
 };
 
-//! Vertex alias -> incident edge keys, filled while the path patterns are translated. The join conditions are
-//! emitted from this map afterwards, so that vertices that are only joined for their key can be left out.
-struct VertexJoinMap {
-	case_insensitive_map_t<VertexJoinInfo> entries;
-	//! Vertex aliases in the order they were first joined, for deterministic output
-	vector<string> order;
-
-	void AddReference(const string &vertex_alias, VertexEdgeKeyReference reference);
-	void MarkRequired(const string &vertex_alias);
-
-private:
-	VertexJoinInfo &GetOrCreate(const string &vertex_alias);
+//! The one CSR built for a select node: its registry slot, plus which edge traversal built it.
+//!
+//! `"cte1"` is keyed by name per select node, so every CSR-route site in that node names the
+//! same entry -- that part is deliberate (see csr_keyed_registry.test). What was missing is
+//! *which* traversal it was built from. Two path patterns in one MATCH share a select node,
+//! so the second used to find `"cte1"` present and reuse it, silently traversing the FIRST
+//! pattern's edge table. Recording the key lets a mismatch be refused instead of answered
+//! wrongly.
+struct PGQCSRSlot {
+	//! Registry slot handed out by DuckPGQState::AllocateCSRId; -1 until the CSR is built.
+	int32_t slot = -1;
+	//! Qualified edge table + direction that built "cte1". Empty until then.
+	string edge_key;
+	//! True once the count-anchor subquery `__x` has been cross-joined into this select
+	//! node's FROM clause. It is `0 * count(cte1.temp)` -- a dependency edge forcing the CSR
+	//! CTE to be evaluated first -- so one per select node is both sufficient and necessary:
+	//! a second copy is an ambiguous duplicate alias, not extra work.
+	bool anchor_added = false;
 };
 
-//! Vertex-join elimination: a vertex table that is only joined to prove that the edge endpoints exist, and whose key
-//! is unique, contributes nothing to the result. The edges incident to the vertex are joined to each other on their
-//! key columns instead, references to the vertex key are redirected to one of the edge keys, and the vertex table is
-//! left out of the FROM clause. CREATE PROPERTY GRAPH verifies that every edge key references a vertex row, which is
-//! what makes the join redundant; an edge made incomplete by later modifications is no longer dropped. A vertex is
-//! only eliminated when every reference to it is to its key, it is not a path-finding endpoint or label-inheritance
-//! check, all incident edges use the same key columns, and the key has a PRIMARY KEY or UNIQUE constraint.
-class VertexEliminationPlanner {
-public:
-	static constexpr const char *SETTING_NAME = "duckpgq_vertex_join_elimination";
+struct PGQDirectLinkInfo {
+	string graph_name;
+	string link_name;
+	string src_label;
+	string dst_label;
+	string relationship_label;
+	string cardinality;
+	string mode;
+	string link_catalog_name;
+	string link_schema_name;
+	string link_table_name;
+	string src_col;
+	string dst_col;
+	string src_vertex_catalog_name;
+	string src_vertex_schema_name;
+	string src_vertex_table_name;
+	string src_vertex_key;
+	string dst_vertex_catalog_name;
+	string dst_vertex_schema_name;
+	string dst_vertex_table_name;
+	string dst_vertex_key;
+	int64_t estimated_rows = -1;
+};
 
-	//! graph_verified: CREATE PROPERTY GRAPH verified that every edge key references a vertex row; without it the
-	//! vertex joins are kept.
-	VertexEliminationPlanner(ClientContext &context, VertexJoinMap &vertex_joins,
-	                         const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map,
-	                         bool graph_verified);
+struct PGQPathTableCache {
+	//! Keyed by PathTableKey (catalog.schema.table). Every index below stores that same
+	//! qualified key, never a bare artifact name.
+	PGQPathTableCatalog catalog;
+	//! Bare artifact name -> qualified key, for the constructed-name fast path. A name that
+	//! occurs in more than one attached database is DELETED from here rather than resolved to
+	//! either candidate: the lookup then misses and the query falls back to the bridge, which
+	//! is slower but correct. Guessing would answer one snapshot's query from another's rows.
+	case_insensitive_map_t<string> name_index;
+	case_insensitive_map_t<string> semantic_index;
+	//! Same keys as semantic_index, but resolving to reverse-sorted twins. Kept separate
+	//! so a twin never displaces the forward artifact for source-anchored lookups.
+	case_insensitive_map_t<string> reverse_semantic_index;
+	case_insensitive_map_t<PGQBranchSummaryLookup> branch_summary_index;
+	vector<PGQDirectLinkInfo> direct_links;
+	case_insensitive_map_t<vector<idx_t>> direct_link_index;
+	//! One-hop `edge` artifact row counts keyed by edge label, used to size a fallback
+	//! traversal before running it. Populated from the same catalog rows as semantic_index.
+	//! Catalog-derived and therefore safe to share via the ObjectCache; the session-scoped
+	//! budget it is compared against is threaded in separately, never cached here.
+	case_insensitive_map_t<int64_t> edge_label_rows;
+};
 
-	//! Decide which vertex variables are eliminated, looking at every expression of the translated query.
-	void Plan(const vector<unique_ptr<ParsedExpression>> &column_list,
-	          const vector<unique_ptr<ParsedExpression>> &conditions);
-	bool IsEliminated(const string &vertex_alias) const;
-	//! Replace references to the key of an eliminated vertex by the representative edge key column. Unaliased
-	//! references in the COLUMNS list keep their output name.
-	void RewriteReferences(vector<unique_ptr<ParsedExpression>> &column_list,
-	                       vector<unique_ptr<ParsedExpression>> &conditions);
-	//! Append the vertex-edge join conditions. For an eliminated vertex the incident edges are joined to each other
-	//! on their key columns, guarded by IS NOT NULL on the representative key when the column is nullable.
-	void EmitJoinConditions(vector<unique_ptr<ParsedExpression>> &conditions);
+//! A resolved ABI artifact reference. For an `edge` artifact the vertex keys live in
+//! v0/v1; for a k-hop `fixed_path` artifact they live in v0..vk. Either way the artifact
+//! is keyed by vertex key values, so it drops into the same key-to-key join skeleton as a
+//! bridge table. `valid == false` means "no ABI coverage -- use the bridge".
+struct PGQABIArtifactScan {
+	string catalog_name;
+	string schema_name;
+	string table_name;
+	bool valid = false;
+};
 
-private:
-	struct EliminatedVertex {
-		string representative_alias;
-		//! vertex key column -> column of representative_alias that replaces it
-		case_insensitive_map_t<Identifier> representative_column;
-		//! vertex key column -> its name in the catalog, which is what the result column was called before
-		case_insensitive_map_t<Identifier> output_name;
-		//! vertex key column -> type to cast the replacement to, when the edge column type differs
-		case_insensitive_map_t<LogicalType> cast_type;
-		//! vertex key column -> whether the replacement column can be NULL
-		case_insensitive_set_t nullable_keys;
-	};
-
-	void CollectReferences(const ParsedExpression &expression);
-	void Disqualify(const string &vertex_alias);
-	void DisqualifyAll();
-	bool IsVertexKey(const VertexJoinInfo &info, const Identifier &column) const;
-	bool TableHasColumn(const string &vertex_alias, const Identifier &column);
-	optional_ptr<TableCatalogEntry> LookupTable(const PropertyGraphTable &table);
-	bool TryPlanVertex(const string &vertex_alias, const VertexJoinInfo &info, EliminatedVertex &result);
-	void RewriteExpression(unique_ptr<ParsedExpression> &expression, bool preserve_name);
-
-	static bool SameKeySet(const vector<Identifier> &left, const vector<Identifier> &right);
-	static idx_t KeyPosition(const vector<Identifier> &keys, const Identifier &key);
-	static bool HasUniqueConstraint(const TableCatalogEntry &table, const vector<Identifier> &keys);
-	static bool IsNotNull(const TableCatalogEntry &table, const Identifier &column);
-
-	ClientContext &context;
-	VertexJoinMap &vertex_joins;
-	const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map;
-	bool enabled = true;
-	bool graph_verified = false;
-	case_insensitive_set_t disqualified;
-	case_insensitive_map_t<EliminatedVertex> eliminated;
-	//! Catalog lookups, keyed by the qualified table name
-	case_insensitive_map_t<optional_ptr<TableCatalogEntry>> table_cache;
+//! How much of a quantified variable-length traversal ABI artifacts can absorb. Coverage
+//! is graded: `exact` answers the whole quantifier from one artifact scan, otherwise
+//! `step` at least backs each recursive step with an artifact instead of the bridge.
+struct PGQABITraversalPlan {
+	//! 7a: `edge` artifact scanned by each recursive step in place of the bridge table.
+	PGQABIArtifactScan step;
+	//! 7b: artifact answering an exact-length quantifier {k,k} outright, no recursion.
+	PGQABIArtifactScan exact;
+	//! Hop count k of the `exact` artifact.
+	idx_t exact_hops = 0;
 };
 
 struct PGQMatchFunction : public TableFunction {
@@ -150,22 +176,30 @@ public:
 	static void CheckInheritance(const shared_ptr<PropertyGraphTable> &tableref, PathElement *element,
 	                             vector<unique_ptr<ParsedExpression>> &conditions);
 
-	static void CheckEdgeTableConstraints(const Identifier &src_reference, const Identifier &dst_reference,
+	static void CheckEdgeTableConstraints(const string &src_reference, const string &dst_reference,
 	                                      const shared_ptr<PropertyGraphTable> &edge_table);
 
-	static unique_ptr<ParsedExpression> CreateMatchJoinExpression(vector<Identifier> vertex_keys,
-	                                                              vector<Identifier> edge_keys,
+	static unique_ptr<ParsedExpression> CreateMatchJoinExpression(vector<string> vertex_keys, vector<string> edge_keys,
 	                                                              const string &vertex_alias, const string &edge_alias);
 
 	// Populate all vertex and edge tables and their alias into
 	// [alias_to_vertex_and_edge_tables], from paths information from
 	// [path_reference].
+	//
+	// An unlabeled-but-named vertex has no table of its own, so an arbitrary one is
+	// registered as a STUB purely so qualified column references can be validated. A stub
+	// is a placeholder, NOT a statement about which label the binding actually has -- any
+	// consumer that reports the binding's identity (label(), x.*) must treat it as unknown
+	// rather than as fact. Pass [stub_bindings] to find out which entries are stubs; the
+	// overload without it keeps the historical behaviour for callers that only validate.
 	static void
 	PopulateGraphTableAliasMap(const CreatePropertyGraphInfo &pg_table, const unique_ptr<PathReference> &path_reference,
-	                           case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_to_vertex_and_edge_tables);
+	                           case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_to_vertex_and_edge_tables,
+	                           case_insensitive_set_t *stub_bindings = nullptr);
 
 	static case_insensitive_map_t<shared_ptr<PropertyGraphTable>>
-	PopulateGraphTableAliasMap(const CreatePropertyGraphInfo &pg_table, const MatchExpression &match_expr);
+	PopulateGraphTableAliasMap(const CreatePropertyGraphInfo &pg_table, const MatchExpression &match_expr,
+	                           case_insensitive_set_t *stub_bindings = nullptr);
 
 	static PathElement *GetPathElement(const unique_ptr<PathReference> &path_reference);
 
@@ -178,38 +212,32 @@ public:
 
 	static unique_ptr<ParsedExpression> CreateWhereClause(vector<unique_ptr<ParsedExpression>> &conditions);
 
-	//! Record that vertex_alias.vertex_keys = edge_alias.edge_keys. The condition itself is emitted later by the
-	//! VertexEliminationPlanner, which may replace it when the vertex is eliminated.
-	static void RecordVertexJoin(VertexJoinMap &vertex_joins, const string &vertex_alias,
-	                             const vector<Identifier> &vertex_keys, const string &edge_alias,
-	                             const vector<Identifier> &edge_keys, const shared_ptr<PropertyGraphTable> &edge_table,
-	                             const shared_ptr<PropertyGraphTable> &referenced_vertex_table,
-	                             vector<vector<Identifier>> backing_keys = {});
-
 	static void EdgeTypeAny(const shared_ptr<PropertyGraphTable> &edge_table, const string &edge_binding,
-	                        const string &prev_binding, const string &next_binding, VertexJoinMap &vertex_joins,
-	                        unique_ptr<TableRef> &from_clause);
+	                        const string &prev_binding, const string &next_binding,
+	                        vector<unique_ptr<ParsedExpression>> &conditions, unique_ptr<TableRef> &from_clause);
 
-	static void EdgeTypeLeft(const shared_ptr<PropertyGraphTable> &edge_table, const Identifier &next_table_name,
-	                         const Identifier &prev_table_name, const string &edge_binding, const string &prev_binding,
-	                         const string &next_binding, VertexJoinMap &vertex_joins);
+	static void EdgeTypeLeft(const shared_ptr<PropertyGraphTable> &edge_table, const string &next_table_name,
+	                         const string &prev_table_name, const string &edge_binding, const string &prev_binding,
+	                         const string &next_binding, vector<unique_ptr<ParsedExpression>> &conditions);
 
-	static void EdgeTypeRight(const shared_ptr<PropertyGraphTable> &edge_table, const Identifier &next_table_name,
-	                          const Identifier &prev_table_name, const string &edge_binding, const string &prev_binding,
-	                          const string &next_binding, VertexJoinMap &vertex_joins);
+	static void EdgeTypeRight(const shared_ptr<PropertyGraphTable> &edge_table, const string &next_table_name,
+	                          const string &prev_table_name, const string &edge_binding, const string &prev_binding,
+	                          const string &next_binding, vector<unique_ptr<ParsedExpression>> &conditions);
 
 	static void EdgeTypeLeftRight(const shared_ptr<PropertyGraphTable> &edge_table, const string &edge_binding,
-	                              const string &prev_binding, const string &next_binding, VertexJoinMap &vertex_joins,
+	                              const string &prev_binding, const string &next_binding,
+	                              vector<unique_ptr<ParsedExpression>> &conditions,
 	                              case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map,
 	                              int32_t &extra_alias_counter);
 
 	static PathElement *HandleNestedSubPath(unique_ptr<PathReference> &path_reference,
 	                                        vector<unique_ptr<ParsedExpression>> &conditions, idx_t element_idx);
 
+	// csr_id must match the slot the paired CSR CTE was built into.
 	static unique_ptr<ParsedExpression> AddPathQuantifierCondition(const string &prev_binding,
 	                                                               const string &next_binding,
 	                                                               const shared_ptr<PropertyGraphTable> &edge_table,
-	                                                               const SubPath *subpath);
+	                                                               const SubPath *subpath, int32_t csr_id);
 
 	static unique_ptr<TableRef> MatchBindReplace(ClientContext &context, TableFunctionBindInput &input);
 
@@ -221,36 +249,79 @@ public:
 	static unique_ptr<CommonTableExpressionInfo>
 	GenerateShortestPathCTE(CreatePropertyGraphInfo &pg_table, SubPath *edge_subpath, PathElement *path_element,
 	                        PathElement *next_vertex_element,
-	                        vector<unique_ptr<ParsedExpression>> &path_finding_conditions);
+	                        vector<unique_ptr<ParsedExpression>> &path_finding_conditions, int32_t csr_id,
+	                        bool all_shortest = false);
 
 	static unique_ptr<ParsedExpression> CreatePathFindingFunction(vector<unique_ptr<PathReference>> &path_list,
 	                                                              CreatePropertyGraphInfo &pg_table,
 	                                                              const string &path_variable,
 	                                                              unique_ptr<SelectNode> &final_select_node,
-	                                                              vector<unique_ptr<ParsedExpression>> &conditions);
+	                                                              vector<unique_ptr<ParsedExpression>> &conditions,
+	                                                              int32_t &csr_id_counter, PGQCSRSlot &cte1_slot,
+	                                                              bool all_shortest = false);
 
+	static void AddTraversalPathFinding(unique_ptr<SelectNode> &select_node,
+	                                    vector<unique_ptr<ParsedExpression>> &conditions, const string &prev_binding,
+	                                    const string &next_binding,
+	                                    const shared_ptr<PropertyGraphTable> &prev_vertex_table,
+	                                    const shared_ptr<PropertyGraphTable> &next_vertex_table,
+	                                    const vector<shared_ptr<PropertyGraphTable>> &edge_tables, bool undirected,
+	                                    idx_t lower, idx_t upper);
+
+	// csr_id_counter hands out a distinct registry slot per CSR built in this query. It is
+	// a reference to DuckPGQState::csr_id_counter, threaded because this call chain carries
+	// no ClientContext (same reason as vl_fallback_budget).
 	static void AddPathFinding(unique_ptr<SelectNode> &select_node, vector<unique_ptr<ParsedExpression>> &conditions,
 	                           const string &prev_binding, const string &edge_binding, const string &next_binding,
 	                           const shared_ptr<PropertyGraphTable> &edge_table, CreatePropertyGraphInfo &pg_table,
-	                           SubPath *subpath, PGQMatchType edge_type, VertexJoinMap &vertex_joins);
+	                           SubPath *subpath, PGQMatchType edge_type, int32_t &csr_id_counter, PGQCSRSlot &cte1_slot,
+	                           unique_ptr<ParsedExpression> anchor_filter = nullptr, bool any_shortest = false,
+	                           const PGQABITraversalPlan *abi_plan = nullptr,
+	                           const string &edge_label = string());
+
+	static void AddPathModeFilter(PGQPathMode mode, const string &path_cte,
+	                              vector<unique_ptr<ParsedExpression>> &conditions);
 
 	static void AddEdgeJoins(const shared_ptr<PropertyGraphTable> &edge_table,
 	                         const shared_ptr<PropertyGraphTable> &previous_vertex_table,
 	                         const shared_ptr<PropertyGraphTable> &next_vertex_table, PGQMatchType edge_type,
 	                         const string &edge_binding, const string &prev_binding, const string &next_binding,
-	                         VertexJoinMap &vertex_joins,
+	                         vector<unique_ptr<ParsedExpression>> &conditions,
 	                         case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map,
 	                         int32_t &extra_alias_counter, unique_ptr<TableRef> &from_clause);
 
+	// path_table_cache (optional) lets the recursive-CTE fallback still scan ABI edge
+	// artifacts for its traversal steps when no whole-pattern ABI rewrite applied --
+	// i.e. ABI coverage is graded, not all-or-nothing.
+	// vl_fallback_budget is pgq_max_vl_fallback_rows, read where a ClientContext exists and
+	// passed down because this call chain carries none. 0 disables the guard.
 	static void ProcessPathList(vector<unique_ptr<PathReference>> &path_pattern,
 	                            vector<unique_ptr<ParsedExpression>> &conditions, unique_ptr<SelectNode> &select_node,
 	                            case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map,
 	                            CreatePropertyGraphInfo &pg_table, int32_t &extra_alias_counter,
-	                            MatchExpression &original_ref, VertexJoinMap &vertex_joins);
+	                            MatchExpression &original_ref, int32_t &csr_id_counter, PGQCSRSlot &cte1_slot,
+	                            bool all_shortest = false,
+	                            bool any_shortest = false,
+	                            const PGQPathTableCache *path_table_cache = nullptr,
+	                            int64_t vl_fallback_budget = 0);
+
+	// Process one OPTIONAL MATCH group: adds LEFT JOINs for each edge+vertex pair directly
+	// to select_node->from_table. Populates opt_alias_map with the new aliases.
+	// mandatory_alias_map is used to resolve already-bound variable bindings that carry no label.
+	static void ProcessOptionalPathList(const vector<unique_ptr<PathPattern>> &opt_patterns,
+	                                    unique_ptr<SelectNode> &select_node,
+	                                    case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &opt_alias_map,
+	                                    CreatePropertyGraphInfo &pg_table,
+	                                    int32_t &extra_alias_counter,
+	                                    const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &mandatory_alias_map,
+	                                    const PGQPathTableCache &path_table_cache,
+	                                    bool require_abi_paths = false,
+	                                    const ParsedExpression *where_hint = nullptr);
 
 	static void CheckNamedSubpath(SubPath &subpath, MatchExpression &original_ref, CreatePropertyGraphInfo &pg_table,
 	                              unique_ptr<SelectNode> &final_select_node,
-	                              vector<unique_ptr<ParsedExpression>> &conditions);
+	                              vector<unique_ptr<ParsedExpression>> &conditions, int32_t &csr_id_counter,
+	                              PGQCSRSlot &cte1_slot, bool all_shortest = false);
 
 	// Check whether columns to query are valid against the property graph, throws
 	// BinderException if error.

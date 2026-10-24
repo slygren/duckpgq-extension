@@ -2,6 +2,9 @@ set(EXTENSION_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/create_property_graph.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/describe_property_graph.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/drop_property_graph.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/explain_abi_path.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/last_rewrite_diagnostics.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/verify_abi_rewrite.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/local_clustering_coefficient.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/match.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/pagerank.cpp

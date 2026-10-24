@@ -1,0 +1,106 @@
+# name: test/sql/path_finding/union.test
+# description: UNION / UNION ALL of two MATCH patterns in GRAPH_TABLE
+# group: [path_finding]
+
+require duckpgq
+
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE Person (id BIGINT, name VARCHAR);
+
+statement ok
+CREATE TABLE Knows (src BIGINT, dst BIGINT);
+
+statement ok
+CREATE TABLE Likes (src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO Person VALUES (0,'Alice'),(1,'Bob'),(2,'Carol');
+
+statement ok
+INSERT INTO Knows VALUES (0,1);
+
+statement ok
+INSERT INTO Likes VALUES (0,2),(1,2);
+
+statement ok
+CREATE PROPERTY GRAPH net
+VERTEX TABLES (Person PROPERTIES (id, name) LABEL Person)
+EDGE TABLES (
+    Knows SOURCE KEY (src) REFERENCES Person (id)
+          DESTINATION KEY (dst) REFERENCES Person (id)
+          PROPERTIES (src, dst) LABEL Knows,
+    Likes SOURCE KEY (src) REFERENCES Person (id)
+          DESTINATION KEY (dst) REFERENCES Person (id)
+          PROPERTIES (src, dst) LABEL Likes
+);
+
+# UNION ALL: both Knows and Likes edges (Alice->Bob via Knows, Alice->Carol and Bob->Carol via Likes)
+query TT rowsort
+FROM GRAPH_TABLE (net
+    MATCH (a:Person)-[:Knows]->(b:Person)
+    UNION ALL
+    MATCH (a:Person)-[:Likes]->(b:Person)
+    COLUMNS (a.name, b.name)
+) r;
+----
+Alice	Bob
+Alice	Carol
+Bob	Carol
+
+# UNION (distinct): same result here since all rows are already distinct
+query TT rowsort
+FROM GRAPH_TABLE (net
+    MATCH (a:Person)-[:Knows]->(b:Person)
+    UNION
+    MATCH (a:Person)-[:Likes]->(b:Person)
+    COLUMNS (a.name, b.name)
+) r;
+----
+Alice	Bob
+Alice	Carol
+Bob	Carol
+
+# UNION ALL with three branches: Knows + Likes + Knows again (duplicates visible)
+query TT rowsort
+FROM GRAPH_TABLE (net
+    MATCH (a:Person)-[:Knows]->(b:Person)
+    UNION ALL
+    MATCH (a:Person)-[:Likes]->(b:Person)
+    UNION ALL
+    MATCH (a:Person)-[:Knows]->(b:Person)
+    COLUMNS (a.name, b.name)
+) r;
+----
+Alice	Bob
+Alice	Bob
+Alice	Carol
+Bob	Carol
+
+# UNION ALL with WHERE in second branch
+query TT rowsort
+FROM GRAPH_TABLE (net
+    MATCH (a:Person)-[:Knows]->(b:Person)
+    UNION ALL
+    MATCH (a:Person)-[:Likes]->(b:Person) WHERE b.name = 'Carol'
+    COLUMNS (a.name, b.name)
+) r;
+----
+Alice	Bob
+Alice	Carol
+Bob	Carol
+
+statement ok
+DROP PROPERTY GRAPH net;
+
+statement ok
+DROP TABLE Likes;
+
+statement ok
+DROP TABLE Knows;
+
+statement ok
+DROP TABLE Person;

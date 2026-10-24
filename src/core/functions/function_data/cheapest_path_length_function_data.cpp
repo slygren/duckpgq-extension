@@ -6,27 +6,14 @@ namespace duckdb {
 
 unique_ptr<FunctionData> CheapestPathLengthFunctionData::CheapestPathLengthBind(BindScalarFunctionInput &input) {
 	auto &context = input.GetClientContext();
-	auto &bound_function = input.GetBoundFunction();
 	auto &arguments = input.GetArguments();
 	if (!arguments[0]->IsFoldable()) {
 		throw InvalidInputException("Id must be constant.");
 	}
 
-	auto duckpgq_state = GetDuckPGQState(context);
-
 	int32_t csr_id = ExpressionExecutor::EvaluateScalar(context, *arguments[0]).GetValue<int32_t>();
-	CSR *csr = duckpgq_state->GetCSR(csr_id);
+	auto duckpgq_state = GetDuckPGQState(context);
 	duckpgq_state->csr_to_delete.insert(csr_id);
-
-	if (!(csr->initialized_v && csr->initialized_e && csr->initialized_w)) {
-		throw ConstraintException("Need to initialize CSR before doing cheapest path");
-	}
-
-	if (csr->w.empty()) {
-		bound_function.SetReturnType(LogicalType::DOUBLE);
-	} else {
-		bound_function.SetReturnType(LogicalType::BIGINT);
-	}
 
 	return make_uniq<CheapestPathLengthFunctionData>(context, csr_id);
 }

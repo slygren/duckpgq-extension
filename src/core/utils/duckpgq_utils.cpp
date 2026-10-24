@@ -66,11 +66,11 @@ shared_ptr<PropertyGraphTable> ValidateSourceNodeAndEdgeTable(CreatePropertyGrap
 
 // Function to create the SELECT node
 unique_ptr<SelectNode> CreateSelectNode(const shared_ptr<PropertyGraphTable> &edge_pg_entry,
-                                        const string &function_name, const string &function_alias) {
+                                        const string &function_name, const string &function_alias, int32_t csr_id) {
 	std::ostringstream query;
 	query << "SELECT " << DuckPGQSQL::Column(edge_pg_entry->source_pk[0], edge_pg_entry->source_reference) << ", add("
 	      << DuckPGQSQL::Column(string("temp"), string("__x")) << ", " << DuckPGQSQL::Identifier(function_name)
-	      << "(0, " << DuckPGQSQL::Column(string("rowid"), edge_pg_entry->source_reference) << ")) AS "
+	      << "(" << csr_id << ", " << DuckPGQSQL::Column(string("rowid"), edge_pg_entry->source_reference) << ")) AS "
 	      << DuckPGQSQL::Identifier(function_alias) << " FROM "
 	      << DuckPGQSQL::TableRef(*edge_pg_entry->source_pg_table, edge_pg_entry->source_reference)
 	      << " CROSS JOIN (SELECT multiply(0, count(csr_cte.temp)) AS temp FROM csr_cte) AS __x";

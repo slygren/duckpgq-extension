@@ -1,0 +1,65 @@
+# name: test/sql/pattern_matching/branched_variable_reference.test
+# description: Comma-separated path patterns can reuse an already-bound vertex variable without repeating its label
+# group: [pattern_matching]
+
+require duckpgq
+
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE tag(id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO tag VALUES (1, 'Pump A'), (2, 'Pump B');
+
+statement ok
+CREATE TABLE workorder(id INTEGER, title VARCHAR);
+
+statement ok
+INSERT INTO workorder VALUES (10, 'WO-10');
+
+statement ok
+CREATE TABLE notification(id INTEGER, title VARCHAR);
+
+statement ok
+INSERT INTO notification VALUES (20, 'N-20');
+
+statement ok
+CREATE TABLE has_workorder(tag_id INTEGER, wo_id INTEGER);
+
+statement ok
+INSERT INTO has_workorder VALUES (1, 10);
+
+statement ok
+CREATE TABLE has_notification(tag_id INTEGER, notification_id INTEGER);
+
+statement ok
+INSERT INTO has_notification VALUES (1, 20);
+
+statement ok
+CREATE PROPERTY GRAPH test_graph
+VERTEX TABLES (
+    tag PROPERTIES (id, name) LABEL Tag,
+    workorder PROPERTIES (id, title) LABEL Workorder,
+    notification PROPERTIES (id, title) LABEL Notification
+)
+EDGE TABLES (
+    has_workorder SOURCE KEY (tag_id) REFERENCES tag(id)
+                  DESTINATION KEY (wo_id) REFERENCES workorder(id)
+                  LABEL HasWorkorder,
+    has_notification SOURCE KEY (tag_id) REFERENCES tag(id)
+                     DESTINATION KEY (notification_id) REFERENCES notification(id)
+                     LABEL HasNotification
+);
+
+query III
+FROM GRAPH_TABLE (
+    test_graph
+    MATCH (t:Tag)-[:HasWorkorder]->(w:Workorder),
+          (t)-[:HasNotification]->(n:Notification)
+    COLUMNS (t.name AS tag_name, w.title AS workorder_title, n.title AS notification_title)
+);
+----
+Pump A	WO-10	N-20
