@@ -6618,6 +6618,15 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 	//
 	// src_id is carried through the recursion rather than read back out of path_vertices, so
 	// v0 keeps the source key's own type and still joins natively to the source table.
+	//
+	// The edge side is semi-joined to the frontier (`v0 IN (SELECT dst_id FROM __pgq_ctx ...)`).
+	// The semi-join changes nothing in the result, but it makes both sides of the step join
+	// read the recursive table. When only one side does, DuckDB 2.0's build/probe optimizer keeps
+	// the recursive side as the probe side, so it can reuse the other side's hash table across
+	// iterations. Here that would hash every row of every edge table, every iteration
+	// (benchmark Q6: ~38M rows, 13 GB). With both sides reading it, the size-based choice
+	// applies again and the small frontier becomes the build side. The depth guard makes the
+	// last iteration's semi-join empty, so that iteration skips the edge scan.
 	const string query = StringUtil::Format(
 	    "WITH RECURSIVE __pgq_ctx(dst_label, src_id, dst_id, depth, path_vertices, path_vertex_labels, "
 	    "path_edge_labels, path_participants) AS ("
@@ -6634,7 +6643,8 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 	    "         list_append(c.path_edge_labels, e.edge_label) AS path_edge_labels, "
 	    "         list_append(c.path_participants, e.dst_label || ':' || CAST(e.v1 AS VARCHAR)) AS path_participants "
 	    "  FROM __pgq_ctx c "
-	    "  JOIN (%s) e ON lower(e.src_label) = lower(c.dst_label) AND e.v0 = c.dst_id "
+	    "  JOIN (SELECT * FROM (%s) WHERE v0 IN (SELECT f.dst_id FROM __pgq_ctx f WHERE f.depth < %s)) e "
+	    "    ON lower(e.src_label) = lower(c.dst_label) AND e.v0 = c.dst_id "
 	    "  WHERE c.depth < %s "
 	    "    AND NOT list_contains(c.path_participants, e.dst_label || ':' || CAST(e.v1 AS VARCHAR))"
 	    ") %s "
@@ -6648,6 +6658,7 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 	    "WHERE %s%s",
 	    src_label_sql, src_pk, src_pk, src_pk, src_label_sql, src_label_sql, src_pk,
 	    src_table_name, seed_where, JoinSQLUnionAll(edge_selects),
+	    std::to_string(static_cast<int64_t>(recursion_limit)),
 	    std::to_string(static_cast<int64_t>(recursion_limit)), vertex_properties_cte, vertex_properties_select,
 	    final_filter, direct_selects.empty() ? string() : " UNION ALL " + JoinSQLUnionAll(direct_selects));
 
