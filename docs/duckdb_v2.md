@@ -69,8 +69,9 @@ This was verified in a browser against stock duckdb-wasm source built for `v2.0.
 2. **Open the database** with `db.open({ allowUnsignedExtensions: true })`.
 3. **Load the extensions.** Run `LOAD '<url>/duckpgq.duckdb_extension.wasm'`, then `INSTALL httpfs; LOAD httpfs; INSTALL ducklake; LOAD ducklake;`. The official, signed v2.0.0 builds come from extensions.duckdb.org, so they no longer need to be baked into the bundle.
 4. **Activate the grammar** on each connection: `SET active_grammar_extensions = ['duckpgq']`.
-5. **Disable the ETag check before attaching:** `SET unsafe_disable_etag_checks = true`. In the browser, httpfs otherwise rejects the frozen catalog with "ETag … changed after it was opened". Natively it does not. Frozen lakes never change, so skipping the check is safe for them. The root cause is not known yet; MinIO's CORS does expose `ETag`.
-6. **Attach the lake:** `ATTACH 'ducklake:s3://datalake/frozen_….ducklake' AS f001 (READ_ONLY)`, then create the graph and query it.
+5. **Make scans synchronous:** `SET debug_physical_table_scan_execution_strategy = 'SYNCHRONOUS'`. DuckDB 2.0 hands parquet and DuckLake scan I/O to an async task pool, which has no threads in duckdb-wasm. While a recursive CTE runs an iteration it only works on its own tasks, so any recursive query over remote files never finishes without this setting. That covers every variable-length pattern answered by context expansion, such as `-[:!X]->{1,2}`. The setting made no measurable difference to the other benchmark queries.
+6. **Disable the ETag check before attaching:** `SET unsafe_disable_etag_checks = true`. In the browser, httpfs otherwise rejects the frozen catalog with "ETag … changed after it was opened". Natively it does not. Frozen lakes never change, so skipping the check is safe for them. The root cause is not known yet; MinIO's CORS does expose `ETag`.
+7. **Attach the lake:** `ATTACH 'ducklake:s3://datalake/frozen_….ducklake' AS f001 (READ_ONLY)`, then create the graph and query it.
 
 Statically linking duckpgq into the bundle also works if loadable extensions are switched off. httpfs and ducklake then have to be linked in too, as before.
 
