@@ -25,7 +25,51 @@ FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->(b:Person) COLUMNS (a.name, b.nam
 | `pgq_disable_abi_rewrite` | false | Use the fallback traversal only. `pgq_verify_abi_rewrite()` uses this to compare the two. |
 | `pgq_max_vl_fallback_rows` | 20000000 | Row budget for a variable-length fallback traversal. |
 | `pgq_verify_edges_on_create` | false | Have CREATE PROPERTY GRAPH reject incomplete edges. It scans every edge table, which takes about 15 s on `maintenance_graph`. |
+| `pgq_abi_mode` | `consume` | `consume`: use ABI artifacts that exist, never build any. `auto`: also build a graph's artifacts at CREATE PROPERTY GRAPH when it has none and its database is writable. `off`: ignore artifacts. |
+| `pgq_abi_auto_max_rows` | 10000000 | In `auto` mode, leave out fixed-path artifacts whose chain holds more rows than this. |
+| `pgq_abi_on_stale` | `skip` | An artifact built from DuckLake tables that changed afterwards is stale. `skip`: leave it out and traverse. `use`: use it anyway. |
 | `duckpgq_vertex_join_elimination` | true | Leave a vertex table out of a MATCH when the query only uses its key (see below). Only applies to graphs created with `pgq_verify_edges_on_create`. |
+
+## ABI artifacts
+
+The MATCH rewrite answers path patterns from precomputed tables ("ABI artifacts") listed in a `__pgq_path_catalog` table. The extension builds them itself:
+
+```sql
+FROM pgq_abi_build('g');                                  -- build, one row per artifact
+FROM pgq_abi_build('g', max_hops := 3, closures := ['HAS_PARENT']);
+FROM pgq_abi_status('g');                                 -- what exists, row counts, freshness
+FROM pgq_abi_sql('g');                                    -- the build script, without running it
+FROM pgq_abi_drop('g');                                   -- drop the artifacts and their catalog rows
+```
+
+- **Where they go:** schema `graph` in the database of the graph's first vertex table, or `schema := 'catalog.schema'`. They must be in a database the graph reads tables from: the rewrite ignores artifacts anywhere else.
+- **How it runs:** one statement at a time, each in its own transaction, on an internal connection, and only when the call executes (DESCRIBE or EXPLAIN of it build nothing). A failed build removes the graph's catalog rows, so its queries traverse instead of failing on a dropped table. A rebuild drops the artifacts it no longer produces.
+
+| Option | Default | Builds |
+| --- | --- | --- |
+| `max_hops` | 2 | Fixed-path artifacts for every edge-label chain of 1..max_hops hops. `fixed_paths := false` builds none. |
+| `exclude_self_referential` | true | Leave chains containing a self-referential edge (A→A) out of multi-hop artifacts; closures cover those. |
+| `exclude_paths` | | Edge-label chains never to build, e.g. `[['A', 'B']]`. |
+| `closures` | | Transitive closure, witness and chain artifacts per self-referential edge label: `['HAS_PARENT']`, or structs `{'relationship': ..., 'max_depth': 20, 'witness': true}`. `closure_max_depth`, `closure_witness` set the defaults. |
+| `branch_summaries` | | `[{'anchor': 'TAG', 'branches': ['HAS_WORKORDER', 'HAS_NOTIFICATION']}]`: per-anchor counts. |
+| `reverse_twins` | | Edge labels whose artifacts also get a copy ordered by `v1`, for destination-anchored lookups. |
+| `cover` | | `MAP {'HAS_X': ['prop', ...]}`: destination properties stored on the 1-hop artifact. |
+| `max_rows` | 0 | Leave out fixed-path artifacts whose chain holds more rows than this (measured from aggregates first; nothing is ever trimmed). |
+| `metadata`, `fixed_metadata`, `edge_domains` | | Catalog metadata (`semantic_grain`, `temporal_mode`, `multiplicity_mode`, `property_support`, `freshness_policy`, `domain`). |
+| `row_group_size`, `partition_closures` | 0, true | DuckLake targets only: set the lake's parquet row group size first; partition closures by depth. |
+
+The shapes, names, edge ids and catalog rows are those of the dwh layout compiler (`compile_graph_layout.py`); see `pgq/v2/tools/abi_parity.py` and `abi_runtime.py` for the checks that prove it.
+
+**Declaring the build on the graph.** `CREATE PROPERTY GRAPH ... WITH ABI (max_hops := 3, closures := ['HAS_PARENT'])` takes the same options. Declaring builds nothing: `pgq_abi_build('g')` uses the declaration, and options passed to the call override it. The declaration is kept with the graph.
+
+**When artifacts are built.** In the default `consume` mode, never implicitly: consumers such as shells and MCP tools only read what exists. `SET pgq_abi_mode = 'auto'` makes CREATE PROPERTY GRAPH build too, but only when the graph has no artifacts yet and its database is writable, and only artifacts under `pgq_abi_auto_max_rows`.
+
+**Freshness.** An artifact is a snapshot of its source tables.
+- **DuckLake sources:** a build records the lake snapshot it read and the tables each artifact came from. When a later snapshot changes one of those tables, the artifact is stale and is left out until rebuilt (`pgq_abi_status` shows `fresh = false`). The check costs one metadata query per lake when the artifact list is loaded, and one per query to see whether the lake moved. A copy of the lake, such as a frozen snapshot, has its own snapshot history; there the recorded snapshot is not found, freshness is not judged (`fresh` is NULL), and the artifacts are used as they are.
+- **Plain DuckDB tables:** there is no change history to read. Rebuild after loading data.
+- **Artifacts from the layout compiler:** they record no provenance and are always used.
+
+**DuckLake versions.** DuckDB 2.0 writes DuckLake format 1.1 and, on file-backed catalogs, a newer DuckDB storage version; DuckDB 1.5 reads neither. Building into a lake that 1.5 tools still read: attach it without `AUTOMATIC_MIGRATION` (the format then stays 1.0), and keep in mind that a file-backed catalog written by 2.0 cannot be opened by 1.5 afterwards.
 
 ## Building
 
