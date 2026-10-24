@@ -11,6 +11,9 @@ statement ok
 SET active_grammar_extensions = ['duckpgq'];
 
 statement ok
+SET pgq_verify_edges_on_create = true;
+
+statement ok
 CREATE TABLE Person(id BIGINT PRIMARY KEY, name VARCHAR);
 
 statement ok
@@ -45,6 +48,9 @@ restart
 statement ok
 SET active_grammar_extensions = ['duckpgq'];
 
+statement ok
+SET pgq_verify_edges_on_create = true;
+
 query I
 SELECT DISTINCT verified FROM __duckpgq_internal WHERE property_graph = 'g';
 ----
@@ -68,6 +74,9 @@ restart
 
 statement ok
 SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+SET pgq_verify_edges_on_create = true;
 
 # Skipped: asserts upstream's vertex elimination, which the ABI MATCH rewrite does not perform yet.
 mode skip

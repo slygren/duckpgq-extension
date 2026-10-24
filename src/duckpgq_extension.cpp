@@ -32,6 +32,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    "immediately instead of running an unbounded scan. 0 disables the guard.",
 		    LogicalType::BIGINT, Value::BIGINT(20000000), nullptr, SetScope::SESSION);
 	}
+	if (!config.HasExtensionOption("pgq_verify_edges_on_create")) {
+		config.AddExtensionOption(
+		    "pgq_verify_edges_on_create",
+		    "Have CREATE PROPERTY GRAPH check that every edge key references a vertex row, rejecting incomplete edges. "
+		    "Scans every edge table, so it is off by default.",
+		    LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::SESSION);
+	}
 	CoreModule::Register(loader);
 }
 

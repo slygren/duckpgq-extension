@@ -452,8 +452,16 @@ void CreatePropertyGraphFunction::CreatePropertyGraphFunc(ClientContext &context
 
 	// Verify the data before anything is registered, so that a failed CREATE leaves no trace and CREATE OR REPLACE
 	// keeps the previous definition.
-	pg_info->verified = true;
+	// The check scans every edge table; it is opt-in because only vertex elimination, which this build's MATCH
+	// translation does not perform, relies on it.
+	Value verify_edges;
+	const bool verify = context.TryGetCurrentSetting("pgq_verify_edges_on_create", verify_edges) &&
+	                    !verify_edges.IsNull() && verify_edges.GetValue<bool>();
+	pg_info->verified = verify;
 	for (auto &edge_table : pg_info->edge_tables) {
+		if (!verify) {
+			break;
+		}
 		pg_info->verified &=
 		    CheckEdgeKeysReferenceVertices(context, *new_conn, edge_table, "source", edge_table->source_fk,
 		                                   edge_table->source_pg_table, edge_table->source_pk);
