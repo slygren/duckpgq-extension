@@ -21,6 +21,7 @@
 #include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/operator_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
+#include "duckdb/storage/table_storage_info.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 
@@ -13459,6 +13460,132 @@ static unique_ptr<ParsedExpression> NullAbsentProperties(unique_ptr<ParsedExpres
 	return expression;
 }
 
+//! The rows of a graph table as the catalog estimates them, or -1 when it cannot say.
+static int64_t GraphTableRows(ClientContext &context, const PropertyGraphTable &table,
+                              case_insensitive_map_t<int64_t> &cache) {
+	const auto key = TableKey(table);
+	auto cached = cache.find(key);
+	if (cached != cache.end()) {
+		return cached->second;
+	}
+	int64_t rows = -1;
+	try {
+		const string catalog_name = table.catalog_name.empty() ? PGQStr(DatabaseManager::GetDefaultDatabase(context))
+		                                                       : PGQStr(table.catalog_name);
+		const string schema_name = table.schema_name.empty() ? string(DEFAULT_SCHEMA) : PGQStr(table.schema_name);
+		auto entry = Catalog::GetEntry<TableCatalogEntry>(
+		    context, QualifiedName(Identifier(catalog_name), Identifier(schema_name), table.table_name),
+		    OnEntryNotFound::RETURN_NULL);
+		if (entry) {
+			auto info = entry->GetStorageInfo(context);
+			if (info.cardinality.IsValid()) {
+				rows = NumericCast<int64_t>(info.cardinality.GetIndex());
+			}
+		}
+	} catch (...) {
+		rows = -1;
+	}
+	cache[key] = rows;
+	return rows;
+}
+
+//! A MATCH whose quantified path patterns no vertex condition seeds expands from every vertex. Its size is estimated
+//! (per leaf, the product of its edge tables' rows over the product of its inner vertices' rows) and refused over
+//! pgq_max_vl_fallback_rows, as an unanchored variable-length traversal is. A condition on one vertex outside the
+//! groups (in the MATCH WHERE, or the vertex's own WHERE) seeds it: the joins then start from the matching rows.
+static void CheckGroupBudget(ClientContext &context, const MatchExpression &block, const vector<PGQGroupSpec> &specs,
+                             const case_insensitive_map_t<idx_t> &group_of,
+                             const vector<unique_ptr<PGQGroupLeaf>> &leaves, CreatePropertyGraphInfo &pg_table) {
+	const auto budget = MaxVLFallbackRows(context);
+	bool lists = false;
+	for (auto &spec : specs) {
+		lists = lists || spec.lists;
+	}
+	if (budget <= 0 || !lists) {
+		return;
+	}
+	// Seeds: a vertex outside every group read alone by a WHERE conjunct, or carrying an element WHERE.
+	case_insensitive_set_t outer_vertices;
+	bool seeded = false;
+	for (auto &pattern : block.path_patterns) {
+		for (auto &entry : PatternSequence(*pattern)) {
+			auto *element = EntryElement(entry);
+			if (!element || element->match_type != PGQMatchType::MATCH_VERTEX || group_of.count(element->variable_binding)) {
+				continue;
+			}
+			outer_vertices.insert(element->variable_binding);
+			auto *wrapper = PGQMatchFunction::GetSubPath(entry);
+			seeded = seeded || (wrapper && wrapper->where_clause);
+		}
+	}
+	if (!seeded && block.where_clause) {
+		vector<unique_ptr<ParsedExpression>> conjuncts;
+		SplitConjuncts(block.where_clause->Copy(), conjuncts);
+		for (auto &conjunct : conjuncts) {
+			case_insensitive_set_t read;
+			bool subquery = false;
+			CollectReadVariables(*conjunct, read, subquery);
+			seeded = seeded || (!subquery && read.size() == 1 && outer_vertices.count(*read.begin()));
+		}
+	}
+	if (seeded) {
+		return;
+	}
+	case_insensitive_map_t<int64_t> rows_cache;
+	case_insensitive_map_t<shared_ptr<PropertyGraphTable>> tables;
+	for (auto *list : {&pg_table.vertex_tables, &pg_table.edge_tables}) {
+		for (auto &table : *list) {
+			tables[TableKey(*table)] = table;
+		}
+	}
+	auto domain_rows = [&](const PGQGroupLeaf &leaf, const string &variable) -> double {
+		auto domain = leaf.domains.find(variable);
+		if (domain == leaf.domains.end()) {
+			return -1;
+		}
+		double total = 0;
+		for (auto &key : domain->second) {
+			auto table = tables[key];
+			auto rows = table ? GraphTableRows(context, *table, rows_cache) : -1;
+			if (rows < 0) {
+				return -1;
+			}
+			total += double(rows);
+		}
+		return total;
+	};
+	double estimate = 0;
+	for (auto &leaf : leaves) {
+		double leaf_rows = 1;
+		for (idx_t p = 0; p < leaf->sequences.size(); p++) {
+			auto &sequence = leaf->sequences[p];
+			double pattern_rows = domain_rows(*leaf, sequence[0]);
+			for (idx_t i = 1; i + 1 < sequence.size() && pattern_rows >= 0; i += 2) {
+				const double edges = domain_rows(*leaf, sequence[i]);
+				const double sources = domain_rows(*leaf, sequence[i - 1]);
+				if (edges < 0 || sources < 0) {
+					pattern_rows = -1;
+					break;
+				}
+				pattern_rows = sources > 0 ? pattern_rows * edges / sources : 0;
+			}
+			if (pattern_rows < 0) {
+				return; // a table without an estimate: nothing to cost against
+			}
+			leaf_rows *= pattern_rows;
+		}
+		estimate += leaf_rows;
+	}
+	if (estimate > double(budget)) {
+		throw BinderException(
+		    "This MATCH with a quantified path pattern has no condition on a vertex outside the pattern, so it expands "
+		    "from every vertex, and is estimated to produce ~%.0f rows, exceeding pgq_max_vl_fallback_rows (%lld). "
+		    "Constrain a vertex before or after the quantified pattern (any condition on that vertex alone seeds the "
+		    "expansion), lower the upper bound, or raise or disable the budget with SET pgq_max_vl_fallback_rows",
+		    estimate, static_cast<long long>(budget));
+	}
+}
+
 //! element_id(v) and label(v) of a leaf variable, anywhere in an expression. The translation resolves them only at
 //! the top of a column or a WHERE conjunct, and the lowering nests them in lists.
 static unique_ptr<ParsedExpression> ResolveElementFunctions(unique_ptr<ParsedExpression> expression,
@@ -13552,6 +13679,7 @@ static unique_ptr<QueryNode> BuildQuantifiedGroupNode(ClientContext &context, Ma
 	if (leaves.empty()) {
 		return EmptyGroupResult(block);
 	}
+	CheckGroupBudget(context, block, specs, group_of, leaves, pg_table);
 	// The table each group variable binds, where it is one table in every iteration of every leaf.
 	case_insensitive_map_t<string> variable_tables;
 	case_insensitive_set_t ambiguous;
