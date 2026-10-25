@@ -306,6 +306,7 @@ FROM triangle_count('social', 'Person', 'Knows');
 FROM total_triangle_count('social', 'Person', 'Knows');    -- one row
 FROM betweenness_centrality('social', 'Person', 'Knows', k := 256, seed := 7, normalized := true, directed := true);
 FROM label_propagation('social', 'Person', 'Knows', seed := 7, max_iterations := 100);
+FROM louvain('social', 'Person', 'Knows', resolution := 1.0, seed := 7);
 ```
 
 How each function reads the edges (n vertices, m edges):
@@ -317,6 +318,7 @@ How each function reads the edges (n vertices, m edges):
 | `total_triangle_count(g, v, e)` | undirected | ignored | count once | one row, `triangle_count BIGINT` | O(m^1.5) |
 | `betweenness_centrality(g, v, e, k, normalized, directed, seed)` | directed (default) or undirected | ignored | count once | `betweenness_centrality DOUBLE` | O(n m), O(k m) sampled |
 | `label_propagation(g, v, e, seed, max_iterations)` | undirected | ignored | count once | `community BIGINT` | O(m) per round |
+| `louvain(g, v, e, resolution, seed)` | undirected, unweighted | ignored | count once | `community BIGINT` | O(m) per pass, typically O(m log n) |
 
 - **`strongly_connected_component`**: Tarjan's algorithm, iterative, so long chains are no problem. Two vertices
   share a `componentId` when each reaches the other. The id is the smallest rowid among the component's vertices,
@@ -338,6 +340,14 @@ How each function reads the edges (n vertices, m edges):
   holds a most frequent neighbour label, or after `max_iterations` rounds (default 100). The same seed gives the same
   communities on every platform. NetworkX uses Python's random generator, so labels differ from NetworkX's. A
   `community` is the smallest rowid among its members.
+- **`louvain`**: Louvain modularity optimisation (Blondel et al. 2008), as `networkx.louvain_communities` runs it.
+  Vertices move one at a time, in a random order drawn from `seed`, to the neighbouring community with the best
+  modularity gain until no vertex moves. Each community then becomes a vertex of the next level. It stops when a
+  level moves nothing or raises modularity by at most 1e-7. `resolution` (default 1) above 1 favours smaller
+  communities, below 1 larger ones; 0 merges every connected part. The result is deterministic for a seed but is not
+  NetworkX's partition (different random generator). On the generated test graphs its modularity is within 0.02 of
+  the best of five NetworkX seeds, and planted partitions are recovered exactly. As with any Louvain, a community can
+  be internally disconnected; Leiden's refinement step, which prevents that, is not implemented.
 
 `scripts/compare_graph_algorithms.py` compares every function with NetworkX (or a brute force) on generated graphs:
 directed and undirected readings, disconnected parts, self-loops, parallel and reciprocal edges, empty edge and vertex

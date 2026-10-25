@@ -175,6 +175,7 @@ private:
 	static void RegisterTriangleCount(ExtensionLoader &loader);
 	static void RegisterBetweennessCentrality(ExtensionLoader &loader);
 	static void RegisterLabelPropagation(ExtensionLoader &loader);
+	static void RegisterLouvain(ExtensionLoader &loader);
 };
 
 } // namespace duckdb

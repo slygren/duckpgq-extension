@@ -1,0 +1,98 @@
+# name: test/sql/algorithms/louvain.test
+# description: louvain: multi-level Louvain on the undirected simple graph, deterministic for a seed.
+#              scripts/compare_graph_algorithms.py compares its modularity with networkx.louvain_communities and
+#              checks planted partitions on generated graphs.
+# group: [algorithms]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+# Two 5-cliques joined by the single edge 4 - 5 (both directions), a self-loop on 3, and an isolated 10.
+statement ok
+CREATE TABLE v AS SELECT range AS id FROM range(11);
+
+statement ok
+CREATE TABLE e AS SELECT a.id AS src, b.id AS dst FROM v a, v b WHERE a.id < b.id AND a.id < 5 AND b.id < 5
+    UNION ALL SELECT a.id, b.id FROM v a, v b WHERE a.id < b.id AND a.id BETWEEN 5 AND 9 AND b.id BETWEEN 5 AND 9
+    UNION ALL SELECT 4, 5 UNION ALL SELECT 5, 4 UNION ALL SELECT 3, 3;
+
+statement ok
+CREATE PROPERTY GRAPH g VERTEX TABLES (v) EDGE TABLES (e SOURCE KEY (src) REFERENCES v (id) DESTINATION KEY (dst) REFERENCES v (id));
+
+query II
+SELECT id, community FROM louvain('g', 'v', 'e') ORDER BY id;
+----
+0	0
+1	0
+2	0
+3	0
+4	0
+5	5
+6	5
+7	5
+8	5
+9	5
+10	10
+
+# Resolution 0 rewards any merge: one community per connected part. A high resolution keeps every vertex apart
+# (networkx.louvain_communities with resolution = 10 gives singletons too).
+query I
+SELECT list(community ORDER BY id) FROM louvain('g', 'v', 'e', resolution := 0);
+----
+[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10]
+
+query I
+SELECT list(community ORDER BY id) FROM louvain('g', 'v', 'e', resolution := 10);
+----
+[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+
+statement error
+FROM louvain('g', 'v', 'e', resolution := -1);
+----
+Invalid Input Error: louvain: resolution must be a finite number >= 0, not -1.0
+
+# Ten planted 30-vertex groups, dense inside, sparsely linked: recovered exactly.
+statement ok
+CREATE TABLE pv AS SELECT range AS id FROM range(300);
+
+statement ok
+CREATE TABLE pe AS
+    SELECT a.id AS src, b.id AS dst FROM pv a, pv b WHERE a.id // 30 = b.id // 30 AND a.id < b.id AND hash(a.id * 1000 + b.id) % 3 <> 0
+    UNION ALL SELECT range * 30, (range * 30 + 31) % 300 FROM range(10);
+
+statement ok
+CREATE PROPERTY GRAPH pg VERTEX TABLES (pv) EDGE TABLES (pe SOURCE KEY (src) REFERENCES pv (id) DESTINATION KEY (dst) REFERENCES pv (id));
+
+query II
+SELECT count(DISTINCT community), count(*) FILTER (WHERE community <> (id // 30) * 30) FROM louvain('pg', 'pv', 'pe', seed := 4);
+----
+10	0
+
+# The same seed gives the same communities.
+statement ok
+CREATE TABLE rv AS SELECT range AS id FROM range(300);
+
+statement ok
+CREATE TABLE re AS SELECT (range * 7919) % 300 AS src, (range * 104729 + 13) % 300 AS dst FROM range(900);
+
+statement ok
+CREATE PROPERTY GRAPH rg VERTEX TABLES (rv) EDGE TABLES (re SOURCE KEY (src) REFERENCES rv (id) DESTINATION KEY (dst) REFERENCES rv (id));
+
+query I
+SELECT count(*) FROM louvain('rg', 'rv', 're', seed := 5) a JOIN louvain('rg', 'rv', 're', seed := 5) b USING (id) WHERE a.community = b.community;
+----
+300
+
+# No edges: every vertex is its own community.
+statement ok
+CREATE TABLE ne (src BIGINT, dst BIGINT);
+
+statement ok
+CREATE PROPERTY GRAPH ng VERTEX TABLES (v) EDGE TABLES (ne SOURCE KEY (src) REFERENCES v (id) DESTINATION KEY (dst) REFERENCES v (id));
+
+query I
+SELECT count(DISTINCT community) FROM louvain('ng', 'v', 'ne');
+----
+11
