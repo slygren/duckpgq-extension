@@ -9702,6 +9702,292 @@ BuildFinalColumnList(vector<unique_ptr<ParsedExpression>> col_list,
 	return final_column_list;
 }
 
+// A fixed-length chain answered by joining one artifact per run of its hops: the shapes no single artifact covers,
+// (a)<-[:R]-(b)-[:S]->(c) or (a)-[:R]-(b)-[:S]->(c), and a one-way chain whose fixed_path artifact is missing or
+// lost rows. A run of right- or left-directed hops reads its fixed_path artifact (a left run reads it from the far
+// end) when one counts exactly, otherwise one edge artifact per hop; an undirected hop reads its edge artifact both
+// ways, without the self-loop's second reading, as the traversal does. Every vertex binding is joined to its table,
+// because an artifact keeps edges whose endpoint is no vertex and the traversal does not.
+//
+// Declined (left to the traversal) wherever the answer could differ: a selector, path mode, COST or ONE ROW PER;
+// anonymous vertices, compound or filtered labels, composite keys; an undirected hop between two vertex tables (the
+// traversal reads such an edge backwards too, comparing one table's key with the other's) or whose two ends use
+// different key columns; an edge variable on an undirected hop; and any artifact that is missing or, where paths
+// are counted, lost rows.
+struct PGQComposedChainSegment {
+	const PGQPathTableInfo *info = nullptr;
+	bool undirected = false;
+	//! Pattern hops [first_hop, first_hop + hops) covered, and whether the artifact runs against the pattern
+	idx_t first_hop = 0;
+	idx_t hops = 1;
+	bool reversed = false;
+	string alias;
+};
+
+static bool TryComposedChainRewrite(ClientContext &context, CreatePropertyGraphInfo &pg_table,
+                                    const vector<unique_ptr<PathReference>> &path_elements,
+                                    const vector<unique_ptr<PathReference>> &elements, MatchExpression &match_ref,
+                                    vector<unique_ptr<ParsedExpression>> &conditions,
+                                    unique_ptr<SelectNode> &select_node,
+                                    case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map,
+                                    int32_t &extra_alias_counter, const PGQPathTableCache &path_table_cache,
+                                    const ReferencedBindings &referenced_bindings,
+                                    const WhereConstraints &where_constraints, OneRowPerMode one_row_per_mode,
+                                    PGQPathSelector selector,
+                                    const std::function<bool(const PGQPathTableInfo *)> &counts_exactly) {
+	const idx_t n_hops = (elements.size() - 1) / 2;
+	if (n_hops < 2 || selector != PGQPathSelector::WALK || one_row_per_mode != OneRowPerMode::NONE ||
+	    PatternHasCost(path_elements)) {
+		return false;
+	}
+	if (path_elements.size() == 1 && path_elements[0]->path_reference_type == PGQPathReferenceType::SUBPATH &&
+	    reinterpret_cast<SubPath *>(path_elements[0].get())->path_mode != PGQPathMode::NONE) {
+		return false;
+	}
+	auto referenced = [&](const string &binding) {
+		return !binding.empty() && referenced_bindings.find(binding) != referenced_bindings.end();
+	};
+	struct Hop {
+		PathElement *edge;
+		shared_ptr<PropertyGraphTable> table;
+		PGQMatchType direction;
+		//! Vertex labels at the pattern's start and end of the hop, and the key column each end joins on
+		string from_label, to_label, from_key, to_key;
+	};
+	vector<PathElement *> vertices;
+	vector<Hop> hops;
+	for (idx_t i = 0; i < elements.size(); i++) {
+		if (elements[i]->path_reference_type != PGQPathReferenceType::PATH_ELEMENT) {
+			return false;
+		}
+		auto *element = reinterpret_cast<PathElement *>(elements[i].get());
+		if (i % 2 == 0) {
+			if (element->variable_binding.empty() || IsCompoundLabel(element->label)) {
+				return false;
+			}
+			vertices.push_back(element);
+			continue;
+		}
+		if (element->label.empty() || IsCompoundLabel(element->label)) {
+			return false;
+		}
+		Hop hop;
+		hop.edge = element;
+		hop.direction = element->match_type;
+		try {
+			hop.table = ResolveTable(element->label, PGQMatchType::MATCH_EDGE_RIGHT, pg_table);
+		} catch (...) {
+			return false;
+		}
+		auto &table = *hop.table;
+		if (!table.source_pg_table || !table.destination_pg_table || table.source_pk.size() != 1 ||
+		    table.destination_pk.size() != 1 || table.source_fk.size() != 1 || table.destination_fk.size() != 1 ||
+		    EdgeLabelRowFilter(element->label, hop.table)) {
+			return false;
+		}
+		const string src_label = PGQStr(table.source_pg_table->main_label);
+		const string dst_label = PGQStr(table.destination_pg_table->main_label);
+		const string src_key = PGQStr(table.source_pk[0]);
+		const string dst_key = PGQStr(table.destination_pk[0]);
+		switch (hop.direction) {
+		case PGQMatchType::MATCH_EDGE_RIGHT:
+			hop.from_label = src_label, hop.to_label = dst_label, hop.from_key = src_key, hop.to_key = dst_key;
+			break;
+		case PGQMatchType::MATCH_EDGE_LEFT:
+			hop.from_label = dst_label, hop.to_label = src_label, hop.from_key = dst_key, hop.to_key = src_key;
+			break;
+		case PGQMatchType::MATCH_EDGE_ANY:
+			if (!table.source_pg_table->SameTableIdentity(*table.destination_pg_table) || src_key != dst_key ||
+			    referenced(element->variable_binding)) {
+				return false;
+			}
+			hop.from_label = hop.to_label = src_label, hop.from_key = hop.to_key = src_key;
+			break;
+		default:
+			return false;
+		}
+		hops.push_back(std::move(hop));
+	}
+	// Each vertex takes the label its hops give it; a label written on it must be that one.
+	vector<shared_ptr<PropertyGraphTable>> vertex_tables;
+	for (idx_t i = 0; i < vertices.size(); i++) {
+		const string &label = i < hops.size() ? hops[i].from_label : hops[i - 1].to_label;
+		if (i > 0 && i < hops.size() && !StringUtil::CIEquals(hops[i - 1].to_label, hops[i].from_label)) {
+			return false;
+		}
+		if (!vertices[i]->label.empty() && !StringUtil::CIEquals(vertices[i]->label, label)) {
+			return false;
+		}
+		shared_ptr<PropertyGraphTable> vertex_table;
+		try {
+			vertex_table = ResolveTable(label, PGQMatchType::MATCH_VERTEX, pg_table);
+		} catch (...) {
+			return false;
+		}
+		vertex_tables.push_back(std::move(vertex_table));
+	}
+
+	const string &graph_name = pg_table.property_graph_name;
+	auto bound = [&](idx_t vertex, const string &key) {
+		return HasEqualityConstraint(where_constraints, vertices[vertex]->variable_binding, key);
+	};
+	// The artifact over hops [first, first + count) in its own (edge source to destination) order.
+	auto lookup = [&](idx_t first, idx_t count, bool reversed) -> const PGQPathTableInfo * {
+		vector<string> vertex_sequence;
+		vector<string> edge_sequence;
+		for (idx_t k = 0; k < count; k++) {
+			const auto &hop = hops[reversed ? first + count - 1 - k : first + k];
+			if (k == 0) {
+				vertex_sequence.push_back(reversed ? hop.to_label : hop.from_label);
+			}
+			edge_sequence.push_back(hop.edge->label);
+			vertex_sequence.push_back(reversed ? hop.from_label : hop.to_label);
+		}
+		string name = "__pg_" + graph_name + "__" + vertex_sequence[0];
+		for (idx_t k = 0; k < count; k++) {
+			name += "__" + edge_sequence[k] + "__" + vertex_sequence[k + 1];
+		}
+		// The artifact's v1 end bound and its v0 end not: the twin ordered by v1 prunes, the artifact would not.
+		const idx_t v0_vertex = reversed ? first + count : first;
+		const idx_t v1_vertex = reversed ? first : first + count;
+		const auto &v0_hop = hops[reversed ? first + count - 1 : first];
+		const auto &v1_hop = hops[reversed ? first : first + count - 1];
+		const bool prefer_reverse = count == 1 && bound(v1_vertex, reversed ? v1_hop.from_key : v1_hop.to_key) &&
+		                            !bound(v0_vertex, reversed ? v0_hop.to_key : v0_hop.from_key);
+		auto *info = FindPathTableInfo(path_table_cache, name, count == 1 ? "edge" : "fixed_path", vertex_sequence,
+		                               edge_sequence, prefer_reverse);
+		return counts_exactly(info) ? info : nullptr;
+	};
+	vector<PGQComposedChainSegment> segments;
+	for (idx_t i = 0; i < hops.size();) {
+		const auto direction = hops[i].direction;
+		idx_t run = 1;
+		while (direction != PGQMatchType::MATCH_EDGE_ANY && i + run < hops.size() &&
+		       hops[i + run].direction == direction) {
+			run++;
+		}
+		const bool reversed = direction == PGQMatchType::MATCH_EDGE_LEFT;
+		PGQComposedChainSegment whole;
+		if (run > 1 && (whole.info = lookup(i, run, reversed))) {
+			whole.first_hop = i, whole.hops = run, whole.reversed = reversed;
+			segments.push_back(whole);
+		} else {
+			for (idx_t k = i; k < i + run; k++) {
+				PGQComposedChainSegment single;
+				single.info = lookup(k, 1, reversed);
+				if (!single.info) {
+					return false;
+				}
+				single.first_hop = k, single.reversed = reversed;
+				single.undirected = direction == PGQMatchType::MATCH_EDGE_ANY;
+				segments.push_back(single);
+			}
+		}
+		i += run;
+	}
+
+	vector<string> table_names;
+	int64_t estimated_rows = 0;
+	for (auto &segment : segments) {
+		segment.alias = "_pgq_pt_" + to_string(extra_alias_counter++);
+		const auto &info = *segment.info;
+		const string table = QualifiedTableName(info.catalog_name, info.schema_name, info.table_name);
+		unique_ptr<TableRef> ref;
+		if (segment.undirected) {
+			// Both readings of each edge; a self-loop's reversed reading is the same match and is left out.
+			ref = make_uniq<SubqueryRef>(ParseSelectStatement("SELECT v0, v1 FROM " + table +
+			                                                  " UNION ALL SELECT v1 AS v0, v0 AS v1 FROM " + table +
+			                                                  " WHERE v0 IS DISTINCT FROM v1"),
+			                             PGQId(segment.alias));
+		} else {
+			auto base = make_uniq<BaseTableRef>();
+			base->SetQualifiedName(Identifier(info.catalog_name), Identifier(info.schema_name),
+			                       Identifier(info.table_name));
+			base->alias = Identifier(segment.alias);
+			ref = std::move(base);
+		}
+		if (select_node->from_table) {
+			auto cross = make_uniq<JoinRef>(JoinRefType::CROSS);
+			cross->left = std::move(select_node->from_table);
+			cross->right = std::move(ref);
+			select_node->from_table = std::move(cross);
+		} else {
+			select_node->from_table = std::move(ref);
+		}
+		table_names.push_back(info.table_name);
+		if (info.estimated_rows > 0) {
+			estimated_rows += info.estimated_rows;
+		}
+		// Pattern vertex first_hop + k sits in artifact column v{k}, or v{hops - k} for a reversed run.
+		for (idx_t k = 0; k <= segment.hops; k++) {
+			const idx_t vertex = segment.first_hop + k;
+			const string column = "v" + to_string(segment.reversed ? segment.hops - k : k);
+			// The key this hop joins the vertex on (a vertex between two segments joins on both).
+			const string &key = k < segment.hops ? hops[vertex].from_key : hops[vertex - 1].to_key;
+			const string &binding = vertices[vertex]->variable_binding;
+			alias_map[binding] = vertex_tables[vertex];
+			conditions.push_back(make_uniq<ComparisonExpression>(
+			    ExpressionType::COMPARE_EQUAL, PGQColRef(key, binding), PGQColRef(column, segment.alias)));
+			PushConstraintToPathTable(where_constraints, binding, key, column, segment.alias, conditions);
+		}
+		// A directed edge variable joins its edge table back on the artifact's endpoints, as the fixed_path route does.
+		for (idx_t k = 0; k < segment.hops && !segment.undirected; k++) {
+			const auto &hop = hops[segment.first_hop + k];
+			const string &edge_binding = hop.edge->variable_binding;
+			if (!referenced(edge_binding)) {
+				continue;
+			}
+			const string from_column = "v" + to_string(segment.reversed ? segment.hops - k : k);
+			const string to_column = "v" + to_string(segment.reversed ? segment.hops - k - 1 : k + 1);
+			const string &src_column = segment.reversed ? to_column : from_column;
+			const string &dst_column = segment.reversed ? from_column : to_column;
+			alias_map[edge_binding] = hop.table;
+			conditions.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+			                                                     PGQColRef(hop.table->source_fk[0], edge_binding),
+			                                                     PGQColRef(src_column, segment.alias)));
+			conditions.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+			                                                     PGQColRef(hop.table->destination_fk[0], edge_binding),
+			                                                     PGQColRef(dst_column, segment.alias)));
+		}
+	}
+
+	vector<string> vertex_labels, edge_labels, parts;
+	for (idx_t i = 0; i < vertices.size(); i++) {
+		vertex_labels.push_back(i < hops.size() ? hops[i].from_label : hops[i - 1].to_label);
+	}
+	for (const auto &hop : hops) {
+		edge_labels.push_back(hop.edge->label);
+	}
+	for (const auto &segment : segments) {
+		parts.push_back(segment.info->table_name +
+		                (segment.undirected ? " (both ways)" : segment.reversed ? " (reversed)" : ""));
+	}
+	PGQRewriteDiagnostic diagnostic;
+	diagnostic.graph_name = graph_name;
+	diagnostic.rewrite_type = "composed_chain";
+	diagnostic.status = "selected";
+	diagnostic.reason = "joined one artifact per run of hops: " + StringUtil::Join(parts, " + ");
+	diagnostic.catalog_name = segments[0].info->catalog_name;
+	diagnostic.schema_name = segments[0].info->schema_name;
+	diagnostic.path_table_name = StringUtil::Join(table_names, ",");
+	diagnostic.path_kind = "composed";
+	diagnostic.vertex_label_sequence = JoinLabelSequence(vertex_labels);
+	diagnostic.edge_label_sequence = JoinLabelSequence(edge_labels);
+	diagnostic.table_alias = segments[0].alias;
+	diagnostic.one_row_per_mode = OneRowPerModeToString(one_row_per_mode);
+	diagnostic.estimated_rows = estimated_rows;
+	diagnostic.multiplicity_mode = "composed_exact";
+	diagnostic.property_support = "late_vertex_property_fetch";
+	idx_t endpoint_filters = 0;
+	for (idx_t i = 0; i < vertices.size(); i++) {
+		const string &key = i < hops.size() ? hops[i].from_key : hops[i - 1].to_key;
+		endpoint_filters += bound(i, key) ? 1 : 0;
+	}
+	diagnostic.endpoint_filter_count = static_cast<int64_t>(endpoint_filters);
+	RecordRewriteDiagnostic(context, std::move(diagnostic));
+	return true;
+}
+
 // Tier 1 path table rewrite — catalog-driven.
 //
 // Checks whether one or more pre-computed path tables in any attached catalog's
@@ -10261,8 +10547,8 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 
 	// Unpack into flat (src, edge, dst) triples.
 	// Left-directed edges are accepted and normalized below.
-	// Undirected (MATCH_EDGE_ANY) and bidirectional (MATCH_EDGE_LEFT_RIGHT) are handled
-	// by a dedicated 1-hop block below; multi-hop undirected falls through to Tier 2.
+	// Undirected 1-hop patterns have a dedicated block below; multi-hop chains with an undirected hop or both
+	// directions go to TryComposedChainRewrite.
 	struct ElemSpec {
 		PathElement *src;
 		PathElement *edge;
@@ -10299,6 +10585,25 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 		const bool undir = (edge->match_type == PGQMatchType::MATCH_EDGE_ANY ||
 		                    edge->match_type == PGQMatchType::MATCH_EDGE_LEFT_RIGHT);
 		specs.push_back({src, edge, dst, rev, undir});
+	}
+	const std::function<bool(const PGQPathTableInfo *)> counts_exactly_fn = counts_exactly;
+	auto composed_chain = [&]() {
+		return TryComposedChainRewrite(context, pg_table, path_elements, *rewrite_path_elements, match_ref, conditions,
+		                               select_node, alias_map, extra_alias_counter, path_table_cache,
+		                               referenced_bindings, where_constraints, one_row_per_mode, selector,
+		                               counts_exactly_fn);
+	};
+	// Several hops that do not all run one way: no single artifact holds the chain, but one per run of hops can.
+	if (n_hops >= 2) {
+		bool any_undirected = false, any_left = false, any_right = false;
+		for (const auto &s : specs) {
+			any_undirected |= s.undirected;
+			any_left |= !s.undirected && s.reversed;
+			any_right |= !s.undirected && !s.reversed;
+		}
+		if (any_undirected || (any_left && any_right)) {
+			return composed_chain();
+		}
 	}
 
 	// -----------------------------------------------------------------------
@@ -10345,7 +10650,9 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 			} catch (...) {
 				return false;
 			}
-			if (etbl->source_pk.empty() || etbl->destination_pk.empty()) {
+			// Both readings join each end on one key column, which the edge must reference from both ends.
+			if (etbl->source_pk.size() != 1 || etbl->destination_pk.size() != 1 ||
+			    etbl->source_pk[0] != etbl->destination_pk[0]) {
 				return false;
 			}
 
@@ -10368,6 +10675,9 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 					sel->select_list.push_back(PGQColRef("e1"));
 					sel->select_list.push_back(PGQColRef("v0"));
 					sel->select_list.back()->SetAlias(Identifier("v1"));
+					// A self-loop read backwards is the same match: the traversal reads it once.
+					sel->where_clause = make_uniq<ComparisonExpression>(ExpressionType::COMPARE_DISTINCT_FROM,
+					                                                    PGQColRef("v0"), PGQColRef("v1"));
 				}
 				return sel;
 			};
@@ -10434,8 +10744,7 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 	// (e.g. (c)<-[E2]-(b)<-[E1]-(a)), reverse the spec order and swap src/dst so the
 	// path is right-directed (a)-[E1]->(b)-[E2]->(c).  The existing Case A/B logic then
 	// produces the correct table name and join conditions unchanged.
-	// Mixed-direction patterns (some left, some right) fall through to bridge table scans.
-	// Undirected specs (handled above) never reach this point.
+	// Mixed-direction and undirected chains were sent to TryComposedChainRewrite above and never reach this point.
 	{
 		bool all_right = true, all_left = true;
 		for (const auto &s : specs) {
@@ -10443,7 +10752,7 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 			else             { all_left  = false; }
 		}
 		if (!all_right && !all_left) {
-			return false; // mixed directions — no precomputed table covers this
+			return false; // 1-hop cannot mix directions; longer chains returned above
 		}
 		if (all_left) {
 			std::reverse(specs.begin(), specs.end());
@@ -10803,7 +11112,8 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 	                                                      n_hops == 1 ? "edge" : "fixed_path", vertex_sequence,
 	                                                      edge_sequence, prefer_reverse_sorted);
 	if (!counts_exactly(path_info)) {
-		return false;
+		// No fixed_path artifact that counts exactly: the chain's edge artifacts may still answer it.
+		return n_hops >= 2 && composed_chain();
 	}
 
 	// Rewrite: path table reference (plain BaseTableRef).

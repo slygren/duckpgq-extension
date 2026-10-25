@@ -1,0 +1,568 @@
+# name: test/sql/path_finding/abi_composed_chains.test
+# description: Fixed-length chains with undirected or mixed-direction hops, answered from one artifact per run of
+#              hops (edge artifacts read either way, fixed_path artifacts, reverse twins) exactly as the traversal
+#              answers them; expected rows are the traversal's (generated with pgq_disable_abi_rewrite = true)
+# group: [path_finding]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+# P and Q vertices. K: P -> P with a self-loop (2, 2) and an edge to a missing vertex (3, 99); S: P -> Q with an edge
+# to a missing vertex (4, 99); T: Q -> Q with a self-loop.
+
+statement ok
+CREATE TABLE P (id BIGINT, name VARCHAR);
+
+statement ok
+INSERT INTO P VALUES (1, 'p1'), (2, 'p2'), (3, 'p3'), (4, 'p4');
+
+statement ok
+CREATE TABLE Q (id BIGINT, name VARCHAR);
+
+statement ok
+INSERT INTO Q VALUES (1, 'q1'), (2, 'q2'), (3, 'q3');
+
+statement ok
+CREATE TABLE K (src BIGINT, dst BIGINT, w BIGINT);
+
+statement ok
+INSERT INTO K VALUES (1, 2, 10), (2, 3, 20), (2, 2, 30), (3, 1, 40), (4, 2, 50), (3, 99, 60);
+
+statement ok
+CREATE TABLE S (src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO S VALUES (1, 1), (2, 1), (2, 2), (3, 3), (4, 99);
+
+statement ok
+CREATE TABLE T (src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO T VALUES (1, 2), (2, 3), (3, 3);
+
+statement ok
+CREATE PROPERTY GRAPH g VERTEX TABLES (P LABEL P, Q LABEL Q) EDGE TABLES (
+    K SOURCE KEY (src) REFERENCES P (id) DESTINATION KEY (dst) REFERENCES P (id) LABEL K,
+    S SOURCE KEY (src) REFERENCES P (id) DESTINATION KEY (dst) REFERENCES Q (id) LABEL S,
+    T SOURCE KEY (src) REFERENCES Q (id) DESTINATION KEY (dst) REFERENCES Q (id) LABEL T);
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('g', exclude_self_referential := false, max_hops := 2, reverse_twins := ['K', 'S']);
+
+# 1-hop undirected: a self-loop is one match (the artifact used to read it twice)
+query II
+FROM GRAPH_TABLE (g MATCH (a:P)-[:K]-(b:P) COLUMNS (a.id AS a, b.id AS b)) ORDER BY ALL;
+----
+1	2
+1	3
+2	1
+2	2
+2	3
+2	4
+3	1
+3	2
+4	2
+
+query T
+SELECT coalesce(string_agg(rewrite_type, ','), 'traversal') FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+undirected_edge
+
+query TTI
+SELECT status, rewrite_fired, only_in_abi + only_in_fallback FROM pgq_verify_abi_rewrite($$FROM GRAPH_TABLE (g MATCH (a:P)-[:K]-(b:P) COLUMNS (a.id AS a, b.id AS b))$$);
+----
+match	true	0
+
+# <-> is an edge in either direction: the same matches
+query II
+FROM GRAPH_TABLE (g MATCH (a:P)<-[:K]->(b:P) COLUMNS (a.id AS a, b.id AS b)) ORDER BY ALL;
+----
+1	2
+1	3
+2	1
+2	2
+2	3
+2	4
+3	1
+3	2
+4	2
+
+query T
+SELECT coalesce(string_agg(rewrite_type, ','), 'traversal') FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+undirected_edge
+
+query TTI
+SELECT status, rewrite_fired, only_in_abi + only_in_fallback FROM pgq_verify_abi_rewrite($$FROM GRAPH_TABLE (g MATCH (a:P)<-[:K]->(b:P) COLUMNS (a.id AS a, b.id AS b))$$);
+----
+match	true	0
+
+# Mixed directions: K read backwards, then S forwards
+query III
+FROM GRAPH_TABLE (g MATCH (a:P)<-[:K]-(b:P)-[:S]->(c:Q) COLUMNS (a.id AS a, b.id AS b, c.id AS c)) ORDER BY ALL;
+----
+1	3	3
+2	1	1
+2	2	1
+2	2	2
+3	2	1
+3	2	2
+
+query T
+SELECT coalesce(string_agg(rewrite_type, ','), 'traversal') FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+composed_chain
+
+query TTI
+SELECT status, rewrite_fired, only_in_abi + only_in_fallback FROM pgq_verify_abi_rewrite($$FROM GRAPH_TABLE (g MATCH (a:P)<-[:K]-(b:P)-[:S]->(c:Q) COLUMNS (a.id AS a, b.id AS b, c.id AS c))$$);
+----
+match	true	0
+
+# ... seeded on the end that the backwards hop reads as v1: the reverse twin
+query IT
+FROM GRAPH_TABLE (g MATCH (a:P)<-[:K]-(b:P)-[:S]->(c:Q) WHERE a.id = 2 COLUMNS (b.id AS b, c.name AS c)) ORDER BY ALL;
+----
+1	q1
+2	q1
+2	q2
+
+query T
+SELECT coalesce(string_agg(rewrite_type, ','), 'traversal') FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+composed_chain
+
+query TTI
+SELECT status, rewrite_fired, only_in_abi + only_in_fallback FROM pgq_verify_abi_rewrite($$FROM GRAPH_TABLE (g MATCH (a:P)<-[:K]-(b:P)-[:S]->(c:Q) WHERE a.id = 2 COLUMNS (b.id AS b, c.name AS c))$$);
+----
+match	true	0
+
+# ... seeded on the far end
+query II
+FROM GRAPH_TABLE (g MATCH (a:P)<-[:K]-(b:P)-[:S]->(c:Q) WHERE c.id = 1 COLUMNS (a.id AS a, b.id AS b)) ORDER BY ALL;
+----
+2	1
+2	2
+3	2
+
+query T
+SELECT coalesce(string_agg(rewrite_type, ','), 'traversal') FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+composed_chain
+
+query TTI
+SELECT status, rewrite_fired, only_in_abi + only_in_fallback FROM pgq_verify_abi_rewrite($$FROM GRAPH_TABLE (g MATCH (a:P)<-[:K]-(b:P)-[:S]->(c:Q) WHERE c.id = 1 COLUMNS (a.id AS a, b.id AS b))$$);
+----
+match	true	0
+
+# Forwards, then backwards: two paths meeting at c
+query III
+FROM GRAPH_TABLE (g MATCH (a:P)-[:S]->(c:Q)<-[:S]-(b:P) COLUMNS (a.id AS a, c.id AS c, b.id AS b)) ORDER BY ALL;
+----
+1	1	1
+1	1	2
+2	1	1
+2	1	2
+2	2	2
+3	3	3
+
+query T
+SELECT coalesce(string_agg(rewrite_type, ','), 'traversal') FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+composed_chain
+
+query TTI
+SELECT status, rewrite_fired, only_in_abi + only_in_fallback FROM pgq_verify_abi_rewrite($$FROM GRAPH_TABLE (g MATCH (a:P)-[:S]->(c:Q)<-[:S]-(b:P) COLUMNS (a.id AS a, c.id AS c, b.id AS b))$$);
+----
+match	true	0
+
+# Undirected hop, then a directed one (the self-loop once)
+query III
+FROM GRAPH_TABLE (g MATCH (a:P)-[:K]-(b:P)-[:S]->(c:Q) COLUMNS (a.id AS a, b.id AS b, c.id AS c)) ORDER BY ALL;
+----
+1	2	1
+1	2	2
+1	3	3
+2	1	1
+2	2	1
+2	2	2
+2	3	3
+3	1	1
+3	2	1
+3	2	2
+4	2	1
+4	2	2
+
+query T
+SELECT coalesce(string_agg(rewrite_type, ','), 'traversal') FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+composed_chain
+
+query TTI
+SELECT status, rewrite_fired, only_in_abi + only_in_fallback FROM pgq_verify_abi_rewrite($$FROM GRAPH_TABLE (g MATCH (a:P)-[:K]-(b:P)-[:S]->(c:Q) COLUMNS (a.id AS a, b.id AS b, c.id AS c))$$);
+----
+match	true	0
+
+# Two undirected hops, walking back over the same edge allowed
+query III
+FROM GRAPH_TABLE (g MATCH (a:P)-[:K]-(b:P)-[:K]-(c:P) COLUMNS (a.id AS a, b.id AS b, c.id AS c)) ORDER BY ALL;
+----
+1	2	1
+1	2	2
+1	2	3
+1	2	4
+1	3	1
+1	3	2
+2	1	2
+2	1	3
+2	2	1
+2	2	2
+2	2	3
+2	2	4
+2	3	1
+2	3	2
+2	4	2
+3	1	2
+3	1	3
+3	2	1
+3	2	2
+3	2	3
+3	2	4
+4	2	1
+4	2	2
+4	2	3
+4	2	4
+
+query T
+SELECT coalesce(string_agg(rewrite_type, ','), 'traversal') FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+composed_chain
+
+query TTI
+SELECT status, rewrite_fired, only_in_abi + only_in_fallback FROM pgq_verify_abi_rewrite($$FROM GRAPH_TABLE (g MATCH (a:P)-[:K]-(b:P)-[:K]-(c:P) COLUMNS (a.id AS a, b.id AS b, c.id AS c))$$);
+----
+match	true	0
+
+# Three hops: a backwards S, then the K,K fixed_path artifact
+query IIII
+FROM GRAPH_TABLE (g MATCH (q:Q)<-[:S]-(a:P)-[:K]->(b:P)-[:K]->(c:P) COLUMNS (q.id AS q, a.id AS a, b.id AS b, c.id AS c)) ORDER BY ALL;
+----
+1	1	2	2
+1	1	2	3
+1	2	2	2
+1	2	2	3
+1	2	3	1
+2	2	2	2
+2	2	2	3
+2	2	3	1
+3	3	1	2
+
+query T
+SELECT coalesce(string_agg(rewrite_type, ','), 'traversal') FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+composed_chain
+
+query TTI
+SELECT status, rewrite_fired, only_in_abi + only_in_fallback FROM pgq_verify_abi_rewrite($$FROM GRAPH_TABLE (g MATCH (q:Q)<-[:S]-(a:P)-[:K]->(b:P)-[:K]->(c:P) COLUMNS (q.id AS q, a.id AS a, b.id AS b, c.id AS c))$$);
+----
+match	true	0
+
+# Three hops: K,K backwards (the fixed_path artifact read from its far end), then S
+query IIII
+FROM GRAPH_TABLE (g MATCH (c:P)<-[:K]-(b:P)<-[:K]-(a:P)-[:S]->(q:Q) COLUMNS (c.id AS c, b.id AS b, a.id AS a, q.id AS q)) ORDER BY ALL;
+----
+1	3	2	1
+1	3	2	2
+2	1	3	3
+2	2	1	1
+2	2	2	1
+2	2	2	2
+3	2	1	1
+3	2	2	1
+3	2	2	2
+
+query T
+SELECT coalesce(string_agg(rewrite_type, ','), 'traversal') FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+composed_chain
+
+query TTI
+SELECT status, rewrite_fired, only_in_abi + only_in_fallback FROM pgq_verify_abi_rewrite($$FROM GRAPH_TABLE (g MATCH (c:P)<-[:K]-(b:P)<-[:K]-(a:P)-[:S]->(q:Q) COLUMNS (c.id AS c, b.id AS b, a.id AS a, q.id AS q))$$);
+----
+match	true	0
+
+# Undirected T between Q vertices, then backwards S
+query III
+FROM GRAPH_TABLE (g MATCH (x:Q)-[:T]-(y:Q)<-[:S]-(p:P) COLUMNS (x.id AS x, y.id AS y, p.id AS p)) ORDER BY ALL;
+----
+1	2	2
+2	1	1
+2	1	2
+2	3	3
+3	2	2
+3	3	3
+
+query T
+SELECT coalesce(string_agg(rewrite_type, ','), 'traversal') FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+composed_chain
+
+query TTI
+SELECT status, rewrite_fired, only_in_abi + only_in_fallback FROM pgq_verify_abi_rewrite($$FROM GRAPH_TABLE (g MATCH (x:Q)-[:T]-(y:Q)<-[:S]-(p:P) COLUMNS (x.id AS x, y.id AS y, p.id AS p))$$);
+----
+match	true	0
+
+# Unlabeled vertices take the label their hops give them
+query III
+FROM GRAPH_TABLE (g MATCH (a)<-[:K]-(b)-[:S]->(c) COLUMNS (a.id AS a, b.id AS b, c.id AS c)) ORDER BY ALL;
+----
+1	3	3
+2	1	1
+2	2	1
+2	2	2
+3	2	1
+3	2	2
+
+query T
+SELECT coalesce(string_agg(rewrite_type, ','), 'traversal') FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+composed_chain
+
+query TTI
+SELECT status, rewrite_fired, only_in_abi + only_in_fallback FROM pgq_verify_abi_rewrite($$FROM GRAPH_TABLE (g MATCH (a)<-[:K]-(b)-[:S]->(c) COLUMNS (a.id AS a, b.id AS b, c.id AS c))$$);
+----
+match	true	0
+
+# A repeated variable closes a cycle
+query II
+FROM GRAPH_TABLE (g MATCH (a:P)-[:K]->(b:P)<-[:K]-(a) COLUMNS (a.id AS a, b.id AS b)) ORDER BY ALL;
+----
+1	2
+2	2
+2	3
+3	1
+4	2
+
+query T
+SELECT coalesce(string_agg(rewrite_type, ','), 'traversal') FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+composed_chain
+
+query TTI
+SELECT status, rewrite_fired, only_in_abi + only_in_fallback FROM pgq_verify_abi_rewrite($$FROM GRAPH_TABLE (g MATCH (a:P)-[:K]->(b:P)<-[:K]-(a) COLUMNS (a.id AS a, b.id AS b))$$);
+----
+match	true	0
+
+# Edge variables on directed hops join their edge table back
+query III
+FROM GRAPH_TABLE (g MATCH (a:P)<-[e:K]-(b:P)-[:S]->(c:Q) COLUMNS (a.id AS a, e.w AS w, c.id AS c)) ORDER BY ALL;
+----
+1	40	3
+2	10	1
+2	30	1
+2	30	2
+3	20	1
+3	20	2
+
+query T
+SELECT coalesce(string_agg(rewrite_type, ','), 'traversal') FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+composed_chain
+
+query TTI
+SELECT status, rewrite_fired, only_in_abi + only_in_fallback FROM pgq_verify_abi_rewrite($$FROM GRAPH_TABLE (g MATCH (a:P)<-[e:K]-(b:P)-[:S]->(c:Q) COLUMNS (a.id AS a, e.w AS w, c.id AS c))$$);
+----
+match	true	0
+
+# Vertex properties and a property filter
+query TT
+FROM GRAPH_TABLE (g MATCH (a:P)<-[:K]-(b:P)-[:S]->(c:Q) WHERE b.name <> 'p2' COLUMNS (a.name AS a, c.name AS c)) ORDER BY ALL;
+----
+p1	q3
+p2	q1
+
+query T
+SELECT coalesce(string_agg(rewrite_type, ','), 'traversal') FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+composed_chain
+
+query TTI
+SELECT status, rewrite_fired, only_in_abi + only_in_fallback FROM pgq_verify_abi_rewrite($$FROM GRAPH_TABLE (g MATCH (a:P)<-[:K]-(b:P)-[:S]->(c:Q) WHERE b.name <> 'p2' COLUMNS (a.name AS a, c.name AS c))$$);
+----
+match	true	0
+
+# A one-way chain without a fixed_path artifact (P -S-> Q -T-> Q is built; Q -T-> Q -T-> Q is not excluded either, so use three hops)
+query II
+FROM GRAPH_TABLE (g MATCH (a:P)-[:S]->(b:Q)-[:T]->(c:Q)-[:T]->(d:Q) COLUMNS (a.id AS a, d.id AS d)) ORDER BY ALL;
+----
+1	3
+2	3
+2	3
+3	3
+
+query T
+SELECT coalesce(string_agg(rewrite_type, ','), 'traversal') FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+composed_chain
+
+query TTI
+SELECT status, rewrite_fired, only_in_abi + only_in_fallback FROM pgq_verify_abi_rewrite($$FROM GRAPH_TABLE (g MATCH (a:P)-[:S]->(b:Q)-[:T]->(c:Q)-[:T]->(d:Q) COLUMNS (a.id AS a, d.id AS d))$$);
+----
+match	true	0
+
+# Declined: an undirected hop between P and Q (the traversal reads it backwards across tables)
+query III
+FROM GRAPH_TABLE (g MATCH (a:P)-[:S]-(b:Q)-[:T]->(c:Q) COLUMNS (a.id AS a, b.id AS b, c.id AS c)) ORDER BY ALL;
+----
+1	1	2
+1	1	2
+1	2	3
+2	1	2
+2	2	3
+2	2	3
+3	3	3
+3	3	3
+
+query T
+SELECT coalesce(string_agg(rewrite_type, ','), 'traversal') FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+traversal
+
+# Declined: an edge variable on an undirected hop
+query III
+FROM GRAPH_TABLE (g MATCH (a:P)-[e:K]-(b:P)-[:S]->(c:Q) COLUMNS (a.id AS a, e.w AS w, c.id AS c)) ORDER BY ALL;
+----
+1	10	1
+1	10	2
+1	40	3
+2	10	1
+2	20	3
+2	30	1
+2	30	2
+3	20	1
+3	20	2
+3	40	1
+4	50	1
+4	50	2
+
+query T
+SELECT coalesce(string_agg(rewrite_type, ','), 'traversal') FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+traversal
+
+# Declined: a path mode
+query III
+FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)<-[:K]-(b:P)-[:S]->(c:Q) COLUMNS (a.id AS a, b.id AS b, c.id AS c)) ORDER BY ALL;
+----
+1	3	3
+2	1	1
+2	2	1
+2	2	2
+3	2	1
+3	2	2
+
+query T
+SELECT coalesce(string_agg(rewrite_type, ','), 'traversal') FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+traversal
+
+# Declined: a named path read as a whole
+query IT
+FROM GRAPH_TABLE (g MATCH p = (a:P)<-[:K]-(b:P)-[:S]->(c:Q) COLUMNS (a.id AS a, vertices(p) AS vs)) ORDER BY ALL;
+----
+1	[0, 2, 2]
+2	[1, 0, 0]
+2	[1, 1, 0]
+2	[1, 1, 1]
+3	[2, 1, 0]
+3	[2, 1, 1]
+
+query T
+SELECT coalesce(string_agg(rewrite_type, ','), 'traversal') FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+traversal
+
+# ── Which artifacts a chain reads ──────────────────────────────────────────────────────────────────────────────────
+
+# Seeded on a, which the backwards K hop holds in v1: the twin ordered by v1
+statement ok
+FROM GRAPH_TABLE (g MATCH (a:P)<-[:K]-(b:P)-[:S]->(c:Q) WHERE a.id = 2 COLUMNS (b.id AS b, c.name AS c));
+
+query TI
+SELECT reason, endpoint_filter_count FROM pgq_last_rewrite_diagnostics();
+----
+joined one artifact per run of hops: __pg_g__P__K__P__rev (reversed) + __pg_g__P__S__Q	1
+
+statement ok
+FROM GRAPH_TABLE (g MATCH (a:P)<-[:K]-(b:P)-[:S]->(c:Q) COLUMNS (b.id AS b, c.name AS c));
+
+query T
+SELECT reason FROM pgq_last_rewrite_diagnostics();
+----
+joined one artifact per run of hops: __pg_g__P__K__P (reversed) + __pg_g__P__S__Q
+
+# A run of two hops reads the fixed_path artifact, from its far end when the run is backwards
+statement ok
+FROM GRAPH_TABLE (g MATCH (q:Q)<-[:S]-(a:P)-[:K]->(b:P)-[:K]->(c:P) COLUMNS (q.id AS q));
+
+query T
+SELECT reason FROM pgq_last_rewrite_diagnostics();
+----
+joined one artifact per run of hops: __pg_g__P__S__Q (reversed) + __pg_g__P__K__P__K__P
+
+statement ok
+FROM GRAPH_TABLE (g MATCH (c:P)<-[:K]-(b:P)<-[:K]-(a:P)-[:S]->(q:Q) COLUMNS (c.id AS c));
+
+query T
+SELECT reason FROM pgq_last_rewrite_diagnostics();
+----
+joined one artifact per run of hops: __pg_g__P__K__P__K__P (reversed) + __pg_g__P__S__Q
+
+statement ok
+FROM GRAPH_TABLE (g MATCH (a:P)-[:K]-(b:P)-[:S]->(c:Q) COLUMNS (c.id AS c));
+
+query T
+SELECT reason FROM pgq_last_rewrite_diagnostics();
+----
+joined one artifact per run of hops: __pg_g__P__K__P (both ways) + __pg_g__P__S__Q
+
+# Under pgq_require_abi_paths a mixed chain is answered instead of refused
+statement ok
+SET pgq_require_abi_paths = true;
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH (a:P)<-[:K]-(b:P)-[:S]->(c:Q) COLUMNS (a.id AS a));
+----
+6
+
+statement error
+SELECT count(*) FROM GRAPH_TABLE (g MATCH (a:P)-[:S]-(b:Q)-[:T]->(c:Q) COLUMNS (a.id AS a));
+----
+pgq_require_abi_paths
+
+statement ok
+SET pgq_require_abi_paths = false;
+
+# ── An edge stored twice: the artifact holds it once, so counted answers traverse; EXISTS reads the artifacts ─────
+
+statement ok
+INSERT INTO S VALUES (2, 2);
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('g', exclude_self_referential := false, max_hops := 2, reverse_twins := ['K', 'S']);
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH (a:P)<-[:K]-(b:P)-[:S]->(c:Q) COLUMNS (a.id AS a, b.id AS b, c.id AS c));
+----
+8
+
+query T
+SELECT coalesce(string_agg(rewrite_type, ','), 'traversal') FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+traversal
+
+query TTI
+SELECT status, rewrite_fired, only_in_abi + only_in_fallback FROM pgq_verify_abi_rewrite($$FROM GRAPH_TABLE (g MATCH (a:P) WHERE EXISTS { (a)<-[:K]-(b:P)-[:S]->(c:Q) } COLUMNS (a.id AS a))$$);
+----
+match	true	0

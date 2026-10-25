@@ -47,6 +47,8 @@ In every such case the old rows were wrong.
     now traverse unless the table is proven exact.
   - **Edge path tables built with duplicate edges collapsed** no longer answer counting patterns. They used to
     undercount.
+  - **An undirected 1-hop pattern answered from an edge path table** (`(a)-[:K]-(b)`, and `<-[:K]->`) counts a
+    self-loop once, as the traversal does. It used to count it twice.
 
 **Errors where there used to be silent wrong output**
 - **A path function on a name that isn't a path** (`path_length(o)` with no `o = …`) is an error. The column used to
@@ -91,6 +93,8 @@ In every such case the old rows were wrong.
   (`pgq_abi_on_stale`).
 - **Measured multiplicity:** whether a table is exact for walk-style queries is measured at build time. For tables
   from other builders it is probed once and cached.
+- **Mixed-direction and undirected chains** of two or three hops are answered from one path table per run of hops
+  (edge and fixed-path tables, read either way, and reverse twins).
 - **Diagnostics:** `pgq_last_rewrite_diagnostics()`, `pgq_explain_abi_path(…)`, `pgq_verify_abi_rewrite(…)`, and the
   `pgq_require_abi_paths` guard.
 

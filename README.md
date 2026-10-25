@@ -262,6 +262,16 @@ So a closure answers:
   `CHEAPEST` the same as `SHORTEST`, and path modes (`TRAIL`, `ACYCLIC`, `SIMPLE`) restrict nothing here: every
   match already visits no vertex twice.
 
+A fixed-length chain of two or three hops that no single artifact holds -- hops in both directions
+(`(a)<-[:R]-(b)-[:S]->(c)`), an undirected hop (`(a)-[:R]-(b)-[:S]->(c)`), or a one-way chain without its fixed_path
+artifact -- is answered by joining one artifact per run of hops (`composed_chain` in the diagnostics): a run of hops in
+one direction reads its fixed_path artifact (from the far end when the run points backwards) or else one edge
+artifact per hop, and an undirected hop reads its edge artifact both ways, a self-loop once. A hop bound on the end an
+artifact stores in `v1` reads the reverse twin when there is one. Every vertex is joined to its table, as the
+traversal does. Such a chain traverses instead when it has a selector, path mode, `COST` or `ONE ROW PER`, an
+anonymous vertex, compound labels, an edge variable on an undirected hop, or an undirected hop between two different
+vertex tables.
+
 Edge and fixed_path artifacts are `SELECT DISTINCT`, so an edge stored twice in its table is one artifact row.
 Where an answer counts matches (every fixed-length pattern, `OPTIONAL MATCH`, walks) such an artifact is used only
 when it lost nothing (`preserves_multiplicity`). `EXISTS` and `ANY SHORTEST` read it either way.
@@ -431,7 +441,8 @@ building in [abi_build.cpp](src/core/functions/table/abi_build.cpp); vertex-join
 - **`SHORTEST k`** takes one quantified edge between two vertices over one edge table (no element `WHERE` on the
   edge); longer patterns are refused. Inside a longer pattern, an unbounded quantifier with only a path mode or with a
   lower bound above 1 is answered from the CSR, which finds one shortest path per pair (refused for `<-`).
-- **ABI rewrites** cover the common path shapes, not every pattern; multi-hop undirected and mixed-direction chains
+- **ABI rewrites** cover the common path shapes, not every pattern. Fixed-length chains longer than three hops, and
+  chains with an undirected hop between two different vertex tables or an edge variable on an undirected hop,
   traverse. Choosing between several matching artifacts is simple.
 - **`pgq_abi_build` on a SQLite-backed DuckLake catalog** fails (the build's connection and the caller's contend
   for the file); run the statements from `pgq_abi_sql` on the caller's connection instead.
