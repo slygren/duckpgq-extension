@@ -47,6 +47,9 @@ In every such case the old rows were wrong.
     now traverse unless the table is proven exact.
   - **Edge path tables built with duplicate edges collapsed** no longer answer counting patterns. They used to
     undercount.
+  - **Zero hops over an edge between two tables:** `(a:Tag)-[:HasWorkorder]->{0,k}(b)` has a zero-hop row per tag
+    (b = a); an unlabeled end vertex took the edge's other table, so there was none. `{0,k}` / `{1,k}` over such an
+    edge are one hop at most (an unbounded or named one was refused).
   - **ANY SHORTEST over a fixed-length pattern** (`-[e]->{1,1}`, a plain edge, several fixed hops) returns one path
     per pair of endpoints, in every direction; it returned one row per parallel edge. Over a pattern that mixes fixed
     hops with a variable-length one, ANY / ALL SHORTEST compare the whole paths: they returned the shortest

@@ -165,7 +165,11 @@ only pattern of its MATCH, without OPTIONAL MATCH, UNION or ONE ROW PER). A walk
 walks that return to their start vertex are left out, and an edge stored twice is two walks. The path variable
 (`vertices(p)`, `path_length(p)`, `ONE ROW PER`) describes the row's own walk. A quantifier from 0 also matches the
 zero-hop walk, which binds the end vertex to the start; `-[e]->?` (`{0,1}`) is the plain edge's matches, self-loops
-included, plus those, with `e` NULL in them.
+included, plus those, with `e` NULL in them. Over an edge between two vertex tables (`(a:Tag)-[:HasWorkorder]->{0,k}(b)`) the
+zero-hop match binds an unlabeled end vertex to the start, a `Tag` (its properties that only the other table has are
+NULL there), and since such an edge cannot be taken twice in a row, `{0,k}` and `{1,k}` are `{0,1}` and `{1,1}` over
+it, unbounded included. With both ends unlabeled, or the unlabeled end used by another pattern, zero hops are not
+matched over such an edge.
 
 `SHORTEST k` follows SQL/PGQ: the k shortest paths per endpoint pair, as walks (a vertex or edge may repeat, and a
 path may return to its start) unless a path mode restricts them: `TRAIL` (no edge twice), `ACYCLIC` (no vertex twice),

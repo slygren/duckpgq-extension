@@ -3575,7 +3575,8 @@ static void AddBoundedORPRecursiveCTE(unique_ptr<SelectNode> &select_node, const
 	// Measured before this guard, cross-table ONE ROW PER STEP reported 4 steps where 3 is
 	// the truth, and ONE ROW PER VERTEX 5 vertices where 4 is: silently wrong, like every
 	// other symptom of the shared rowid space.
-	if (!edge_table->source_reference.empty() && !edge_table->destination_reference.empty() &&
+	// A zero-hop path takes no step: it is its start vertex, in the start's table.
+	if (upper > 0 && !edge_table->source_reference.empty() && !edge_table->destination_reference.empty() &&
 	    !StringUtil::CIEquals(PGQStr(edge_table->source_reference), PGQStr(edge_table->destination_reference))) {
 		throw NotImplementedException(
 		    "ONE ROW PER over edge '%s' is not supported: it connects two different vertex tables ('%s' -> '%s'), and "
@@ -6531,8 +6532,15 @@ PGQMatchFunction::PopulateGraphTableAliasMap(const CreatePropertyGraphInfo &pg_t
 		}
 	}
 	for (idx_t idx_i = 0; idx_i < match_expr.path_patterns.size(); idx_i++) {
-		ResolveStubBindingsFromEdges(pg_table, match_expr.path_patterns[idx_i]->path_elements,
-		                             alias_to_vertex_and_edge_tables, stubs);
+		// A named path's elements are inside its subpath: its unlabeled vertices are typed by their edges there too.
+		const auto *elements = &match_expr.path_patterns[idx_i]->path_elements;
+		if (elements->size() == 1) {
+			auto *wrapper = GetSubPath((*elements)[0]);
+			if (wrapper && wrapper->path_list.size() > 1) {
+				elements = &wrapper->path_list;
+			}
+		}
+		ResolveStubBindingsFromEdges(pg_table, *elements, alias_to_vertex_and_edge_tables, stubs);
 	}
 	return alias_to_vertex_and_edge_tables;
 }
@@ -11694,6 +11702,34 @@ static unique_ptr<ParsedExpression> NullMissingVariables(unique_ptr<ParsedExpres
 	return expression;
 }
 
+//! A property its variable's table in this operand does not have, where another operand's table for the variable
+//! does: NULL here, as for an element without that property in SQL/PGQ. (A property no operand has stays, and is
+//! refused as before.)
+static unique_ptr<ParsedExpression> NullMissingProperties(unique_ptr<ParsedExpression> expression,
+                                                          const case_insensitive_set_t &here,
+                                                          const case_insensitive_set_t &anywhere,
+                                                          const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &tables) {
+	if (!expression) {
+		return expression;
+	}
+	if (expression->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+		auto &names = expression->Cast<ColumnRefExpression>().ColumnNames();
+		if (names.size() == 2 && tables.find(PGQStr(names[0])) != tables.end()) {
+			const string qualified = PGQStr(names[0]) + "." + PGQStr(names[1]);
+			if (here.find(qualified) == here.end() && anywhere.find(qualified) != anywhere.end()) {
+				auto null_value = ConstantExpression::FromValue(Value());
+				null_value->SetAlias(expression->HasAlias() ? expression->GetAlias() : names[1]);
+				return std::move(null_value);
+			}
+		}
+		return expression;
+	}
+	ParsedExpressionIterator::EnumerateChildren(*expression, [&](unique_ptr<ParsedExpression> &child) {
+		child = NullMissingProperties(std::move(child), here, anywhere, tables);
+	});
+	return expression;
+}
+
 static void CheckExistsReferences(const ParsedExpression *expression, const case_insensitive_set_t &missing) {
 	if (!expression || missing.empty()) {
 		return;
@@ -12330,6 +12366,24 @@ static unique_ptr<QueryNode> BuildMatchBlockNode(ClientContext &context, MatchEx
 					chosen->path_elements.push_back(reference->Copy());
 				}
 			}
+			// An operand whose every edge takes zero hops has one path per pair of endpoints, (a, a): a search
+			// prefix selects it as it is, so the operand is matched without one (no path search over the edge).
+			{
+				auto *elements = &chosen->path_elements;
+				if (elements->size() == 1 && PGQMatchFunction::GetSubPath((*elements)[0]) &&
+				    PGQMatchFunction::GetSubPath((*elements)[0])->path_list.size() > 1) {
+					elements = &PGQMatchFunction::GetSubPath((*elements)[0])->path_list;
+				}
+				bool zero_hops = elements->size() >= 3 && chosen->shortest && !chosen->cheapest && chosen->topk == 0;
+				for (idx_t i = 1; zero_hops && i < elements->size(); i += 2) {
+					auto *edge = PGQMatchFunction::GetSubPath((*elements)[i]);
+					zero_hops = edge && edge->lower == 0 && edge->upper == 0;
+				}
+				if (zero_hops) {
+					chosen->shortest = false;
+					chosen->all = false;
+				}
+			}
 			vector<PGQUnionPosition> positions;
 			leaf.flattened = FlattenUnionOperand(chosen->path_elements, positions) && leaf.flattened;
 			leaf.positions.push_back(std::move(positions));
@@ -12411,6 +12465,25 @@ static unique_ptr<QueryNode> BuildMatchBlockNode(ClientContext &context, MatchEx
 		}
 	}
 
+	// The properties each operand's variables have, and those any operand's have.
+	vector<case_insensitive_set_t> leaf_properties;
+	vector<case_insensitive_map_t<shared_ptr<PropertyGraphTable>>> leaf_tables;
+	case_insensitive_set_t any_properties;
+	for (auto &leaf : leaves) {
+		case_insensitive_set_t stubs;
+		auto tables = PGQMatchFunction::PopulateGraphTableAliasMap(pg_table, *leaf.match, &stubs);
+		for (auto &stub : stubs) {
+			tables.erase(stub);
+		}
+		case_insensitive_set_t properties;
+		for (auto &qualified : GetFullyQualifiedColFromPg(pg_table, tables)) {
+			properties.insert(qualified);
+			any_properties.insert(qualified);
+		}
+		leaf_properties.push_back(std::move(properties));
+		leaf_tables.push_back(std::move(tables));
+	}
+
 	vector<unique_ptr<QueryNode>> nodes;
 	for (idx_t root = 0; root < leaves.size(); root++) {
 		if (find(root) != root) {
@@ -12436,6 +12509,11 @@ static unique_ptr<QueryNode> BuildMatchBlockNode(ClientContext &context, MatchEx
 				}
 			}
 			CheckExistsReferences(leaf.match->where_clause.get(), missing);
+			for (auto &column : leaf.match->column_list) {
+				column = NullMissingProperties(std::move(column), leaf_properties[index], any_properties, leaf_tables[index]);
+			}
+			leaf.match->where_clause = NullMissingProperties(std::move(leaf.match->where_clause), leaf_properties[index],
+			                                                 any_properties, leaf_tables[index]);
 			for (auto &column : leaf.match->column_list) {
 				const bool top_level_missing = column->GetAlias().empty();
 				auto name = column->GetName();
@@ -12595,12 +12673,99 @@ static vector<idx_t> ZeroOrOneHopEdges(vector<unique_ptr<PathReference>> &elemen
 // of the two: the one-hop operand keeps the fast join and its edge artifacts, the zero-hop one only reads vertices,
 // and e is NULL there. Kept on the variable-length route where that would not be the same answer: under a search
 // prefix (the zero-hop path is the shortest one for a vertex and itself), with ONE ROW PER, and in a union already.
+//! The table of an edge with a single label whose two ends are different tables, or null.
+static shared_ptr<PropertyGraphTable> CrossTableEdge(const PathElement &edge, CreatePropertyGraphInfo &pg_table) {
+	if (edge.label.empty() || IsCompoundLabel(edge.label)) {
+		return nullptr;
+	}
+	try {
+		auto edge_table = ResolveTable(edge.label, edge.match_type, pg_table);
+		if (edge_table && edge_table->source_pg_table && edge_table->destination_pg_table &&
+		    !edge_table->source_pg_table->SameTableIdentity(*edge_table->destination_pg_table)) {
+			return edge_table;
+		}
+	} catch (std::exception &) {
+	}
+	return nullptr;
+}
+
+//! An edge between two different vertex tables cannot be taken twice in a row (its far end is never its near end's
+//! table), so {0,k} is {0,1} and {1,k} is {1,1} over it, for any k >= 1, unbounded included. Normalizing says so: the
+//! zero-hop split below and the one-hop routes then answer it (the variable-length routes refused it unbounded, and
+//! dropped the zero-hop matches bounded). Left as written under ONE ROW PER, and for a COST (CHEAPEST).
+static void NormalizeCrossTableQuantifiers(vector<unique_ptr<PathReference>> &elements, CreatePropertyGraphInfo &pg_table) {
+	for (auto &reference : elements) {
+		auto *subpath = PGQMatchFunction::GetSubPath(reference);
+		if (!subpath) {
+			continue;
+		}
+		if (subpath->path_list.size() != 1) {
+			NormalizeCrossTableQuantifiers(subpath->path_list, pg_table);
+			continue;
+		}
+		auto *edge = PGQMatchFunction::GetPathElement(subpath->path_list[0]);
+		if (!edge || edge->match_type == PGQMatchType::MATCH_VERTEX || subpath->cost_expr || subpath->lower > 1 ||
+		    subpath->upper <= 1 || !CrossTableEdge(*edge, pg_table)) {
+			continue;
+		}
+		subpath->upper = 1;
+	}
+}
+
+static void NormalizeCrossTableQuantifiers(MatchExpression &block, CreatePropertyGraphInfo &pg_table) {
+	if (block.one_row_per == OneRowPerMode::NONE) {
+		for (auto &pattern : block.path_patterns) {
+			if (!pattern->cheapest) {
+				NormalizeCrossTableQuantifiers(pattern->path_elements, pg_table);
+			}
+		}
+		for (auto &group : block.optional_match_patterns) {
+			for (auto &pattern : group) {
+				if (!pattern->cheapest) {
+					NormalizeCrossTableQuantifiers(pattern->path_elements, pg_table);
+				}
+			}
+		}
+	}
+	for (auto &branch : block.union_matches) {
+		NormalizeCrossTableQuantifiers(*branch, pg_table);
+	}
+}
+
+static bool BindingUsedOutsidePattern(const MatchExpression &block, const PathPattern &pattern, const string &binding) {
+	bool used = false;
+	std::function<void(const PathReference &)> visit = [&](const PathReference &reference) {
+		if (auto *element = dynamic_cast<const PathElement *>(&reference)) {
+			used = used || StringUtil::CIEquals(element->variable_binding, binding);
+			return;
+		}
+		for (auto &child : static_cast<const SubPath &>(reference).path_list) {
+			visit(*child);
+		}
+	};
+	for (auto &other : block.path_patterns) {
+		if (other.get() != &pattern) {
+			for (auto &reference : other->path_elements) {
+				visit(*reference);
+			}
+		}
+	}
+	for (auto &group : block.optional_match_patterns) {
+		for (auto &other : group) {
+			for (auto &reference : other->path_elements) {
+				visit(*reference);
+			}
+		}
+	}
+	return used;
+}
+
 static void SplitZeroOrOneHopEdges(MatchExpression &block, CreatePropertyGraphInfo &pg_table) {
 	if (block.one_row_per != OneRowPerMode::NONE) {
 		return;
 	}
 	for (auto &pattern : block.path_patterns) {
-		if (!pattern->union_operands.empty() || pattern->shortest || pattern->cheapest || pattern->topk) {
+		if (!pattern->union_operands.empty() || pattern->cheapest || pattern->topk) {
 			continue;
 		}
 		// The element list, or the one inside the subpath a path variable or path mode wraps around it.
@@ -12612,21 +12777,81 @@ static void SplitZeroOrOneHopEdges(MatchExpression &block, CreatePropertyGraphIn
 			}
 			elements = &wrapper->path_list;
 		}
-		const auto edge_count = ZeroOrOneHopEdges(*elements).size();
+		const auto split_edges = ZeroOrOneHopEdges(*elements);
+		const auto edge_count = split_edges.size();
 		if (edge_count == 0 || edge_count > 3) {
 			continue;
 		}
-		// A vertex types an unlabeled neighbour by the edge's table at that end, so a zero-hop operand over an edge
-		// between two different tables matches nothing (as {0,k} does there): it is left out.
-		auto zero_hop_possible = [&](SubPath &edge) {
+		// Under a search prefix the zero-hop path competes with the others for the same pair of endpoints, which
+		// the split would not see, so the variable-length route keeps it -- unless the edge joins two different
+		// tables: then the zero-hop path ends in the start's table and the one-hop paths in the other, no pair has
+		// both, and each operand's selection is the pattern's.
+		if (pattern->shortest) {
+			auto *edge = edge_count == 1 && elements->size() == 3
+			                 ? PGQMatchFunction::GetPathElement(PGQMatchFunction::GetSubPath((*elements)[1])->path_list[0])
+			                 : nullptr;
+			if (!edge || !CrossTableEdge(*edge, pg_table)) {
+				continue;
+			}
+		}
+		// Zero hops bind the far vertex to the near one. Over an edge between two tables an unlabeled vertex next to
+		// it is typed by the edge's table at that end, which the zero-hop path does not have: there the unlabeled
+		// end takes the labeled end's label (the vertex it is). With both ends labeled the zero-hop path exists when
+		// they are one table; with neither, and when the unlabeled end is a variable another pattern also types, it
+		// is left out (a vertex of any table would match).
+		auto zero_hop_possible = [&](vector<unique_ptr<PathReference>> &operand_elements, idx_t position) {
+			auto &edge = *PGQMatchFunction::GetSubPath(operand_elements[position]);
 			auto *element = PGQMatchFunction::GetPathElement(edge.path_list[0]);
-			try {
-				auto edge_table = ResolveTable(element->label, element->match_type, pg_table);
-				return !edge_table->source_pg_table || !edge_table->destination_pg_table ||
-				       edge_table->source_pg_table->SameTableIdentity(*edge_table->destination_pg_table);
-			} catch (std::exception &) {
+			if (!CrossTableEdge(*element, pg_table)) {
 				return true;
 			}
+			auto *near = PathListVertex(operand_elements[position - 1]);
+			auto *far = PathListVertex(operand_elements[position + 1]);
+			if (!near || !far) {
+				return false;
+			}
+			if (!near->label.empty() && !far->label.empty()) {
+				try {
+					return ResolveTable(near->label, near->match_type, pg_table)
+					    ->SameTableIdentity(*ResolveTable(far->label, far->match_type, pg_table));
+				} catch (std::exception &) {
+					return false;
+				}
+			}
+			if (near->label.empty() == far->label.empty()) {
+				return false;
+			}
+			auto *unlabeled = near->label.empty() ? near : far;
+			auto *labeled = near->label.empty() ? far : near;
+			if (BindingUsedOutsidePattern(block, *pattern, unlabeled->variable_binding)) {
+				return false;
+			}
+			unlabeled->label = labeled->label;
+			return true;
+		};
+		// The one-hop operand over an edge between two tables whose labeled end is the wrong table matches nothing
+		// (a fixed edge with that label would be refused): left out, so that `(a:Tag)-[:R]->{0,1}(b:Tag)` is its
+		// zero-hop matches.
+		auto one_hop_possible = [&](vector<unique_ptr<PathReference>> &operand_elements, idx_t position) {
+			auto &edge = *PGQMatchFunction::GetSubPath(operand_elements[position]);
+			auto *element = PGQMatchFunction::GetPathElement(edge.path_list[0]);
+			auto edge_table = CrossTableEdge(*element, pg_table);
+			if (!edge_table || (element->match_type != PGQMatchType::MATCH_EDGE_RIGHT &&
+			                    element->match_type != PGQMatchType::MATCH_EDGE_LEFT)) {
+				return true;
+			}
+			const bool right = element->match_type == PGQMatchType::MATCH_EDGE_RIGHT;
+			auto fits = [&](PathElement *vertex, const shared_ptr<PropertyGraphTable> &table) {
+				if (!vertex || vertex->label.empty() || IsCompoundLabel(vertex->label)) {
+					return true;
+				}
+				auto entry = pg_table.label_map.find(vertex->label);
+				return entry == pg_table.label_map.end() || entry->second->SameTableIdentity(*table);
+			};
+			return fits(PathListVertex(operand_elements[position - 1]),
+			            right ? edge_table->source_pg_table : edge_table->destination_pg_table) &&
+			       fits(PathListVertex(operand_elements[position + 1]),
+			            right ? edge_table->destination_pg_table : edge_table->source_pg_table);
 		};
 		vector<vector<unique_ptr<PathReference>>> operands;
 		for (idx_t choice = 0; choice < (idx_t(1) << edge_count); choice++) {
@@ -12639,8 +12864,8 @@ static void SplitZeroOrOneHopEdges(MatchExpression &block, CreatePropertyGraphIn
 			auto edges = ZeroOrOneHopEdges(*operand_elements);
 			bool possible = true;
 			for (idx_t k = 0; k < edges.size(); k++) {
-				possible = possible && (!(choice & (idx_t(1) << k)) ||
-				                        zero_hop_possible(*PGQMatchFunction::GetSubPath((*operand_elements)[edges[k]])));
+				possible = possible && ((choice & (idx_t(1) << k)) ? zero_hop_possible(*operand_elements, edges[k])
+				                                                   : one_hop_possible(*operand_elements, edges[k]));
 			}
 			if (!possible) {
 				continue;
@@ -12666,6 +12891,9 @@ static void SplitZeroOrOneHopEdges(MatchExpression &block, CreatePropertyGraphIn
 				}
 			}
 			operands.push_back(std::move(operand->path_elements));
+		}
+		if (operands.empty()) {
+			continue; // neither form can match: the pattern as written refuses it, as it did
 		}
 		pattern->path_elements = std::move(operands[0]);
 		for (idx_t i = 1; i < operands.size(); i++) {
@@ -12888,6 +13116,7 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	{
 		QualifiedName graph_name(Identifier(ref->pg_catalog), Identifier(ref->pg_schema), Identifier(ref->pg_name));
 		auto &pg_table = *duckpgq_state->GetPropertyGraph(context, graph_name);
+		NormalizeCrossTableQuantifiers(*ref, pg_table);
 		SplitZeroOrOneHopEdges(*ref, pg_table);
 		for (auto &branch : ref->union_matches) {
 			SplitZeroOrOneHopEdges(*branch, pg_table);
