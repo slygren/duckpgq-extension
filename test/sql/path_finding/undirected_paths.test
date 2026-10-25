@@ -52,7 +52,8 @@ FROM GRAPH_TABLE (pg
 4	3	1
 4	4	0
 
-statement error
+# Left-directed: against the edges, 4 <- 2 <- {0, 1}, 0 <- 3
+query III
 FROM GRAPH_TABLE (pg
     MATCH
     o = ANY SHORTEST (a:Student WHERE a.id = 4)<-[e:know]- *(b:Student)
@@ -60,9 +61,14 @@ FROM GRAPH_TABLE (pg
     ) study
     ORDER BY a_id, b_id;
 ----
-Cannot do shortest path for edge type MATCH_EDGE_LEFT
+4	0	2
+4	1	2
+4	2	1
+4	3	3
+4	4	0
 
-statement error
+# Bidirectional: a step needs an edge each way; the only reciprocal pair is 0 <-> 3, so 4 reaches only itself
+query III
 FROM GRAPH_TABLE (pg
     MATCH
     o = ANY SHORTEST (a:Student WHERE a.id = 4)<-[e:know]-> *(b:Student)
@@ -70,7 +76,18 @@ FROM GRAPH_TABLE (pg
     ) study
     ORDER BY a_id, b_id;
 ----
-Cannot do shortest path for edge type MATCH_EDGE_LEFT_RIGHT
+4	4	0
+
+query III
+FROM GRAPH_TABLE (pg
+    MATCH
+    o = ANY SHORTEST (a:Student WHERE a.id = 0)<-[e:know]-> *(b:Student)
+    COLUMNS (a.id as a_id, b.id as b_id, path_length(o))
+    ) study
+    ORDER BY a_id, b_id;
+----
+0	0	0
+0	3	1
 
 # The pattern names no path 'o'. path_length(o) used to vanish from the output without a word, and this
 # test expected the two remaining columns; it is refused now.

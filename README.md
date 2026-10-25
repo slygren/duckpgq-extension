@@ -122,6 +122,7 @@ put over DuckLake catalogs. A graph is stored in the database it is created in a
 | `(v:A\|B)`, `(v:A&B)`, `(v:!A)` | label disjunction, conjunction, negation (`!` binds tightest, then `&`, then `\|`) |
 | `(v:Person WHERE v.age > 30)` | element-level predicate |
 | `-[e:Knows]->`, `<-[e:Knows]-`, `-[e:Knows]-` | directed, reversed, either direction |
+| `<-[e:Knows]->` | both ways: `e` runs from the next vertex back, with an edge the other way beside it (each such pair is a match); quantified, each step is such a pair |
 | `->`, `<-`, `-`, `<->` | anonymous edge of any label |
 | `-[:R]->{1,5}`, `{,3}`, `{2,}`, `{2}`, `*`, `+`, `?` | quantified (variable-length) edge, quantifier after the arrow |
 | `MATCH (t)-[:A]->(a), (t)-[:B]->(b)` | several patterns sharing a variable |
@@ -386,8 +387,9 @@ building in [abi_build.cpp](src/core/functions/table/abi_build.cpp); vertex-join
   Cypher's `[:R*1..5]` (write `-[:R]->{1,5}`), `LATERAL` inside `MATCH`, horizontal aggregation along a path,
   graph updates (`INSERT`/`DELETE` of vertices or edges; the graph is a view over tables).
 - **Parsed, not implemented:** top-k shortest (`SHORTEST k`).
-- **`OPTIONAL MATCH`** cannot use the path variable of its own pattern in `COLUMNS` or `WHERE`. `ONE ROW PER` does
-  not cover unbounded left-directed or bidirectional variable-length patterns.
+- **`OPTIONAL MATCH`** cannot use the path variable of its own pattern in `COLUMNS` or `WHERE`.
+- **Unbounded `<-` and `<->` quantifiers** take `ANY SHORTEST` or `ALL SHORTEST` from depth 0 or 1; with only a path
+  mode, or a lower bound above 1, they are refused.
 - **`UNION` of MATCH blocks** shares one final `COLUMNS` clause.
 - **ABI rewrites** cover the common path shapes, not every pattern; multi-hop undirected and mixed-direction chains
   traverse. Choosing between several matching artifacts is simple.
