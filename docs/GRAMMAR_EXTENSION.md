@@ -60,6 +60,9 @@ new connections can reconstruct graphs created with aliased references.
   (`->*`, `->?`, `-*`, `-?`).
 - Path variables, `ANY SHORTEST`, `ALL SHORTEST`, `SHORTEST k`, and the `WALK`/`TRAIL`/`SIMPLE`/`ACYCLIC` modes.
   Which of these the match rewrite can execute is decided in the rewrite, not the grammar.
+- Path pattern unions `A | B` and multiset alternations `A |+| B` between element sequences, stored as the
+  operands of one `PathPattern` (`union_operands`, `union_multiset`). A parenthesized path pattern is parsed only to
+  be rejected with an explanation.
 
 ### Graph-management statements
 

@@ -101,6 +101,7 @@ FROM GRAPH_TABLE (pg
 ----
 'o' is not a named path of this MATCH
 
+# {0,1} includes the zero-hop match (4, 4); it was read as exactly one hop
 query II
 FROM GRAPH_TABLE (pg
     MATCH
@@ -111,6 +112,7 @@ FROM GRAPH_TABLE (pg
 ----
 4	2
 4	3
+4	4
 
 query III
 FROM GRAPH_TABLE (pg

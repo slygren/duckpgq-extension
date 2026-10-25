@@ -10,7 +10,7 @@ documentation for the upstream project is at [duckpgq.org](https://duckpgq.org/)
 
 | Added here | In short | More |
 | --- | --- | --- |
-| PGQL-style patterns | label expressions, `OPTIONAL MATCH`, `EXISTS { }`, `UNION` of MATCH blocks, `ONE ROW PER …`, path functions, property projection | [Query language](#query-language) |
+| PGQL-style patterns | label expressions, `OPTIONAL MATCH`, `EXISTS { }`, `UNION` of MATCH blocks, path pattern unions (`\|`, `\|+\|`), `ONE ROW PER …`, path functions and aggregation along a path, property projection | [Query language](#query-language) |
 | ABI path tables | precomputed path tables that `GRAPH_TABLE` reads instead of traversing; the extension builds them, checks they are fresh and reports which one a query used | [ABI path tables](#abi-path-tables) |
 | Server and browser use | a setting that turns the grammar on for every connection, so a [Quack](#serving-graphs-over-quack) server can serve graphs; a wasm build | [Deployment](#deployment) |
 | Planner work | factorized joins for counts over n:m paths, vertex-join elimination, a frontier semi-join for bounded context expansion | [docs/FACTORIZED_JOINS.md](docs/FACTORIZED_JOINS.md), [docs/duckdb_v2.md](docs/duckdb_v2.md) |
@@ -135,6 +135,7 @@ put over DuckLake catalogs. A graph is stored in the database it is created in a
 | `WHERE EXISTS { (t)-[:HAS_WORKORDER]->() }`, `NOT EXISTS { … }` | correlated pattern existence |
 | `MATCH … UNION [ALL] MATCH … COLUMNS (…)` | several MATCH blocks sharing the final `COLUMNS` |
 | `MATCH … COLUMNS (…) UNION [ALL] MATCH … COLUMNS (…)` | each MATCH block with its own `COLUMNS`, combined by position as in a SQL `UNION` |
+| `MATCH (a)-[:R]->(b) \| (a)-[:S]->(b)`, `… \|+\| …` | path pattern union: either operand; `\|` removes duplicate path bindings, `\|+\|` (multiset alternation) keeps them. A variable an operand does not bind is NULL in its rows |
 | `ONE ROW PER VERTEX (v)`, `ONE ROW PER EDGE (e)`, `ONE ROW PER STEP (v1, e, v2)` | one output row per element of each matched path |
 
 Cypher's quantifier inside the edge means what it means in Cypher, so a pattern copied from Neo4j returns the same
@@ -150,10 +151,19 @@ paths. Its lower bound defaults to 1, so **a bare `*` is one or more hops here, 
 | `-[:R*0..3]->` | `-[:R]->{0,3}` (`{,3}`) |
 | `-[:R*0..]->` | `-[:R]->{0,}` (`->*`) |
 
+A path pattern union is a set of path bindings, not of output rows: two operands give the same binding only when
+they match the same elements in the same order and bind the same variables to them. Operands that cannot (a
+different vertex or edge table at some position, different lengths, different variables) are combined with UNION ALL
+and each keeps its ABI artifact. Between the others, `|` removes the duplicates by element identity, which needs
+fixed-length, directed operands and the traversal. The path variable and path mode in front of a union apply to
+every operand, and `EXISTS { A | B }` holds when either operand matches.
+
 A quantified pattern without a search prefix returns **every walk** (SQL/PGQ semantics), not one row per endpoint;
 use `ANY SHORTEST` for one per endpoint, `ALL SHORTEST` for every shortest path. A walk visits no vertex twice, so
 walks that return to their start vertex are left out, and an edge stored twice is two walks. The path variable
-(`vertices(p)`, `path_length(p)`, `ONE ROW PER`) describes the row's own walk.
+(`vertices(p)`, `path_length(p)`, `ONE ROW PER`) describes the row's own walk. A quantifier from 0 also matches the
+zero-hop walk, which binds the end vertex to the start; `-[e]->?` (`{0,1}`) is the plain edge's matches, self-loops
+included, plus those, with `e` NULL in them.
 
 `SHORTEST k` follows SQL/PGQ: the k shortest paths per endpoint pair, as walks (a vertex or edge may repeat, and a
 path may return to its start) unless a path mode restricts them: `TRAIL` (no edge twice), `ACYCLIC` (no vertex twice),
@@ -175,6 +185,7 @@ runs on. No artifact holds k paths per pair: `SHORTEST k` always traverses.
 | `ALL_DIFFERENT(a, b, …)` | the bound elements are pairwise distinct |
 | `path_length(p)`, `vertices(p)`, `edges(p)` | hops; the path's vertices (row ids when traversed, keys when an ABI artifact answers) and edges (row ids; no artifact has them, so a pattern asking for `edges(p)` is traversed) |
 | `vertex_labels(p)`, `edge_labels(p)` | declared labels along the path, in path order, traversed or answered by an ABI artifact. They need each vertex and edge of the path to have one table, from its label or from the edge next to it |
+| `vertex_property(p, 'x')`, `edge_property(p, 'x')` | property `x` of every vertex / edge of path `p`, in path order (NULL where an element's table has no `x`), for aggregating along the path: `list_sum(edge_property(p, 'weight'))`, `list_avg`, `list_min`, `list_max`, `len`. In COLUMNS and WHERE, on every route that answers `vertices(p)` / `edges(p)`, ABI artifacts included; `edge_property` is traversed, like `edges(p)` |
 | `cost(p)` | total cost of an `ANY`/`ALL CHEAPEST` path: BIGINT for integer costs, DOUBLE for any other number (DECIMAL included) |
 | `path_tree_json(…)`, `graph_tree_json(…)` | nest paths into a JSON tree |
 
@@ -408,9 +419,14 @@ building in [abi_build.cpp](src/core/functions/table/abi_build.cpp); vertex-join
 ## Limitations
 
 - **One DuckDB version per binary**, and unsigned (see [Deployment](#deployment)).
-- **Patterns not supported:** bracketed sub-path groups `[ … ]{n,m}`, path unions `|` / `|+|` inside a pattern,
-  `LATERAL` inside `MATCH`, horizontal aggregation along a path,
-  graph updates (`INSERT`/`DELETE` of vertices or edges; the graph is a view over tables).
+- **Patterns not supported:** bracketed sub-path groups `[ … ]{n,m}` and parenthesized path patterns (a quantified
+  or nested union such as `((a)-[:R]->(b) | (a)-[:S]->(b)){1,3}`), `LATERAL` inside `MATCH`, graph updates
+  (`INSERT`/`DELETE` of vertices or edges; the graph is a view over tables).
+- **Path pattern unions** (`|`, `|+|`) stand at the top level of a MATCH pattern, and take no search prefix
+  (`ANY SHORTEST … | …`), OPTIONAL MATCH or ONE ROW PER. `|` removes duplicates only between fixed-length, directed
+  operands; operands that may match the same variable-length walk need `|+|` or disjoint labels.
+- **`vertex_property(p, 'x')` / `edge_property(p, 'x')`** take a literal property name. The lists are looked up
+  after the match (one join per element table), so they cost about what the equivalent hand-written join does.
 - **`OPTIONAL MATCH`** cannot use the path variable of its own pattern in `COLUMNS` or `WHERE`.
 - **`SHORTEST k`** takes one quantified edge between two vertices over one edge table (no element `WHERE` on the
   edge); longer patterns are refused. Inside a longer pattern, an unbounded quantifier with only a path mode or with a

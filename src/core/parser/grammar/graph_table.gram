@@ -19,8 +19,11 @@ DuckPGQOneRowPerStep <- 'STEP' Parens(List(Identifier))
 DuckPGQGraphTableKeyword <- 'GRAPH_TABLE' / ('GRAPH' 'TABLE')
 DuckPGQColumns <- 'COLUMNS' Parens(TargetList)
 
-# A path pattern: optional path variable, search prefix and path mode, then the element sequence.
-DuckPGQPathPattern <- DuckPGQPathVariable? DuckPGQSearchPrefix? DuckPGQPathMode? DuckPGQPathSequence
+# A path pattern: optional path variable, search prefix and path mode, then the element sequence. Further sequences
+# after '|' (path pattern union) or '|+|' (multiset alternation) are alternatives binding the same variables.
+DuckPGQPathPattern <- DuckPGQPathVariable? DuckPGQSearchPrefix? DuckPGQPathMode? DuckPGQPathSequence DuckPGQPathUnionOperand*
+DuckPGQPathUnionOperand <- DuckPGQPathUnionOperator DuckPGQPathSequence
+DuckPGQPathUnionOperator <- '|+|' / ('|' '+' '|') / '|'
 DuckPGQPathVariable <- Identifier '='
 DuckPGQSearchPrefix <- DuckPGQAllShortest / DuckPGQAnyShortest / DuckPGQTopKShortest / DuckPGQAllCheapest / DuckPGQAnyCheapest
 DuckPGQAllShortest <- 'ALL' 'SHORTEST'
@@ -29,8 +32,13 @@ DuckPGQTopKShortest <- 'SHORTEST' NumberLiteral
 DuckPGQAllCheapest <- 'ALL' 'CHEAPEST'
 DuckPGQAnyCheapest <- 'ANY' 'CHEAPEST'
 DuckPGQPathMode <- 'WALK' / 'TRAIL' / 'SIMPLE' / 'ACYCLIC'
-DuckPGQPathSequence <- DuckPGQVertex DuckPGQEdgeVertex*
-DuckPGQEdgeVertex <- DuckPGQEdge DuckPGQVertex
+DuckPGQPathSequence <- DuckPGQPathStart DuckPGQEdgeVertex*
+DuckPGQPathStart <- DuckPGQParenthesizedPath / DuckPGQVertex
+DuckPGQEdgeVertex <- DuckPGQEdgeVertexStep / DuckPGQParenthesizedPath
+DuckPGQEdgeVertexStep <- DuckPGQEdge DuckPGQPathStart
+# A parenthesized path pattern, e.g. a quantified union ((a)-[:R]->(b) | (a)-[:S]->(b)){1,3}. Parsed only to be
+# rejected with an explanation: sub-path groups are not supported.
+DuckPGQParenthesizedPath <- '(' DuckPGQPathPattern ')' DuckPGQQuantifier?
 DuckPGQEdge <- DuckPGQQuantifiedEdge / DuckPGQAbbreviatedEdge
 
 # Edges with optional quantifiers. The tokenizer reads "->*", "->?", "-*" and "-?" as one operator token, so those

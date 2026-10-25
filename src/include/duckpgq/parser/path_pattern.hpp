@@ -22,6 +22,11 @@ public:
 	bool cheapest = false;
 	bool group = false;
 	int32_t topk = false;
+	//! Path pattern union `A | B` (set semantics) or multiset alternation `A |+| B`: the operands after the first,
+	//! which is path_elements. Empty for an ordinary path pattern.
+	vector<vector<unique_ptr<PathReference>>> union_operands;
+	//! True for `|+|` (duplicates kept), false for `|` (duplicate path bindings removed).
+	bool union_multiset = false;
 
 	PathPattern() = default;
 

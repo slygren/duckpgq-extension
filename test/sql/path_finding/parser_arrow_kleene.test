@@ -135,8 +135,18 @@ FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)<-[e1:E]-?(n2:N));
 statement ok
 FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)<-[e1:E] - ?(n2:N));
 
-statement ok
+# Parses; '?' admits zero hops, so this is a quantified <-> edge (it used to be read as exactly one hop, dropping
+# the zero-hop matches). No edges: every vertex reaches only itself.
+query II rowsort
 FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)<-[e1:E] -> ?(n2:N));
+----
+1	1
+2	2
+3	3
 
-statement ok
+query II rowsort
 FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)<-[e1:E] - >?(n2:N));
+----
+1	1
+2	2
+3	3
