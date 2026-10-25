@@ -1,0 +1,135 @@
+# name: test/sql/common_subplan_guard.test
+# description: Several GRAPH_TABLEs in one statement give the same rows as each one alone. DuckDB 2.0.0's
+#              common_subplan optimizer merged two occurrences of a subplan and read one scan's column in the other's
+#              place (x came back as y). A plain-SQL statement of the same shape shows it without duckpgq; the
+#              extension keeps the optimizer off the scans of statements that bind a GRAPH_TABLE, and only those.
+# group: [sql]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE P(id BIGINT);
+
+statement ok
+INSERT INTO P SELECT range FROM range(1, 7);
+
+statement ok
+CREATE TABLE K(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO K VALUES (1,2),(1,2),(2,3),(1,3),(3,4),(2,4),(4,1),(2,1),(3,5);
+
+statement ok
+CREATE PROPERTY GRAPH g VERTEX TABLES (P LABEL P)
+EDGE TABLES (K SOURCE KEY (src) REFERENCES P (id) DESTINATION KEY (dst) REFERENCES P (id) LABEL K);
+
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+# The brute-force answer: y -> t -> x for t = 1
+statement ok
+CREATE TABLE expected AS
+SELECT e.dst AS x, f.src AS y FROM K e JOIN K f ON f.dst = e.src WHERE e.src = 1;
+
+query I
+SELECT list((x, y) ORDER BY x, y) FROM expected;
+----
+[(2, 2), (2, 2), (2, 4), (2, 4), (3, 2), (3, 4)]
+
+# The same subplan twice in one statement, once only counted (the shape that went wrong)
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT o.x, o.y FROM (SELECT id AS t FROM P WHERE id = 1) m
+          LEFT JOIN GRAPH_TABLE (g MATCH (t:P)-[e:K]->(x:P), (t)<-[f:K]-(y:P) COLUMNS (t.id AS t, x.id AS x, y.id AS y)) o
+          ON m.t = o.t)),
+       (SELECT list((x, y) ORDER BY x, y) FROM (
+          SELECT o.x, o.y FROM (SELECT id AS t FROM P WHERE id = 1) m
+          LEFT JOIN GRAPH_TABLE (g MATCH (t:P)-[e:K]->(x:P), (t)<-[f:K]-(y:P) COLUMNS (t.id AS t, x.id AS x, y.id AS y)) o
+          ON m.t = o.t));
+----
+6	[(2, 2), (2, 2), (2, 4), (2, 4), (3, 2), (3, 4)]
+
+# The repro of the bug report: a left join of two GRAPH_TABLEs against a third, EXCEPT ALL in the same statement
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT m.t, o.x, o.y FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 1 COLUMNS (t.id AS t)) m
+          LEFT JOIN GRAPH_TABLE (g MATCH (t:P)-[e:K]->(x:P), (t)<-[f:K]-(y:P) COLUMNS (t.id AS t, x.id AS x, y.id AS y)) o
+          ON m.t = o.t)),
+       (SELECT list((t, x, y)) FROM (
+          SELECT m.t, o.x, o.y FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 1 COLUMNS (t.id AS t)) m
+          LEFT JOIN GRAPH_TABLE (g MATCH (t:P)-[e:K]->(x:P), (t)<-[f:K]-(y:P) COLUMNS (t.id AS t, x.id AS x, y.id AS y)) o
+          ON m.t = o.t
+          EXCEPT ALL
+          SELECT * FROM GRAPH_TABLE (g MATCH (t:P)-[e:K]->(x:P), (t)<-[f:K]-(y:P) WHERE t.id = 1
+                                     COLUMNS (t.id AS t, x.id AS x, y.id AS y))));
+----
+6	NULL
+
+# Two GRAPH_TABLEs that differ only in an edge variable's name, compared in one statement
+query I
+SELECT count(*) FROM (
+  FROM GRAPH_TABLE (g MATCH (a:P)-[:K]->(b:P) COLUMNS (a.id AS a, b.id AS b))
+  EXCEPT ALL
+  FROM GRAPH_TABLE (g MATCH (a:P)-[x:K]->(b:P) COLUMNS (a.id AS a, b.id AS b)));
+----
+0
+
+query I
+SELECT count(*) FROM (
+  FROM GRAPH_TABLE (g MATCH (a:P)-[x:K]->(b:P)<-[y:K]-(c:P) COLUMNS (a.id AS a, b.id AS b, c.id AS c))
+  UNION ALL
+  FROM GRAPH_TABLE (g MATCH (a:P)-[x:K]->(b:P)<-[y:K]-(c:P) COLUMNS (a.id AS a, b.id AS b, c.id AS c))
+  EXCEPT ALL
+  (SELECT e.src, e.dst, f.src FROM K e JOIN K f ON f.dst = e.dst
+   UNION ALL
+   SELECT e.src, e.dst, f.src FROM K e JOIN K f ON f.dst = e.dst));
+----
+0
+
+# The guard is per statement: a statement without GRAPH_TABLE keeps the optimizer (its plan has the CTE)
+query II
+EXPLAIN SELECT (SELECT count(*) FROM (SELECT x.id AS x, y.id AS y FROM (SELECT id AS t FROM P WHERE id = 1) m
+                LEFT JOIN (P x JOIN K e ON x.id = e.dst JOIN K f ON e.src = f.dst JOIN P y ON y.id = f.src)
+                ON m.t = e.src)),
+               (SELECT list((x, y)) FROM (SELECT x.id AS x, y.id AS y FROM (SELECT id AS t FROM P WHERE id = 1) m
+                LEFT JOIN (P x JOIN K e ON x.id = e.dst JOIN K f ON e.src = f.dst JOIN P y ON y.id = f.src)
+                ON m.t = e.src));
+----
+physical_plan	<REGEX>:.*CTE.*
+
+# ... and the same statement with a GRAPH_TABLE in it does not
+query II
+EXPLAIN SELECT (SELECT count(*) FROM (
+          SELECT o.x, o.y FROM (SELECT id AS t FROM P WHERE id = 1) m
+          LEFT JOIN GRAPH_TABLE (g MATCH (t:P)-[e:K]->(x:P), (t)<-[f:K]-(y:P) COLUMNS (t.id AS t, x.id AS x, y.id AS y)) o
+          ON m.t = o.t)),
+       (SELECT list((x, y)) FROM (
+          SELECT o.x, o.y FROM (SELECT id AS t FROM P WHERE id = 1) m
+          LEFT JOIN GRAPH_TABLE (g MATCH (t:P)-[e:K]->(x:P), (t)<-[f:K]-(y:P) COLUMNS (t.id AS t, x.id AS x, y.id AS y)) o
+          ON m.t = o.t));
+----
+physical_plan	<!REGEX>:.*CTE.*
+
+# A prepared statement keeps the guard when it is executed again
+statement ok
+PREPARE q AS SELECT (SELECT count(*) FROM (
+          SELECT o.x, o.y FROM (SELECT id AS t FROM P WHERE id = $1) m
+          LEFT JOIN GRAPH_TABLE (g MATCH (t:P)-[e:K]->(x:P), (t)<-[f:K]-(y:P) COLUMNS (t.id AS t, x.id AS x, y.id AS y)) o
+          ON m.t = o.t)),
+       (SELECT list((x, y) ORDER BY x, y) FROM (
+          SELECT o.x, o.y FROM (SELECT id AS t FROM P WHERE id = $1) m
+          LEFT JOIN GRAPH_TABLE (g MATCH (t:P)-[e:K]->(x:P), (t)<-[f:K]-(y:P) COLUMNS (t.id AS t, x.id AS x, y.id AS y)) o
+          ON m.t = o.t));
+
+query II
+EXECUTE q(1);
+----
+6	[(2, 2), (2, 2), (2, 4), (2, 4), (3, 2), (3, 4)]
+
+query II
+EXECUTE q(1);
+----
+6	[(2, 2), (2, 2), (2, 4), (2, 4), (3, 2), (3, 4)]

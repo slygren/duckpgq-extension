@@ -47,6 +47,9 @@ In every such case the old rows were wrong.
     now traverse unless the table is proven exact.
   - **Edge path tables built with duplicate edges collapsed** no longer answer counting patterns. They used to
     undercount.
+  - **Several `GRAPH_TABLE`s in one statement** (a join, `EXCEPT`, two scalar subqueries over the same graph) give
+    the rows each gives alone. DuckDB 2.0.0's `common_subplan` optimizer merged their subplans and could read one
+    vertex scan's column in place of another's; it is kept off the scans of statements with a `GRAPH_TABLE`.
 
 **Errors where there used to be silent wrong output**
 - **A path function on a name that isn't a path** (`path_length(o)` with no `o = …`) is an error. The column used to
@@ -141,5 +144,3 @@ See README "Limitations". Work in progress for the next release:
 - **DuckLake version coupling:** DuckDB 2.0 writes DuckLake format 1.1 and a newer file storage version, which 1.5
   tools can't read. A 2.0 write into a Postgres-backed 1.0 catalog once removed column statistics 1.5 then failed on
   (repaired by hand). See README "DuckLake versions": build lakes with the version their other writers use.
-- **Wrong rows from DuckDB's `common_subplan` optimizer** with several `GRAPH_TABLE`s in one statement. Being fixed;
-  until then avoid putting several `GRAPH_TABLE`s that share a subquery in one statement.

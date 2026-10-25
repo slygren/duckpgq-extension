@@ -85,6 +85,9 @@ public:
 	idx_t rewrite_diagnostics_query = DConstants::INVALID_INDEX;
 	void BeginRewriteDiagnostics(ClientContext &context);
 
+	//! The last query that bound a GRAPH_TABLE; CommonSubplanGuard protects that query's plan.
+	idx_t graph_table_query = DConstants::INVALID_INDEX;
+
 	//! Used to build the CSR data structures required for path-finding queries
 	std::unordered_map<int32_t, unique_ptr<CSR>> csr_list;
 	std::mutex csr_lock;

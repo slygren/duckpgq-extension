@@ -1,4 +1,5 @@
 #include "duckpgq/core/optimizer/factorized_join_optimizer.hpp"
+#include "duckpgq/core/optimizer/common_subplan_guard.hpp"
 
 #include "duckpgq/core/operator/logical_factorized_group_join.hpp"
 #include "duckpgq/core/operator/physical_factorized_group_join.hpp"
@@ -662,6 +663,7 @@ void CoreOptimizer::Register(ExtensionLoader &loader) {
 	OptimizerExtension extension;
 	extension.optimize_function = FactorizedJoinOptimizer::Optimize;
 	OptimizerExtension::Register(config, extension);
+	CommonSubplanGuard::Register(config);
 }
 
 } // namespace duckdb

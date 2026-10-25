@@ -319,6 +319,7 @@ artifact applies.
 | `duckpgq_factorized_joins` | `true` | Pre-aggregate join sides that are only counted or summed, so path counts become degree products. |
 | `duckpgq_factorized_join_operator` | `true` | Use the `FACTORIZED_GROUP_JOIN` operator when both sides are only counted or summed. |
 | `duckpgq_factorized_join_directory` | `true` | Let that operator count into a dense array when key bounds are known. |
+| `duckpgq_common_subplan_guard` | `true` | Keep DuckDB's `common_subplan` optimizer off the table scans of a statement with a `GRAPH_TABLE`. DuckDB 2.0.0's optimizer can merge two occurrences of a subplan and read one table scan's column for another's, which gave wrong rows when several `GRAPH_TABLE`s shared one statement; statements without `GRAPH_TABLE` keep it. |
 
 All but `duckpgq_default_grammar` are per session.
 

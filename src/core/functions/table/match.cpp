@@ -12736,6 +12736,7 @@ unique_ptr<TableRef> PGQMatchFunction::AggregateOverUnion(ClientContext &context
 
 unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, TableFunctionBindInput &bind_input) {
 	auto duckpgq_state = GetDuckPGQState(context);
+	duckpgq_state->graph_table_query = context.transaction.GetActiveQuery();
 
 	auto match_info = dynamic_cast<DuckPGQMatchInfo *>(bind_input.ref.bind_info.get());
 	if (!match_info) {
