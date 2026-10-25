@@ -266,7 +266,8 @@ public:
 	                                                              unique_ptr<SelectNode> &final_select_node,
 	                                                              vector<unique_ptr<ParsedExpression>> &conditions,
 	                                                              int32_t &csr_id_counter, PGQCSRSlot &cte1_slot,
-	                                                              bool all_shortest = false);
+	                                                              bool all_shortest = false, bool any_shortest = false,
+	                                                              const ParsedExpression *where_hint = nullptr);
 
 	static void AddTraversalPathFinding(unique_ptr<SelectNode> &select_node,
 	                                    vector<unique_ptr<ParsedExpression>> &conditions, const string &prev_binding,
@@ -285,7 +286,7 @@ public:
 	                           SubPath *subpath, PGQMatchType edge_type, int32_t &csr_id_counter, PGQCSRSlot &cte1_slot,
 	                           unique_ptr<ParsedExpression> anchor_filter = nullptr, bool any_shortest = false,
 	                           const PGQABITraversalPlan *abi_plan = nullptr,
-	                           const string &edge_label = string());
+	                           const string &edge_label = string(), bool all_shortest = false);
 
 	static void AddPathModeFilter(PGQPathMode mode, const string &path_cte,
 	                              vector<unique_ptr<ParsedExpression>> &conditions);
@@ -332,7 +333,7 @@ public:
 	static void CheckNamedSubpath(SubPath &subpath, MatchExpression &original_ref, CreatePropertyGraphInfo &pg_table,
 	                              unique_ptr<SelectNode> &final_select_node,
 	                              vector<unique_ptr<ParsedExpression>> &conditions, int32_t &csr_id_counter,
-	                              PGQCSRSlot &cte1_slot, bool all_shortest = false);
+	                              PGQCSRSlot &cte1_slot, bool all_shortest = false, bool any_shortest = false);
 
 	// Check whether columns to query are valid against the property graph, throws
 	// BinderException if error.

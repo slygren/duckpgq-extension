@@ -134,7 +134,9 @@ put over DuckLake catalogs. A graph is stored in the database it is created in a
 | `ONE ROW PER VERTEX (v)`, `ONE ROW PER EDGE (e)`, `ONE ROW PER STEP (v1, e, v2)` | one output row per element of each matched path |
 
 A quantified pattern without a search prefix returns **every walk** (SQL/PGQ semantics), not one row per endpoint;
-use `ANY SHORTEST` for one per endpoint. Walks that return to their start vertex are left out.
+use `ANY SHORTEST` for one per endpoint, `ALL SHORTEST` for every shortest path. A walk visits no vertex twice, so
+walks that return to their start vertex are left out, and an edge stored twice is two walks. The path variable
+(`vertices(p)`, `path_length(p)`, `ONE ROW PER`) describes the row's own walk.
 
 ### In WHERE and COLUMNS
 

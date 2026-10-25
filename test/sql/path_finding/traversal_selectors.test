@@ -1,0 +1,677 @@
+# name: test/sql/path_finding/traversal_selectors.test
+# description: The traversal returns the paths a selector asks for, in every direction and output form
+# group: [path_finding]
+
+# Reference semantics: a quantified pattern matches simple paths (no vertex twice, never back to the start),
+# one per edge row taken; ANY SHORTEST keeps one shortest path per endpoint pair, ALL SHORTEST every shortest
+# one. Each query below is compared, both ways with EXCEPT ALL, against a brute-force enumeration of exactly
+# that (the CTE `ref`). Before this, among others: ALL SHORTEST returned every walk, a named path reported the
+# shortest path's vertices and length for every walk, ANY/ALL SHORTEST with ONE ROW PER returned every walk's
+# steps, an undirected walk pattern returned one row per pair, and left-directed named paths were refused.
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+# 1 -> 2 -> 3 -> 4 with shortcuts 1 -> 3 and 2 -> 4, the edge 1 -> 2 stored twice, and 4 -> 1 closing a cycle
+statement ok
+CREATE TABLE P(id BIGINT PRIMARY KEY);
+
+statement ok
+CREATE TABLE K(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO P VALUES (1), (2), (3), (4);
+
+statement ok
+INSERT INTO K VALUES (1, 2), (1, 2), (2, 3), (1, 3), (3, 4), (2, 4), (4, 1);
+
+statement ok
+CREATE PROPERTY GRAPH g VERTEX TABLES (P LABEL P)
+EDGE TABLES (K SOURCE KEY (src) REFERENCES P (id) DESTINATION KEY (dst) REFERENCES P (id) LABEL K);
+
+# Simple paths of every direction, by length (row ids are id - 1 in P)
+statement ok
+CREATE TABLE ref_paths AS
+WITH RECURSIVE w(dir, src, cur, depth, path) AS (
+    SELECT d, id, id, 0, [id] FROM P, (VALUES ('->'), ('<-'), ('-')) t(d)
+    UNION ALL
+    SELECT w.dir, w.src, e.t, w.depth + 1, list_append(w.path, e.t)
+    FROM w JOIN (SELECT '->' AS dir, src AS s, dst AS t FROM K UNION ALL SELECT '<-', dst, src FROM K
+                 UNION ALL SELECT '-', src, dst FROM K UNION ALL SELECT '-', dst, src FROM K) e
+      ON e.dir = w.dir AND e.s = w.cur
+    WHERE w.depth < 3 AND NOT list_contains(w.path, e.t))
+SELECT * FROM w WHERE depth >= 1;
+
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b FROM GRAPH_TABLE (g MATCH (a:P)-[:K]->{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))) = (SELECT count(*) FROM (SELECT src, cur FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1))),
+    (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH (a:P)-[:K]->{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b))) EXCEPT ALL (SELECT src, cur FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1)) EXCEPT ALL (SELECT a, b FROM GRAPH_TABLE (g MATCH (a:P)-[:K]->{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = (a:P)-[:K]->{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))) = (SELECT count(*) FROM (SELECT src, cur, depth FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = (a:P)-[:K]->{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l))) EXCEPT ALL (SELECT src, cur, depth FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1)) EXCEPT ALL (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = (a:P)-[:K]->{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = (a:P)-[:K]->{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs)))) = (SELECT count(*) FROM (SELECT src, cur, path FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = (a:P)-[:K]->{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs))) EXCEPT ALL (SELECT src, cur, path FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, path FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1)) EXCEPT ALL (SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = (a:P)-[:K]->{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, v FROM GRAPH_TABLE (g MATCH (a:P)-[:K]->{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)))) = (SELECT count(*) FROM (SELECT src, cur, unnest(path) FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, v FROM GRAPH_TABLE (g MATCH (a:P)-[:K]->{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v))) EXCEPT ALL (SELECT src, cur, unnest(path) FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, unnest(path) FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1)) EXCEPT ALL (SELECT a, b, v FROM GRAPH_TABLE (g MATCH (a:P)-[:K]->{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH (a:P)-[:K]->{1,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)))) = (SELECT count(*) FROM (SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1)))),
+    (SELECT count(*) FROM ((SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH (a:P)-[:K]->{1,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y))) EXCEPT ALL (SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1))))),
+    (SELECT count(*) FROM ((SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1))) EXCEPT ALL (SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH (a:P)-[:K]->{1,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]->{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))) = (SELECT count(*) FROM (SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1))),
+    (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]->{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b))) EXCEPT ALL (SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)) EXCEPT ALL (SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]->{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[:K]->{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))) = (SELECT count(*) FROM (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[:K]->{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l))) EXCEPT ALL (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)) EXCEPT ALL (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[:K]->{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]->{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)) GROUP BY ALL)) = (SELECT count(*) FROM (SELECT src, cur, depth + 1 FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]->{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)) GROUP BY ALL) EXCEPT ALL (SELECT src, cur, depth + 1 FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth + 1 FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)) EXCEPT ALL (SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]->{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)) GROUP BY ALL)));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]->{1,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)) GROUP BY ALL)) = (SELECT count(*) FROM (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]->{1,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)) GROUP BY ALL) EXCEPT ALL (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)) EXCEPT ALL (SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]->{1,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)) GROUP BY ALL)));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]->{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))) = (SELECT count(*) FROM (SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))),
+    (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]->{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b))) EXCEPT ALL (SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))))),
+    (SELECT count(*) FROM ((SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))) EXCEPT ALL (SELECT a, b FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]->{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[:K]->{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))) = (SELECT count(*) FROM (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))),
+    (SELECT count(*) FROM ((SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[:K]->{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l))) EXCEPT ALL (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))) EXCEPT ALL (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[:K]->{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[:K]->{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs)))) = (SELECT count(*) FROM (SELECT src, cur, path FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))),
+    (SELECT count(*) FROM ((SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[:K]->{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs))) EXCEPT ALL (SELECT src, cur, path FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))))),
+    (SELECT count(*) FROM ((SELECT src, cur, path FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))) EXCEPT ALL (SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[:K]->{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, v FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]->{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)))) = (SELECT count(*) FROM (SELECT src, cur, unnest(path) FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))),
+    (SELECT count(*) FROM ((SELECT a, b, v FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]->{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v))) EXCEPT ALL (SELECT src, cur, unnest(path) FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))))),
+    (SELECT count(*) FROM ((SELECT src, cur, unnest(path) FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))) EXCEPT ALL (SELECT a, b, v FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]->{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]->{1,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)))) = (SELECT count(*) FROM (SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))))),
+    (SELECT count(*) FROM ((SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]->{1,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y))) EXCEPT ALL (SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))))),
+    (SELECT count(*) FROM ((SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))) EXCEPT ALL (SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]->{1,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b FROM GRAPH_TABLE (g MATCH (a:P)-[:K]->{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))) = (SELECT count(*) FROM (SELECT src, cur FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1))),
+    (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH (a:P)-[:K]->{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b))) EXCEPT ALL (SELECT src, cur FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1)) EXCEPT ALL (SELECT a, b FROM GRAPH_TABLE (g MATCH (a:P)-[:K]->{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = (a:P)-[:K]->{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))) = (SELECT count(*) FROM (SELECT src, cur, depth FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = (a:P)-[:K]->{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l))) EXCEPT ALL (SELECT src, cur, depth FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1)) EXCEPT ALL (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = (a:P)-[:K]->{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = (a:P)-[:K]->{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs)))) = (SELECT count(*) FROM (SELECT src, cur, path FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = (a:P)-[:K]->{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs))) EXCEPT ALL (SELECT src, cur, path FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, path FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1)) EXCEPT ALL (SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = (a:P)-[:K]->{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, v FROM GRAPH_TABLE (g MATCH (a:P)-[:K]->{2,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)))) = (SELECT count(*) FROM (SELECT src, cur, unnest(path) FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, v FROM GRAPH_TABLE (g MATCH (a:P)-[:K]->{2,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v))) EXCEPT ALL (SELECT src, cur, unnest(path) FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, unnest(path) FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1)) EXCEPT ALL (SELECT a, b, v FROM GRAPH_TABLE (g MATCH (a:P)-[:K]->{2,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH (a:P)-[:K]->{2,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)))) = (SELECT count(*) FROM (SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1)))),
+    (SELECT count(*) FROM ((SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH (a:P)-[:K]->{2,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y))) EXCEPT ALL (SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1))))),
+    (SELECT count(*) FROM ((SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1))) EXCEPT ALL (SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH (a:P)-[:K]->{2,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]->{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))) = (SELECT count(*) FROM (SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1))),
+    (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]->{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b))) EXCEPT ALL (SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)) EXCEPT ALL (SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]->{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[:K]->{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))) = (SELECT count(*) FROM (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[:K]->{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l))) EXCEPT ALL (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)) EXCEPT ALL (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[:K]->{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]->{2,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)) GROUP BY ALL)) = (SELECT count(*) FROM (SELECT src, cur, depth + 1 FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]->{2,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)) GROUP BY ALL) EXCEPT ALL (SELECT src, cur, depth + 1 FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth + 1 FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)) EXCEPT ALL (SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]->{2,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)) GROUP BY ALL)));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]->{2,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)) GROUP BY ALL)) = (SELECT count(*) FROM (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]->{2,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)) GROUP BY ALL) EXCEPT ALL (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)) EXCEPT ALL (SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]->{2,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)) GROUP BY ALL)));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]->{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))) = (SELECT count(*) FROM (SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))),
+    (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]->{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b))) EXCEPT ALL (SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))))),
+    (SELECT count(*) FROM ((SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))) EXCEPT ALL (SELECT a, b FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]->{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[:K]->{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))) = (SELECT count(*) FROM (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))),
+    (SELECT count(*) FROM ((SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[:K]->{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l))) EXCEPT ALL (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))) EXCEPT ALL (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[:K]->{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[:K]->{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs)))) = (SELECT count(*) FROM (SELECT src, cur, path FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))),
+    (SELECT count(*) FROM ((SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[:K]->{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs))) EXCEPT ALL (SELECT src, cur, path FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))))),
+    (SELECT count(*) FROM ((SELECT src, cur, path FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))) EXCEPT ALL (SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[:K]->{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, v FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]->{2,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)))) = (SELECT count(*) FROM (SELECT src, cur, unnest(path) FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))),
+    (SELECT count(*) FROM ((SELECT a, b, v FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]->{2,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v))) EXCEPT ALL (SELECT src, cur, unnest(path) FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))))),
+    (SELECT count(*) FROM ((SELECT src, cur, unnest(path) FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))) EXCEPT ALL (SELECT a, b, v FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]->{2,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]->{2,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)))) = (SELECT count(*) FROM (SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))))),
+    (SELECT count(*) FROM ((SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]->{2,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y))) EXCEPT ALL (SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))))),
+    (SELECT count(*) FROM ((SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))) EXCEPT ALL (SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]->{2,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b FROM GRAPH_TABLE (g MATCH (a:P)<-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))) = (SELECT count(*) FROM (SELECT src, cur FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1))),
+    (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH (a:P)<-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b))) EXCEPT ALL (SELECT src, cur FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1)) EXCEPT ALL (SELECT a, b FROM GRAPH_TABLE (g MATCH (a:P)<-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = (a:P)<-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))) = (SELECT count(*) FROM (SELECT src, cur, depth FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = (a:P)<-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l))) EXCEPT ALL (SELECT src, cur, depth FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1)) EXCEPT ALL (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = (a:P)<-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = (a:P)<-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs)))) = (SELECT count(*) FROM (SELECT src, cur, path FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = (a:P)<-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs))) EXCEPT ALL (SELECT src, cur, path FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, path FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1)) EXCEPT ALL (SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = (a:P)<-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, v FROM GRAPH_TABLE (g MATCH (a:P)<-[:K]-{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)))) = (SELECT count(*) FROM (SELECT src, cur, unnest(path) FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, v FROM GRAPH_TABLE (g MATCH (a:P)<-[:K]-{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v))) EXCEPT ALL (SELECT src, cur, unnest(path) FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, unnest(path) FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1)) EXCEPT ALL (SELECT a, b, v FROM GRAPH_TABLE (g MATCH (a:P)<-[:K]-{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH (a:P)<-[:K]-{1,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)))) = (SELECT count(*) FROM (SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1)))),
+    (SELECT count(*) FROM ((SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH (a:P)<-[:K]-{1,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y))) EXCEPT ALL (SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1))))),
+    (SELECT count(*) FROM ((SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1))) EXCEPT ALL (SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH (a:P)<-[:K]-{1,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))) = (SELECT count(*) FROM (SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1))),
+    (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b))) EXCEPT ALL (SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)) EXCEPT ALL (SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)<-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))) = (SELECT count(*) FROM (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)<-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l))) EXCEPT ALL (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)) EXCEPT ALL (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)<-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[:K]-{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)) GROUP BY ALL)) = (SELECT count(*) FROM (SELECT src, cur, depth + 1 FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[:K]-{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)) GROUP BY ALL) EXCEPT ALL (SELECT src, cur, depth + 1 FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth + 1 FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)) EXCEPT ALL (SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[:K]-{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)) GROUP BY ALL)));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[:K]-{1,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)) GROUP BY ALL)) = (SELECT count(*) FROM (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[:K]-{1,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)) GROUP BY ALL) EXCEPT ALL (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)) EXCEPT ALL (SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[:K]-{1,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)) GROUP BY ALL)));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))) = (SELECT count(*) FROM (SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))),
+    (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b))) EXCEPT ALL (SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))))),
+    (SELECT count(*) FROM ((SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))) EXCEPT ALL (SELECT a, b FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)<-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))) = (SELECT count(*) FROM (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))),
+    (SELECT count(*) FROM ((SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)<-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l))) EXCEPT ALL (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))) EXCEPT ALL (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)<-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)<-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs)))) = (SELECT count(*) FROM (SELECT src, cur, path FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))),
+    (SELECT count(*) FROM ((SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)<-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs))) EXCEPT ALL (SELECT src, cur, path FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))))),
+    (SELECT count(*) FROM ((SELECT src, cur, path FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))) EXCEPT ALL (SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)<-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, v FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[:K]-{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)))) = (SELECT count(*) FROM (SELECT src, cur, unnest(path) FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))),
+    (SELECT count(*) FROM ((SELECT a, b, v FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[:K]-{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v))) EXCEPT ALL (SELECT src, cur, unnest(path) FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))))),
+    (SELECT count(*) FROM ((SELECT src, cur, unnest(path) FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))) EXCEPT ALL (SELECT a, b, v FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[:K]-{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[:K]-{1,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)))) = (SELECT count(*) FROM (SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))))),
+    (SELECT count(*) FROM ((SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[:K]-{1,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y))) EXCEPT ALL (SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))))),
+    (SELECT count(*) FROM ((SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))) EXCEPT ALL (SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[:K]-{1,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b FROM GRAPH_TABLE (g MATCH (a:P)<-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))) = (SELECT count(*) FROM (SELECT src, cur FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1))),
+    (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH (a:P)<-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b))) EXCEPT ALL (SELECT src, cur FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1)) EXCEPT ALL (SELECT a, b FROM GRAPH_TABLE (g MATCH (a:P)<-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = (a:P)<-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))) = (SELECT count(*) FROM (SELECT src, cur, depth FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = (a:P)<-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l))) EXCEPT ALL (SELECT src, cur, depth FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1)) EXCEPT ALL (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = (a:P)<-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = (a:P)<-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs)))) = (SELECT count(*) FROM (SELECT src, cur, path FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = (a:P)<-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs))) EXCEPT ALL (SELECT src, cur, path FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, path FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1)) EXCEPT ALL (SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = (a:P)<-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, v FROM GRAPH_TABLE (g MATCH (a:P)<-[:K]-{2,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)))) = (SELECT count(*) FROM (SELECT src, cur, unnest(path) FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, v FROM GRAPH_TABLE (g MATCH (a:P)<-[:K]-{2,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v))) EXCEPT ALL (SELECT src, cur, unnest(path) FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, unnest(path) FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1)) EXCEPT ALL (SELECT a, b, v FROM GRAPH_TABLE (g MATCH (a:P)<-[:K]-{2,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH (a:P)<-[:K]-{2,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)))) = (SELECT count(*) FROM (SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1)))),
+    (SELECT count(*) FROM ((SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH (a:P)<-[:K]-{2,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y))) EXCEPT ALL (SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1))))),
+    (SELECT count(*) FROM ((SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1))) EXCEPT ALL (SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH (a:P)<-[:K]-{2,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))) = (SELECT count(*) FROM (SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1))),
+    (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b))) EXCEPT ALL (SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)) EXCEPT ALL (SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)<-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))) = (SELECT count(*) FROM (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)<-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l))) EXCEPT ALL (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)) EXCEPT ALL (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)<-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[:K]-{2,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)) GROUP BY ALL)) = (SELECT count(*) FROM (SELECT src, cur, depth + 1 FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[:K]-{2,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)) GROUP BY ALL) EXCEPT ALL (SELECT src, cur, depth + 1 FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth + 1 FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)) EXCEPT ALL (SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[:K]-{2,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)) GROUP BY ALL)));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[:K]-{2,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)) GROUP BY ALL)) = (SELECT count(*) FROM (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[:K]-{2,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)) GROUP BY ALL) EXCEPT ALL (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)) EXCEPT ALL (SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[:K]-{2,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)) GROUP BY ALL)));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))) = (SELECT count(*) FROM (SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))),
+    (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b))) EXCEPT ALL (SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))))),
+    (SELECT count(*) FROM ((SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))) EXCEPT ALL (SELECT a, b FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)<-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))) = (SELECT count(*) FROM (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))),
+    (SELECT count(*) FROM ((SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)<-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l))) EXCEPT ALL (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))) EXCEPT ALL (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)<-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)<-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs)))) = (SELECT count(*) FROM (SELECT src, cur, path FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))),
+    (SELECT count(*) FROM ((SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)<-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs))) EXCEPT ALL (SELECT src, cur, path FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))))),
+    (SELECT count(*) FROM ((SELECT src, cur, path FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))) EXCEPT ALL (SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)<-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, v FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[:K]-{2,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)))) = (SELECT count(*) FROM (SELECT src, cur, unnest(path) FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))),
+    (SELECT count(*) FROM ((SELECT a, b, v FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[:K]-{2,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v))) EXCEPT ALL (SELECT src, cur, unnest(path) FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))))),
+    (SELECT count(*) FROM ((SELECT src, cur, unnest(path) FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))) EXCEPT ALL (SELECT a, b, v FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[:K]-{2,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[:K]-{2,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)))) = (SELECT count(*) FROM (SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))))),
+    (SELECT count(*) FROM ((SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[:K]-{2,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y))) EXCEPT ALL (SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))))),
+    (SELECT count(*) FROM ((SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))) EXCEPT ALL (SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[:K]-{2,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b FROM GRAPH_TABLE (g MATCH (a:P)-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))) = (SELECT count(*) FROM (SELECT src, cur FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1))),
+    (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH (a:P)-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b))) EXCEPT ALL (SELECT src, cur FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1)) EXCEPT ALL (SELECT a, b FROM GRAPH_TABLE (g MATCH (a:P)-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = (a:P)-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))) = (SELECT count(*) FROM (SELECT src, cur, depth FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = (a:P)-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l))) EXCEPT ALL (SELECT src, cur, depth FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1)) EXCEPT ALL (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = (a:P)-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = (a:P)-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs)))) = (SELECT count(*) FROM (SELECT src, cur, path FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = (a:P)-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs))) EXCEPT ALL (SELECT src, cur, path FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, path FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1)) EXCEPT ALL (SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = (a:P)-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, v FROM GRAPH_TABLE (g MATCH (a:P)-[:K]-{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)))) = (SELECT count(*) FROM (SELECT src, cur, unnest(path) FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, v FROM GRAPH_TABLE (g MATCH (a:P)-[:K]-{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v))) EXCEPT ALL (SELECT src, cur, unnest(path) FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, unnest(path) FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1)) EXCEPT ALL (SELECT a, b, v FROM GRAPH_TABLE (g MATCH (a:P)-[:K]-{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH (a:P)-[:K]-{1,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)))) = (SELECT count(*) FROM (SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1)))),
+    (SELECT count(*) FROM ((SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH (a:P)-[:K]-{1,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y))) EXCEPT ALL (SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1))))),
+    (SELECT count(*) FROM ((SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1))) EXCEPT ALL (SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH (a:P)-[:K]-{1,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))) = (SELECT count(*) FROM (SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1))),
+    (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b))) EXCEPT ALL (SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)) EXCEPT ALL (SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))) = (SELECT count(*) FROM (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l))) EXCEPT ALL (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)) EXCEPT ALL (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]-{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)) GROUP BY ALL)) = (SELECT count(*) FROM (SELECT src, cur, depth + 1 FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]-{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)) GROUP BY ALL) EXCEPT ALL (SELECT src, cur, depth + 1 FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth + 1 FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)) EXCEPT ALL (SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]-{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)) GROUP BY ALL)));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]-{1,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)) GROUP BY ALL)) = (SELECT count(*) FROM (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]-{1,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)) GROUP BY ALL) EXCEPT ALL (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)) EXCEPT ALL (SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]-{1,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)) GROUP BY ALL)));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))) = (SELECT count(*) FROM (SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))),
+    (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b))) EXCEPT ALL (SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))))),
+    (SELECT count(*) FROM ((SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))) EXCEPT ALL (SELECT a, b FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))) = (SELECT count(*) FROM (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))),
+    (SELECT count(*) FROM ((SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l))) EXCEPT ALL (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))) EXCEPT ALL (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs)))) = (SELECT count(*) FROM (SELECT src, cur, path FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))),
+    (SELECT count(*) FROM ((SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs))) EXCEPT ALL (SELECT src, cur, path FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))))),
+    (SELECT count(*) FROM ((SELECT src, cur, path FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))) EXCEPT ALL (SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[:K]-{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, v FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]-{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)))) = (SELECT count(*) FROM (SELECT src, cur, unnest(path) FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))),
+    (SELECT count(*) FROM ((SELECT a, b, v FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]-{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v))) EXCEPT ALL (SELECT src, cur, unnest(path) FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))))),
+    (SELECT count(*) FROM ((SELECT src, cur, unnest(path) FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))) EXCEPT ALL (SELECT a, b, v FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]-{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]-{1,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)))) = (SELECT count(*) FROM (SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))))),
+    (SELECT count(*) FROM ((SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]-{1,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y))) EXCEPT ALL (SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))))),
+    (SELECT count(*) FROM ((SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))) EXCEPT ALL (SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]-{1,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b FROM GRAPH_TABLE (g MATCH (a:P)-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))) = (SELECT count(*) FROM (SELECT src, cur FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1))),
+    (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH (a:P)-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b))) EXCEPT ALL (SELECT src, cur FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1)) EXCEPT ALL (SELECT a, b FROM GRAPH_TABLE (g MATCH (a:P)-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = (a:P)-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))) = (SELECT count(*) FROM (SELECT src, cur, depth FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = (a:P)-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l))) EXCEPT ALL (SELECT src, cur, depth FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1)) EXCEPT ALL (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = (a:P)-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = (a:P)-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs)))) = (SELECT count(*) FROM (SELECT src, cur, path FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = (a:P)-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs))) EXCEPT ALL (SELECT src, cur, path FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, path FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1)) EXCEPT ALL (SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = (a:P)-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, v FROM GRAPH_TABLE (g MATCH (a:P)-[:K]-{2,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)))) = (SELECT count(*) FROM (SELECT src, cur, unnest(path) FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, v FROM GRAPH_TABLE (g MATCH (a:P)-[:K]-{2,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v))) EXCEPT ALL (SELECT src, cur, unnest(path) FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, unnest(path) FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1)) EXCEPT ALL (SELECT a, b, v FROM GRAPH_TABLE (g MATCH (a:P)-[:K]-{2,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH (a:P)-[:K]-{2,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)))) = (SELECT count(*) FROM (SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1)))),
+    (SELECT count(*) FROM ((SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH (a:P)-[:K]-{2,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y))) EXCEPT ALL (SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1))))),
+    (SELECT count(*) FROM ((SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1))) EXCEPT ALL (SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH (a:P)-[:K]-{2,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))) = (SELECT count(*) FROM (SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1))),
+    (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b))) EXCEPT ALL (SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)) EXCEPT ALL (SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))) = (SELECT count(*) FROM (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l))) EXCEPT ALL (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)) EXCEPT ALL (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]-{2,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)) GROUP BY ALL)) = (SELECT count(*) FROM (SELECT src, cur, depth + 1 FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]-{2,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)) GROUP BY ALL) EXCEPT ALL (SELECT src, cur, depth + 1 FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth + 1 FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)) EXCEPT ALL (SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]-{2,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)) GROUP BY ALL)));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]-{2,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)) GROUP BY ALL)) = (SELECT count(*) FROM (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1))),
+    (SELECT count(*) FROM ((SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]-{2,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)) GROUP BY ALL) EXCEPT ALL (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY row_number() OVER (PARTITION BY src, cur ORDER BY depth) = 1)) EXCEPT ALL (SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]-{2,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)) GROUP BY ALL)));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))) = (SELECT count(*) FROM (SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))),
+    (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b))) EXCEPT ALL (SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))))),
+    (SELECT count(*) FROM ((SELECT src, cur FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))) EXCEPT ALL (SELECT a, b FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))) = (SELECT count(*) FROM (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))),
+    (SELECT count(*) FROM ((SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l))) EXCEPT ALL (SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))) EXCEPT ALL (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs)))) = (SELECT count(*) FROM (SELECT src, cur, path FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))),
+    (SELECT count(*) FROM ((SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs))) EXCEPT ALL (SELECT src, cur, path FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))))),
+    (SELECT count(*) FROM ((SELECT src, cur, path FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))) EXCEPT ALL (SELECT a, b, list_transform(vs, lambda x: x + 1) FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[:K]-{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, v FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]-{2,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)))) = (SELECT count(*) FROM (SELECT src, cur, unnest(path) FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))),
+    (SELECT count(*) FROM ((SELECT a, b, v FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]-{2,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v))) EXCEPT ALL (SELECT src, cur, unnest(path) FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))))),
+    (SELECT count(*) FROM ((SELECT src, cur, unnest(path) FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))) EXCEPT ALL (SELECT a, b, v FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]-{2,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]-{2,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)))) = (SELECT count(*) FROM (SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur))))),
+    (SELECT count(*) FROM ((SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]-{2,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y))) EXCEPT ALL (SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))))),
+    (SELECT count(*) FROM ((SELECT src, cur, path[i], path[i + 1] FROM (SELECT *, unnest(range(1, depth + 1)) AS i FROM (SELECT * FROM (SELECT * FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)))) EXCEPT ALL (SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]-{2,3}(b:P) ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS x, v2.id AS y)))));
+----
+true	0	0
+
+# A statement with several CSR traversals (here three, on the CSR route: ANY SHORTEST named paths from depth
+# 1). Each builds its own CSR; the path functions used to read the registry without its lock while another
+# CSR of the statement was being inserted, and failed intermittently with "Invalid ID".
+query III
+SELECT (SELECT count(*) FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[:K]->{1,3}(b:P) COLUMNS (path_length(p) AS l))) =
+           (SELECT count(DISTINCT (src, cur)) FROM ref_paths WHERE dir = '->'),
+       (SELECT count(*) FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[:K]-{1,3}(b:P) COLUMNS (path_length(p) AS l))) =
+           (SELECT count(DISTINCT (src, cur)) FROM ref_paths WHERE dir = '-'),
+       (SELECT count(*) FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[:K]->{1,3}(b:P) COLUMNS (path_length(p) AS l))) =
+           (SELECT count(*) FROM (SELECT * FROM ref_paths WHERE dir = '->' QUALIFY depth = min(depth) OVER (PARTITION BY src, cur)));
+----
+true	true	true
+
+# With artifacts built the answers agree with the traversal. (On this graph, with a duplicate edge and a cycle,
+# some shapes have no exact artifact and are traversed both ways: 'unverified'.)
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+FROM pgq_abi_build('g', exclude_self_referential := false, closures := ['K']);
+
+query T
+SELECT status IN ('match', 'unverified') FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[:K]->{1,3}(b) COLUMNS (a.id AS a, b.id AS b))');
+----
+true
+
+query T
+SELECT status IN ('match', 'unverified') FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[:K]->{1,3}(b) WHERE a.id = 1 COLUMNS (a.id AS a, path_length(p) AS l))');
+----
+true
+
+query T
+SELECT status IN ('match', 'unverified') FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:K]->{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b))');
+----
+true
+
+query T
+SELECT status IN ('match', 'unverified') FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH p = (a:P)-[:K]->{1,3}(b) COLUMNS (a.id AS a, path_length(p) AS l, edge_labels(p) AS el))');
+----
+true

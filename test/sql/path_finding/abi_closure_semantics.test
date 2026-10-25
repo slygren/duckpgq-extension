@@ -208,9 +208,7 @@ SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (dia_
 ----
 unverified	false
 
-# ANY SHORTEST + ONE ROW PER is answered from the witness: one path per pair, so a path's steps are its own.
-# (The traversal currently disagrees here: it repeats rows and mixes the steps of both tied 1 -> 4 paths. The
-# answer below is the correct one; see the traversal note in docs.)
+# ANY SHORTEST + ONE ROW PER is answered from the witness: one path per pair, so a path's steps are its own
 query I
 SELECT count(*) FROM GRAPH_TABLE (dia_g MATCH ANY SHORTEST (a:Person)-[:Knows]->{1,3}(b:Person)
     ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (b.id AS b, v.id AS v));
@@ -224,6 +222,14 @@ SELECT count(*) FROM (
     GROUP BY b HAVING count(*) <> count(DISTINCT v));
 ----
 0
+
+# and the traversal now gives the same number of steps per path (which tied path it picks may differ)
+query T
+SELECT status FROM pgq_verify_abi_rewrite('SELECT a, b, count(*) FROM GRAPH_TABLE (dia_g MATCH ANY SHORTEST
+    (a:Person)-[:Knows]->{1,3}(b:Person) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v))
+    GROUP BY ALL');
+----
+match
 
 # =====================================================================================================================
 # A tree: every closure is exact, and every route answers from it
