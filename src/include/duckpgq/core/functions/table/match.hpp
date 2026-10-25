@@ -285,7 +285,7 @@ public:
 	                                 case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &opt_alias_map,
 	                                 CreatePropertyGraphInfo &pg_table, int32_t &extra_alias_counter,
 	                                 const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &mandatory_alias_map,
-	                                 const ParsedExpression *where_hint);
+	                                 const ParsedExpression *where_hint, bool optional = true);
 	//! The query for one MATCH block and its UNION [ALL] MATCH branches. allow_abi = false keeps every pattern on the
 	//! traversal routes, which bind each element to a table row.
 	static unique_ptr<QueryNode> BuildMatchQueryNode(ClientContext &context, MatchExpression *ref, bool allow_abi);

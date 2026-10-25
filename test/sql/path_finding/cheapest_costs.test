@@ -430,13 +430,15 @@ FROM GRAPH_TABLE (g MATCH
 ----
 0.6	2.7
 
-statement error
+# Different COSTs: each pattern its own search, joined (here a cross product: no shared variable)
+query RR
 FROM GRAPH_TABLE (g MATCH
     p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person),
     q = ANY CHEAPEST (c:Person)-[f:Link COST 1]->+(d:Person)
-    COLUMNS (COST(p) AS cp, COST(q) AS cq));
+    WHERE a.name = 'A' AND b.name = 'D' AND c.name = 'B' AND d.name = 'E'
+    COLUMNS (round(COST(p), 9) AS cp, COST(q) AS cq));
 ----
-<REGEX>:.*(must search the same edge label|must be the only variable-length pattern).*
+0.6	2
 
 # COST belongs on edges
 statement error

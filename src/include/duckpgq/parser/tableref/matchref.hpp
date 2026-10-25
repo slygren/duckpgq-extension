@@ -27,6 +27,9 @@ public:
 	vector<unique_ptr<PathPattern>> path_patterns;
 	//! One entry per OPTIONAL MATCH clause; each group of patterns left-joins onto the mandatory ones.
 	vector<vector<unique_ptr<PathPattern>>> optional_match_patterns;
+	//! Set by the binder: path patterns matched as a MATCH of their own and joined onto the others on the variables
+	//! they share (CHEAPEST searches that cannot share the block's one CSR and path CTE). Not serialized.
+	vector<unique_ptr<PathPattern>> joined_patterns;
 
 	vector<unique_ptr<ParsedExpression>> column_list;
 

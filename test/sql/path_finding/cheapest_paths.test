@@ -971,6 +971,91 @@ FROM GRAPH_TABLE (gf MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w * c.f]->
 ----
 may only read properties of its own edge
 
+# ── Several CHEAPEST patterns in one MATCH: each selected on its own, then joined on their shared variables ──────
+# Against the join of the same patterns matched one per GRAPH_TABLE (materialised first).
+
+statement ok
+CREATE TABLE two_w AS FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person)
+    COLUMNS (a.id AS a, b.id AS b, COST(p) AS cp, vertices(p) AS vp));
+
+statement ok
+CREATE TABLE two_d AS FROM GRAPH_TABLE (g MATCH q = ALL CHEAPEST (b:Person)-[f:Link COST f.d]->{1,3}(c:Person)
+    COLUMNS (b.id AS b, c.id AS c, COST(q) AS cq, edges(q) AS eq));
+
+# Different COSTs (and selectors, bounds), path functions of both
+statement ok
+CREATE TABLE two_both AS FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person),
+    q = ALL CHEAPEST (b)-[f:Link COST f.d]->{1,3}(c:Person)
+    COLUMNS (a.id AS a, b.id AS b, c.id AS c, COST(p) AS cp, vertices(p) AS vp, COST(q) AS cq, edges(q) AS eq));
+
+statement ok
+CREATE TABLE two_ref AS SELECT w.a, w.b, d.c, w.cp, w.vp, d.cq, d.eq FROM two_w w JOIN two_d d ON d.b = w.b;
+
+query III
+SELECT (SELECT count(*) FROM (FROM two_both EXCEPT ALL FROM two_ref)), (SELECT count(*) FROM (FROM two_ref EXCEPT ALL FROM two_both)),
+       (SELECT count(*) FROM two_both) > 0;
+----
+0	0	true
+
+# With the MATCH WHERE on both, which seeds each pattern
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person),
+        q = ALL CHEAPEST (b)-[f:Link COST f.d]->{1,3}(c:Person) WHERE a.id = 0 AND c.id = 5 AND COST(p) + COST(q) < 5
+        COLUMNS (a.id AS a, b.id AS b, c.id AS c, COST(p) AS cp, vertices(p) AS vp, COST(q) AS cq, edges(q) AS eq)))
+    EXCEPT ALL (SELECT * FROM two_ref WHERE a = 0 AND c = 5 AND cp + cq < 5));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person),
+            q = ALL CHEAPEST (b)-[f:Link COST f.d]->{1,3}(c:Person) WHERE a.id = 0 AND c.id = 5 AND COST(p) + COST(q) < 5
+            COLUMNS (a.id)))
+     = (SELECT count(*) FROM two_ref WHERE a = 0 AND c = 5 AND cp + cq < 5);
+----
+true
+
+# The same COST, but more than COST(p) of each (one path CTE per block): split too
+statement ok
+CREATE TABLE same_both AS FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person),
+    q = ANY CHEAPEST (b)-[f:Link COST f.w]->+(c:Person) COLUMNS (a.id AS a, b.id AS b, c.id AS c, vertices(p) AS vp, vertices(q) AS vq));
+
+query II
+SELECT (SELECT count(*) FROM (FROM same_both EXCEPT ALL SELECT w.a, w.b, v.b, w.vp, v.vp FROM two_w w JOIN two_w v ON v.a = w.b)),
+       (SELECT count(*) FROM (SELECT w.a, w.b, v.b, w.vp, v.vp FROM two_w w JOIN two_w v ON v.a = w.b EXCEPT ALL FROM same_both));
+----
+0	0
+
+# A CHEAPEST pattern next to another variable-length pattern
+statement ok
+CREATE TABLE next_vl AS FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person), (b)-[f:Link]->{1,2}(c:Person)
+    COLUMNS (a.id AS a, b.id AS b, c.id AS c, COST(p) AS cp));
+
+statement ok
+CREATE TABLE vl_only AS FROM GRAPH_TABLE (g MATCH (b:Person)-[f:Link]->{1,2}(c:Person) COLUMNS (b.id AS b, c.id AS c));
+
+query II
+SELECT (SELECT count(*) FROM (FROM next_vl EXCEPT ALL SELECT w.a, w.b, v.c, w.cp FROM two_w w JOIN vl_only v ON v.b = w.b)),
+       (SELECT count(*) FROM (SELECT w.a, w.b, v.c, w.cp FROM two_w w JOIN vl_only v ON v.b = w.b EXCEPT ALL FROM next_vl));
+----
+0	0
+
+# A constant COST(p) next to a varying one, and three patterns in a chain
+query II
+SELECT (SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person), q = ANY CHEAPEST (b)-[f:Link COST 1]->+(c:Person)
+        COLUMNS (a.id AS a, b.id AS b, c.id AS c, COST(p) AS cp, COST(q) AS cq)))
+    EXCEPT ALL (SELECT w.a, w.b, s.dst, w.cp, s.depth FROM two_w w JOIN shortest_by(1, 99) s ON s.src = w.b
+                QUALIFY row_number() OVER (PARTITION BY w.a, w.b, s.dst) = 1))),
+       (SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person), q = ANY CHEAPEST (b)-[f:Link COST f.d]->+(c:Person),
+        r = ANY CHEAPEST (c)-[h:Link COST h.w * 2]->+(d:Person) WHERE a.id = 0
+        COLUMNS (a.id AS a, b.id AS b, c.id AS c, d.id AS d, COST(p) AS cp, COST(r) AS cr)))
+    EXCEPT ALL (SELECT w.a, w.b, x.dst, v.b, w.cp, 2 * v.cp FROM two_w w JOIN any_d x ON x.src = w.b JOIN two_w v ON v.a = x.dst
+                WHERE w.a = 0)));
+----
+0	0
+
 # A search too large for pgq_max_vl_fallback_rows says so; one that runs too long is interrupted
 statement ok
 CREATE TABLE kv(id BIGINT);
@@ -1096,3 +1181,18 @@ SELECT count(*) FROM (
     EXCEPT ALL (SELECT * FROM all_l3));
 ----
 0
+
+# A pattern matched on its own shares its variables with an OPTIONAL MATCH group after it
+statement ok
+CREATE TABLE split_opt AS FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person),
+    q = ALL CHEAPEST (b)-[f:Link COST f.d]->{1,3}(c:Person) OPTIONAL MATCH (c)-[h:Link]->(d:Person) WHERE a.id = 0
+    COLUMNS (a.id AS a, b.id AS b, c.id AS c, d.id AS d, COST(q) AS cq));
+
+statement ok
+CREATE TABLE split_opt_ref AS SELECT r.a, r.b, r.c, l.dst AS d, r.cq FROM (SELECT * FROM two_ref WHERE a = 0) r
+LEFT JOIN link l ON l.src = r.c;
+
+query II
+SELECT (SELECT count(*) FROM (FROM split_opt EXCEPT ALL FROM split_opt_ref)), (SELECT count(*) FROM (FROM split_opt_ref EXCEPT ALL FROM split_opt));
+----
+0	0

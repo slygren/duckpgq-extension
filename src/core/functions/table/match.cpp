@@ -6250,7 +6250,10 @@ void PGQMatchFunction::AddOptionalGroupJoin(ClientContext &context, MatchExpress
                                             case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &opt_alias_map,
                                             CreatePropertyGraphInfo &pg_table, int32_t &extra_alias_counter,
                                             const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &mandatory_alias_map,
-                                            const ParsedExpression *where_hint) {
+                                            const ParsedExpression *where_hint, bool optional) {
+	// optional = false: a mandatory pattern matched on its own (MatchExpression::joined_patterns), joined rather than
+	// left-joined; every vertex it binds is rejoined (a later pattern or group may share it), and the MATCH WHERE's
+	// predicates on any one of its vertices seed it.
 	auto bound_table = [&](const string &binding) -> shared_ptr<PropertyGraphTable> {
 		auto entry = mandatory_alias_map.find(binding);
 		if (entry != mandatory_alias_map.end()) {
@@ -6373,7 +6376,7 @@ void PGQMatchFunction::AddOptionalGroupJoin(ClientContext &context, MatchExpress
 		const auto match_type = binding_types[binding];
 		if (!shared) {
 			const bool read = referenced.find(binding) != referenced.end() ||
-			                  (all_vertices && match_type == PGQMatchType::MATCH_VERTEX);
+			                  ((all_vertices || !optional) && match_type == PGQMatchType::MATCH_VERTEX);
 			if (!read) {
 				continue;
 			}
@@ -6393,7 +6396,7 @@ void PGQMatchFunction::AddOptionalGroupJoin(ClientContext &context, MatchExpress
 			direction->SetAlias(Identifier(column + "_dir"));
 			inner->column_list.push_back(std::move(direction));
 		}
-		if (shared && where_hint) {
+		if ((shared || (!optional && match_type == PGQMatchType::MATCH_VERTEX)) && where_hint) {
 			auto seed = ExtractSrcFilter(*where_hint, binding);
 			if (seed) {
 				seeds.push_back(std::move(seed));
@@ -6426,7 +6429,7 @@ void PGQMatchFunction::AddOptionalGroupJoin(ClientContext &context, MatchExpress
 		}
 	}
 	auto join = make_uniq<JoinRef>(JoinRefType::REGULAR);
-	join->type = JoinType::LEFT;
+	join->type = optional ? JoinType::LEFT : JoinType::INNER;
 	join->left = std::move(select_node->from_table);
 	join->right = std::move(sub);
 	join->condition = on_conditions.empty() ? ConstantExpression::FromValue(Value::BOOLEAN(true))
@@ -11298,7 +11301,13 @@ static void PrepareCheapest(MatchExpression &match, bool shared_union_columns) {
 	bool needs_path_cte = false;
 	idx_t variable_length = 0;
 	bool constant_cost_search = false;
+	bool different_searches = false;
+	// The patterns that search by cost (or over constant costs) with a CSR or path CTE of their own: split off into
+	// MATCHes of their own when the block cannot hold them all.
+	vector<bool> searching(match.path_patterns.size(), false);
+	idx_t pattern_index = 0;
 	for (auto &pattern : match.path_patterns) {
+		const idx_t this_pattern = pattern_index++;
 		string path_variable;
 		auto &elements = PatternPath(*pattern, path_variable);
 		variable_length += PatternHasVariableLength(pattern->path_elements) ? 1 : 0;
@@ -11339,7 +11348,10 @@ static void PrepareCheapest(MatchExpression &match, bool shared_union_columns) {
 				                              "the costed edge",
 				                              path_variable);
 			}
-			constant_cost_search = constant_cost_search || ConstantCostSearch(*edge, match.one_row_per);
+			if (ConstantCostSearch(*edge, match.one_row_per)) {
+				constant_cost_search = true;
+				searching[this_pattern] = true;
+			}
 		} else {
 			if (!edge) {
 				throw NotImplementedException("ANY / ALL CHEAPEST with a COST that is not the same positive constant on "
@@ -11372,13 +11384,10 @@ static void PrepareCheapest(MatchExpression &match, bool shared_union_columns) {
 			                                                         edge_element->variable_binding, "__pgq_edge")
 			                                           ->ToString()
 			                                     : string());
-			if (searches > 0 && signature != search_signature) {
-				throw NotImplementedException("Several CHEAPEST patterns in one MATCH block must search the same edge "
-				                              "label, bounds and COST; put %s in a GRAPH_TABLE of its own",
-				                              path_variable.empty() ? string("one of them") : path_variable);
-			}
+			different_searches = different_searches || (searches > 0 && signature != search_signature);
 			search_signature = signature;
 			searches++;
+			searching[this_pattern] = true;
 			// The search by cost (any direction but -> without an upper bound, a lower bound above 1 without one, an
 			// element WHERE) always materialises its paths.
 			const bool searched_by_cost =
@@ -11415,11 +11424,31 @@ static void PrepareCheapest(MatchExpression &match, bool shared_union_columns) {
 		}
 	}
 	// A cost search shares the block's CSR with every other variable-length pattern, and a path CTE is one per block.
-	if ((searches > 0 && variable_length > searches) || (searches > 1 && needs_path_cte) ||
+	// Patterns over the same edges and COST asking for nothing but COST(p) share one search; otherwise the searching
+	// patterns are matched each as a MATCH of its own, joined onto the others on the variables they share
+	// (BuildMatchRef), as several path patterns of one MATCH are: selected each on its own, then joined.
+	if (different_searches || (searches > 0 && variable_length > searches) || (searches > 1 && needs_path_cte) ||
 	    (constant_cost_search && variable_length > costed_paths.size())) {
-		throw NotImplementedException("A CHEAPEST pattern searched by cost must be the only variable-length pattern of "
-		                              "its MATCH block (or all of them must be ANY CHEAPEST over the same edges and "
-		                              "COST, with nothing but COST(p)); put the others in a GRAPH_TABLE of their own");
+		if (match.one_row_per != OneRowPerMode::NONE) {
+			throw NotImplementedException("ONE ROW PER with a CHEAPEST pattern next to other variable-length patterns "
+			                              "is not supported; put the others in a GRAPH_TABLE of their own");
+		}
+		idx_t split = 0;
+		for (idx_t i = 0; i < searching.size(); i++) {
+			split += searching[i] ? 1 : 0;
+		}
+		// At least one pattern stays: the first searching one when all of them search.
+		bool keep_first = split == match.path_patterns.size();
+		vector<unique_ptr<PathPattern>> kept;
+		for (idx_t i = 0; i < match.path_patterns.size(); i++) {
+			if (searching[i] && !keep_first) {
+				match.joined_patterns.push_back(std::move(match.path_patterns[i]));
+			} else {
+				kept.push_back(std::move(match.path_patterns[i]));
+				keep_first = keep_first && !searching[i];
+			}
+		}
+		match.path_patterns = std::move(kept);
 	}
 }
 
@@ -13630,8 +13659,15 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 		}
 	}
 
-	// Process OPTIONAL MATCH groups — each group becomes a chain of LEFT JOINs.
+	// Process OPTIONAL MATCH groups — each group becomes a chain of LEFT JOINs. First the patterns matched on their
+	// own (MatchExpression::joined_patterns), joined: the groups may share their variables.
 	case_insensitive_map_t<shared_ptr<PropertyGraphTable>> optional_alias_map;
+	for (auto &joined : ref->joined_patterns) {
+		vector<unique_ptr<PathPattern>> group;
+		group.push_back(joined->Copy());
+		AddOptionalGroupJoin(context, *ref, group, final_select_node, optional_alias_map, *pg_table, extra_alias_counter,
+		                     alias_map, ref->where_clause.get(), false);
+	}
 	for (auto &opt_group : ref->optional_match_patterns) {
 		if (OptionalGroupNeedsJoin(opt_group, DisableABIRewrite(context) ? nullptr : &path_table_cache)) {
 			AddOptionalGroupJoin(context, *ref, opt_group, final_select_node, optional_alias_map, *pg_table,
@@ -13844,6 +13880,13 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 		}
 
 		case_insensitive_map_t<shared_ptr<PropertyGraphTable>> branch_opt_alias_map;
+		for (auto &joined : branch.joined_patterns) {
+			vector<unique_ptr<PathPattern>> group;
+			group.push_back(joined->Copy());
+			AddOptionalGroupJoin(context, branch.column_list.empty() ? *ref : branch, group, branch_select,
+			                     branch_opt_alias_map, *pg_table, branch_counter, branch_alias_map,
+			                     branch.where_clause.get(), false);
+		}
 		for (auto &opt_group : branch.optional_match_patterns) {
 			if (OptionalGroupNeedsJoin(opt_group, DisableABIRewrite(context) ? nullptr : &path_table_cache)) {
 				// The branch's own COLUMNS decide what of the group is read (the head's when the COLUMNS are shared).
