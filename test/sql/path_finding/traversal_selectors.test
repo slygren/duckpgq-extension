@@ -635,6 +635,72 @@ SELECT (SELECT count(*) FROM (SELECT a, b, x, y FROM GRAPH_TABLE (g MATCH ALL SH
 ----
 true	0	0
 
+# TRAIL, ACYCLIC and SIMPLE restrict nothing further: every path here already visits no vertex twice. They used to
+# keep the pattern off the artifact routes, and ONE ROW PER with a mode on an unnamed pattern failed to find its
+# quantified element. A seed given as a scalar subquery reaches the traversal (it used to search from every vertex).
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = TRAIL (a:P)-[:K]->{1,3}(b:P) WHERE a.id = (SELECT 1) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))) = (SELECT count(*) FROM (SELECT src, cur, depth FROM ref_paths WHERE dir = '->' AND src = 1)),
+    (SELECT count(*) FROM ((SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = TRAIL (a:P)-[:K]->{1,3}(b:P) WHERE a.id = (SELECT 1) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l))) EXCEPT ALL (SELECT src, cur, depth FROM ref_paths WHERE dir = '->' AND src = 1))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth FROM ref_paths WHERE dir = '->' AND src = 1) EXCEPT ALL (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = TRAIL (a:P)-[:K]->{1,3}(b:P) WHERE a.id = (SELECT 1) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST TRAIL (a:P)-[:K]->{1,3}(b:P) WHERE a.id = (SELECT 1) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))) = (SELECT count(*) FROM (SELECT src, cur, min(depth) FROM ref_paths WHERE dir = '->' AND src = 1 GROUP BY ALL)),
+    (SELECT count(*) FROM ((SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST TRAIL (a:P)-[:K]->{1,3}(b:P) WHERE a.id = (SELECT 1) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l))) EXCEPT ALL (SELECT src, cur, min(depth) FROM ref_paths WHERE dir = '->' AND src = 1 GROUP BY ALL))),
+    (SELECT count(*) FROM ((SELECT src, cur, min(depth) FROM ref_paths WHERE dir = '->' AND src = 1 GROUP BY ALL) EXCEPT ALL (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST TRAIL (a:P)-[:K]->{1,3}(b:P) WHERE a.id = (SELECT 1) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, v FROM GRAPH_TABLE (g MATCH TRAIL (a:P)-[:K]->{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)))) = (SELECT count(*) FROM (SELECT src, cur, unnest(path) FROM ref_paths WHERE dir = '->' AND src = 1)),
+    (SELECT count(*) FROM ((SELECT a, b, v FROM GRAPH_TABLE (g MATCH TRAIL (a:P)-[:K]->{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v))) EXCEPT ALL (SELECT src, cur, unnest(path) FROM ref_paths WHERE dir = '->' AND src = 1))),
+    (SELECT count(*) FROM ((SELECT src, cur, unnest(path) FROM ref_paths WHERE dir = '->' AND src = 1) EXCEPT ALL (SELECT a, b, v FROM GRAPH_TABLE (g MATCH TRAIL (a:P)-[:K]->{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ACYCLIC (a:P)-[:K]->{1,3}(b:P) WHERE a.id = (SELECT 1) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))) = (SELECT count(*) FROM (SELECT src, cur, depth FROM ref_paths WHERE dir = '->' AND src = 1)),
+    (SELECT count(*) FROM ((SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ACYCLIC (a:P)-[:K]->{1,3}(b:P) WHERE a.id = (SELECT 1) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l))) EXCEPT ALL (SELECT src, cur, depth FROM ref_paths WHERE dir = '->' AND src = 1))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth FROM ref_paths WHERE dir = '->' AND src = 1) EXCEPT ALL (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ACYCLIC (a:P)-[:K]->{1,3}(b:P) WHERE a.id = (SELECT 1) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST ACYCLIC (a:P)-[:K]->{1,3}(b:P) WHERE a.id = (SELECT 1) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))) = (SELECT count(*) FROM (SELECT src, cur, min(depth) FROM ref_paths WHERE dir = '->' AND src = 1 GROUP BY ALL)),
+    (SELECT count(*) FROM ((SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST ACYCLIC (a:P)-[:K]->{1,3}(b:P) WHERE a.id = (SELECT 1) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l))) EXCEPT ALL (SELECT src, cur, min(depth) FROM ref_paths WHERE dir = '->' AND src = 1 GROUP BY ALL))),
+    (SELECT count(*) FROM ((SELECT src, cur, min(depth) FROM ref_paths WHERE dir = '->' AND src = 1 GROUP BY ALL) EXCEPT ALL (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST ACYCLIC (a:P)-[:K]->{1,3}(b:P) WHERE a.id = (SELECT 1) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, v FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)-[:K]->{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)))) = (SELECT count(*) FROM (SELECT src, cur, unnest(path) FROM ref_paths WHERE dir = '->' AND src = 1)),
+    (SELECT count(*) FROM ((SELECT a, b, v FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)-[:K]->{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v))) EXCEPT ALL (SELECT src, cur, unnest(path) FROM ref_paths WHERE dir = '->' AND src = 1))),
+    (SELECT count(*) FROM ((SELECT src, cur, unnest(path) FROM ref_paths WHERE dir = '->' AND src = 1) EXCEPT ALL (SELECT a, b, v FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)-[:K]->{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = SIMPLE (a:P)-[:K]->{1,3}(b:P) WHERE a.id = (SELECT 1) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))) = (SELECT count(*) FROM (SELECT src, cur, depth FROM ref_paths WHERE dir = '->' AND src = 1)),
+    (SELECT count(*) FROM ((SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = SIMPLE (a:P)-[:K]->{1,3}(b:P) WHERE a.id = (SELECT 1) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l))) EXCEPT ALL (SELECT src, cur, depth FROM ref_paths WHERE dir = '->' AND src = 1))),
+    (SELECT count(*) FROM ((SELECT src, cur, depth FROM ref_paths WHERE dir = '->' AND src = 1) EXCEPT ALL (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = SIMPLE (a:P)-[:K]->{1,3}(b:P) WHERE a.id = (SELECT 1) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST SIMPLE (a:P)-[:K]->{1,3}(b:P) WHERE a.id = (SELECT 1) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))) = (SELECT count(*) FROM (SELECT src, cur, min(depth) FROM ref_paths WHERE dir = '->' AND src = 1 GROUP BY ALL)),
+    (SELECT count(*) FROM ((SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST SIMPLE (a:P)-[:K]->{1,3}(b:P) WHERE a.id = (SELECT 1) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l))) EXCEPT ALL (SELECT src, cur, min(depth) FROM ref_paths WHERE dir = '->' AND src = 1 GROUP BY ALL))),
+    (SELECT count(*) FROM ((SELECT src, cur, min(depth) FROM ref_paths WHERE dir = '->' AND src = 1 GROUP BY ALL) EXCEPT ALL (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST SIMPLE (a:P)-[:K]->{1,3}(b:P) WHERE a.id = (SELECT 1) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))));
+----
+true	0	0
+
+query III
+SELECT (SELECT count(*) FROM (SELECT a, b, v FROM GRAPH_TABLE (g MATCH SIMPLE (a:P)-[:K]->{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)))) = (SELECT count(*) FROM (SELECT src, cur, unnest(path) FROM ref_paths WHERE dir = '->' AND src = 1)),
+    (SELECT count(*) FROM ((SELECT a, b, v FROM GRAPH_TABLE (g MATCH SIMPLE (a:P)-[:K]->{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v))) EXCEPT ALL (SELECT src, cur, unnest(path) FROM ref_paths WHERE dir = '->' AND src = 1))),
+    (SELECT count(*) FROM ((SELECT src, cur, unnest(path) FROM ref_paths WHERE dir = '->' AND src = 1) EXCEPT ALL (SELECT a, b, v FROM GRAPH_TABLE (g MATCH SIMPLE (a:P)-[:K]->{1,3}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v)))));
+----
+true	0	0
+
 # A statement with several CSR traversals (here three, on the CSR route: ANY SHORTEST named paths from depth
 # 1). Each builds its own CSR; the path functions used to read the registry without its lock while another
 # CSR of the statement was being inserted, and failed intermittently with "Invalid ID".

@@ -1674,13 +1674,19 @@ static unique_ptr<ParsedExpression> ExtractSafeCTEConjuncts(const ParsedExpressi
 }
 
 // Return true if expr references ONLY the given binding (as qualified table.column) and constants.
-// Unqualified column refs and subqueries are rejected; returning false means "do not push."
+// Unqualified column refs and correlated (non-scalar) subqueries are rejected; returning false means "do not push."
 static bool ExprOnlyReferencesSingleBinding(const ParsedExpression &expr, const string &binding) {
 	auto *col = dynamic_cast<const ColumnRefExpression *>(&expr);
 	if (col) {
 		return col->ColumnNames().size() >= 2 && col->ColumnNames()[0] == binding;
 	}
 	if (dynamic_cast<const ConstantExpression *>(&expr)) return true;
+	// A scalar subquery is a value, like a constant -- the same assumption every artifact route's pushdown makes
+	// (IsPathPushdownValue): `child.key = (SELECT ...)` is how a seeded traversal is usually written, and without
+	// it the seed never reached the traversal, which then searched from every vertex.
+	if (auto *subquery = dynamic_cast<const SubqueryExpression *>(&expr)) {
+		return subquery->GetSubqueryType() == SubqueryType::SCALAR;
+	}
 	// A CAST around the column is transparent here: the contract is "references this binding
 	// and nothing else", which a cast of a qualified column still satisfies. Leaving it out
 	// made the product's own filter form invisible to every pushdown on this path -- the
@@ -2862,6 +2868,21 @@ unique_ptr<ParsedExpression> PGQMatchFunction::CreatePathFindingFunction(
 			if (edge_subpath->upper > 1) {
 				// (un)bounded shortest path
 				// Add the shortest path UDF as a CTE
+				// The source's own predicates, from its element WHERE and the MATCH WHERE: they seed the path
+				// search, which otherwise starts from every source vertex.
+				unique_ptr<ParsedExpression> source_filter;
+				if (previous_vertex_subpath && previous_vertex_subpath->where_clause) {
+					source_filter = previous_vertex_subpath->where_clause->Copy();
+				}
+				if (where_hint) {
+					auto hinted = ExtractSrcFilter(*where_hint, previous_vertex_element->variable_binding);
+					if (hinted) {
+						source_filter = source_filter ? make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND,
+						                                                                  std::move(source_filter),
+						                                                                  std::move(hinted))
+						                              : std::move(hinted);
+					}
+				}
 				if (previous_vertex_subpath) {
 					path_finding_conditions.push_back(std::move(previous_vertex_subpath->where_clause));
 				}
@@ -2885,21 +2906,21 @@ unique_ptr<ParsedExpression> PGQMatchFunction::CreatePathFindingFunction(
 				       edge_element->match_type == PGQMatchType::MATCH_EDGE_ANY)) ||
 				     (selector == PGQPathSelector::ALL_SHORTEST &&
 				      edge_element->match_type == PGQMatchType::MATCH_EDGE_RIGHT));
-				const bool enumerate = edge_subpath->upper < static_cast<int64_t>(1 << 30) && !csr_exact &&
+				// A seeded bounded search enumerates too: it reads only what is reachable from the seed, where the
+				// CSR is built from the whole edge table and searched from every source the predicate admits.
+				const bool enumerate = edge_subpath->upper < static_cast<int64_t>(1 << 30) &&
+				                       (!csr_exact || source_filter) &&
 				                       edge_element->match_type != PGQMatchType::MATCH_EDGE_LEFT_RIGHT;
 				if (enumerate) {
 					// The element predicates hold for the endpoint bindings in the outer query; the source's also
-					// seeds the enumeration so it starts from matching vertices only.
-					unique_ptr<ParsedExpression> anchor_filter;
+					// seed the enumeration so it starts from matching vertices only.
+					unique_ptr<ParsedExpression> anchor_filter = std::move(source_filter);
 					for (auto &cond : path_finding_conditions) {
 						if (cond) {
 							conditions.push_back(std::move(cond));
 						}
 					}
 					path_finding_conditions.clear();
-					if (where_hint) {
-						anchor_filter = ExtractSrcFilter(*where_hint, previous_vertex_element->variable_binding);
-					}
 					if (final_select_node->cte_map.map.find(Identifier("shortest_path_cte")) ==
 					    final_select_node->cte_map.map.end()) {
 						AddBoundedORPRecursiveCTE(final_select_node, previous_vertex_element->variable_binding,
@@ -2965,6 +2986,18 @@ unique_ptr<ParsedExpression> PGQMatchFunction::CreatePathFindingFunction(
 				string shortest_path_cte_name = "shortest_path_cte";
 				if (final_select_node->cte_map.map.find(Identifier(shortest_path_cte_name)) ==
 				    final_select_node->cte_map.map.end()) {
+					// The CTE pairs every source with every destination: the MATCH WHERE's predicates on either end
+					// belong inside it, or it searches paths for vertices the query then discards.
+					if (where_hint) {
+						auto hinted = ExtractSrcFilter(*where_hint, previous_vertex_element->variable_binding);
+						if (hinted) {
+							path_finding_conditions.push_back(std::move(hinted));
+						}
+						auto dst_hinted = ExtractSrcFilter(*where_hint, next_vertex_element->variable_binding);
+						if (dst_hinted) {
+							path_finding_conditions.push_back(std::move(dst_hinted));
+						}
+					}
 					final_select_node->cte_map.map[Identifier(shortest_path_cte_name)] = GenerateShortestPathCTE(
 					    pg_table, edge_subpath, previous_vertex_element, next_vertex_element, path_finding_conditions,
 					    csr_slot.slot, all_shortest);
@@ -6028,16 +6061,18 @@ private:
 	CreatePropertyGraphInfo &pg_table;
 };
 
-// A path mode (TRAIL, ACYCLIC, ...) or a COST on any element changes which paths match; the
-// artifact routes implement neither, so such patterns are left to the traversal.
-static bool PatternHasPathModeOrCost(const vector<unique_ptr<PathReference>> &path_list) {
+// A COST on any element changes which paths match (CHEAPEST is chosen by it); the artifact routes have no
+// costs, so such patterns are left to the traversal. Path modes do not count: every match here is already a
+// path that visits no vertex twice -- the traversal enumerates exactly those, and filters the shortest paths it
+// finds by the mode -- which is ACYCLIC and therefore also TRAIL and SIMPLE. TRAIL, ACYCLIC and SIMPLE restrict
+// nothing further, so the artifact routes answer them exactly as they answer the pattern without a mode.
+static bool PatternHasCost(const vector<unique_ptr<PathReference>> &path_list) {
 	for (const auto &reference : path_list) {
 		if (reference->path_reference_type != PGQPathReferenceType::SUBPATH) {
 			continue;
 		}
 		auto &subpath = reinterpret_cast<const SubPath &>(*reference);
-		if ((subpath.path_mode != PGQPathMode::NONE && subpath.path_mode != PGQPathMode::WALK) || subpath.cost_expr ||
-		    PatternHasPathModeOrCost(subpath.path_list)) {
+		if (subpath.cost_expr || PatternHasCost(subpath.path_list)) {
 			return true;
 		}
 	}
@@ -6505,7 +6540,10 @@ static vector<unique_ptr<PathReference>> *GetRewritePathElements(vector<unique_p
 	if (path_elements.size() == 1 &&
 	    path_elements[0]->path_reference_type == PGQPathReferenceType::SUBPATH) {
 		auto *outer_subpath = reinterpret_cast<SubPath *>(path_elements[0].get());
-		if (!outer_subpath->path_variable.empty() && outer_subpath->path_list.size() > 1) {
+		// A named path, or an unnamed one wrapped only to carry a path mode (MATCH TRAIL (a)-...): both are the
+		// pattern itself. A quantified group is not.
+		const bool plain_wrapper = outer_subpath->lower == 1 && outer_subpath->upper == 1;
+		if ((!outer_subpath->path_variable.empty() || plain_wrapper) && outer_subpath->path_list.size() > 1) {
 			path_variable = outer_subpath->path_variable;
 			return &outer_subpath->path_list;
 		}
@@ -6519,7 +6557,10 @@ GetRewritePathElements(const vector<unique_ptr<PathReference>> &path_elements, s
 	if (path_elements.size() == 1 &&
 	    path_elements[0]->path_reference_type == PGQPathReferenceType::SUBPATH) {
 		auto *outer_subpath = reinterpret_cast<const SubPath *>(path_elements[0].get());
-		if (!outer_subpath->path_variable.empty() && outer_subpath->path_list.size() > 1) {
+		// A named path, or an unnamed one wrapped only to carry a path mode (MATCH TRAIL (a)-...): both are the
+		// pattern itself. A quantified group is not.
+		const bool plain_wrapper = outer_subpath->lower == 1 && outer_subpath->upper == 1;
+		if ((!outer_subpath->path_variable.empty() || plain_wrapper) && outer_subpath->path_list.size() > 1) {
 			path_variable = outer_subpath->path_variable;
 			return &outer_subpath->path_list;
 		}
@@ -8675,11 +8716,11 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 					return false;
 				}
 				// The closures answer neither CHEAPEST nor a zero lower bound (they hold no empty
-				// path), implement no path mode or COST, and have no column for edges(p): those go
-				// to the expansion or the traversal.
+				// path), carry no COST, and have no column for edges(p): those go to the expansion or
+				// the traversal.
 				const bool closure_shape =
 				    selector != PGQPathSelector::CHEAPEST && tc_sp->lower >= 1 &&
-				    !PatternHasPathModeOrCost(path_elements) &&
+				    !PatternHasCost(path_elements) &&
 				    !HasUnprovidedPathFunction(match_ref, named_path_variable,
 				                               {"path_length", "vertices", "vertex_labels", "edge_labels"});
 				if (closure_shape) {
@@ -8998,12 +9039,11 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 		if ((*rewrite_path_elements)[1]->path_reference_type == PGQPathReferenceType::SUBPATH) {
 			ctx_sp = reinterpret_cast<SubPath *>((*rewrite_path_elements)[1].get());
 		}
-		// No CHEAPEST, no empty path (lower bound 0), no path mode or COST: the expansion
-		// implements none of them.
+		// No CHEAPEST, no empty path (lower bound 0), no COST: the expansion implements none of them.
 		if (ctx_src && ctx_dst && ctx_sp && ctx_sp->path_list.size() == 1 &&
 		    !ctx_src->variable_binding.empty() && !ctx_src->label.empty() &&
 		    !IsCompoundLabel(ctx_src->label) && selector != PGQPathSelector::CHEAPEST && ctx_sp->lower >= 1 &&
-		    !PatternHasPathModeOrCost(path_elements) &&
+		    !PatternHasCost(path_elements) &&
 		    !HasUnprovidedPathFunction(match_ref, named_path_variable,
 		                               {"path_length", "vertices", "vertex_labels", "edge_labels",
 		                                "vertex_properties"})) {
