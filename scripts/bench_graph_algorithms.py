@@ -32,9 +32,13 @@ CALLS = {
     "k_core": "SELECT count(*), max(core_number) FROM k_core('g', 'v', 'e')",
     "degree": "SELECT count(*), sum(degree) FROM degree('g', 'v', 'e')",
     "shortest_path_lengths": "SELECT count(*), max(distance) FROM shortest_path_lengths('g', 'v', 'e', 0)",
+    # Path finding over the same CSR code (the vertex-count change touches it).
+    "path_any_shortest_1_3": "SELECT count(*), sum(len) FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:v WHERE a.id = 0)"
+                             "-[x:e]->{1,3}(b:v) COLUMNS (path_length(p) AS len))",
 }
-# Functions an older build has too (for --compare-extension).
-OLD = {"pagerank", "weakly_connected_component", "local_clustering_coefficient"}
+# Calls an older build can answer too (for --compare-*).
+OLD_ALGORITHMS = {"pagerank", "weakly_connected_component", "local_clustering_coefficient"}
+OLD_PATHS = {"path_any_shortest_1_3"}
 
 
 def run(duckdb, db, extension, threads, sql, timeout=None):
@@ -79,8 +83,9 @@ def main():
     ap.add_argument("--duckdb", default=os.path.join(here, "..", "build", "release", "duckdb"))
     ap.add_argument("--extension", default=os.path.join(here, "..", "build", "release", "extension", "duckpgq",
                                                         "duckpgq.duckdb_extension"))
-    ap.add_argument("--compare-extension", default=None)
+    ap.add_argument("--compare-extension", default=None, help="baseline build for pagerank / WCC / LCC")
     ap.add_argument("--compare-duckdb", default=None)
+    ap.add_argument("--compare-path-extension", default=None, help="baseline build for the path queries")
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--only", default=",".join(CALLS))
@@ -98,26 +103,41 @@ def main():
     print(f"graph: {args.vertices} vertices, {edges} edges; threads = {args.threads}")
     print(f"{'baseline (scan)':34s} {wall:8.2f} s  {rss / 2**20:8.0f} MiB")
 
-    def measure(duckdb, ext, name, sql):
-        walls, peak, result, errors = [], 0, "", []
-        for _ in range(args.runs):
-            w, r, o, e = run(duckdb, db, ext, args.threads, graph + sql)
-            walls.append(w)
-            peak = max(peak, r)
-            result, errors = o, e
-        return statistics.median(walls), peak, result, errors
+    def baseline(name):
+        if args.compare_extension and name in OLD_ALGORITHMS:
+            return args.compare_duckdb or args.duckdb, os.path.abspath(args.compare_extension)
+        if args.compare_path_extension and name in OLD_PATHS:
+            return args.duckdb, os.path.abspath(args.compare_path_extension)
+        return None
 
+    def show(label, walls, peak, result, errors):
+        print(f"{label:34s} {statistics.median(walls):8.2f} s  {peak / 2**20:8.0f} MiB   {result} {' '.join(errors)}"
+              f"   runs: {' '.join('%.2f' % w for w in walls)}", flush=True)
+
+    print("uptime at start:", subprocess.run(["uptime"], capture_output=True, text=True).stdout.strip(), flush=True)
     only = args.only.split(",")
     for name in only:
-        sql = CALLS[name]
-        w, r, o, e = measure(args.duckdb, extension, name, sql)
-        print(f"{name:34s} {w:8.2f} s  {r / 2**20:8.0f} MiB   {o} {' '.join(e)}", flush=True)
-        if args.compare_extension and name in OLD:
-            w, r, o, e = measure(args.compare_duckdb or args.duckdb, os.path.abspath(args.compare_extension), name, sql)
-            print(f"{'  (compare build)':34s} {w:8.2f} s  {r / 2**20:8.0f} MiB   {o} {' '.join(e)}", flush=True)
+        sql = graph + CALLS[name]
+        base = baseline(name)
+        # This build and the baseline alternate run by run, so load from elsewhere hits both alike.
+        mine, theirs = ([], 0, "", []), ([], 0, "", [])
+        for _ in range(args.runs):
+            for side, (duckdb, ext) in enumerate([(args.duckdb, extension)] + ([base] if base else [])):
+                w, r, o, e = run(duckdb, db, ext, args.threads, sql)
+                walls, peak, _, _ = mine if side == 0 else theirs
+                walls.append(w)
+                entry = (walls, max(peak, r), o, e)
+                if side == 0:
+                    mine = entry
+                else:
+                    theirs = entry
+        show(name, *mine)
+        if base:
+            show("  (baseline build)", *theirs)
+    print("uptime at end:  ", subprocess.run(["uptime"], capture_output=True, text=True).stdout.strip(), flush=True)
 
     print(f"\ncancellation: max_execution_time = {args.cancel_ms} ms")
-    for name in only:
+    for name in [n for n in only if n not in OLD_PATHS]:
         sql = f"SET max_execution_time = {args.cancel_ms};\n" + CALLS[name]
         w, _, o, e = run(args.duckdb, db, extension, args.threads, graph + sql)
         stopped = any("maximum execution time" in x for x in e)
