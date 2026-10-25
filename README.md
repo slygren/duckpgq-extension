@@ -272,6 +272,15 @@ So a closure answers:
   `CHEAPEST` the same as `SHORTEST`, and path modes (`TRAIL`, `ACYCLIC`, `SIMPLE`) restrict nothing here: every
   match already visits no vertex twice.
 
+An artifact holds only edges whose endpoints are vertices, as the traversal sees them (it joins both endpoints):
+`pgq_abi_build` reads every edge table through its vertex keys, so an edge with a key no vertex has (or NULL) is in no
+artifact, and records that as `endpoints_complete = true` in `__pgq_path_catalog` (the vertex tables count among the
+artifact's sources for freshness). A row without that proof (another builder, an older catalog) answers only once the
+binder has measured that its rows reach a vertex at every end -- the `v0 .. vk` of an edge or fixed_path artifact, the
+edge tables of a closure or branch summary -- once per process and lake state (`multiplicity_probe` rows `far_ends|…`
+and `complete|…`; an anti-join each). Where they do not, the pattern is traversed (refused under
+`pgq_require_abi_paths`), and a context expansion with such a family declines as a whole.
+
 Edge and fixed_path artifacts are `SELECT DISTINCT`, so an edge stored twice in its table is one artifact row.
 Where an answer counts matches (every fixed-length pattern, `OPTIONAL MATCH`, walks) such an artifact is used only
 when it lost nothing (`preserves_multiplicity`). `EXISTS` and `ANY SHORTEST` read it either way.

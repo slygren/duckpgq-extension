@@ -1,0 +1,900 @@
+# name: test/sql/path_finding/abi_endpoint_completeness.test
+# description: An ABI artifact never answers with an edge whose endpoint is no vertex. pgq_abi_build copied such edges
+#              into its artifacts (person(1,2), likes(1,2),(2,9): two rows from the edge artifact, one traversed); it
+#              now reads the edge tables through their vertex keys and records endpoints_complete. For a catalog
+#              without that proof (another builder, an older one) the binder measures the artifact's ends (or its edge
+#              tables) once, and traverses where they are incomplete. Every shape is compared with the traversal.
+# group: [path_finding]
+
+require duckpgq
+
+load __TEST_DIR__/abi_endpoint_completeness.db
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE Person(id BIGINT, name VARCHAR);
+
+statement ok
+INSERT INTO Person VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd');
+
+statement ok
+CREATE TABLE Tag(id BIGINT, name VARCHAR);
+
+statement ok
+INSERT INTO Tag VALUES (10, 't10'), (11, 't11');
+
+# Dangling: likes (2, 99), (9, 11), (NULL, 10); knows (2, 9), (9, 3), (3, NULL)
+statement ok
+CREATE TABLE likes(personId BIGINT, tagId BIGINT);
+
+statement ok
+INSERT INTO likes VALUES (1, 10), (2, 10), (2, 99), (9, 11), (NULL, 10), (3, 11);
+
+statement ok
+CREATE TABLE knows(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO knows VALUES (1, 2), (2, 3), (2, 9), (9, 3), (3, NULL), (3, 4);
+
+statement ok
+CREATE PROPERTY GRAPH g VERTEX TABLES (Person LABEL Person, Tag LABEL Tag)
+EDGE TABLES (likes SOURCE KEY (personId) REFERENCES Person (id) DESTINATION KEY (tagId) REFERENCES Tag (id) LABEL Likes,
+             knows SOURCE KEY (src) REFERENCES Person (id) DESTINATION KEY (dst) REFERENCES Person (id) LABEL Knows);
+
+# The reported repro, traversed
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+query II
+FROM GRAPH_TABLE (g MATCH (p:Person)-[:Likes]->(t:Tag) COLUMNS (p.id AS p, t.id AS t)) ORDER BY ALL;
+----
+1	10
+2	10
+3	11
+
+# =====================================================================================================================
+# A. pgq_abi_build: the artifacts hold the complete edges only, and say so
+# =====================================================================================================================
+statement ok
+SELECT count(*) FROM pgq_abi_build('g', exclude_self_referential := false, closures := ['Knows'],
+    branch_summaries := [{'anchor': 'Person', 'branches': ['Likes', 'Knows']}]);
+
+query I
+SELECT count(*) FROM graph.__pg_g__Person__Likes__Tag;
+----
+3
+
+query I
+SELECT count(*) FROM graph.__pg_g__Person__Knows__Person;
+----
+3
+
+query II
+SELECT count(*), bool_and(endpoints_complete) FROM graph.__pgq_path_catalog WHERE graph_name = 'g';
+----
+8	true
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+query II
+FROM GRAPH_TABLE (g MATCH (p:Person)-[:Likes]->(t:Tag) COLUMNS (p.id AS p, t.id AS t)) ORDER BY ALL;
+----
+1	10
+2	10
+3	11
+
+query I
+SELECT count(*) > 0 FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+true
+
+# branch summary counts only tags that exist
+query II
+SELECT likes_count, knows_count FROM graph.__pg_g__branch__Person__Likes__Knows WHERE v0 = 2;
+----
+1	1
+
+# A: edge, keys only
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (g MATCH (p:Person)-[:Likes]->(t:Tag) COLUMNS (p.id AS p, t.id AS t));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (g MATCH (p:Person)-[:Likes]->(t:Tag) COLUMNS (p.id AS p, t.id AS t));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+# A: edge, properties
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (g MATCH (p:Person)-[:Likes]->(t:Tag) COLUMNS (p.name AS p, t.name AS t));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (g MATCH (p:Person)-[:Likes]->(t:Tag) COLUMNS (p.name AS p, t.name AS t));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+# A: edge, reversed
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (g MATCH (t:Tag)<-[:Likes]-(p:Person) COLUMNS (p.id AS p, t.id AS t));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (g MATCH (t:Tag)<-[:Likes]-(p:Person) COLUMNS (p.id AS p, t.id AS t));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+# A: fixed path
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->(b:Person)-[:Likes]->(t:Tag) COLUMNS (a.id AS a, t.id AS t));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->(b:Person)-[:Likes]->(t:Tag) COLUMNS (a.id AS a, t.id AS t));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+# A: two knows hops
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->(b:Person)-[:Knows]->(c:Person) COLUMNS (a.id AS a, c.id AS c));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->(b:Person)-[:Knows]->(c:Person) COLUMNS (a.id AS a, c.id AS c));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+# A: closure ANY SHORTEST
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:Person)-[:Knows]->{1,3}(b:Person) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:Person)-[:Knows]->{1,3}(b:Person) COLUMNS (a.id AS a, b.id AS b));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+# A: closure ALL SHORTEST
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:Person)-[:Knows]->{1,3}(b:Person) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:Person)-[:Knows]->{1,3}(b:Person) COLUMNS (a.id AS a, b.id AS b));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+
+# A: EXISTS
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (g MATCH (a:Person) WHERE EXISTS { (a)-[:Likes]->(t:Tag) } COLUMNS (a.id AS a));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (g MATCH (a:Person) WHERE EXISTS { (a)-[:Likes]->(t:Tag) } COLUMNS (a.id AS a));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+# A: OPTIONAL hop
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (g MATCH (a:Person) OPTIONAL MATCH (a)-[:Likes]->(t:Tag) COLUMNS (a.id AS a, t.id AS t));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (g MATCH (a:Person) OPTIONAL MATCH (a)-[:Likes]->(t:Tag) COLUMNS (a.id AS a, t.id AS t));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+
+# =====================================================================================================================
+# B. A catalog without the proof whose artifacts hold edges to a vertex that is gone: measured, declined, traversed
+# =====================================================================================================================
+statement ok
+CREATE TABLE Person2 AS FROM Person;
+
+statement ok
+CREATE TABLE likes2 AS FROM likes;
+
+statement ok
+CREATE TABLE knows2 AS FROM knows;
+
+statement ok
+CREATE PROPERTY GRAPH h VERTEX TABLES (Person2 LABEL Person, Tag LABEL Tag)
+EDGE TABLES (likes2 SOURCE KEY (personId) REFERENCES Person2 (id) DESTINATION KEY (tagId) REFERENCES Tag (id) LABEL Likes,
+             knows2 SOURCE KEY (src) REFERENCES Person2 (id) DESTINATION KEY (dst) REFERENCES Person2 (id) LABEL Knows);
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('h', schema := 'abi_h', exclude_self_referential := false, closures := ['Knows'],
+    branch_summaries := [{'anchor': 'Person', 'branches': ['Likes', 'Knows']}]);
+
+# Person 3 is deleted after the build: every artifact over an edge of 3 now holds an edge the graph does not have.
+# The rows look like another builder's: no built_by, no endpoints_complete.
+statement ok
+DELETE FROM Person2 WHERE id = 3;
+
+statement ok
+UPDATE abi_h.__pgq_path_catalog SET built_by = NULL, endpoints_complete = NULL WHERE graph_name = 'h';
+
+# B: edge, keys only
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (h MATCH (p:Person)-[:Likes]->(t:Tag) COLUMNS (p.id AS p, t.id AS t));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (h MATCH (p:Person)-[:Likes]->(t:Tag) COLUMNS (p.id AS p, t.id AS t));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+# B: edge, properties
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (h MATCH (p:Person)-[:Likes]->(t:Tag) COLUMNS (p.name AS p, t.name AS t));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (h MATCH (p:Person)-[:Likes]->(t:Tag) COLUMNS (p.name AS p, t.name AS t));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+# B: edge, reversed
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (h MATCH (t:Tag)<-[:Likes]-(p:Person) COLUMNS (p.id AS p, t.id AS t));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (h MATCH (t:Tag)<-[:Likes]-(p:Person) COLUMNS (p.id AS p, t.id AS t));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+# B: fixed path
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (h MATCH (a:Person)-[:Knows]->(b:Person)-[:Likes]->(t:Tag) COLUMNS (a.id AS a, t.id AS t));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (h MATCH (a:Person)-[:Knows]->(b:Person)-[:Likes]->(t:Tag) COLUMNS (a.id AS a, t.id AS t));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+# B: two knows hops
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (h MATCH (a:Person)-[:Knows]->(b:Person)-[:Knows]->(c:Person) COLUMNS (a.id AS a, c.id AS c));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (h MATCH (a:Person)-[:Knows]->(b:Person)-[:Knows]->(c:Person) COLUMNS (a.id AS a, c.id AS c));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+# B: closure ANY SHORTEST
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (h MATCH ANY SHORTEST (a:Person)-[:Knows]->{1,3}(b:Person) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (h MATCH ANY SHORTEST (a:Person)-[:Knows]->{1,3}(b:Person) COLUMNS (a.id AS a, b.id AS b));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+# B: closure ALL SHORTEST
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (h MATCH ALL SHORTEST (a:Person)-[:Knows]->{1,3}(b:Person) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (h MATCH ALL SHORTEST (a:Person)-[:Knows]->{1,3}(b:Person) COLUMNS (a.id AS a, b.id AS b));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+
+# B: EXISTS
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (h MATCH (a:Person) WHERE EXISTS { (a)-[:Likes]->(t:Tag) } COLUMNS (a.id AS a));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (h MATCH (a:Person) WHERE EXISTS { (a)-[:Likes]->(t:Tag) } COLUMNS (a.id AS a));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+# B: OPTIONAL hop
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (h MATCH (a:Person) OPTIONAL MATCH (a)-[:Likes]->(t:Tag) COLUMNS (a.id AS a, t.id AS t));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (h MATCH (a:Person) OPTIONAL MATCH (a)-[:Likes]->(t:Tag) COLUMNS (a.id AS a, t.id AS t));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+# The measurement declined the edge artifact
+statement ok
+FROM GRAPH_TABLE (h MATCH (p:Person)-[:Likes]->(t:Tag) COLUMNS (p.id AS p, t.id AS t));
+
+query I
+SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+0
+
+# =====================================================================================================================
+# C. A catalog without the proof over complete data: measured once, and the artifacts still answer
+# =====================================================================================================================
+statement ok
+CREATE TABLE likes3 AS SELECT * FROM likes WHERE personId IN (SELECT id FROM Person) AND tagId IN (SELECT id FROM Tag);
+
+statement ok
+CREATE TABLE knows3 AS SELECT * FROM knows WHERE src IN (SELECT id FROM Person) AND dst IN (SELECT id FROM Person);
+
+statement ok
+CREATE PROPERTY GRAPH c VERTEX TABLES (Person LABEL Person, Tag LABEL Tag)
+EDGE TABLES (likes3 SOURCE KEY (personId) REFERENCES Person (id) DESTINATION KEY (tagId) REFERENCES Tag (id) LABEL Likes,
+             knows3 SOURCE KEY (src) REFERENCES Person (id) DESTINATION KEY (dst) REFERENCES Person (id) LABEL Knows);
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('c', schema := 'abi_c', exclude_self_referential := false, closures := ['Knows']);
+
+statement ok
+UPDATE abi_c.__pgq_path_catalog SET built_by = NULL, endpoints_complete = false WHERE graph_name = 'c';
+
+statement ok
+FROM GRAPH_TABLE (c MATCH (p:Person)-[:Likes]->(t:Tag) COLUMNS (p.id AS p, t.id AS t));
+
+query II
+SELECT (SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected') > 0,
+       (SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE rewrite_type = 'multiplicity_probe' AND reason LIKE 'far_ends|%' AND status = 'exact') > 0;
+----
+true	true
+
+# C: edge, keys only
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (c MATCH (p:Person)-[:Likes]->(t:Tag) COLUMNS (p.id AS p, t.id AS t));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (c MATCH (p:Person)-[:Likes]->(t:Tag) COLUMNS (p.id AS p, t.id AS t));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+# C: edge, properties
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (c MATCH (p:Person)-[:Likes]->(t:Tag) COLUMNS (p.name AS p, t.name AS t));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (c MATCH (p:Person)-[:Likes]->(t:Tag) COLUMNS (p.name AS p, t.name AS t));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+# C: edge, reversed
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (c MATCH (t:Tag)<-[:Likes]-(p:Person) COLUMNS (p.id AS p, t.id AS t));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (c MATCH (t:Tag)<-[:Likes]-(p:Person) COLUMNS (p.id AS p, t.id AS t));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+# C: fixed path
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (c MATCH (a:Person)-[:Knows]->(b:Person)-[:Likes]->(t:Tag) COLUMNS (a.id AS a, t.id AS t));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (c MATCH (a:Person)-[:Knows]->(b:Person)-[:Likes]->(t:Tag) COLUMNS (a.id AS a, t.id AS t));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+# C: two knows hops
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (c MATCH (a:Person)-[:Knows]->(b:Person)-[:Knows]->(c:Person) COLUMNS (a.id AS a, c.id AS c));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (c MATCH (a:Person)-[:Knows]->(b:Person)-[:Knows]->(c:Person) COLUMNS (a.id AS a, c.id AS c));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+# C: closure ANY SHORTEST
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (c MATCH ANY SHORTEST (a:Person)-[:Knows]->{1,3}(b:Person) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (c MATCH ANY SHORTEST (a:Person)-[:Knows]->{1,3}(b:Person) COLUMNS (a.id AS a, b.id AS b));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+# C: closure ALL SHORTEST
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (c MATCH ALL SHORTEST (a:Person)-[:Knows]->{1,3}(b:Person) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (c MATCH ALL SHORTEST (a:Person)-[:Knows]->{1,3}(b:Person) COLUMNS (a.id AS a, b.id AS b));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+
+# C: EXISTS
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (c MATCH (a:Person) WHERE EXISTS { (a)-[:Likes]->(t:Tag) } COLUMNS (a.id AS a));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (c MATCH (a:Person) WHERE EXISTS { (a)-[:Likes]->(t:Tag) } COLUMNS (a.id AS a));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+# C: OPTIONAL hop
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (c MATCH (a:Person) OPTIONAL MATCH (a)-[:Likes]->(t:Tag) COLUMNS (a.id AS a, t.id AS t));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (c MATCH (a:Person) OPTIONAL MATCH (a)-[:Likes]->(t:Tag) COLUMNS (a.id AS a, t.id AS t));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+
+# =====================================================================================================================
+# D. A catalog from before the column: read, measured
+# =====================================================================================================================
+statement ok
+ALTER TABLE abi_h.__pgq_path_catalog DROP COLUMN endpoints_complete;
+
+# D: edge, keys only
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (h MATCH (p:Person)-[:Likes]->(t:Tag) COLUMNS (p.id AS p, t.id AS t));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (h MATCH (p:Person)-[:Likes]->(t:Tag) COLUMNS (p.id AS p, t.id AS t));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+# D: edge, properties
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (h MATCH (p:Person)-[:Likes]->(t:Tag) COLUMNS (p.name AS p, t.name AS t));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (h MATCH (p:Person)-[:Likes]->(t:Tag) COLUMNS (p.name AS p, t.name AS t));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+# D: edge, reversed
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (h MATCH (t:Tag)<-[:Likes]-(p:Person) COLUMNS (p.id AS p, t.id AS t));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (h MATCH (t:Tag)<-[:Likes]-(p:Person) COLUMNS (p.id AS p, t.id AS t));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+# D: fixed path
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (h MATCH (a:Person)-[:Knows]->(b:Person)-[:Likes]->(t:Tag) COLUMNS (a.id AS a, t.id AS t));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (h MATCH (a:Person)-[:Knows]->(b:Person)-[:Likes]->(t:Tag) COLUMNS (a.id AS a, t.id AS t));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+# D: two knows hops
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (h MATCH (a:Person)-[:Knows]->(b:Person)-[:Knows]->(c:Person) COLUMNS (a.id AS a, c.id AS c));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (h MATCH (a:Person)-[:Knows]->(b:Person)-[:Knows]->(c:Person) COLUMNS (a.id AS a, c.id AS c));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+# D: closure ANY SHORTEST
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (h MATCH ANY SHORTEST (a:Person)-[:Knows]->{1,3}(b:Person) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (h MATCH ANY SHORTEST (a:Person)-[:Knows]->{1,3}(b:Person) COLUMNS (a.id AS a, b.id AS b));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+# D: closure ALL SHORTEST
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (h MATCH ALL SHORTEST (a:Person)-[:Knows]->{1,3}(b:Person) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (h MATCH ALL SHORTEST (a:Person)-[:Knows]->{1,3}(b:Person) COLUMNS (a.id AS a, b.id AS b));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+
+# D: EXISTS
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (h MATCH (a:Person) WHERE EXISTS { (a)-[:Likes]->(t:Tag) } COLUMNS (a.id AS a));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (h MATCH (a:Person) WHERE EXISTS { (a)-[:Likes]->(t:Tag) } COLUMNS (a.id AS a));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+# D: OPTIONAL hop
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_trav AS FROM GRAPH_TABLE (h MATCH (a:Person) OPTIONAL MATCH (a)-[:Likes]->(t:Tag) COLUMNS (a.id AS a, t.id AS t));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE OR REPLACE TABLE t_abi AS FROM GRAPH_TABLE (h MATCH (a:Person) OPTIONAL MATCH (a)-[:Likes]->(t:Tag) COLUMNS (a.id AS a, t.id AS t));
+
+query I
+SELECT count(*) FROM ((FROM t_abi EXCEPT ALL FROM t_trav) UNION ALL (FROM t_trav EXCEPT ALL FROM t_abi));
+----
+0
+
+# =====================================================================================================================
+# E. Context expansion (every edge label but Knows; answered from artifacts only -- the traversal refuses an
+#    unlabeled vertex over two vertex tables)
+# =====================================================================================================================
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+# Complete artifacts: person 2's complete likes are tag 10 only
+query II
+SELECT count(*), list(v) FROM GRAPH_TABLE (g MATCH p = (a:Person)-[:!Knows]->{1,2}(x) WHERE a.id = 2
+                                           COLUMNS (vertices(p) AS v));
+----
+1	[[2, 10]]
+
+query II
+SELECT count(*), list(v) FROM GRAPH_TABLE (c MATCH p = (a:Person)-[:!Knows]->{1,2}(x) WHERE a.id = 2
+                                           COLUMNS (vertices(p) AS v));
+----
+1	[[2, 10]]
+
+# A family holding an edge of the deleted person: the expansion declines rather than step along it
+statement error
+FROM GRAPH_TABLE (h MATCH p = (a:Person)-[:!Knows]->{1,2}(x) WHERE a.id = 2 COLUMNS (vertices(p) AS v));
+----
+ambiguous
+
+# =====================================================================================================================
+# F. Keys of different types (a BIGINT vertex key referenced by a VARCHAR edge column, as some lake bridges do): the
+#    build and the measurement compare them as text, so neither fails and the artifact still answers
+# =====================================================================================================================
+statement ok
+CREATE TABLE MV(id BIGINT, name VARCHAR);
+
+statement ok
+INSERT INTO MV VALUES (1, 'a'), (2, 'b');
+
+statement ok
+CREATE TABLE MT(code VARCHAR, name VARCHAR);
+
+statement ok
+INSERT INTO MT VALUES ('x', 'tx'), ('y', 'ty');
+
+statement ok
+CREATE TABLE ME(vid VARCHAR, tcode VARCHAR);
+
+statement ok
+INSERT INTO ME VALUES ('1', 'x'), ('2', 'y'), ('9', 'x');
+
+statement ok
+CREATE PROPERTY GRAPH mg VERTEX TABLES (MV LABEL V, MT LABEL T)
+EDGE TABLES (ME SOURCE KEY (vid) REFERENCES MV (id) DESTINATION KEY (tcode) REFERENCES MT (code) LABEL E);
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('mg', schema := 'abi_m');
+
+query I
+SELECT count(*) FROM abi_m.__pg_mg__V__E__T;
+----
+2
+
+statement ok
+UPDATE abi_m.__pgq_path_catalog SET built_by = NULL, endpoints_complete = NULL WHERE graph_name = 'mg';
+
+query II
+FROM GRAPH_TABLE (mg MATCH (v:V)-[:E]->(t:T) COLUMNS (v.id AS v, t.code AS t)) ORDER BY ALL;
+----
+1	x
+2	y
+
+query II
+SELECT (SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected') > 0,
+       (SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE reason LIKE 'far_ends|%' AND status = 'exact');
+----
+true	2

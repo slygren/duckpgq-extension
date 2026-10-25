@@ -47,6 +47,10 @@ In every such case the old rows were wrong.
     now traverse unless the table is proven exact.
   - **Edge path tables built with duplicate edges collapsed** no longer answer counting patterns. They used to
     undercount.
+  - **ABI artifacts no longer hold edges whose endpoint is no vertex.** `pgq_abi_build` copied such edges, so an
+    artifact answered them where the traversal does not (`(p)-[:L]->(t)`: 2 rows from the artifact, 1 traversed).
+    It now builds from the complete edges and records `endpoints_complete`; a catalog without that column is
+    measured once and its incomplete artifacts are not used.
   - **Zero hops over an edge between two tables:** `(a:Tag)-[:HasWorkorder]->{0,k}(b)` has a zero-hop row per tag
     (b = a); an unlabeled end vertex took the edge's other table, so there was none. `{0,k}` / `{1,k}` over such an
     edge are one hop at most (an unbounded or named one was refused).

@@ -59,6 +59,10 @@ struct PGQPathTableInfo {
 	//! and can stand in for the bridge in multiplicity-sensitive walk traversal. Defaults
 	//! false for artifacts predating the probe, which keeps walk mode on the bridge.
 	bool preserves_multiplicity = false;
+	//! Recorded by the builder: the artifact holds only edges whose endpoints are vertices (pgq_abi_build reads the
+	//! edge tables through their vertex keys). Without it the binder measures the edge tables the artifact rests on
+	//! before it lets the artifact answer (PGQExactness::EndpointsComplete).
+	bool endpoints_complete = false;
 	bool from_metadata = false;
 	//! Provenance recorded by pgq_abi_build for artifacts computed from DuckLake tables (see abi_build.hpp)
 	string source_snapshot;

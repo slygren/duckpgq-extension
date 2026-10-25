@@ -84,6 +84,7 @@ const vector<pair<string, string>> &PathCatalogColumns() {
 	                                                   {"domain", "VARCHAR"},
 	                                                   {"covered_target_properties", "VARCHAR"},
 	                                                   {"preserves_multiplicity", "BOOLEAN"},
+	                                                   {"endpoints_complete", "BOOLEAN"},
 	                                                   {"abi_version", "INTEGER"},
 	                                                   {"graph_fingerprint", "VARCHAR"},
 	                                                   {"built_by", "VARCHAR"},
@@ -398,7 +399,7 @@ private:
 	int64_t EstimateChainRows(const vector<idx_t> &sequence) {
 		string sql;
 		if (sequence.size() == 1) {
-			sql = "SELECT count(*) FROM " + TableSql(*edges[sequence[0]].table);
+			sql = "SELECT count(*) FROM " + CompleteEdgesSql(edges[sequence[0]]) + " e";
 		} else {
 			vector<string> ctes;
 			for (idx_t i = 0; i < sequence.size(); i++) {
@@ -406,10 +407,10 @@ private:
 				auto name = "__c" + to_string(i + 1);
 				if (i == 0) {
 					ctes.push_back(name + " AS (SELECT e." + Ident(edge.dst_col) + " AS v, count(*) AS n FROM " +
-					               TableSql(*edge.table) + " e GROUP BY 1)");
+					               CompleteEdgesSql(edge) + " e GROUP BY 1)");
 				} else {
 					ctes.push_back(name + " AS (SELECT e." + Ident(edge.dst_col) + " AS v, sum(p.n) AS n FROM " +
-					               TableSql(*edge.table) + " e JOIN __c" + to_string(i) + " p ON e." +
+					               CompleteEdgesSql(edge) + " e JOIN __c" + to_string(i) + " p ON e." +
 					               Ident(edge.src_col) + " = p.v GROUP BY 1)");
 				}
 			}
@@ -425,6 +426,45 @@ private:
 		}
 		PGQMaterializedResult rows(*result);
 		return rows.RowCount() == 0 || rows.GetValue(0, 0).IsNull() ? -1 : rows.GetValue(0, 0).GetValue<int64_t>();
+	}
+
+	//! The edges of the graph an edge table holds: the rows whose source and destination keys are vertex keys. A row
+	//! with a key no vertex has (or NULL) is no edge -- a traversal joins both endpoints -- so no artifact holds it;
+	//! the catalog records that as endpoints_complete. Without it an artifact answered such an edge where the
+	//! traversal does not (`(p)-[:L]->(t) COLUMNS (p.id, t.id)` returned it from the edge artifact).
+	string CompleteEdgesSql(const AbiEdge &edge) {
+		auto &table = *edge.table;
+		return "(SELECT * FROM " + TableSql(table) + " WHERE " +
+		       KeyIn(table, edge.src_col, *table.source_pg_table, PGQStr(table.source_pk[0])) + " AND " +
+		       KeyIn(table, edge.dst_col, *table.destination_pg_table, PGQStr(table.destination_pk[0])) + ")";
+	}
+
+	//! <fk> IN (SELECT <key> FROM <vertices>), compared as text when the two columns' types differ (lake bridges join
+	//! BIGINT keys to VARCHAR ones; a typed comparison would not bind).
+	string KeyIn(const PropertyGraphTable &edge_table, const string &fk, const PropertyGraphTable &vertex_table,
+	             const string &key) {
+		const auto fk_type = ColumnTypeOf(edge_table, fk);
+		const auto key_type = ColumnTypeOf(vertex_table, key);
+		if (fk_type.id() != LogicalTypeId::INVALID && fk_type == key_type) {
+			return Ident(fk) + " IN (SELECT " + Ident(key) + " FROM " + TableSql(vertex_table) + ")";
+		}
+		return "CAST(" + Ident(fk) + " AS VARCHAR) IN (SELECT CAST(" + Ident(key) + " AS VARCHAR) FROM " +
+		       TableSql(vertex_table) + ")";
+	}
+
+	LogicalType ColumnTypeOf(const PropertyGraphTable &table, const string &column) {
+		try {
+			const string catalog = PGQStr(table.catalog_name).empty() ? PGQStr(DatabaseManager::GetDefaultDatabase(context))
+			                                                          : PGQStr(table.catalog_name);
+			const string schema = PGQStr(table.schema_name).empty() ? string(DEFAULT_SCHEMA) : PGQStr(table.schema_name);
+			auto entry = Catalog::GetEntry<TableCatalogEntry>(
+			    context, QualifiedName(Identifier(catalog), Identifier(schema), table.table_name), OnEntryNotFound::RETURN_NULL);
+			if (entry && entry->ColumnExists(Identifier(column))) {
+				return entry->GetColumn(Identifier(column)).Type();
+			}
+		} catch (...) {
+		}
+		return LogicalType::INVALID;
 	}
 
 	static string EdgeHash(const AbiEdge &edge, const string &alias) {
@@ -466,14 +506,14 @@ private:
 			select_cols.push_back("  " + EdgeHash(edge, alias) + " AS e" + to_string(idx));
 			select_cols.push_back("  " + alias + "." + Ident(edge.dst_col) + " AS v" + to_string(idx));
 		}
-		const string from_sql = "FROM " + TableSql(*first.table) + " e1";
+		const string from_sql = "FROM " + CompleteEdgesSql(first) + " e1";
 		vector<string> joins;
 		for (idx_t idx = 1; idx < sequence.size(); idx++) {
 			auto &prev = edges[sequence[idx - 1]];
 			auto &edge = edges[sequence[idx]];
 			auto prev_alias = "e" + to_string(idx);
 			auto alias = "e" + to_string(idx + 1);
-			joins.push_back("JOIN " + TableSql(*edge.table) + " " + alias + " ON " + alias + "." + Ident(edge.src_col) +
+			joins.push_back("JOIN " + CompleteEdgesSql(edge) + " " + alias + " ON " + alias + "." + Ident(edge.src_col) +
 			                " = " + prev_alias + "." + Ident(prev.dst_col));
 		}
 		// The multiplicity probe counts exactly the chain the artifact was built from: covering joins are 1:1 lookups.
@@ -533,6 +573,9 @@ private:
 		row.covered_target_properties = JoinStrings(covered_groups, ";");
 		for (auto index : sequence) {
 			row.sources.push_back(edges[index].table);
+			// The vertex tables decide which edges are complete (CompleteEdgesSql), so they are sources too.
+			row.sources.push_back(edges[index].table->source_pg_table);
+			row.sources.push_back(edges[index].table->destination_pg_table);
 		}
 		if (!covered_groups.empty()) {
 			row.sources.push_back(FindVertex(first.dst_label)->table);
@@ -579,6 +622,8 @@ private:
 			row.metadata[entry.first] = entry.second;
 		}
 		row.sources.push_back(edge.table);
+		row.sources.push_back(edge.table->source_pg_table);
+		row.sources.push_back(edge.table->destination_pg_table);
 		return row;
 	}
 
@@ -589,7 +634,7 @@ private:
 			    "ABI build of %s: closure over %s needs a self-referential edge, but it connects %s to %s", graph_name,
 			    edge.label, edge.src_label, edge.dst_label);
 		}
-		const auto edge_table = TableSql(*edge.table);
+		const auto edge_table = CompleteEdgesSql(edge);
 		const auto src = Ident(edge.src_col);
 		const auto dst = Ident(edge.dst_col);
 		const auto max_depth = to_string(closure.max_depth);
@@ -688,7 +733,7 @@ private:
 			select_cols.push_back("  coalesce(" + alias + ".branch_count, 0) AS " + Ident(lower + "_count"));
 			select_cols.push_back("  coalesce(" + alias + ".branch_count, 0) > 0 AS " + Ident(lower + "_exists"));
 			joins.push_back("LEFT JOIN (\n  SELECT " + Ident(edge.src_col) + " AS v0, count(DISTINCT " +
-			                Ident(edge.dst_col) + ") AS branch_count\n  FROM " + TableSql(*edge.table) +
+			                Ident(edge.dst_col) + ") AS branch_count\n  FROM " + CompleteEdgesSql(edge) + " __pgq_e" +
 			                "\n  GROUP BY " + Ident(edge.src_col) + "\n) " + alias + " ON " + alias + ".v0 = a." +
 			                Ident(anchor->key));
 		}
@@ -717,6 +762,7 @@ private:
 		row.sources.push_back(anchor->table);
 		for (auto &label : branch.branches) {
 			row.sources.push_back(RequireEdge(label, "a branch summary").table);
+			row.sources.push_back(RequireEdge(label, "a branch summary").table->destination_pg_table);
 		}
 		rows.push_back(std::move(row));
 	}
@@ -788,6 +834,7 @@ private:
 		vector<string> snapshots;
 		vector<string> tables;
 		case_insensitive_set_t seen_catalogs;
+		case_insensitive_set_t seen_tables;
 		for (auto &table : row.sources) {
 			auto catalog = SourceCatalog(*table);
 			auto database = DatabaseManager::Get(context).GetDatabase(context, Identifier(catalog));
@@ -798,7 +845,10 @@ private:
 				return;
 			}
 			auto schema = PGQStr(table->schema_name).empty() ? string("main") : PGQStr(table->schema_name);
-			tables.push_back(catalog + "." + schema + "." + PGQStr(table->table_name));
+			const auto qualified = catalog + "." + schema + "." + PGQStr(table->table_name);
+			if (seen_tables.insert(qualified).second) {
+				tables.push_back(qualified);
+			}
 			if (seen_catalogs.insert(catalog).second) {
 				auto snapshot = SnapshotOf(catalog);
 				if (snapshot.empty()) {
@@ -891,6 +941,7 @@ private:
 			    Literal(row.metadata["freshness_policy"]) + " AS freshness_policy, " +
 			    Literal(row.metadata["domain"]) + " AS domain, " + Literal(row.covered_target_properties) +
 			    " AS covered_target_properties, " + row.multiplicity_probe + " AS preserves_multiplicity, " +
+			    "true AS endpoints_complete, " +
 			    to_string(PGQ_ABI_VERSION) + " AS abi_version, " + Literal(fingerprint) +
 			    " AS graph_fingerprint, 'pgq_abi_build' AS built_by, " +
 			    (source_snapshot.empty() ? string("NULL") : Literal(source_snapshot)) + " AS source_snapshot, " +
