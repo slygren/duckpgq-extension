@@ -142,6 +142,51 @@ SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected' AN
 ----
 0
 
+# ── a closure exactly as deep as its cap (as on the served lake: TAG/HAS_PARENT depth 12, cap 12) ──────────────────
+# Reaching the cap is not truncation when no chain continues past it: complete, by pgq_abi_build's own measure ...
+
+statement ok
+FROM pgq_abi_build('tree_g', exclude_self_referential := false, closures := [{'relationship': 'HasParent', 'max_depth': 4}]);
+
+query TT
+SELECT path_kind, preserves_multiplicity FROM graph.__pgq_path_catalog
+WHERE graph_name = 'tree_g' AND path_kind IN ('transitive_closure', 'tc_witness', 'tc_chain') ORDER BY ALL;
+----
+tc_chain	true
+tc_witness	true
+transitive_closure	true
+
+statement ok
+FROM GRAPH_TABLE (tree_g MATCH (child:Node)-[:HasParent]->{1,6}(ancestor:Node) ONE ROW PER STEP (v1, e, v2)
+    WHERE child.id = 8 COLUMNS (v1.id AS x, v2.id AS y));
+
+query T
+SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+tc_chain_one_row_per
+
+# ... and by the binder's, for the same catalog as the layout compiler writes it (no built_by column), queried past
+# the deepest row so the completeness probe runs
+statement ok
+UPDATE graph.__pgq_path_catalog SET built_by = NULL, preserves_multiplicity = false WHERE graph_name = 'tree_g';
+
+statement ok
+ALTER TABLE graph.__pgq_path_catalog DROP COLUMN built_by;
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (tree_g MATCH (child:Node)-[:HasParent]->{1,6}(ancestor:Node) ONE ROW PER STEP (v1, e, v2)
+    WHERE child.id = 8 COLUMNS (v1.id AS x, v2.id AS y));
+----
+10
+
+query T
+SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+tc_chain_one_row_per
+
+statement ok
+ALTER TABLE graph.__pgq_path_catalog ADD COLUMN built_by VARCHAR;
+
 # =====================================================================================================================
 # Not a hierarchy, but every pair still has one path: 1 -> 2, 1 -> 3, 2 -> 4
 # =====================================================================================================================
