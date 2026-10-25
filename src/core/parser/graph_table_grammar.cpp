@@ -225,6 +225,7 @@ unique_ptr<PathReference> TransformElement(PEGTransformer &transformer, ParseRes
 			    cost_default.GetResult().Cast<ListParseResult>().GetChild(1));
 			subpath->default_value =
 			    default_value->Cast<ConstantExpression>().GetLiteral().ToValue().GetValue<double>();
+			subpath->has_default = true;
 		}
 	}
 	subpath->path_list.push_back(std::move(element));
@@ -357,6 +358,7 @@ unique_ptr<PathReference> TransformQuantifiedEdge(PEGTransformer &transformer, P
 		result->where_clause = std::move(nested.where_clause);
 		result->cost_expr = std::move(nested.cost_expr);
 		result->default_value = nested.default_value;
+		result->has_default = nested.has_default;
 		result->path_list.push_back(std::move(nested.path_list[0]));
 	} else {
 		result->path_list.push_back(std::move(edge));

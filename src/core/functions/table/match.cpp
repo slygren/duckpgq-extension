@@ -60,7 +60,7 @@ namespace duckdb {
 enum class PGQPathSelector : uint8_t { WALK, ANY_SHORTEST, ALL_SHORTEST, CHEAPEST };
 
 // A COST that is the same positive constant on every edge makes the cheapest path the shortest one.
-static bool IsConstantPositiveCost(const ParsedExpression &cost) {
+static bool IsConstantPositiveCost(const ParsedExpression &cost, Value &value) {
 	auto *expr = &cost;
 	while (auto *cast = dynamic_cast<const CastExpression *>(expr)) {
 		expr = &cast->Child();
@@ -69,31 +69,50 @@ static bool IsConstantPositiveCost(const ParsedExpression &cost) {
 	if (!constant) {
 		return false;
 	}
-	auto value = constant->GetLiteral().ToValue();
+	value = constant->GetLiteral().ToValue();
 	if (value.IsNull() || !value.type().IsNumeric()) {
 		return false;
 	}
 	return value.DefaultCastAs(LogicalType::DOUBLE).GetValue<double>() > 0;
 }
 
-// Every COST in the pattern is a positive constant, and there is at least one.
-static bool AllCostsConstant(const vector<unique_ptr<PathReference>> &path_list, bool &found) {
+static bool IsConstantPositiveCost(const ParsedExpression &cost) {
+	Value value;
+	return IsConstantPositiveCost(cost, value);
+}
+
+// Every COST in the pattern is the same positive constant, and there is at least one. `constant` is that cost; it
+// is a DOUBLE if any of the constants is not an integer.
+static bool AllCostsConstant(const vector<unique_ptr<PathReference>> &path_list, bool &found, Value &constant) {
 	for (const auto &reference : path_list) {
 		if (reference->path_reference_type != PGQPathReferenceType::SUBPATH) {
 			continue;
 		}
 		auto &subpath = reinterpret_cast<const SubPath &>(*reference);
 		if (subpath.cost_expr) {
-			if (!IsConstantPositiveCost(*subpath.cost_expr)) {
+			Value value;
+			if (!IsConstantPositiveCost(*subpath.cost_expr, value)) {
 				return false;
+			}
+			auto as_double = value.DefaultCastAs(LogicalType::DOUBLE).GetValue<double>();
+			if (found && as_double != constant.DefaultCastAs(LogicalType::DOUBLE).GetValue<double>()) {
+				return false;
+			}
+			if (!found || !value.type().IsIntegral()) {
+				constant = value.type().IsIntegral() ? value.DefaultCastAs(LogicalType::BIGINT) : Value::DOUBLE(as_double);
 			}
 			found = true;
 		}
-		if (!AllCostsConstant(subpath.path_list, found)) {
+		if (!AllCostsConstant(subpath.path_list, found, constant)) {
 			return false;
 		}
 	}
 	return true;
+}
+
+static bool AllCostsConstant(const vector<unique_ptr<PathReference>> &path_list, bool &found) {
+	Value constant;
+	return AllCostsConstant(path_list, found, constant);
 }
 
 static PGQPathSelector PatternSelector(const PathPattern &pattern) {
@@ -4618,6 +4637,21 @@ static void FoldStaticPathFunctions(MatchExpression &match_ref, vector<unique_pt
 }
 
 // True when an expression still reads the named path itself: p, or a function of p.
+//! The COST of an edge, with its DEFAULT where it is NULL. An integer DEFAULT keeps integer costs integers.
+static unique_ptr<ParsedExpression> CostWithDefault(const SubPath &edge) {
+	auto cost = edge.cost_expr->Copy();
+	if (!edge.has_default) {
+		return cost;
+	}
+	auto value = edge.default_value;
+	auto integral = value == std::floor(value) && std::fabs(value) < 9.0e18;
+	auto result = make_uniq<OperatorExpression>(ExpressionType::OPERATOR_COALESCE);
+	result->GetChildrenMutable().push_back(std::move(cost));
+	result->GetChildrenMutable().push_back(ConstantExpression::FromValue(
+	    integral ? Value::BIGINT(static_cast<int64_t>(value)) : Value::DOUBLE(value)));
+	return std::move(result);
+}
+
 static bool ReferencesPathVariable(const ParsedExpression &expression, const string &path_variable) {
 	auto *column_ref = dynamic_cast<const ColumnRefExpression *>(&expression);
 	if (column_ref) {
@@ -4631,10 +4665,116 @@ static bool ReferencesPathVariable(const ParsedExpression &expression, const str
 	return found;
 }
 
+static bool IsCostCall(ParsedExpression &expression, const string &path_variable) {
+	auto *function = dynamic_cast<FunctionExpression *>(&expression);
+	if (!function || !StringUtil::CIEquals(function->FunctionName().GetIdentifierName(), "cost") ||
+	    function->GetArgumentsMutable().size() != 1) {
+		return false;
+	}
+	auto *argument =
+	    dynamic_cast<ColumnRefExpression *>(function->GetArgumentsMutable()[0].GetExpressionMutable().get());
+	return argument && argument->ColumnNames().size() == 1 &&
+	       StringUtil::CIEquals(PGQStr(argument->ColumnNames()[0]), path_variable);
+}
+
+static unique_ptr<ParsedExpression> ReplaceCostCalls(unique_ptr<ParsedExpression> expression,
+                                                     const string &path_variable,
+                                                     const std::function<unique_ptr<ParsedExpression>()> &make_cost) {
+	if (!expression) {
+		return expression;
+	}
+	if (IsCostCall(*expression, path_variable)) {
+		return make_cost();
+	}
+	ParsedExpressionIterator::EnumerateChildren(*expression, [&](unique_ptr<ParsedExpression> &child) {
+		child = ReplaceCostCalls(std::move(child), path_variable, make_cost);
+	});
+	return expression;
+}
+
 void PGQMatchFunction::CheckNamedSubpath(SubPath &subpath, MatchExpression &original_ref,
                                          CreatePropertyGraphInfo &pg_table, unique_ptr<SelectNode> &final_select_node,
                                          vector<unique_ptr<ParsedExpression>> &conditions, int32_t &csr_id_counter,
                                          PGQCSRSlot &csr_slot, bool all_shortest, bool any_shortest) {
+	// cost(p), anywhere in COLUMNS: the cheapest cost between the path's endpoints. First, so that the CSR the other
+	// path functions share is the weighted one.
+	auto make_cost = [&]() -> unique_ptr<ParsedExpression> {
+		// Find edge subpath with cost_expr within this named subpath's path_list.
+		// A vertex with an element-local WHERE arrives wrapped in a single-element subpath.
+		auto vertex_element = [](const unique_ptr<PathReference> &reference) -> PathElement * {
+			auto element = GetPathElement(reference);
+			if (element) {
+				return element;
+			}
+			auto wrapper = GetSubPath(reference);
+			return wrapper && wrapper->path_list.size() == 1 ? GetPathElement(wrapper->path_list[0]) : nullptr;
+		};
+		SubPath *edge_sub = nullptr;
+		PathElement *edge_elem = nullptr;
+		PathElement *prev_elem = vertex_element(subpath.path_list[0]);
+		PathElement *next_elem = nullptr;
+		for (idx_t k = 1; k + 1 < subpath.path_list.size(); k += 2) {
+			auto *candidate = dynamic_cast<SubPath *>(subpath.path_list[k].get());
+			if (candidate && candidate->cost_expr) {
+				edge_sub = candidate;
+				edge_elem = GetPathElement(edge_sub->path_list[0]);
+				next_elem = vertex_element(subpath.path_list[k + 1]);
+				break;
+			}
+		}
+		if (!edge_sub || !edge_elem || !prev_elem || !next_elem) {
+			throw BinderException("COST(%s) requires a COST expression on the edge pattern",
+			                      subpath.path_variable);
+		}
+		auto edge_table = ResolveTable(edge_elem->label, edge_elem->match_type, pg_table);
+		// Build weighted CSR CTE if not already built.
+		if (final_select_node->cte_map.map.find("cte1") == final_select_node->cte_map.map.end()) {
+			if (edge_elem->match_type != PGQMatchType::MATCH_EDGE_RIGHT) {
+				throw NotImplementedException("COST() is only supported for right-directed edges (->) currently");
+			}
+			ClaimCSRSlot(csr_slot, CSREdgeKey(edge_table, edge_elem->match_type, edge_elem->label),
+			             csr_id_counter);
+			final_select_node->cte_map.map["cte1"] = CreateWeightedDirectedCSRCTE(
+			    edge_table, prev_elem->variable_binding, edge_elem->variable_binding,
+			    next_elem->variable_binding, CostWithDefault(*edge_sub), csr_slot.slot,
+			    EdgeLabelRowFilter(edge_elem->label, edge_table));
+		}
+		// Generate cheapest_path_length(<slot>, v_size, src_rowid, dst_rowid).
+		vector<unique_ptr<ParsedExpression>> cpl_args;
+		// Reuses whatever slot built "cte1" for this select node -- the CTE is shared by
+		// name, so the id must be shared too. Allocating a second one here pointed
+		// cheapest_path_length() at an empty registry entry ("Invalid ID").
+		cpl_args.push_back(ConstantExpression::FromValue(Value::INTEGER(csr_slot.slot)));
+		cpl_args.push_back(GetCountTable(edge_table->source_pg_table, prev_elem->variable_binding,
+		                                 PGQStr(edge_table->source_pk[0])));
+		cpl_args.push_back(PGQColRef("rowid", prev_elem->variable_binding));
+		cpl_args.push_back(PGQColRef("rowid", next_elem->variable_binding));
+		// (SELECT <cost> FROM <the costed edges> LIMIT 0): no rows, but the COST's type, which is what makes the
+		// cost a BIGINT (integer costs) or a DOUBLE.
+		auto probe = make_uniq<SelectNode>();
+		probe->select_list.push_back(CostWithDefault(*edge_sub));
+		probe->from_table =
+		    ::duckdb::GetJoinRef(edge_table, edge_elem->variable_binding, EdgeLabelRowFilter(edge_elem->label, edge_table),
+		               prev_elem->variable_binding, next_elem->variable_binding);
+		auto no_rows = make_uniq<LimitModifier>();
+		no_rows->limit = ConstantExpression::FromValue(Value::BIGINT(0));
+		probe->modifiers.push_back(std::move(no_rows));
+		auto probe_statement = make_uniq<SelectStatement>();
+		probe_statement->node = std::move(probe);
+		auto probe_subquery = make_uniq<SubqueryExpression>();
+		probe_subquery->GetSubqueryTypeMutable() = SubqueryType::SCALAR;
+		probe_subquery->SubqueryMutable() = std::move(probe_statement);
+		cpl_args.push_back(std::move(probe_subquery));
+		return make_uniq<FunctionExpression>("cheapest_path_length", std::move(cpl_args));
+	};
+	for (auto &column : original_ref.column_list) {
+		auto top_level = IsCostCall(*column, subpath.path_variable);
+		Identifier name = column->HasAlias() ? column->GetAlias() : Identifier("cost(" + subpath.path_variable + ")");
+		column = ReplaceCostCalls(std::move(column), subpath.path_variable, make_cost);
+		if (top_level) {
+			column->SetAlias(name);
+		}
+	}
 	for (idx_t idx_i = 0; idx_i < original_ref.column_list.size(); idx_i++) {
 		auto parsed_ref = dynamic_cast<FunctionExpression *>(original_ref.column_list[idx_i].get());
 		if (parsed_ref == nullptr) {
@@ -4736,62 +4876,6 @@ void PGQMatchFunction::CheckNamedSubpath(SubPath &subpath, MatchExpression &orig
 			auto label_list = BuildPathLabelList(labels, function_name == "vertex_labels", variable_hops.get());
 			label_list->SetAlias(Identifier(column_alias.empty() ? call : column_alias));
 			original_ref.column_list[idx_i] = std::move(label_list);
-		} else if (parsed_ref->FunctionName().GetIdentifierName() == "cost") {
-			// Find edge subpath with cost_expr within this named subpath's path_list.
-			// A vertex with an element-local WHERE arrives wrapped in a single-element subpath.
-			auto vertex_element = [](const unique_ptr<PathReference> &reference) -> PathElement * {
-				auto element = GetPathElement(reference);
-				if (element) {
-					return element;
-				}
-				auto wrapper = GetSubPath(reference);
-				return wrapper && wrapper->path_list.size() == 1 ? GetPathElement(wrapper->path_list[0]) : nullptr;
-			};
-			SubPath *edge_sub = nullptr;
-			PathElement *edge_elem = nullptr;
-			PathElement *prev_elem = vertex_element(subpath.path_list[0]);
-			PathElement *next_elem = nullptr;
-			for (idx_t k = 1; k + 1 < subpath.path_list.size(); k += 2) {
-				auto *candidate = dynamic_cast<SubPath *>(subpath.path_list[k].get());
-				if (candidate && candidate->cost_expr) {
-					edge_sub = candidate;
-					edge_elem = GetPathElement(edge_sub->path_list[0]);
-					next_elem = vertex_element(subpath.path_list[k + 1]);
-					break;
-				}
-			}
-			if (!edge_sub || !edge_elem || !prev_elem || !next_elem) {
-				throw BinderException("COST(%s) requires a COST expression on the edge pattern",
-				                      subpath.path_variable);
-			}
-			auto edge_table = ResolveTable(edge_elem->label, edge_elem->match_type, pg_table);
-			// Build weighted CSR CTE if not already built.
-			if (final_select_node->cte_map.map.find("cte1") == final_select_node->cte_map.map.end()) {
-				if (edge_elem->match_type != PGQMatchType::MATCH_EDGE_RIGHT) {
-					throw NotImplementedException("COST() is only supported for right-directed edges (->) currently");
-				}
-				ClaimCSRSlot(csr_slot, CSREdgeKey(edge_table, edge_elem->match_type, edge_elem->label),
-				             csr_id_counter);
-				final_select_node->cte_map.map["cte1"] = CreateWeightedDirectedCSRCTE(
-				    edge_table, prev_elem->variable_binding, edge_elem->variable_binding,
-				    next_elem->variable_binding, edge_sub->cost_expr->Copy(), csr_slot.slot,
-				    EdgeLabelRowFilter(edge_elem->label, edge_table));
-			}
-			// Generate cheapest_path_length(<slot>, v_size, src_rowid, dst_rowid).
-			vector<unique_ptr<ParsedExpression>> cpl_args;
-			// Reuses whatever slot built "cte1" for this select node -- the CTE is shared by
-			// name, so the id must be shared too. Allocating a second one here pointed
-			// cheapest_path_length() at an empty registry entry ("Invalid ID").
-			cpl_args.push_back(ConstantExpression::FromValue(Value::INTEGER(csr_slot.slot)));
-			cpl_args.push_back(GetCountTable(edge_table->source_pg_table, prev_elem->variable_binding,
-			                                 PGQStr(edge_table->source_pk[0])));
-			cpl_args.push_back(PGQColRef("rowid", prev_elem->variable_binding));
-			cpl_args.push_back(PGQColRef("rowid", next_elem->variable_binding));
-			auto cpl_func = make_uniq<FunctionExpression>("cheapest_path_length", std::move(cpl_args));
-			cpl_func->SetAlias(Identifier(column_alias.empty() ? "cost(" + subpath.path_variable + ")" : column_alias));
-			original_ref.column_list.erase(original_ref.column_list.begin() + static_cast<int64_t>(idx_i));
-			original_ref.column_list.insert(original_ref.column_list.begin() + static_cast<int64_t>(idx_i),
-			                                std::move(cpl_func));
 		}
 	}
 }
@@ -10137,11 +10221,246 @@ static void NormalizePatterns(vector<unique_ptr<PathPattern>> &patterns) {
 	}
 }
 
+static void RejectVertexCosts(const vector<unique_ptr<PathReference>> &path_list) {
+	for (auto &reference : path_list) {
+		auto *subpath = dynamic_cast<SubPath *>(reference.get());
+		if (!subpath) {
+			continue;
+		}
+		auto *element = subpath->path_list.size() == 1 ? dynamic_cast<PathElement *>(subpath->path_list[0].get())
+		                                               : nullptr;
+		if (subpath->cost_expr && element && element->match_type == PGQMatchType::MATCH_VERTEX) {
+			throw BinderException("COST applies to edges, not to vertex %s: a CHEAPEST path is the one whose edges "
+			                      "cost least",
+			                      element->variable_binding);
+		}
+		RejectVertexCosts(subpath->path_list);
+	}
+}
+
+//! The path variable of a pattern written `p = ...`, and the elements of its path.
+static const vector<unique_ptr<PathReference>> &PatternPath(const PathPattern &pattern, string &path_variable) {
+	if (pattern.path_elements.size() == 1) {
+		auto *subpath = dynamic_cast<SubPath *>(pattern.path_elements[0].get());
+		if (subpath && !subpath->path_variable.empty()) {
+			path_variable = subpath->path_variable;
+			return subpath->path_list;
+		}
+	}
+	return pattern.path_elements;
+}
+
+//! cost(x) calls in an expression, by the path variable x they name.
+static void CollectCostCalls(ParsedExpression &expression, vector<string> &variables) {
+	auto *function = dynamic_cast<FunctionExpression *>(&expression);
+	if (function && StringUtil::CIEquals(function->FunctionName().GetIdentifierName(), "cost") &&
+	    function->GetArgumentsMutable().size() == 1) {
+		auto *argument =
+		    dynamic_cast<ColumnRefExpression *>(function->GetArgumentsMutable()[0].GetExpressionMutable().get());
+		if (argument && argument->ColumnNames().size() == 1) {
+			variables.push_back(PGQStr(argument->ColumnNames()[0]));
+			return;
+		}
+	}
+	ParsedExpressionIterator::EnumerateChildren(
+	    expression, [&](ParsedExpression &child) { CollectCostCalls(child, variables); });
+}
+
+//! Whether the path variable is used other than as cost(path_variable).
+static bool UsesPathOutsideCost(ParsedExpression &expression, const string &path_variable) {
+	auto *function = dynamic_cast<FunctionExpression *>(&expression);
+	if (function && StringUtil::CIEquals(function->FunctionName().GetIdentifierName(), "cost") &&
+	    function->GetArgumentsMutable().size() == 1) {
+		auto *argument =
+		    dynamic_cast<ColumnRefExpression *>(function->GetArgumentsMutable()[0].GetExpressionMutable().get());
+		if (argument && argument->ColumnNames().size() == 1 &&
+		    StringUtil::CIEquals(PGQStr(argument->ColumnNames()[0]), path_variable)) {
+			return false;
+		}
+	}
+	auto *column_ref = dynamic_cast<ColumnRefExpression *>(&expression);
+	if (column_ref) {
+		return column_ref->ColumnNames().size() == 1 &&
+		       StringUtil::CIEquals(PGQStr(column_ref->ColumnNames()[0]), path_variable);
+	}
+	bool found = false;
+	ParsedExpressionIterator::EnumerateChildren(
+	    expression, [&](ParsedExpression &child) { found = found || UsesPathOutsideCost(child, path_variable); });
+	return found;
+}
+
+static bool PatternHasVariableLength(const vector<unique_ptr<PathReference>> &elements) {
+	for (auto &reference : elements) {
+		auto *subpath = dynamic_cast<SubPath *>(reference.get());
+		if (subpath && ((subpath->path_list.size() == 1 && (subpath->lower != 1 || subpath->upper != 1)) ||
+		                PatternHasVariableLength(subpath->path_list))) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//! A path of one quantified edge between two vertices (each possibly with an element WHERE): the quantified edge.
+static SubPath *SingleQuantifiedEdge(const vector<unique_ptr<PathReference>> &elements) {
+	auto vertex = [](const unique_ptr<PathReference> &reference) {
+		if (reference->path_reference_type == PGQPathReferenceType::PATH_ELEMENT) {
+			return true;
+		}
+		auto &wrapper = reinterpret_cast<const SubPath &>(*reference);
+		return wrapper.path_list.size() == 1 && !wrapper.cost_expr &&
+		       wrapper.path_list[0]->path_reference_type == PGQPathReferenceType::PATH_ELEMENT &&
+		       reinterpret_cast<const PathElement &>(*wrapper.path_list[0]).match_type == PGQMatchType::MATCH_VERTEX;
+	};
+	if (elements.size() != 3 || !vertex(elements[0]) || !vertex(elements[2])) {
+		return nullptr;
+	}
+	auto *edge = dynamic_cast<SubPath *>(elements[1].get());
+	if (!edge || edge->path_list.size() != 1 || !edge->cost_expr) {
+		return nullptr;
+	}
+	auto *element = dynamic_cast<PathElement *>(edge->path_list[0].get());
+	return element && element->match_type != PGQMatchType::MATCH_VERTEX ? edge : nullptr;
+}
+
+//! CHEAPEST and COST(p) in one MATCH block, checked before the translation. A COST that is the same positive constant
+//! on every edge makes the cheapest paths the shortest ones, and the pattern is answered as SHORTEST. With any other
+//! COST, only the endpoint pairs come from the pattern's search, which counts hops: refused is whatever would show
+//! which path that search picked (the path functions, ONE ROW PER, ALL CHEAPEST's one row per cheapest path).
+//! COST(p) is a Bellman-Ford search over the costed edges: the cheapest cost from the source to the destination over
+//! any number of hops, which is the pattern's cost only for one right-directed edge quantified with + or *.
+static void PrepareCheapest(MatchExpression &match, bool shared_union_columns) {
+	vector<string> cost_calls;
+	for (auto &column : match.column_list) {
+		CollectCostCalls(*column, cost_calls);
+	}
+	if (match.where_clause) {
+		vector<string> where_calls;
+		CollectCostCalls(*match.where_clause, where_calls);
+		if (!where_calls.empty()) {
+			throw NotImplementedException("COST(%s) is not supported in the WHERE of a MATCH; filter on it outside the "
+			                              "GRAPH_TABLE",
+			                              where_calls[0]);
+		}
+	}
+	if (!cost_calls.empty() && shared_union_columns) {
+		throw BinderException("COST(%s) in the COLUMNS shared by the MATCH blocks of a UNION is not supported: give "
+		                      "each block its own COLUMNS",
+		                      cost_calls[0]);
+	}
+	static constexpr const char *kExample = "MATCH p = ANY CHEAPEST (a)-[e:Link COST e.weight]->+(b)";
+	case_insensitive_set_t costed_paths;
+	string cost_signature;
+	for (auto &pattern : match.path_patterns) {
+		string path_variable;
+		auto &elements = PatternPath(*pattern, path_variable);
+		bool costed = false;
+		for (auto &call : cost_calls) {
+			costed |= !path_variable.empty() && StringUtil::CIEquals(call, path_variable);
+		}
+		if (costed) {
+			costed_paths.insert(path_variable);
+		}
+		if (!pattern->cheapest || !PatternHasCostExpr(pattern->path_elements)) {
+			if (costed) {
+				throw BinderException("COST(%s) needs an ANY CHEAPEST path pattern with a COST: %s is not one, so its "
+				                      "path is not chosen by cost",
+				                      path_variable, path_variable);
+			}
+			// CHEAPEST without a COST is refused when the pattern is translated.
+			continue;
+		}
+		bool found = false;
+		const bool constant = AllCostsConstant(pattern->path_elements, found) && found;
+		auto *edge = SingleQuantifiedEdge(elements);
+		if (!constant) {
+			if (pattern->all) {
+				throw NotImplementedException("ALL CHEAPEST with a COST that is not the same positive constant on "
+				                              "every edge is not supported; use ANY CHEAPEST");
+			}
+			if (!edge) {
+				throw NotImplementedException("ANY CHEAPEST with a COST that is not the same positive constant on every "
+				                              "edge supports one quantified edge between two vertices, e.g. %s",
+				                              kExample);
+			}
+			if (match.one_row_per != OneRowPerMode::NONE) {
+				throw NotImplementedException("ONE ROW PER is not supported with ANY CHEAPEST and a COST that is not "
+				                              "the same positive constant on every edge: only its cost, COST(p), is "
+				                              "computed, not its path");
+			}
+			if (!path_variable.empty()) {
+				bool uses_path = match.where_clause && UsesPathOutsideCost(*match.where_clause, path_variable);
+				for (auto &column : match.column_list) {
+					uses_path = uses_path || UsesPathOutsideCost(*column, path_variable);
+				}
+				if (uses_path) {
+					throw NotImplementedException("Only COST(%s) is supported for ANY CHEAPEST with a COST that is not "
+					                              "the same positive constant on every edge: its cost is computed, not "
+					                              "its path (vertices, edges, path_length, ...)",
+					                              path_variable);
+				}
+			}
+		}
+		if (!costed) {
+			continue;
+		}
+		auto *edge_element = edge ? dynamic_cast<PathElement *>(edge->path_list[0].get()) : nullptr;
+		if (!edge || edge->lower > 1 || edge->upper < (1 << 30) || edge->where_clause ||
+		    edge_element->match_type != PGQMatchType::MATCH_EDGE_RIGHT) {
+			throw NotImplementedException("COST(%s) supports one right-directed edge, without an element WHERE, "
+			                              "quantified with + or * between two vertices, e.g. %s",
+			                              path_variable, kExample);
+		}
+		if (!match.optional_match_patterns.empty() || match.one_row_per != OneRowPerMode::NONE) {
+			throw NotImplementedException("COST(%s) is not supported with OPTIONAL MATCH or ONE ROW PER", path_variable);
+		}
+		// The patterns of one MATCH block share one CSR, built for the first COST(p): every COST(p) must be the
+		// search over the same edges with the same cost.
+		auto canonical_cost = RebindColumnAlias(edge->cost_expr->Copy(), edge_element->variable_binding, "__pgq_edge");
+		auto signature = StringUtil::Lower(edge_element->label) + "|" + canonical_cost->ToString() + "|" +
+		                 (edge->has_default ? std::to_string(edge->default_value) : string());
+		if (cost_signature.empty()) {
+			cost_signature = signature;
+		} else if (signature != cost_signature) {
+			throw NotImplementedException("The COST(p) of several ANY CHEAPEST patterns in one MATCH block must search "
+			                              "the same edge label with the same COST; put %s in a GRAPH_TABLE of its own",
+			                              path_variable);
+		}
+	}
+	for (auto &call : cost_calls) {
+		if (!costed_paths.count(call)) {
+			throw BinderException("COST(%s): %s is not a named path of this MATCH (MATCH %s = ANY CHEAPEST ...)", call,
+			                      call, call);
+		}
+	}
+	if (costed_paths.empty()) {
+		return;
+	}
+	// The other variable-length patterns of the block would traverse the CSR the COST(p) search built.
+	for (auto &pattern : match.path_patterns) {
+		string path_variable;
+		PatternPath(*pattern, path_variable);
+		if (!costed_paths.count(path_variable) && PatternHasVariableLength(pattern->path_elements)) {
+			throw NotImplementedException("COST(p) needs every variable-length pattern of its MATCH block to compute "
+			                              "its COST(...) too; put the others in a GRAPH_TABLE of their own");
+		}
+	}
+}
+
 static void NormalizeMatchExpression(MatchExpression &match) {
 	NormalizePatterns(match.path_patterns);
 	for (auto &group : match.optional_match_patterns) {
 		NormalizePatterns(group);
 	}
+	for (auto &pattern : match.path_patterns) {
+		RejectVertexCosts(pattern->path_elements);
+	}
+	for (auto &group : match.optional_match_patterns) {
+		for (auto &pattern : group) {
+			RejectVertexCosts(pattern->path_elements);
+		}
+	}
+	bool shared_union_columns = !match.union_matches.empty() && match.union_matches[0]->column_list.empty();
+	PrepareCheapest(match, shared_union_columns);
 	for (auto &branch : match.union_matches) {
 		NormalizeMatchExpression(*branch);
 	}

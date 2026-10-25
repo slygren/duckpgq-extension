@@ -118,6 +118,12 @@ static void CreateCsrVertexFunction(DataChunk &args, ExpressionState &state, Vec
 	                                                   });
 }
 
+static void ThrowNullCost(DuckPGQState &state, int32_t csr_id) {
+	state.csr_to_delete.insert(csr_id);
+	throw ConstraintException("CHEAPEST needs a cost for every edge, and a COST evaluated to NULL; give it a DEFAULT "
+	                            "(COST expr DEFAULT n) for the edges where it is NULL");
+}
+
 static void CreateCsrEdgeFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
 	auto &info = func_expr.BindInfo()->Cast<CSRFunctionData>();
@@ -174,13 +180,22 @@ static void CreateCsrEdgeFunction(DataChunk &args, ExpressionState &state, Vecto
 			auto edge_id_idx = edge_id_data.sel->get_index(i);
 			auto weight_idx = weight_data.sel->get_index(i);
 			if (!src_data.validity.RowIsValid(src_idx) || !dst_data.validity.RowIsValid(dst_idx) ||
-			    !edge_id_data.validity.RowIsValid(edge_id_idx) || !weight_data.validity.RowIsValid(weight_idx)) {
+			    !edge_id_data.validity.RowIsValid(edge_id_idx)) {
 				result_validity.SetInvalid(i);
 				continue;
+			}
+			// Skipping it would leave its CSR slot unfilled, which reads as an edge to vertex 0 at cost 0.
+			if (!weight_data.validity.RowIsValid(weight_idx)) {
+				ThrowNullCost(*duckpgq_state, info.id);
 			}
 			auto src = src_values[src_idx];
 			auto pos = ++csr_found->v[src + 1];
 			auto weight = weight_values[weight_idx];
+			if (weight < 0) {
+				duckpgq_state->csr_to_delete.insert(info.id);
+				throw ConstraintException("CHEAPEST needs costs that are not negative; an edge has COST %lld",
+				                            static_cast<long long>(weight));
+			}
 			csr_found->e[(int64_t)pos - 1] = dst_values[dst_idx];
 			csr_found->edge_ids[(int64_t)pos - 1] = edge_id_values[edge_id_idx];
 			csr_found->w[(int64_t)pos - 1] = weight;
@@ -196,17 +211,28 @@ static void CreateCsrEdgeFunction(DataChunk &args, ExpressionState &state, Vecto
 		auto edge_id_idx = edge_id_data.sel->get_index(i);
 		auto weight_idx = weight_data.sel->get_index(i);
 		if (!src_data.validity.RowIsValid(src_idx) || !dst_data.validity.RowIsValid(dst_idx) ||
-		    !edge_id_data.validity.RowIsValid(edge_id_idx) || !weight_data.validity.RowIsValid(weight_idx)) {
+		    !edge_id_data.validity.RowIsValid(edge_id_idx)) {
 			result_validity.SetInvalid(i);
 			continue;
+		}
+		// Skipping it would leave its CSR slot unfilled, which reads as an edge to vertex 0 at cost 0.
+		if (!weight_data.validity.RowIsValid(weight_idx)) {
+			ThrowNullCost(*duckpgq_state, info.id);
 		}
 		auto src = src_values[src_idx];
 		auto pos = ++csr_found->v[src + 1];
 		auto weight = weight_values[weight_idx];
+		if (!(weight >= 0) || std::isinf(weight)) {
+			duckpgq_state->csr_to_delete.insert(info.id);
+			throw ConstraintException("CHEAPEST needs finite costs that are not negative; an edge has COST %s",
+			                            Value::DOUBLE(weight).ToString());
+		}
 		csr_found->e[(int64_t)pos - 1] = dst_values[dst_idx];
 		csr_found->edge_ids[(int64_t)pos - 1] = edge_id_values[edge_id_idx];
 		csr_found->w_double[(int64_t)pos - 1] = weight;
-		result_data[i] = static_cast<int32_t>(weight);
+		result_data[i] = weight < static_cast<double>(NumericLimits<int32_t>::Maximum())
+		                     ? static_cast<int32_t>(weight)
+		                     : NumericLimits<int32_t>::Maximum();
 	}
 }
 
@@ -237,15 +263,12 @@ ScalarFunctionSet GetCSREdgeFunction() {
 	                                LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT},
 	                               LogicalType::INTEGER, CreateCsrEdgeFunction, CSRFunctionData::CSREdgeBind));
 
-	//! Integer for edge weight
-	set.AddFunction(ScalarFunction({LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT,
-	                                LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT},
-	                               LogicalType::INTEGER, CreateCsrEdgeFunction, CSRFunctionData::CSREdgeBind));
-
-	//! Double for edge weight
-	set.AddFunction(ScalarFunction({LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT,
-	                                LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::DOUBLE},
-	                               LogicalType::INTEGER, CreateCsrEdgeFunction, CSRFunctionData::CSREdgeBind));
+	//! Edge weight, kept as BIGINT (integer costs) or DOUBLE (other numbers)
+	ScalarFunction weighted({LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT,
+	                         LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::ANY},
+	                        LogicalType::INTEGER, CreateCsrEdgeFunction, CSRFunctionData::CSREdgeBind);
+	weighted.SetResolveTypesCallback(CSRFunctionData::CSREdgeResolveTypes);
+	set.AddFunction(weighted);
 
 	return set;
 }

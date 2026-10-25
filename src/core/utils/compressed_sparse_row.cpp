@@ -94,10 +94,18 @@ unique_ptr<FunctionData> CSRFunctionData::CSREdgeBind(BindScalarFunctionInput &i
 	}
 	Value id = ExpressionExecutor::EvaluateScalar(context, *arguments[0]);
 	if (arguments.size() == 8) {
-		return make_uniq<CSRFunctionData>(context, id.GetValue<int32_t>(), arguments[7]->GetReturnType());
+		// CSREdgeResolveTypes chose BIGINT or DOUBLE for the weights.
+		return make_uniq<CSRFunctionData>(context, id.GetValue<int32_t>(), input.GetBoundFunction().GetArguments()[7]);
 	}
 	auto logical_type = LogicalType::SQLNULL;
 	return make_uniq<CSRFunctionData>(context, id.GetValue<int32_t>(), logical_type);
+}
+
+void CSRFunctionData::CSREdgeResolveTypes(ResolveScalarFunctionTypesInput &input) {
+	// The weights are kept as BIGINT when every cost is an integer that fits one, as DOUBLE otherwise.
+	if (input.GetArgumentCount() == 8) {
+		input.GetBoundFunction().GetArguments()[7] = PGQCostType(input.GetArgumentType(7));
+	}
 }
 
 unique_ptr<FunctionData> CSRFunctionData::CSRBind(BindScalarFunctionInput &input) {
@@ -173,6 +181,34 @@ unique_ptr<SubqueryExpression> GetCountTable(const shared_ptr<PropertyGraphTable
 	result->SubqueryMutable() = std::move(select_count);
 	result->GetSubqueryTypeMutable() = SubqueryType::SCALAR;
 	return result;
+}
+
+LogicalType PGQCostType(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::SQLNULL:
+	case LogicalTypeId::BOOLEAN:
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+		return LogicalType::BIGINT;
+	case LogicalTypeId::UBIGINT:
+	case LogicalTypeId::HUGEINT:
+	case LogicalTypeId::UHUGEINT:
+	case LogicalTypeId::FLOAT:
+	case LogicalTypeId::DOUBLE:
+	case LogicalTypeId::DECIMAL:
+		return LogicalType::DOUBLE;
+	default:
+		throw BinderException("A COST must be a number, not %s", type.ToString());
+	}
+}
+
+bool PGQIntegerCost(const LogicalType &type) {
+	return type.IsIntegral() || type.id() == LogicalTypeId::SQLNULL || type.id() == LogicalTypeId::BOOLEAN;
 }
 
 unique_ptr<JoinRef> GetJoinRef(const shared_ptr<PropertyGraphTable> &edge_table, const string &edge_binding,

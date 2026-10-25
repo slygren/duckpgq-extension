@@ -55,6 +55,7 @@ struct CSRFunctionData : FunctionData {
 	bool Equals(const FunctionData &other_p) const override;
 	static unique_ptr<FunctionData> CSRVertexBind(BindScalarFunctionInput &input);
 	static unique_ptr<FunctionData> CSREdgeBind(BindScalarFunctionInput &input);
+	static void CSREdgeResolveTypes(ResolveScalarFunctionTypesInput &input);
 	static unique_ptr<FunctionData> CSRBind(BindScalarFunctionInput &input);
 
 	ClientContext &context;
@@ -86,6 +87,16 @@ unique_ptr<CommonTableExpressionInfo> CreateWeightedDirectedCSRCTE(const shared_
                                                                    const string &next_binding,
                                                                    unique_ptr<ParsedExpression> weight_expr, int32_t csr_id,
                                                                    const PGQEdgeRowFilter &edge_filter = {});
+
+//! The type a CSR keeps COST values in: BIGINT for integers that fit one, DOUBLE for other numbers (DECIMAL
+//! included). Throws for a type that is not a number.
+LogicalType PGQCostType(const LogicalType &type);
+//! Whether COST(p) of costs of this type is a BIGINT (any integer type) rather than a DOUBLE.
+bool PGQIntegerCost(const LogicalType &type);
+//! The edge table joined to its source and destination vertex tables, as the CSR CTEs read it.
+unique_ptr<JoinRef> GetJoinRef(const shared_ptr<PropertyGraphTable> &edge_table, const string &edge_binding,
+                               const PGQEdgeRowFilter &edge_filter, const string &prev_binding,
+                               const string &next_binding);
 
 // Helper functions
 unique_ptr<CommonTableExpressionInfo> MakeEdgesCTE(const shared_ptr<PropertyGraphTable> &edge_table,

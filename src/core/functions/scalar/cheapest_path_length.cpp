@@ -160,12 +160,25 @@ static void CheapestPathLengthFunction(DataChunk &args, ExpressionState &state, 
 	auto &target = args.data[3];
 	target.ToUnifiedFormat(vdata_target);
 	auto target_data = reinterpret_cast<const int64_t *>(vdata_target.data);
-	if (csr->w.empty()) {
-		// The CSR is built after bind, so the weight type is unknown there: compute in double, return BIGINT.
+	if (csr->w.size() < csr->e.size() && csr->w_double.size() < csr->e.size()) {
+		duckpgq_state->csr_to_delete.insert(info.csr_id);
+		throw ConstraintException("cheapest_path_length: CSR %d holds no costs", info.csr_id);
+	}
+	// The result is BIGINT for integer costs and DOUBLE otherwise; the CSR keeps them as BIGINT or DOUBLE alike.
+	const bool double_result_type = result.GetType().id() == LogicalTypeId::DOUBLE;
+	if (csr->w.empty() && double_result_type) {
+		TemplatedBellmanFord<double>(csr, args, input_size, result, vdata_src, src_data, vdata_target, target_data,
+		                             csr->w_double);
+	} else if (csr->w.empty()) {
 		Vector double_result(LogicalType::DOUBLE, args.size());
 		TemplatedBellmanFord<double>(csr, args, input_size, double_result, vdata_src, src_data, vdata_target,
 		                             target_data, csr->w_double);
 		VectorOperations::Cast(info.context, double_result, result, args.size());
+	} else if (double_result_type) {
+		Vector integer_result(LogicalType::BIGINT, args.size());
+		TemplatedBellmanFord<int64_t>(csr, args, input_size, integer_result, vdata_src, src_data, vdata_target,
+		                              target_data, csr->w);
+		VectorOperations::Cast(info.context, integer_result, result, args.size());
 	} else {
 		TemplatedBellmanFord<int64_t>(csr, args, input_size, result, vdata_src, src_data, vdata_target, target_data,
 		                              csr->w);
@@ -176,9 +189,19 @@ static void CheapestPathLengthFunction(DataChunk &args, ExpressionState &state, 
 // Register functions
 //------------------------------------------------------------------------------
 void CoreScalarFunctions::RegisterCheapestPathLengthScalarFunction(ExtensionLoader &loader) {
-	loader.RegisterFunction(ScalarFunction(
-	    "cheapest_path_length", {LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT},
-	    LogicalType::BIGINT, CheapestPathLengthFunction, CheapestPathLengthFunctionData::CheapestPathLengthBind));
+	ScalarFunctionSet set("cheapest_path_length");
+	set.AddFunction(ScalarFunction({LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT},
+	                               LogicalType::BIGINT, CheapestPathLengthFunction,
+	                               CheapestPathLengthFunctionData::CheapestPathLengthBind));
+	//! The fifth argument only carries the type of the COST, which decides the result type. It is always NULL, so the
+	//! function handles NULLs itself (NULL endpoints give NULL); otherwise the result would be taken to be NULL too.
+	ScalarFunction typed({LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT,
+	                      LogicalType::ANY},
+	                     LogicalType::BIGINT, CheapestPathLengthFunction,
+	                     CheapestPathLengthFunctionData::CheapestPathLengthBind);
+	typed.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	set.AddFunction(typed);
+	loader.RegisterFunction(set);
 }
 
 } // namespace duckdb

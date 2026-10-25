@@ -127,7 +127,7 @@ put over DuckLake catalogs. A graph is stored in the database it is created in a
 | `-[:R*1..5]->`, `-[:R*]->`, `-[:R*2]->`, `-[:R*..3]->`, `-[:R*0..]->` | Cypher's quantifier inside the edge, with Cypher's meaning: `*` is `{1,}`, a missing lower bound is 1 (`*..3` is `{1,3}`) |
 | `MATCH (t)-[:A]->(a), (t)-[:B]->(b)` | several patterns sharing a variable |
 | `MATCH p = …` | path variable |
-| `ANY SHORTEST`, `ALL SHORTEST`, `ANY CHEAPEST`, `ALL CHEAPEST` | path search; `COST expr [DEFAULT n]` on an element gives its weight |
+| `ANY SHORTEST`, `ALL SHORTEST`, `ANY CHEAPEST`, `ALL CHEAPEST` | path search; `COST expr [DEFAULT n]` on an edge gives its weight, a number (`DEFAULT` where `expr` is NULL). A NULL cost without `DEFAULT`, and a negative or non-finite one, is an error |
 | `WALK`, `TRAIL`, `SIMPLE`, `ACYCLIC` | path mode |
 | `OPTIONAL MATCH …` | left-joined pattern (fixed-length, directed) |
 | `WHERE EXISTS { (t)-[:HAS_WORKORDER]->() }`, `NOT EXISTS { … }` | correlated pattern existence |
@@ -151,7 +151,7 @@ walks that return to their start vertex are left out, and an edge stored twice i
 | `ALL_DIFFERENT(a, b, …)` | the bound elements are pairwise distinct |
 | `path_length(p)`, `vertices(p)`, `edges(p)` | hops; the path's vertices (row ids when traversed, keys when an ABI artifact answers) and edges (row ids; no artifact has them, so a pattern asking for `edges(p)` is traversed) |
 | `vertex_labels(p)`, `edge_labels(p)` | declared labels along the path, in path order, traversed or answered by an ABI artifact. They need each vertex and edge of the path to have one table, from its label or from the edge next to it |
-| `cost(p)` | total cost of an `ANY`/`ALL CHEAPEST` path |
+| `cost(p)` | total cost of an `ANY`/`ALL CHEAPEST` path: BIGINT for integer costs, DOUBLE for any other number (DECIMAL included) |
 | `path_tree_json(…)`, `graph_tree_json(…)` | nest paths into a JSON tree |
 
 Examples on a larger graph (the maintenance graph the ABI work was built for) are in
@@ -394,7 +394,11 @@ building in [abi_build.cpp](src/core/functions/table/abi_build.cpp); vertex-join
   traverse. Choosing between several matching artifacts is simple.
 - **`pgq_abi_build` on a SQLite-backed DuckLake catalog** fails (the build's connection and the caller's contend
   for the file); run the statements from `pgq_abi_sql` on the caller's connection instead.
-- **CHEAPEST costs** are BIGINT; fractional weights are rounded.
+- **CHEAPEST with a cost that varies by edge** finds the cheapest cost, not the path: `cost(p)` and the endpoints
+  are answered, the path functions (`vertices(p)`, `path_length(p)`, …), `ONE ROW PER` and `ALL CHEAPEST` are refused.
+  `cost(p)` needs one right-directed edge quantified with `+` or `*`, and is not available in the MATCH's `WHERE`
+  (filter on it outside the `GRAPH_TABLE`). The same positive constant on every edge is `SHORTEST` and has none of
+  these limits, except those on `cost(p)`.
 
 ## Documentation map
 

@@ -1,0 +1,387 @@
+# name: test/sql/path_finding/cheapest_costs.test
+# description: CHEAPEST with DOUBLE, DECIMAL and integer costs, DEFAULT, invalid costs, and the shapes it answers
+# group: [path_finding]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE person(id BIGINT, name VARCHAR);
+
+statement ok
+INSERT INTO person VALUES (0, 'A'), (1, 'B'), (2, 'C'), (3, 'D'), (4, 'E');
+
+# Rounded to integers, A->B->D (0 + 0) would beat A->D (1); it costs 0.9 against 0.6.
+statement ok
+CREATE TABLE link(src BIGINT, dst BIGINT, w DOUBLE, d DECIMAL(6, 2), f FLOAT, i INTEGER, n INTEGER);
+
+statement ok
+INSERT INTO link VALUES
+    (0, 3, 0.6, 0.6, 0.5, 6, 6),
+    (0, 1, 0.45, 0.45, 0.25, 4, 4),
+    (1, 3, 0.45, 0.45, 0.25, 4, NULL),
+    (0, 2, 1.4, 1.4, 1.5, 14, 14),
+    (2, 3, 0.1, 0.1, 0.125, 1, 1),
+    (3, 4, 2.25, 2.25, 2.0, 22, 22);
+
+statement ok
+CREATE PROPERTY GRAPH g
+VERTEX TABLES (person LABEL Person)
+EDGE TABLES (link SOURCE KEY (src) REFERENCES person (id) DESTINATION KEY (dst) REFERENCES person (id) LABEL Link);
+
+# ── DOUBLE costs are not rounded ────────────────────────────────────────────────────────────────────────────────────
+
+query TR
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person) WHERE a.name = 'A'
+    COLUMNS (b.name, round(COST(p), 9) AS c)) ORDER BY ALL;
+----
+B	0.45
+C	1.4
+D	0.6
+E	2.85
+
+query T
+SELECT DISTINCT typeof(c) FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person)
+    COLUMNS (COST(p) AS c));
+----
+DOUBLE
+
+# DECIMAL costs are computed as DOUBLE
+query TR
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.d]->+(b:Person) WHERE a.name = 'A'
+    COLUMNS (b.name, round(COST(p), 9) AS c)) ORDER BY ALL;
+----
+B	0.45
+C	1.4
+D	0.6
+E	2.85
+
+query T
+SELECT DISTINCT typeof(c) FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.d]->+(b:Person)
+    COLUMNS (COST(p) AS c));
+----
+DOUBLE
+
+# FLOAT, and an expression over a cost
+query TR
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.f]->+(b:Person) WHERE a.name = 'A'
+    COLUMNS (b.name, COST(p) AS c)) ORDER BY ALL;
+----
+B	0.25
+C	1.5
+D	0.5
+E	2.5
+
+query TR
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.f * 2]->+(b:Person) WHERE a.name = 'A'
+    COLUMNS (b.name, COST(p) AS c)) ORDER BY ALL;
+----
+B	0.5
+C	3.0
+D	1.0
+E	5.0
+
+# ── Integer costs stay BIGINT ───────────────────────────────────────────────────────────────────────────────────────
+
+query TI
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.i]->+(b:Person) WHERE a.name = 'A'
+    COLUMNS (b.name, COST(p) AS c)) ORDER BY ALL;
+----
+B	4
+C	14
+D	6
+E	28
+
+query T
+SELECT DISTINCT typeof(c) FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.i]->+(b:Person)
+    COLUMNS (COST(p) AS c));
+----
+BIGINT
+
+# A filter on the cost outside the GRAPH_TABLE
+query TI
+SELECT * FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.i]->+(b:Person) WHERE a.name = 'A'
+    COLUMNS (b.name, COST(p) AS c)) WHERE c > 10 ORDER BY ALL;
+----
+C	14
+E	28
+
+# ── DEFAULT, and costs CHEAPEST cannot use ──────────────────────────────────────────────────────────────────────────
+
+# n is NULL for B->D. Without a DEFAULT that is an error, not an edge left out or misread.
+statement error
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.n]->+(b:Person) COLUMNS (COST(p) AS c));
+----
+COST evaluated to NULL
+
+# An integer DEFAULT keeps integer costs BIGINT
+query TI
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.n DEFAULT 1]->+(b:Person) WHERE a.name = 'A'
+    COLUMNS (b.name, COST(p) AS c)) ORDER BY ALL;
+----
+B	4
+C	14
+D	5
+E	27
+
+query TR
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.n DEFAULT 0.5]->+(b:Person) WHERE a.name = 'A'
+    COLUMNS (b.name, COST(p) AS c)) ORDER BY ALL;
+----
+B	4.0
+C	14.0
+D	4.5
+E	26.5
+
+statement ok
+CREATE TABLE bad(src BIGINT, dst BIGINT, w DOUBLE);
+
+statement ok
+INSERT INTO bad VALUES (0, 1, 1), (1, 0, -3);
+
+statement ok
+CREATE PROPERTY GRAPH bad_g
+VERTEX TABLES (person LABEL Person)
+EDGE TABLES (bad SOURCE KEY (src) REFERENCES person (id) DESTINATION KEY (dst) REFERENCES person (id) LABEL Bad);
+
+# A negative cost has no cheapest path once it is on a cycle; it is refused, not searched for ever
+statement error
+FROM GRAPH_TABLE (bad_g MATCH p = ANY CHEAPEST (a:Person)-[e:Bad COST e.w]->+(b:Person) COLUMNS (COST(p) AS c));
+----
+costs that are not negative
+
+statement error
+FROM GRAPH_TABLE (bad_g MATCH p = ANY CHEAPEST (a:Person)-[e:Bad COST CAST(e.w AS BIGINT)]->+(b:Person) COLUMNS (COST(p) AS c));
+----
+costs that are not negative
+
+statement ok
+UPDATE bad SET w = 'nan'::DOUBLE WHERE src = 1;
+
+statement error
+FROM GRAPH_TABLE (bad_g MATCH p = ANY CHEAPEST (a:Person)-[e:Bad COST e.w]->+(b:Person) COLUMNS (COST(p) AS c));
+----
+finite costs
+
+statement ok
+UPDATE bad SET w = 'inf'::DOUBLE WHERE src = 1;
+
+statement error
+FROM GRAPH_TABLE (bad_g MATCH p = ANY CHEAPEST (a:Person)-[e:Bad COST e.w]->+(b:Person) COLUMNS (COST(p) AS c));
+----
+finite costs
+
+statement error
+FROM GRAPH_TABLE (bad_g MATCH p = ANY CHEAPEST (a:Person)-[e:Bad COST 'x']->+(b:Person) COLUMNS (COST(p) AS c));
+----
+must be a number
+
+# ── A constant cost: the cheapest paths are the shortest ones ───────────────────────────────────────────────────────
+
+query TII
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 2]->+(b:Person) WHERE a.name = 'A'
+    COLUMNS (b.name, COST(p) AS c, path_length(p) AS len)) ORDER BY ALL;
+----
+B	2	1
+C	2	1
+D	2	1
+E	4	2
+
+# In either order with the other path functions
+query TII
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 2]->+(b:Person) WHERE a.name = 'A'
+    COLUMNS (b.name, path_length(p) AS len, COST(p) AS c)) ORDER BY ALL;
+----
+B	1	2
+C	1	2
+D	1	2
+E	2	4
+
+# COST(p) inside an expression; in WHERE it is refused, filter outside
+query TR
+SELECT * FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person) WHERE a.name = 'A'
+    COLUMNS (b.name, round(COST(p) * 10, 6) AS c)) WHERE c > 10 ORDER BY ALL;
+----
+C	14.0
+E	28.5
+
+statement error
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person) WHERE COST(p) > 1 COLUMNS (b.name));
+----
+is not supported in the WHERE of a MATCH
+
+query TR
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 0.5]->+(b:Person) WHERE a.name = 'A'
+    COLUMNS (b.name, COST(p) AS c)) ORDER BY ALL;
+----
+B	0.5
+C	0.5
+D	0.5
+E	1.0
+
+# ALL CHEAPEST with a constant cost is ALL SHORTEST
+query TT
+FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST 1]->+(b:Person) WHERE a.name = 'A' AND b.name = 'E'
+    COLUMNS (b.name, vertices(p) AS vs)) ORDER BY ALL;
+----
+E	[0, 3, 4]
+
+# ── Shapes a cost that varies cannot answer, refused rather than answered by the hop-count search ────────────────
+
+# Endpoint pairs alone are right
+query T
+FROM GRAPH_TABLE (g MATCH ANY CHEAPEST (a:Person)-[e:Link COST e.w]->{2,3}(b:Person) WHERE a.name = 'A' COLUMNS (b.name))
+ORDER BY ALL;
+----
+D
+E
+
+statement error
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person) COLUMNS (vertices(p)));
+----
+Only COST(p) is supported
+
+statement error
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person) COLUMNS (path_length(p)));
+----
+Only COST(p) is supported
+
+statement error
+FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person) COLUMNS (b.name));
+----
+ALL CHEAPEST with a COST that is not the same positive constant
+
+statement error
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person) ONE ROW PER VERTEX (v) COLUMNS (v.name));
+----
+ONE ROW PER is not supported
+
+# Two edges, or two different constants: the cost is not one search
+statement error
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->(m:Person)-[f:Link COST f.w]->+(b:Person)
+    COLUMNS (COST(p)));
+----
+supports one quantified edge between two vertices
+
+statement error
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 1]->(m:Person)-[f:Link COST 5]->+(b:Person)
+    COLUMNS (b.name));
+----
+supports one quantified edge between two vertices
+
+# COST(p) is the cheapest cost over any number of hops from at most one hop up
+statement error
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->{1,2}(b:Person) COLUMNS (COST(p)));
+----
+COST(p) supports one right-directed edge
+
+statement error
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->{2,}(b:Person) COLUMNS (COST(p)));
+----
+COST(p) supports one right-directed edge
+
+statement error
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 1]->{2,}(b:Person) COLUMNS (COST(p)));
+----
+COST(p) supports one right-directed edge
+
+statement error
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)<-[e:Link COST e.w]-+(b:Person) COLUMNS (COST(p)));
+----
+COST(p) supports one right-directed edge
+
+# COST(p) of a path that is not chosen by cost
+statement error
+FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Person)-[e:Link COST e.w]->+(b:Person) COLUMNS (COST(p)));
+----
+needs an ANY CHEAPEST path pattern
+
+statement error
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person) COLUMNS (COST(q)));
+----
+is not a named path
+
+# Several COST(p) in one MATCH share one search
+query RR
+FROM GRAPH_TABLE (g MATCH
+    p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person),
+    q = ANY CHEAPEST (c:Person)-[f:Link COST f.w]->+(d:Person)
+    WHERE a.name = 'A' AND b.name = 'D' AND c.name = 'B' AND d.name = 'E'
+    COLUMNS (round(COST(p), 9) AS cp, round(COST(q), 9) AS cq));
+----
+0.6	2.7
+
+statement error
+FROM GRAPH_TABLE (g MATCH
+    p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person),
+    q = ANY CHEAPEST (c:Person)-[f:Link COST 1]->+(d:Person)
+    COLUMNS (COST(p) AS cp, COST(q) AS cq));
+----
+must search the same edge label with the same COST
+
+# COST belongs on edges
+statement error
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person COST 100)-[e:Link COST e.w]->+(b:Person) COLUMNS (COST(p)));
+----
+COST applies to edges
+
+# ── With ABI artifacts ──────────────────────────────────────────────────────────────────────────────────────────────
+
+statement ok
+FROM pgq_abi_build('g', exclude_self_referential := false, closures := ['Link']);
+
+# A constant cost still takes the closure
+statement ok
+FROM GRAPH_TABLE (g MATCH ANY CHEAPEST (a:Person)-[e:Link COST 2]->{1,3}(b:Person) WHERE a.id = 0 COLUMNS (b.name));
+
+query T
+SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+transitive_closure
+
+query TT
+SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH ANY CHEAPEST
+    (a:Person)-[e:Link COST 2]->{1,3}(b:Person) WHERE a.id = 0 COLUMNS (b.name))');
+----
+match	true
+
+statement ok
+FROM GRAPH_TABLE (g MATCH ANY CHEAPEST (a:Person)-[e:Link COST 0.5]->{1,3}(b:Person) WHERE a.id = 0 COLUMNS (b.name));
+
+query T
+SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+transitive_closure
+
+# With COST(p) as well
+query TR
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 0.5]->+(b:Person) WHERE a.id = 0
+    COLUMNS (b.name, COST(p) AS c)) ORDER BY ALL;
+----
+B	0.5
+C	0.5
+D	0.5
+E	1.0
+
+statement error
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 0.5]->{1,3}(b:Person) COLUMNS (COST(p) AS c));
+----
+COST(p) supports one right-directed edge
+
+# A cost that varies is traversed, artifacts or not, and answers the same
+query TR
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person) WHERE a.name = 'A'
+    COLUMNS (b.name, round(COST(p), 9) AS c)) ORDER BY ALL;
+----
+B	0.45
+C	1.4
+D	0.6
+E	2.85
+
+query I
+SELECT count(*) FROM pgq_last_rewrite_diagnostics()
+WHERE status = 'selected' AND (rewrite_type LIKE 'tc%' OR rewrite_type = 'transitive_closure');
+----
+0

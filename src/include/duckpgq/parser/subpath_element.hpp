@@ -21,9 +21,10 @@ public:
 
 	string path_variable;
 
-	//! COST expression of a CHEAPEST path, and the cost used where it evaluates to NULL.
+	//! COST expression of a CHEAPEST path, and the cost used where it evaluates to NULL (when has_default).
 	unique_ptr<ParsedExpression> cost_expr;
 	double default_value = 1.0;
+	bool has_default = false;
 public:
 	explicit SubPath(PGQPathReferenceType path_reference_type) : PathReference(path_reference_type) {
 		path_mode = PGQPathMode::NONE;

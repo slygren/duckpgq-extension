@@ -48,7 +48,7 @@ Parser Error
 query I
 SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (wg MATCH s = ANY CHEAPEST (x:Person)-[g:Link COST g.weight]->+(y:Person) WHERE x.name = 'A' COLUMNS (COST(s) AS c))$$);
 ----
-MATCH ANY CHEAPEST s = {(x:Person) {-[g:Link]-> COST g.weight DEFAULT 1.0}{1,} (y:Person)} WHERE (x."name" = 'A') COLUMNS ("cost"(s) AS c)
+MATCH ANY CHEAPEST s = {(x:Person) {-[g:Link]-> COST g.weight}{1,} (y:Person)} WHERE (x."name" = 'A') COLUMNS ("cost"(s) AS c)
 
 query I
 SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (wg MATCH ALL CHEAPEST (x:Person)-[g:Link WHERE g.w > 0 COST g.weight * 2 DEFAULT 1.5]->(y:Person) COLUMNS (x.id))$$);

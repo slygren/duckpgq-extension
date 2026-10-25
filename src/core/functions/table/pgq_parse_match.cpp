@@ -60,7 +60,9 @@ string DumpReference(const PathReference &reference) {
 	}
 	if (subpath.cost_expr) {
 		result += " COST " + subpath.cost_expr->ToString();
-		result += " DEFAULT " + Value::DOUBLE(subpath.default_value).ToString();
+		if (subpath.has_default) {
+			result += " DEFAULT " + Value::DOUBLE(subpath.default_value).ToString();
+		}
 	}
 	result += "}";
 	if (subpath.lower != 1 || subpath.upper != 1) {

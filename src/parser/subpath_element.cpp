@@ -24,6 +24,7 @@ unique_ptr<PathReference> SubPath::Copy() {
 		result->cost_expr = cost_expr->Copy();
 	}
 	result->default_value = default_value;
+	result->has_default = has_default;
 
 	return std::move(result);
 }
@@ -69,7 +70,8 @@ bool SubPath::Equals(const PathReference *other_p) const {
 	if (path_variable != other->path_variable) {
 		return false;
 	}
-	if (!ParsedExpression::Equals(cost_expr, other->cost_expr) || default_value != other->default_value) {
+	if (!ParsedExpression::Equals(cost_expr, other->cost_expr) || default_value != other->default_value ||
+	    has_default != other->has_default) {
 		return false;
 	}
 	return true;
@@ -84,6 +86,7 @@ void SubPath::Serialize(Serializer &serializer) const {
 	serializer.WriteProperty(106, "path_variable", path_variable);
 	serializer.WritePropertyWithDefault(107, "cost_expr", cost_expr);
 	serializer.WritePropertyWithDefault(108, "default_value", default_value, 1.0);
+	serializer.WritePropertyWithDefault(109, "has_default", has_default, false);
 }
 
 unique_ptr<PathReference> SubPath::Deserialize(Deserializer &deserializer) {
@@ -99,6 +102,7 @@ unique_ptr<PathReference> SubPath::Deserialize(Deserializer &deserializer) {
 	deserializer.ReadProperty(106, "path_variable", result->path_variable);
 	deserializer.ReadPropertyWithDefault(107, "cost_expr", result->cost_expr);
 	deserializer.ReadPropertyWithExplicitDefault(108, "default_value", result->default_value, 1.0);
+	deserializer.ReadPropertyWithExplicitDefault(109, "has_default", result->has_default, false);
 	return std::move(result);
 }
 string SubPath::ToString() const {
