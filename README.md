@@ -124,6 +124,7 @@ put over DuckLake catalogs. A graph is stored in the database it is created in a
 | `-[e:Knows]->`, `<-[e:Knows]-`, `-[e:Knows]-` | directed, reversed, either direction |
 | `->`, `<-`, `-`, `<->` | anonymous edge of any label |
 | `-[:R]->{1,5}`, `{,3}`, `{2,}`, `{2}`, `*`, `+`, `?` | quantified (variable-length) edge, quantifier after the arrow |
+| `-[:R*1..5]->`, `-[:R*]->`, `-[:R*2]->`, `-[:R*..3]->`, `-[:R*0..]->` | Cypher's quantifier inside the edge, with Cypher's meaning: `*` is `{1,}`, a missing lower bound is 1 (`*..3` is `{1,3}`) |
 | `MATCH (t)-[:A]->(a), (t)-[:B]->(b)` | several patterns sharing a variable |
 | `MATCH p = …` | path variable |
 | `ANY SHORTEST`, `ALL SHORTEST`, `ANY CHEAPEST`, `ALL CHEAPEST` | path search; `COST expr [DEFAULT n]` on an element gives its weight |
@@ -383,7 +384,7 @@ building in [abi_build.cpp](src/core/functions/table/abi_build.cpp); vertex-join
 
 - **One DuckDB version per binary**, and unsigned (see [Deployment](#deployment)).
 - **Patterns not supported:** bracketed sub-path groups `[ … ]{n,m}`, path unions `|` / `|+|` inside a pattern,
-  Cypher's `[:R*1..5]` (write `-[:R]->{1,5}`), `LATERAL` inside `MATCH`, horizontal aggregation along a path,
+  `LATERAL` inside `MATCH`, horizontal aggregation along a path,
   graph updates (`INSERT`/`DELETE` of vertices or edges; the graph is a view over tables).
 - **Parsed, not implemented:** top-k shortest (`SHORTEST k`).
 - **`OPTIONAL MATCH`** is fixed-length and directed only. `ONE ROW PER` does not cover unbounded left-directed or

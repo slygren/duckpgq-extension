@@ -9,6 +9,7 @@
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/peg/ast/table_alias.hpp"
+#include "duckdb/parser/peg/matcher.hpp"
 #include "duckdb/parser/peg/transformer/peg_transformer.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckpgq/parser/path_element.hpp"
@@ -178,11 +179,19 @@ LabelText TransformLabelExpression(PEGTransformer &transformer, ParseResult &par
 	return JoinLabels(operands, '|');
 }
 
-// '(' Identifier? DuckPGQElementLabel? WhereClause? DuckPGQCost? ')', or the same between '[' and ']'.
+// '(' Identifier? DuckPGQElementLabel? WhereClause? DuckPGQCost? ')', or between '[' and ']' with
+// DuckPGQCypherQuantifier? after the label. An edge body passes cypher_quantifier to receive that quantifier.
 // An anonymous element binds a generated variable; an unlabeled one keeps an empty label (any label).
 unique_ptr<PathReference> TransformElement(PEGTransformer &transformer, ParseResult &parse_result,
-                                           PGQMatchType match_type, AnonymousNames &anon_names) {
+                                           PGQMatchType match_type, AnonymousNames &anon_names,
+                                           optional_ptr<optional_ptr<ParseResult>> cypher_quantifier = nullptr) {
 	auto &list = parse_result.Cast<ListParseResult>();
+	idx_t offset = 0;
+	if (cypher_quantifier) {
+		auto &quantifier = list.Child<OptionalParseResult>(3);
+		*cypher_quantifier = quantifier.HasResult() ? &quantifier.GetResult() : nullptr;
+		offset = 1;
+	}
 	auto element = make_uniq<PathElement>(PGQPathReferenceType::PATH_ELEMENT);
 	element->match_type = match_type;
 	auto &variable = list.Child<OptionalParseResult>(1);
@@ -196,8 +205,8 @@ unique_ptr<PathReference> TransformElement(PEGTransformer &transformer, ParseRes
 		auto &label_list = label.GetResult().Cast<ListParseResult>();
 		element->label = TransformLabelExpression(transformer, label_list.GetChild(1)).text;
 	}
-	auto &where_clause = list.Child<OptionalParseResult>(3);
-	auto &cost = list.Child<OptionalParseResult>(4);
+	auto &where_clause = list.Child<OptionalParseResult>(3 + offset);
+	auto &cost = list.Child<OptionalParseResult>(4 + offset);
 	if (!where_clause.HasResult() && !cost.HasResult()) {
 		return std::move(element);
 	}
@@ -266,11 +275,52 @@ void ApplyQuantifier(PEGTransformer &transformer, optional_ptr<ParseResult> quan
 	subpath.upper = text == "?" ? 1 : unbounded;
 }
 
+int64_t ParseCypherBound(const string &text, const string &quantifier) {
+	if (text.size() > 18) {
+		throw ParserException("Quantifier bound in *%s is too large", quantifier);
+	}
+	return std::stoll(text);
+}
+
+// '*' DuckPGQCypherRange*: Cypher's variable-length quantifier, read with Cypher's meaning. '*' alone is one or more
+// hops; '*n' exactly n; '*a..b' from a to b; a missing lower bound is 1 and a missing upper bound unbounded.
+void ApplyCypherQuantifier(ParseResult &parse_result, SubPath &subpath) {
+	string text;
+	auto &ranges = parse_result.Cast<ListParseResult>().Child<OptionalParseResult>(1);
+	if (ranges.HasResult()) {
+		for (auto &range : ranges.GetResult().Cast<RepeatParseResult>().GetChildren()) {
+			auto &number = range.get().Cast<NumberParseResult>().number;
+			// "1 2" would read as 12: two bounds must be separated by "..".
+			if (!text.empty() && !number.empty() && StringUtil::CharacterIsDigit(text.back()) &&
+			    StringUtil::CharacterIsDigit(number.front())) {
+				throw ParserException("Invalid quantifier *%s %s: write *n, *a..b, *..b or *a..", text, number);
+			}
+			text += number;
+		}
+	}
+	auto unbounded = NumericLimits<int64_t>::Maximum();
+	auto dots = text.find("..");
+	if (dots == string::npos) {
+		subpath.lower = text.empty() ? 1 : ParseCypherBound(text, text);
+		subpath.upper = text.empty() ? unbounded : subpath.lower;
+		return;
+	}
+	auto lower = text.substr(0, dots);
+	auto upper = text.substr(dots + 2);
+	subpath.lower = lower.empty() ? 1 : ParseCypherBound(lower, text);
+	subpath.upper = upper.empty() ? unbounded : ParseCypherBound(upper, text);
+	if (subpath.lower > subpath.upper) {
+		throw ConstraintException("Lower bound greater than upper bound");
+	}
+}
+
 // DuckPGQEdgeLeft DuckPGQEdgeBody DuckPGQEdgeTail
 unique_ptr<PathReference> TransformQuantifiedEdge(PEGTransformer &transformer, ParseResult &parse_result,
                                                   AnonymousNames &anon_names) {
 	auto &list = parse_result.Cast<ListParseResult>();
-	auto edge = TransformElement(transformer, list.GetChild(1), PGQMatchType::MATCH_EDGE_ANY, anon_names);
+	optional_ptr<ParseResult> cypher_quantifier;
+	auto edge =
+	    TransformElement(transformer, list.GetChild(1), PGQMatchType::MATCH_EDGE_ANY, anon_names, &cypher_quantifier);
 	auto left = DuckPGQLiteralText(list.GetChild(0));
 
 	// DuckPGQFusedTail / (DuckPGQEdgeRight DuckPGQQuantifier?)
@@ -294,7 +344,10 @@ unique_ptr<PathReference> TransformQuantifiedEdge(PEGTransformer &transformer, P
 		}
 	}
 	GetSinglePathElement(*edge).match_type = EdgeDirection(left, right);
-	if (!has_quantifier) {
+	if (cypher_quantifier && has_quantifier) {
+		throw ParserException("An edge takes one quantifier: write -[:R*1..5]-> or -[:R]->{1,5}, not both");
+	}
+	if (!has_quantifier && !cypher_quantifier) {
 		return edge;
 	}
 	auto result = make_uniq<SubPath>(PGQPathReferenceType::SUBPATH);
@@ -308,7 +361,11 @@ unique_ptr<PathReference> TransformQuantifiedEdge(PEGTransformer &transformer, P
 	} else {
 		result->path_list.push_back(std::move(edge));
 	}
-	ApplyQuantifier(transformer, quantifier, fused_quantifier, *result);
+	if (cypher_quantifier) {
+		ApplyCypherQuantifier(*cypher_quantifier, *result);
+	} else {
+		ApplyQuantifier(transformer, quantifier, fused_quantifier, *result);
+	}
 	return std::move(result);
 }
 
@@ -596,6 +653,55 @@ arena_ptr<TransformProcess> StartTransform(PEGTransformer &transformer, ParseRes
 	return transformer.MakeProcess<FinalizeTransformProcess>(transformer, parse_result, TRANSFORM);
 }
 
+//! The bound of a Cypher quantifier: one token of digits with at most one "..", e.g. "2", "1..5", "..3", "1.." or "..".
+//! The tokenizer reads such a run as one number token, but NumberLiteral accepts at most one '.'.
+class DuckPGQCypherRangeMatcher : public AtomicMatcher {
+public:
+	DuckPGQCypherRangeMatcher() : AtomicMatcher(MatcherType::CUSTOM) {
+		name = "DuckPGQCypherRange";
+	}
+
+	MatcherResult MatchAtomic(MatchState &state) const override {
+		auto token = state.token_iterator.Current();
+		if (!token || token->type != TokenType::NUMBER_LITERAL || !IsRange(token->text)) {
+			return MatcherResult::Failure();
+		}
+		auto text = token->text;
+		auto offset = optional_idx(token->offset);
+		auto length = optional_idx(token->length);
+		state.token_iterator.Advance();
+		state.UpdateMaxTokenIndex();
+		return state.AllocateParseResult<NumberParseResult>(std::move(text), offset, length);
+	}
+
+	SuggestionType AddSuggestionInternal(MatchState &state) const override {
+		return SuggestionType::MANDATORY;
+	}
+
+	string ToString() const override {
+		return "DuckPGQCypherRange";
+	}
+
+private:
+	static bool IsRange(const string &text) {
+		if (text.empty()) {
+			return false;
+		}
+		idx_t dots = 0;
+		for (idx_t i = 0; i < text.size(); i++) {
+			if (text[i] == '.') {
+				if (dots > 0 && text[i - 1] != '.') {
+					return false;
+				}
+				dots++;
+			} else if (!StringUtil::CharacterIsDigit(text[i])) {
+				return false;
+			}
+		}
+		return dots == 0 || dots == 2;
+	}
+};
+
 } // namespace
 
 optional_ptr<const MatchExpression> DuckPGQGetExistsPattern(const ParsedExpression &expression) {
@@ -646,6 +752,10 @@ void DuckPGQAddGraphTableGrammar(vector<GrammarChange> &changes) {
 	for (auto rule : DUCKPGQ_GRAPH_TABLE_RULES) {
 		changes.push_back(GrammarChange::AddRule(rule));
 	}
+	changes.push_back(GrammarChange::AddTerminalRuleOverride(
+	    "DuckPGQCypherRange", [](const PEGKeywordHelper &) -> unique_ptr<Matcher> {
+		    return make_uniq<DuckPGQCypherRangeMatcher>();
+	    }));
 	changes.push_back(GrammarChange::SetTransformProcess("DuckPGQGraphTable", StartGraphTableTransform));
 	// Tried before the native table references, so GRAPH_TABLE(...) is not read as a table-function call.
 	changes.push_back(GrammarChange::PrependChoice("InnerTableRef", "DuckPGQGraphTable"));

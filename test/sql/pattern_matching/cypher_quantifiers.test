@@ -1,0 +1,317 @@
+# name: test/sql/pattern_matching/cypher_quantifiers.test
+# description: Cypher's quantifier inside the edge body, -[:R*1..5]->, is sugar for the quantifier after the arrow
+# group: [pattern_matching]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+# ── Parsing: each Cypher form and the arrow form it stands for ──────────────────────────────────────────────────────
+# Cypher's meaning: '*' alone is one or more hops, a missing lower bound is 1, a missing upper bound is unbounded.
+
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a)-[:R*1..5]->(b) COLUMNS (a.id))$$);
+----
+MATCH (a) {-[_anon_0:R]->}{1,5} (b) COLUMNS (a.id)
+
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a)-[:R*]->(b) COLUMNS (a.id))$$);
+----
+MATCH (a) {-[_anon_0:R]->}{1,} (b) COLUMNS (a.id)
+
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a)-[:R*2]->(b) COLUMNS (a.id))$$);
+----
+MATCH (a) {-[_anon_0:R]->}{2,2} (b) COLUMNS (a.id)
+
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a)-[r:R*..3]-(b) COLUMNS (a.id))$$);
+----
+MATCH (a) {-[r:R]-}{1,3} (b) COLUMNS (a.id)
+
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a)<-[:R*1..]-(b) COLUMNS (a.id))$$);
+----
+MATCH (a) {<-[_anon_0:R]-}{1,} (b) COLUMNS (a.id)
+
+# A zero lower bound is written out, as in Cypher
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a)-[*0..2]->(b) COLUMNS (a.id))$$);
+----
+MATCH (a) {-[_anon_0]->}{0,2} (b) COLUMNS (a.id)
+
+# '*..' is '*'
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a)-[e:R*..]->(b) COLUMNS (a.id))$$);
+----
+MATCH (a) {-[e:R]->}{1,} (b) COLUMNS (a.id)
+
+# Spaces inside the range, label disjunctions, and the element WHERE and COST after the quantifier
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a)-[e:R|S* 1 .. 4 WHERE e.w > 1]->(b) COLUMNS (a.id))$$);
+----
+MATCH (a) {-[e:R|S]-> WHERE (e.w > 1)}{1,4} (b) COLUMNS (a.id)
+
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH ANY CHEAPEST (a)-[e:R*1..3 COST e.w]->(b) COLUMNS (a.id))$$);
+----
+MATCH ANY CHEAPEST (a) {-[e:R]-> COST e.w DEFAULT 1.0}{1,3} (b) COLUMNS (a.id)
+
+# ── Malformed quantifiers ───────────────────────────────────────────────────────────────────────────────────────────
+
+statement error
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a)-[e:R*1..2]->{1,2}(b) COLUMNS (a.id))$$);
+----
+An edge takes one quantifier
+
+statement error
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a)-[e:R*]->*(b) COLUMNS (a.id))$$);
+----
+An edge takes one quantifier
+
+statement error
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a)-[e:R*3..2]->(b) COLUMNS (a.id))$$);
+----
+Lower bound greater than upper bound
+
+statement error
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a)-[e:R*1.5]->(b) COLUMNS (a.id))$$);
+----
+syntax error
+
+statement error
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a)-[e:R*1 2]->(b) COLUMNS (a.id))$$);
+----
+Invalid quantifier
+
+statement error
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a)-[e:R*1...3]->(b) COLUMNS (a.id))$$);
+----
+syntax error
+
+# A vertex takes no quantifier
+statement error
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a*2)-[e:R]->(b) COLUMNS (a.id))$$);
+----
+syntax error
+
+# ── Answers: the same rows as the arrow form ────────────────────────────────────────────────────────────────────────
+
+statement ok
+CREATE TABLE person(id BIGINT, name VARCHAR);
+
+statement ok
+INSERT INTO person VALUES (1, 'p1'), (2, 'p2'), (3, 'p3'), (4, 'p4'), (5, 'p5');
+
+statement ok
+CREATE TABLE knows(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO knows VALUES (1, 2), (2, 3), (3, 4), (2, 4), (4, 5);
+
+statement ok
+CREATE PROPERTY GRAPH g
+VERTEX TABLES (person LABEL Person)
+EDGE TABLES (knows SOURCE KEY (src) REFERENCES person (id) DESTINATION KEY (dst) REFERENCES person (id) LABEL Knows);
+
+# Every walk of one or two hops
+query III rowsort
+FROM GRAPH_TABLE (g MATCH p = (a:Person)-[:Knows*1..2]->(b:Person) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS len));
+----
+1	2	1
+1	3	2
+1	4	2
+2	3	1
+2	4	1
+2	4	2
+2	5	2
+3	4	1
+3	5	2
+4	5	1
+
+# The Cypher and arrow forms give the same multiset, both ways round
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = (a:Person)-[:Knows*1..2]->(b:Person) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS len)))
+    EXCEPT ALL
+    (FROM GRAPH_TABLE (g MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS len))));
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS len)))
+    EXCEPT ALL
+    (FROM GRAPH_TABLE (g MATCH p = (a:Person)-[:Knows*1..2]->(b:Person) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS len))));
+----
+0
+
+# Exactly two hops
+query II rowsort
+FROM GRAPH_TABLE (g MATCH (a:Person)-[k:Knows*2]->(b:Person) COLUMNS (a.id AS a, b.id AS b));
+----
+1	3
+1	4
+2	4
+2	5
+3	5
+
+# '*' is one or more hops: no row pairs a vertex with itself
+query III rowsort
+FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Person WHERE a.id = 1)-[:Knows*]->(b:Person)
+    COLUMNS (a.id AS a, b.id AS b, path_length(p) AS len));
+----
+1	2	1
+1	3	2
+1	4	2
+1	5	3
+
+# '*0..' adds the empty path
+query III rowsort
+FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Person WHERE a.id = 1)-[:Knows*0..]->(b:Person)
+    COLUMNS (a.id AS a, b.id AS b, path_length(p) AS len));
+----
+1	1	0
+1	2	1
+1	3	2
+1	4	2
+1	5	3
+
+# Unbounded above
+query III rowsort
+FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Person WHERE a.id = 2)-[:Knows*1..]->(b:Person)
+    COLUMNS (a.id AS a, b.id AS b, path_length(p) AS len));
+----
+2	3	1
+2	4	1
+2	5	2
+
+# Left-directed: every walk of one to three hops into 5
+query III rowsort
+FROM GRAPH_TABLE (g MATCH p = (a:Person WHERE a.id = 5)<-[:Knows*1..3]-(b:Person)
+    COLUMNS (a.id AS a, b.id AS b, path_length(p) AS len));
+----
+5	1	3
+5	2	2
+5	2	3
+5	3	2
+5	4	1
+
+# Either direction, at most two hops
+query II rowsort
+FROM GRAPH_TABLE (g MATCH (a:Person WHERE a.id = 3)-[r:Knows*..2]-(b:Person) COLUMNS (a.id AS a, b.id AS b));
+----
+3	1
+3	2
+3	2
+3	4
+3	4
+3	5
+
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH (a:Person)-[r:Knows*..2]-(b:Person) COLUMNS (a.id AS a, b.id AS b)))
+    EXCEPT ALL
+    (FROM GRAPH_TABLE (g MATCH (a:Person)-[r:Knows]-{1,2}(b:Person) COLUMNS (a.id AS a, b.id AS b))));
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH (a:Person)-[r:Knows]-{1,2}(b:Person) COLUMNS (a.id AS a, b.id AS b)))
+    EXCEPT ALL
+    (FROM GRAPH_TABLE (g MATCH (a:Person)-[r:Knows*..2]-(b:Person) COLUMNS (a.id AS a, b.id AS b))));
+----
+0
+
+# ── The same answers from ABI artifacts ─────────────────────────────────────────────────────────────────────────────
+
+statement ok
+FROM pgq_abi_build('g', exclude_self_referential := false, closures := ['Knows']);
+
+query III rowsort
+FROM GRAPH_TABLE (g MATCH p = (a:Person)-[:Knows*1..2]->(b:Person) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS len));
+----
+1	2	1
+1	3	2
+1	4	2
+2	3	1
+2	4	1
+2	4	2
+2	5	2
+3	4	1
+3	5	2
+4	5	1
+
+query TT
+SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH p = (a:Person)-[:Knows*1..2]->(b:Person)
+    COLUMNS (a.id AS a, b.id AS b, path_length(p) AS len))');
+----
+match	true
+
+query II rowsort
+FROM GRAPH_TABLE (g MATCH (a:Person)-[k:Knows*2]->(b:Person) COLUMNS (a.id AS a, b.id AS b));
+----
+1	3
+1	4
+2	4
+2	5
+3	5
+
+query TT
+SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH (a:Person)-[k:Knows*2]->(b:Person)
+    COLUMNS (a.id AS a, b.id AS b))');
+----
+match	true
+
+# Unbounded, answered by the closure
+query II rowsort
+FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:Person)-[:Knows*]->(b:Person) WHERE a.id <= 2 COLUMNS (a.id AS a, b.id AS b));
+----
+1	2
+1	3
+1	4
+1	5
+2	3
+2	4
+2	5
+
+query TT
+SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:Person)-[:Knows*]->(b:Person)
+    COLUMNS (a.id AS a, b.id AS b))');
+----
+match	true
+
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:Person)-[:Knows*]->(b:Person) COLUMNS (a.id AS a, b.id AS b)))
+    EXCEPT ALL
+    (FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:Person)-[:Knows]->+(b:Person) COLUMNS (a.id AS a, b.id AS b))));
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:Person)-[:Knows]->+(b:Person) COLUMNS (a.id AS a, b.id AS b)))
+    EXCEPT ALL
+    (FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:Person)-[:Knows*]->(b:Person) COLUMNS (a.id AS a, b.id AS b))));
+----
+0
+
+query III rowsort
+FROM GRAPH_TABLE (g MATCH p = (a:Person WHERE a.id = 5)<-[:Knows*1..3]-(b:Person)
+    COLUMNS (a.id AS a, b.id AS b, path_length(p) AS len));
+----
+5	1	3
+5	2	2
+5	2	3
+5	3	2
+5	4	1
+
+# No artifact route takes a left-directed variable-length edge: the traversal answers it either way
+query TT
+SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH p = (a:Person WHERE a.id = 5)<-[:Knows*1..3]-(b:Person)
+    COLUMNS (a.id AS a, b.id AS b, path_length(p) AS len))');
+----
+unverified	false

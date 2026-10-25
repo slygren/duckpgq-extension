@@ -56,7 +56,12 @@ DuckPGQArrowAny <- '-'
 # Vertex and edge element bodies. The variable and the label are both optional: an anonymous element gets a
 # generated variable, and an unlabeled element matches any label.
 DuckPGQVertex <- '(' Identifier? DuckPGQElementLabel? WhereClause? DuckPGQCost? ')'
-DuckPGQEdgeBody <- '[' Identifier? DuckPGQElementLabel? WhereClause? DuckPGQCost? ']'
+DuckPGQEdgeBody <- '[' Identifier? DuckPGQElementLabel? DuckPGQCypherQuantifier? WhereClause? DuckPGQCost? ']'
+# Cypher's quantifier inside the edge body: -[:R*1..5]->, -[:R*]->, -[:R*2]->, -[:R*..3]->, -[:R*1..]->. The tokenizer
+# reads "1..5", "..3" and "1.." as one number token, which NumberLiteral rejects; DuckPGQCypherRange is a terminal
+# that accepts those tokens (its body here is a placeholder for the matcher that replaces it).
+DuckPGQCypherQuantifier <- '*' DuckPGQCypherRange*
+DuckPGQCypherRange <- NumberLiteral
 # The cost of traversing an element in a CHEAPEST path, and the cost used where the expression is NULL.
 DuckPGQCost <- 'COST' Expression DuckPGQCostDefault?
 DuckPGQCostDefault <- 'DEFAULT' NumberLiteral
