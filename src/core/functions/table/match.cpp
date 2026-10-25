@@ -7912,9 +7912,29 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 			union_v0 = i == 0 ? v0_type : exactness.UnionType(union_v0, v0_type);
 			union_v1 = i == 0 ? v1_type : exactness.UnionType(union_v1, v1_type);
 		}
-		// The recursive form semi-joins v0 IN (SELECT dst_id); where that does not bind, it fails, and so must this.
+		// The recursive form semi-joins v0 IN (SELECT dst_id), dst_id in the source key's type. Where that does not
+		// bind -- a source key that is not VARCHAR with some family keyed by VARCHAR -- it fails. Here each label's
+		// keys are then carried in their own type instead: dst_id of a label in the type its incoming families give
+		// it (the source key's type for the source label), each family joined on its own v0, as the traversal joins
+		// an edge's key to the vertex key. Labels' keys meet only in the final UNION ALL, which types them as a SQL
+		// UNION does. The forms that bind are unchanged.
+		bool native_keys = false;
+		case_insensitive_map_t<LogicalType> label_key_types;
 		if (types_known && !edge_tables.empty() && !exactness.InComparable(union_v0, src_type)) {
-			types_known = false;
+			label_key_types[canonical_src_label] = src_type;
+			for (idx_t i = 0; i < edge_tables.size(); i++) {
+				auto entry = label_key_types.find(edge_tables[i].dst_label);
+				label_key_types[edge_tables[i].dst_label] =
+				    entry == label_key_types.end() ? family_types[i].second
+				                                   : exactness.UnionType(entry->second, family_types[i].second);
+			}
+			native_keys = true;
+			for (idx_t i = 0; i < edge_tables.size() && native_keys; i++) {
+				auto source = label_key_types.find(edge_tables[i].src_label);
+				native_keys = source == label_key_types.end() ||
+				              exactness.InComparable(family_types[i].first, source->second);
+			}
+			types_known = native_keys;
 		}
 		case_insensitive_map_t<string> frontier;
 		frontier[canonical_src_label] = "__pgq_x0_0";
@@ -7936,12 +7956,13 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 				if (source == frontier.end()) {
 					continue;
 				}
-				const string v0 = family_types[i].first == union_v0
+				const string v0 = native_keys || family_types[i].first == union_v0
 				                      ? string("a.v0")
 				                      : "CAST(a.v0 AS " + union_v0.ToString() + ")";
-				const string v1 = family_types[i].second == union_v1
+				const string v1 = native_keys || family_types[i].second == union_v1
 				                      ? string("a.v1")
 				                      : "CAST(a.v1 AS " + union_v1.ToString() + ")";
+				const LogicalType dst_type = native_keys ? label_key_types[edge_table.dst_label] : src_type;
 				const string dst_sql = KeywordHelper::WriteQuoted(edge_table.dst_label, '\'');
 				const string artifact = QualifiedTableName(edge_table.catalog_name, edge_table.schema_name,
 				                                           edge_table.table_name);
@@ -7953,7 +7974,7 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 				    "list_append(c.path_participants, %s::VARCHAR || ':' || CAST(%s AS VARCHAR)) AS path_participants "
 				    "FROM %s c JOIN %s a ON %s = c.dst_id "
 				    "WHERE NOT list_contains(c.path_participants, %s::VARCHAR || ':' || CAST(%s AS VARCHAR))",
-				    dst_sql, v1, src_type.ToString(), v1, dst_sql,
+				    dst_sql, v1, dst_type.ToString(), v1, dst_sql,
 				    KeywordHelper::WriteQuoted(edge_table.edge_label, '\''), dst_sql, v1, source->second, artifact, v0,
 				    dst_sql, v1));
 				if (!next.count(edge_table.dst_label)) {
