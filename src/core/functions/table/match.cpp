@@ -58,8 +58,50 @@ namespace duckdb {
 //! exactly and others not at all, so each route is chosen per selector, never assumed.
 enum class PGQPathSelector : uint8_t { WALK, ANY_SHORTEST, ALL_SHORTEST, CHEAPEST };
 
+// A COST that is the same positive constant on every edge makes the cheapest path the shortest one.
+static bool IsConstantPositiveCost(const ParsedExpression &cost) {
+	auto *expr = &cost;
+	while (auto *cast = dynamic_cast<const CastExpression *>(expr)) {
+		expr = &cast->Child();
+	}
+	auto *constant = dynamic_cast<const ConstantExpression *>(expr);
+	if (!constant) {
+		return false;
+	}
+	auto value = constant->GetLiteral().ToValue();
+	if (value.IsNull() || !value.type().IsNumeric()) {
+		return false;
+	}
+	return value.DefaultCastAs(LogicalType::DOUBLE).GetValue<double>() > 0;
+}
+
+// Every COST in the pattern is a positive constant, and there is at least one.
+static bool AllCostsConstant(const vector<unique_ptr<PathReference>> &path_list, bool &found) {
+	for (const auto &reference : path_list) {
+		if (reference->path_reference_type != PGQPathReferenceType::SUBPATH) {
+			continue;
+		}
+		auto &subpath = reinterpret_cast<const SubPath &>(*reference);
+		if (subpath.cost_expr) {
+			if (!IsConstantPositiveCost(*subpath.cost_expr)) {
+				return false;
+			}
+			found = true;
+		}
+		if (!AllCostsConstant(subpath.path_list, found)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 static PGQPathSelector PatternSelector(const PathPattern &pattern) {
 	if (pattern.cheapest) {
+		// One positive constant cost on every edge: the cheapest paths are the shortest ones.
+		bool found = false;
+		if (AllCostsConstant(pattern.path_elements, found) && found) {
+			return pattern.all ? PGQPathSelector::ALL_SHORTEST : PGQPathSelector::ANY_SHORTEST;
+		}
 		return PGQPathSelector::CHEAPEST;
 	}
 	if (pattern.shortest) {
@@ -951,6 +993,38 @@ static bool TrackedSnapshotsUnchanged(ClientContext &context, const PGQPathTable
 	return true;
 }
 
+//! Multiplicity measurements (PGQExactness) belong to the lake's state, not to one database instance: a server
+//! that opens the lake per request would otherwise measure again on every request. One store per process and
+//! per state -- the catalog fingerprint, the lakes' snapshots, the attached databases' paths -- so a regenerated
+//! catalog, a moved-on lake or a different attachment starts afresh.
+static shared_ptr<PGQExactnessCache> ProcessExactnessCache(ClientContext &context, const string &fingerprint,
+                                                           const PGQPathTableCache &cache) {
+	string key = fingerprint;
+	for (const auto &snapshot : cache.tracked_snapshots) {
+		key += "|" + snapshot.first + "@" + std::to_string(snapshot.second);
+	}
+	try {
+		Connection connection(*context.db);
+		auto result = connection.Query("SELECT string_agg(database_name || '=' || coalesce(path, ''), ',' ORDER BY "
+		                               "database_name) FROM duckdb_databases()");
+		if (!result || result->HasError()) {
+			return make_shared_ptr<PGQExactnessCache>();
+		}
+		PGQMaterializedResult rows(*result);
+		key += "|" + rows.GetValue(0, 0).ToString();
+	} catch (...) {
+		return make_shared_ptr<PGQExactnessCache>();
+	}
+	static mutex registry_lock;
+	static unordered_map<string, shared_ptr<PGQExactnessCache>> registry;
+	lock_guard<mutex> guard(registry_lock);
+	auto &entry = registry[key];
+	if (!entry) {
+		entry = make_shared_ptr<PGQExactnessCache>();
+	}
+	return entry;
+}
+
 static shared_ptr<PGQPathTableCache> GetPathTableCache(ClientContext &context, DuckPGQState &duckpgq_state,
                                                        const string &graph_name,
                                                        const CreatePropertyGraphInfo *pg_table = nullptr) {
@@ -982,6 +1056,9 @@ static shared_ptr<PGQPathTableCache> GetPathTableCache(ClientContext &context, D
 	}
 
 	auto cache = BuildPathTableCache(context, graph_name, pg_table);
+	if (!fingerprint.empty()) {
+		cache->exactness = ProcessExactnessCache(context, fingerprint, *cache);
+	}
 	duckpgq_state.path_table_caches[graph_name] = cache;
 	if (!fingerprint.empty()) {
 		object_cache.Put(object_key, make_shared_ptr<PGQPathTableCacheEntry>(cache, fingerprint));
@@ -5762,7 +5839,9 @@ public:
 		if (!StringUtil::CIEquals(info.path_kind, "edge") && !StringUtil::CIEquals(info.path_kind, "fixed_path")) {
 			return info.preserves_multiplicity;
 		}
-		if (BuiltByAbiBuild(info)) {
+		// A stored true is a measurement: both builders probe edge and fixed_path artifacts. Only a false or
+		// missing flag from a builder other than pgq_abi_build (an older catalog, a hand-made one) is measured.
+		if (info.preserves_multiplicity || BuiltByAbiBuild(info)) {
 			return info.preserves_multiplicity;
 		}
 		const auto vertices = SplitCatalogSequence(info.vertex_label_sequence);
@@ -5805,7 +5884,9 @@ public:
 	// A closure (tc, tc_witness, tc_chain) of one self-referential edge holds exactly the traversal's paths up
 	// to `upper` hops.
 	bool ClosureExact(const PGQPathTableInfo &info, int64_t upper) {
-		if (BuiltByAbiBuild(info) && info.preserves_multiplicity) {
+		// A stored true is trusted from any builder; false is measured, because the layout compiler writes false
+		// for every closure without measuring it (and pgq_abi_build did too before it measured closures).
+		if (info.preserves_multiplicity) {
 			return true;
 		}
 		const auto vertices = SplitCatalogSequence(info.vertex_label_sequence);
@@ -5886,6 +5967,22 @@ public:
 		return witness && Probe("witness|" + Table(*witness),
 		                        StringUtil::Format("SELECT (SELECT count(*) FROM %s) = (SELECT count(*) FROM %s)",
 		                                           Table(*witness), Table(*tc)));
+	}
+
+	// No pair of the closure is reachable at two depths, so its rows are already one per pair -- what ANY / ALL
+	// SHORTEST need, without grouping. |tc| = |tc_witness| (one row per pair), two metadata counts.
+	bool OneDepthPerPair(const PGQPathTableInfo &tc) {
+		const auto vertices = SplitCatalogSequence(tc.vertex_label_sequence);
+		const auto edges = SplitCatalogSequence(tc.edge_label_sequence);
+		if (vertices.size() != 2 || edges.size() != 1) {
+			return false;
+		}
+		const auto *witness = Closure("tc_witness", "__tc_witness__", vertices[0], edges[0]);
+		if (!witness) {
+			return false;
+		}
+		return Probe("pairs|" + Table(tc), StringUtil::Format("SELECT (SELECT count(*) FROM %s) = (SELECT count(*) FROM %s)",
+		                                                      Table(tc), Table(*witness)));
 	}
 
 private:
@@ -6062,7 +6159,8 @@ private:
 };
 
 // A COST on any element changes which paths match (CHEAPEST is chosen by it); the artifact routes have no
-// costs, so such patterns are left to the traversal. Path modes do not count: every match here is already a
+// costs, so such patterns are left to the traversal -- unless the cost is one positive constant, which makes
+// CHEAPEST the same as SHORTEST (PatternSelector). Path modes do not count: every match here is already a
 // path that visits no vertex twice -- the traversal enumerates exactly those, and filters the shortest paths it
 // finds by the mode -- which is ACYCLIC and therefore also TRAIL and SIMPLE. TRAIL, ACYCLIC and SIMPLE restrict
 // nothing further, so the artifact routes answer them exactly as they answer the pattern without a mode.
@@ -6072,11 +6170,45 @@ static bool PatternHasCost(const vector<unique_ptr<PathReference>> &path_list) {
 			continue;
 		}
 		auto &subpath = reinterpret_cast<const SubPath &>(*reference);
-		if (subpath.cost_expr || PatternHasCost(subpath.path_list)) {
+		if ((subpath.cost_expr && !IsConstantPositiveCost(*subpath.cost_expr)) || PatternHasCost(subpath.path_list)) {
 			return true;
 		}
 	}
 	return false;
+}
+
+// The interleaved [v0, e1, v1, ...] row ids ONE ROW PER reads, for paths given as vertex keys: `paths_sql` yields
+// (v0, v1, path_vertices), one row per path. The keys on those paths are resolved to row ids once, against only the
+// vertices and edges they name -- not by joining the whole vertex table at every position of every path, which on
+// a large lake was most of the cost. min() keeps one edge row id per position should the bridge hold a pair twice.
+// `with_prefix` is an optional "WITH a AS (...), b AS (...) " the paths read from.
+static string PathRowIdsSQL(const string &with_prefix, const string &paths_sql, const string &vertex_table_name,
+                            const string &vertex_pk, const string &edge_table_name, const string &edge_src_fk,
+                            const string &edge_dst_fk) {
+	return (with_prefix.empty() ? string("WITH ") : with_prefix + ", ") +
+	       StringUtil::Format(
+	           "__pgq_paths AS MATERIALIZED (%s), "
+	           "__pgq_keys AS MATERIALIZED (SELECT DISTINCT unnest(path_vertices) AS k FROM __pgq_paths), "
+	           "__pgq_vk AS MATERIALIZED (SELECT v.%s AS k, v.rowid AS r FROM %s v WHERE v.%s IN (SELECT k FROM __pgq_keys)), "
+	           "__pgq_ek AS MATERIALIZED (SELECT e.%s AS s, e.%s AS t, min(e.rowid) AS r FROM %s e "
+	           "                          WHERE e.%s IN (SELECT k FROM __pgq_keys) GROUP BY ALL) "
+	           "SELECT p.v0, p.v1, list(x.r ORDER BY x.pos) AS path, any_value(sv.r) AS src_rowid, "
+	           "       any_value(dv.r) AS dst_rowid "
+	           "FROM __pgq_paths p "
+	           "JOIN __pgq_vk sv ON sv.k = p.v0 "
+	           "JOIN __pgq_vk dv ON dv.k = p.v1 "
+	           "JOIN ("
+	           "  SELECT q.v0, q.v1, 2 * u.ord - 1 AS pos, vk.r FROM __pgq_paths q "
+	           "  CROSS JOIN unnest(q.path_vertices) WITH ORDINALITY AS u(k, ord) JOIN __pgq_vk vk ON vk.k = u.k "
+	           "  UNION ALL "
+	           "  SELECT q.v0, q.v1, 2 * u.ord AS pos, ek.r FROM __pgq_paths q "
+	           "  CROSS JOIN unnest(q.path_vertices) WITH ORDINALITY AS u(k, ord) "
+	           "  JOIN __pgq_ek ek ON ek.s = u.k AND ek.t = list_extract(q.path_vertices, u.ord + 1) "
+	           "  WHERE u.ord < len(q.path_vertices)"
+	           ") x ON x.v0 = p.v0 AND x.v1 = p.v1 "
+	           "GROUP BY p.v0, p.v1",
+	           paths_sql, vertex_pk, vertex_table_name, vertex_pk, edge_src_fk, edge_dst_fk, edge_table_name,
+	           edge_src_fk);
 }
 
 static void AddTCWitnessORPCTE(unique_ptr<SelectNode> &select_node, const PGQPathTableInfo &witness_info,
@@ -6107,37 +6239,9 @@ static void AddTCWitnessORPCTE(unique_ptr<SelectNode> &select_node, const PGQPat
 		depth_filter += " AND " + filter;
 	}
 
-	// min() keeps one edge row id per position: an edge is found by its endpoints, and a bridge
-	// holding the pair twice would otherwise put both into the path.
-	const string query = StringUtil::Format(
-	    "SELECT v0, v1, list(path_rowid ORDER BY pos) AS path, "
-	    "       any_value(src_rowid) AS src_rowid, any_value(dst_rowid) AS dst_rowid "
-	    "FROM (SELECT v0, v1, pos, min(path_rowid) AS path_rowid, any_value(src_rowid) AS src_rowid, "
-	    "             any_value(dst_rowid) AS dst_rowid FROM ("
-	    "  SELECT w.v0, w.v1, 2 * u.ord - 1 AS pos, v.rowid AS path_rowid, "
-	    "         sv.rowid AS src_rowid, dv.rowid AS dst_rowid "
-	    "  FROM %s w "
-	    "  JOIN %s sv ON sv.%s = w.v0 "
-	    "  JOIN %s dv ON dv.%s = w.v1 "
-	    "  CROSS JOIN unnest(w.path_vertices) WITH ORDINALITY AS u(vertex_key, ord) "
-	    "  JOIN %s v ON v.%s = u.vertex_key "
-	    "  WHERE %s "
-	    "  UNION ALL "
-	    "  SELECT w.v0, w.v1, 2 * u.ord AS pos, e.rowid AS path_rowid, "
-	    "         sv.rowid AS src_rowid, dv.rowid AS dst_rowid "
-	    "  FROM %s w "
-	    "  JOIN %s sv ON sv.%s = w.v0 "
-	    "  JOIN %s dv ON dv.%s = w.v1 "
-	    "  CROSS JOIN unnest(w.path_vertices) WITH ORDINALITY AS u(vertex_key, ord) "
-	    "  JOIN %s e ON e.%s = u.vertex_key "
-	    "            AND e.%s = list_extract(w.path_vertices, u.ord + 1) "
-	    "  WHERE %s AND u.ord < list_count(w.path_vertices)"
-	    ") path_rows GROUP BY v0, v1, pos) positions "
-	    "GROUP BY v0, v1",
-	    witness_table, vertex_table_name, vertex_pk, vertex_table_name, vertex_pk,
-	    vertex_table_name, vertex_pk, depth_filter,
-	    witness_table, vertex_table_name, vertex_pk, vertex_table_name, vertex_pk,
-	    edge_table_name, edge_src_fk, edge_dst_fk, depth_filter);
+	const string query = PathRowIdsSQL(
+	    "", StringUtil::Format("SELECT w.v0, w.v1, w.path_vertices FROM %s w WHERE %s", witness_table, depth_filter),
+	    vertex_table_name, vertex_pk, edge_table_name, edge_src_fk, edge_dst_fk);
 
 	auto witness_cte_info = make_uniq<CommonTableExpressionInfo>();
 	witness_cte_info->query_node = std::move(ParseSelectStatement(query)->node);
@@ -6249,38 +6353,15 @@ static void AddTCChainORPCTE(unique_ptr<SelectNode> &select_node, const PGQPathT
 		return;
 	}
 
-	// The interleaved [vertex, edge, vertex, ...] row ids of each prefix. An edge is found by its
-	// endpoints; min() keeps one row id per position should the bridge hold the pair twice.
-	const string query = local_with_prefix + StringUtil::Format(
-	    "SELECT v0, v1, list(path_rowid ORDER BY pos) AS path, "
-	    "       any_value(src_rowid) AS src_rowid, any_value(dst_rowid) AS dst_rowid "
-	    "FROM ("
-	    "  SELECT v0, v1, pos, min(path_rowid) AS path_rowid, any_value(src_rowid) AS src_rowid, "
-	    "         any_value(dst_rowid) AS dst_rowid "
-	    "  FROM ("
-	    "    SELECT s.v0, s.v1, 2 * s.ord - 1 AS pos, v.rowid AS path_rowid, sv.rowid AS src_rowid, "
-	    "           dv.rowid AS dst_rowid "
-	    "    FROM (SELECT p.v0, list_extract(p.path_vertices, p.k + 1) AS v1, p.path_vertices, p.k, "
-	    "                 unnest(range(1, p.k + 2)) AS ord FROM (%s) p) s "
-	    "    JOIN %s sv ON sv.%s = s.v0 "
-	    "    JOIN %s dv ON dv.%s = s.v1 "
-	    "    JOIN %s v ON v.%s = list_extract(s.path_vertices, s.ord) "
-	    "    UNION ALL "
-	    "    SELECT s.v0, s.v1, 2 * s.ord AS pos, e.rowid AS path_rowid, sv.rowid AS src_rowid, "
-	    "           dv.rowid AS dst_rowid "
-	    "    FROM (SELECT p.v0, list_extract(p.path_vertices, p.k + 1) AS v1, p.path_vertices, p.k, "
-	    "                 unnest(range(1, p.k + 1)) AS ord FROM (%s) p) s "
-	    "    JOIN %s sv ON sv.%s = s.v0 "
-	    "    JOIN %s dv ON dv.%s = s.v1 "
-	    "    JOIN %s e ON e.%s = list_extract(s.path_vertices, s.ord) "
-	    "              AND e.%s = list_extract(s.path_vertices, s.ord + 1)"
-	    "  ) path_rows "
-	    "  GROUP BY v0, v1, pos"
-	    ") positions "
-	    "GROUP BY v0, v1",
-	    prefixes, vertex_table_name, vertex_pk, vertex_table_name, vertex_pk, vertex_table_name, vertex_pk,
-	    prefixes, vertex_table_name, vertex_pk, vertex_table_name, vertex_pk, edge_table_name, edge_src_fk,
-	    edge_dst_fk);
+	// The interleaved [vertex, edge, vertex, ...] row ids of each prefix.
+	string with_prefix = local_with_prefix;
+	StringUtil::RTrim(with_prefix);
+	const string query = PathRowIdsSQL(
+	    with_prefix,
+	    StringUtil::Format("SELECT p.v0, list_extract(p.path_vertices, p.k + 1) AS v1, "
+	                       "list_slice(p.path_vertices, 1, p.k + 1) AS path_vertices FROM (%s) p",
+	                       prefixes),
+	    vertex_table_name, vertex_pk, edge_table_name, edge_src_fk, edge_dst_fk);
 
 	auto chain_cte_info = make_uniq<CommonTableExpressionInfo>();
 	chain_cte_info->query_node = std::move(ParseSelectStatement(query)->node);
@@ -7132,7 +7213,10 @@ static string BuildJsonObjectExpression(const shared_ptr<PropertyGraphTable> &ve
 	       KeywordHelper::WriteQuoted("}", '\'');
 }
 
-static string BuildVertexPropertiesUnionSQL(CreatePropertyGraphInfo &pg_table) {
+// The properties of the vertices named in `path_keys_relation` (columns l: lower-case label, k: key as VARCHAR),
+// as (label, key, JSON object). Only those vertices: rendering every vertex of every table as JSON, as this did,
+// is a scan of the whole graph for the handful of vertices on the expanded paths.
+static string BuildVertexPropertiesUnionSQL(CreatePropertyGraphInfo &pg_table, const string &path_keys_relation) {
 	vector<string> selects;
 	for (const auto &vertex_table : pg_table.vertex_tables) {
 		const string key_column = InferVertexKeyColumn(pg_table, vertex_table);
@@ -7152,10 +7236,13 @@ static string BuildVertexPropertiesUnionSQL(CreatePropertyGraphInfo &pg_table) {
 			    "SELECT %s::VARCHAR AS __pgq_label, "
 			    "       CAST(%s.%s AS VARCHAR) AS __pgq_key, "
 			    "       %s AS __pgq_properties "
-			    "FROM %s %s",
+			    "FROM %s %s "
+			    "WHERE CAST(%s.%s AS VARCHAR) IN (SELECT k FROM %s WHERE l = %s)",
 			    KeywordHelper::WriteQuoted(label, '\''), table_alias,
 			    KeywordHelper::WriteOptionallyQuoted(key_column),
-			    BuildJsonObjectExpression(vertex_table, table_alias), qualified_table, table_alias));
+			    BuildJsonObjectExpression(vertex_table, table_alias), qualified_table, table_alias, table_alias,
+			    KeywordHelper::WriteOptionallyQuoted(key_column), path_keys_relation,
+			    KeywordHelper::WriteQuoted(StringUtil::Lower(label), '\'')));
 		}
 	}
 	return JoinSQLUnionAll(selects);
@@ -7674,9 +7761,15 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 	}
 
 	const string src_label_sql = KeywordHelper::WriteQuoted(canonical_src_label, '\'');
-	const string vertex_properties_union = include_vertex_properties ? BuildVertexPropertiesUnionSQL(pg_table) : "";
+	const string vertex_properties_union =
+	    include_vertex_properties ? BuildVertexPropertiesUnionSQL(pg_table, "__pgq_path_keys") : "";
+	// The (label, key) pairs on the expanded paths, so only those vertices' properties are rendered.
 	const string vertex_properties_cte =
-	    vertex_properties_union.empty() ? "" : ", __pgq_vertex_props AS (" + vertex_properties_union + ") ";
+	    vertex_properties_union.empty()
+	        ? ""
+	        : ", __pgq_path_keys AS (SELECT DISTINCT lower(l) AS l, k FROM (SELECT unnest(path_vertex_labels) AS l, "
+	          "unnest(path_vertices) AS k FROM __pgq_ctx)), __pgq_vertex_props AS (" +
+	              vertex_properties_union + ") ";
 	const string vertex_properties_expr =
 	    BuildVertexPropertiesListSQL("c.path_vertices", "c.path_vertex_labels",
 	                                 vertex_properties_union.empty() ? "" : "__pgq_vertex_props");
@@ -8936,20 +9029,30 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 							bt->SetTable(Identifier(tc_info->table_name));
 							bt->alias        = Identifier(pt_alias);
 							unique_ptr<TableRef> pt_ref = std::move(bt);
-							if (selector != PGQPathSelector::WALK) {
-								// A shortest path per endpoint pair, not one row per depth: the least depth
-								// within the bounds, never a pair that only closes a cycle. (ALL SHORTEST
-								// only reaches here with a verified closure, where that path is unique.)
+							if (selector != PGQPathSelector::WALK && !exactness.OneDepthPerPair(*tc_info)) {
+								// A shortest path per endpoint pair, not one row per depth: the least depth within the
+								// bounds, never a pair that only closes a cycle. (ALL SHORTEST only reaches here with a
+								// verified closure, where that path is unique.) The endpoint predicates go inside, so the
+								// grouping reads only the seeded rows.
 								string depth_filter = "depth >= " + std::to_string(tc_sp->lower);
 								if (tc_sp->upper < (1 << 30)) {
 									depth_filter += " AND depth <= " + std::to_string(tc_sp->upper);
 								}
+								vector<string> endpoint_filters;
+								PushConstraintToSQLFilter(where_constraints, tc_src->variable_binding, PGQStr(etbl->source_pk[0]), "v0",
+								                          endpoint_filters);
+								PushConstraintToSQLFilter(where_constraints, tc_dst->variable_binding, PGQStr(etbl->destination_pk[0]), "v1",
+								                          endpoint_filters);
 								pt_ref = make_uniq<SubqueryRef>(
 								    ParseSelectStatement("SELECT v0, v1, min(depth) AS depth FROM " +
-								                         QualifiedTableName(tc_info->catalog_name, tc_info->schema_name,
-								                                            tc_info->table_name) +
-								                         " WHERE " + depth_filter + " AND v0 <> v1 GROUP BY v0, v1"),
+								                         QualifiedTableName(tc_info->catalog_name, tc_info->schema_name, tc_info->table_name) +
+								                         " WHERE " + BuildSQLFilter(depth_filter + " AND v0 <> v1", endpoint_filters) +
+								                         " GROUP BY v0, v1"),
 								    PGQId(pt_alias));
+							} else if (selector != PGQPathSelector::WALK) {
+								// Already one row per pair; only a pair closing a cycle must go.
+								conditions.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_NOTEQUAL,
+								                                                     PGQColRef("v0", pt_alias), PGQColRef("v1", pt_alias)));
 							}
 							if (select_node->from_table) {
 								auto cross   = make_uniq<JoinRef>(JoinRefType::CROSS);

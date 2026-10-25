@@ -222,16 +222,19 @@ So a closure answers:
 - Walks, `ALL SHORTEST`, any lower bound and `ONE ROW PER`: only when the closure holds exactly the traversal's
   paths (`preserves_multiplicity`): the edge is acyclic, the depth cap was never reached, and every row is exactly
   one path (for `tc_chain` also no vertex with two out-edges, the usual hierarchy).
-- Never `CHEAPEST`, a lower bound of 0, a path mode or a `COST`.
+- Never `CHEAPEST` with a per-edge `COST`, or a lower bound of 0. A `COST` that is one positive constant makes
+  `CHEAPEST` the same as `SHORTEST`, and path modes (`TRAIL`, `ACYCLIC`, `SIMPLE`) restrict nothing here: every
+  match already visits no vertex twice.
 
 Edge and fixed_path artifacts are `SELECT DISTINCT`, so an edge stored twice in its table is one artifact row.
 Where an answer counts matches (every fixed-length pattern, `OPTIONAL MATCH`, walks) such an artifact is used only
 when it lost nothing (`preserves_multiplicity`). `EXISTS` and `ANY SHORTEST` read it either way.
 
-`preserves_multiplicity` is taken from the catalog only for rows `pgq_abi_build` wrote (`built_by`). For any other
-row -- the layout compiler writes `false` for every closure, a hand-made catalog may write anything -- the binder
-measures it with the same probes, once per path catalog, and caches the answer with it (rebuilt when the catalog or
-a lake snapshot changes). The probes are `count(*)`s, answered from metadata on DuckLake: per bridge, the bridge
+A stored `preserves_multiplicity = true` is trusted from any builder (both builders measure it for edge and
+fixed_path artifacts). A false or missing flag is measured by the binder with the same probes when the row was not
+written by `pgq_abi_build` (`built_by`) -- in practice the layout compiler's closures, which it writes as `false`
+without measuring -- once per process and lake state (catalog fingerprint, lake snapshots, attached databases), so a
+warm query pays nothing. The probes are `count(*)`s, answered from metadata on DuckLake: per bridge, the bridge
 against its 1-hop artifact; per closure, bridge, 1-hop artifact, tc, tc_witness and tc_chain. Only a closure queried
 past its deepest row (a key self-join of tc_chain), a closure that is not a hierarchy (tc joined with the bridge)
 and a bridge without a 1-hop artifact read data. Each measurement shows in `pgq_last_rewrite_diagnostics()` as a

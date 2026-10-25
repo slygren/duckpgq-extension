@@ -120,6 +120,34 @@ SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (tree
 ----
 match	true
 
+# ANY CHEAPEST with the same positive constant COST on every edge is ANY SHORTEST: it takes the closure too
+statement ok
+FROM GRAPH_TABLE (tree_g MATCH ANY CHEAPEST (child:Node)-[e:HasParent COST 1]->{1,3}(ancestor:Node)
+    WHERE child.id = 8 COLUMNS (ancestor.id AS a));
+
+query T
+SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+transitive_closure
+
+query TT
+SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (tree_g MATCH ANY CHEAPEST
+    (child:Node)-[e:HasParent COST 1]->{1,3}(ancestor:Node) WHERE child.id = 8 COLUMNS (ancestor.id AS a))');
+----
+match	true
+
+# A cost per edge decides which path is cheapest, which no closure knows: traversed (its steps may still read the
+# edge artifact)
+statement ok
+FROM GRAPH_TABLE (tree_g MATCH ANY CHEAPEST (child:Node)-[e:HasParent COST e.child]->{1,3}(ancestor:Node)
+    WHERE child.id = 8 COLUMNS (ancestor.id AS a));
+
+query I
+SELECT count(*) FROM pgq_last_rewrite_diagnostics()
+WHERE status = 'selected' AND (rewrite_type LIKE 'tc%' OR rewrite_type = 'transitive_closure');
+----
+0
+
 # The same lake read without the provenance column at all (as the layout compiler writes it)
 statement ok
 ALTER TABLE graph.__pgq_path_catalog DROP COLUMN built_by;
@@ -365,7 +393,7 @@ statement ok
 FROM pgq_abi_build('edge_g', exclude_self_referential := false);
 
 statement ok
-UPDATE graph.__pgq_path_catalog SET built_by = NULL, preserves_multiplicity = true WHERE graph_name = 'edge_g';
+UPDATE graph.__pgq_path_catalog SET built_by = NULL, preserves_multiplicity = false WHERE graph_name = 'edge_g';
 
 query II rowsort
 FROM GRAPH_TABLE (edge_g MATCH (a:P)-[:K]->(b:P) COLUMNS (a.id AS a, b.id AS b));
@@ -423,21 +451,28 @@ SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
 ----
 0
 
-# ── a hand-made catalog whose artifact disagrees with the bridge, claiming exactness ────────────────────────────────
-
+# ── a stored true is trusted from any builder ────────────────────────────────────────────────────────────────────
+# Both builders measure edge and fixed_path artifacts, so a true flag is evidence and is not measured again (it
+# would cost every query on a lake whose catalog has no built_by column). Only false or missing flags are.
 statement ok
-CREATE TABLE graph.__pg_edge_g__lying AS SELECT 1 AS v0, hash('x') AS e1, 3 AS v1;
+UPDATE graph.__pgq_path_catalog SET preserves_multiplicity = true WHERE graph_name = 'edge_g';
 
-statement ok
-UPDATE graph.__pgq_path_catalog SET path_table_name = '__pg_edge_g__lying', preserves_multiplicity = true
-WHERE graph_name = 'edge_g' AND path_kind = 'edge';
+# (on a new connection: a catalog edited by hand is not seen by a connection that already cached it)
+statement ok con2
+SET active_grammar_extensions = ['duckpgq'];
 
-query II rowsort
+statement ok con2
 FROM GRAPH_TABLE (edge_g MATCH (a:P)-[:K]->(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+query T con2
+SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
 ----
-1	2
-1	2
-2	3
+edge
+
+query I con2
+SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE rewrite_type = 'multiplicity_probe';
+----
+0
 
 # ── a probe that cannot run is a no ─────────────────────────────────────────────────────────────────────────────────
 
