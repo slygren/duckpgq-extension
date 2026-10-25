@@ -402,7 +402,7 @@ def check_case(chk, case, workdir, only, log):
         compare_values(chk, case, "pagerank", res["pagerank"], nx.pagerank(mg), tol=1e-12)
     if "weakly_connected_component" in only:
         compare_partition(chk, case, "weakly_connected_component", res["weakly_connected_component"],
-                          nx.weakly_connected_components(case.multidigraph()), ids_are_min_rowid=False)
+                          nx.weakly_connected_components(case.multidigraph()))
     if "local_clustering_coefficient" in only:
         compare_values(chk, case, "local_clustering_coefficient", res["local_clustering_coefficient"],
                        nx.clustering(case.graph()), tol=1e-6)

@@ -30,14 +30,15 @@ EDGE TABLES (
            DESTINATION KEY ( dst ) REFERENCES Student ( id )
    );
 
+# A component's id is the smallest rowid among its vertices.
 query II
-select id, componentId from weakly_connected_component(pg, student, know);
+select id, componentId from weakly_connected_component(pg, student, know) ORDER BY id;
 ----
-0	4
-1	4
-2	4
-3	4
-4	4
+0	0
+1	0
+2	0
+3	0
+4	0
 
 statement ok
 CREATE OR REPLACE TABLE Student(id BIGINT, name VARCHAR);
@@ -59,7 +60,7 @@ EDGE TABLES (
 );
 
 query II
-select id, componentId from weakly_connected_component(pg_disconnected, student, know);
+select id, componentId from weakly_connected_component(pg_disconnected, student, know) ORDER BY id;
 ----
 0	0
 1	1
@@ -86,12 +87,12 @@ EDGE TABLES (
 );
 
 query II
-select id, componentId from weakly_connected_component(pg_isolated, student, know);
+select id, componentId from weakly_connected_component(pg_isolated, student, know) ORDER BY id;
 ----
-0	2
-1	2
-2	2
-3	2
+0	0
+1	0
+2	0
+3	0
 4	4
 5	5
 
@@ -115,13 +116,13 @@ EDGE TABLES (
 );
 
 query II
-select id, componentId from weakly_connected_component(pg_two_components, student, know);
+select id, componentId from weakly_connected_component(pg_two_components, student, know) ORDER BY id;
 ----
-0	2
-1	2
-2	2
-3	4
-4	4
+0	0
+1	0
+2	0
+3	3
+4	3
 
 statement ok
 CREATE OR REPLACE TABLE Student(id BIGINT, name VARCHAR);
@@ -142,13 +143,13 @@ EDGE TABLES (
 );
 
 query II
-select id, componentId from weakly_connected_component(pg_cyclic, student, know);
+select id, componentId from weakly_connected_component(pg_cyclic, student, know) ORDER BY id;
 ----
-0	4
-1	4
-2	4
-3	4
-4	4
+0	0
+1	0
+2	0
+3	0
+4	0
 
 statement ok
 CREATE OR REPLACE TABLE Student(id BIGINT, name VARCHAR);
@@ -328,3 +329,20 @@ Invalid Error: Label 'thisisadifferent' not found. Did you mean the vertex label
 #
 # statement ok
 # select id, componentId from weakly_connected_component(random_graph, nodes, edges);
+# No edges at all: every vertex is its own component (this used to fail with "CSR not found").
+statement ok
+CREATE TABLE wcc_v AS SELECT range AS id FROM range(4);
+
+statement ok
+CREATE TABLE wcc_none (src BIGINT, dst BIGINT);
+
+statement ok
+CREATE PROPERTY GRAPH wcc_edgeless VERTEX TABLES (wcc_v) EDGE TABLES (wcc_none SOURCE KEY (src) REFERENCES wcc_v (id) DESTINATION KEY (dst) REFERENCES wcc_v (id));
+
+query II
+select id, componentId from weakly_connected_component(wcc_edgeless, wcc_v, wcc_none) ORDER BY id;
+----
+0	0
+1	1
+2	2
+3	3

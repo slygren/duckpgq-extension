@@ -185,6 +185,7 @@ private:
 	static void RegisterShortestPathLengths(ExtensionLoader &loader);
 	static void RegisterDegree(ExtensionLoader &loader);
 	static void RegisterPageRank(ExtensionLoader &loader);
+	static void RegisterWeaklyConnectedComponent(ExtensionLoader &loader);
 };
 
 } // namespace duckdb

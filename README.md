@@ -317,6 +317,7 @@ How each function reads the edges (n vertices, m edges):
 | Function | Graph | Self-loops | Parallel edges | Result | Time |
 | --- | --- | --- | --- | --- | --- |
 | `pagerank(g, v, e, damping, max_iterations, tolerance)` | directed | out-edge to itself | each counts | `pagerank DOUBLE` | O(n + m) per iteration |
+| `weakly_connected_component(g, v, e)` | undirected | no effect | no effect | `componentId BIGINT` | O(m α(n)) |
 | `strongly_connected_component(g, v, e)` | directed | no effect | no effect | `componentId BIGINT` | O(n + m) |
 | `triangle_count(g, v, e)` | undirected | ignored | count once | `triangle_count BIGINT` | O(m^1.5) |
 | `total_triangle_count(g, v, e)` | undirected | ignored | count once | one row, `triangle_count BIGINT` | O(m^1.5) |
@@ -332,6 +333,9 @@ How each function reads the edges (n vertices, m edges):
   equal shares and spreads the rank of vertices without out-edges over all n. It stops when the summed change is below
   n * `tolerance` (default 1e-6). Not converging within `max_iterations` (default 100) is an error, as in NetworkX.
   Rows deleted from the vertex table are not vertices and take no part.
+- **`weakly_connected_component`**: union-find over the edges, ignoring direction. The `componentId` is the smallest
+  rowid among the component's vertices, as for `strongly_connected_component`. Matches
+  `networkx.weakly_connected_components`.
 - **`strongly_connected_component`**: Tarjan's algorithm, iterative, so long chains are no problem. Two vertices
   share a `componentId` when each reaches the other. The id is the smallest rowid among the component's vertices,
   so it depends only on the partition and the table's row order. Matches `networkx.strongly_connected_components`.
