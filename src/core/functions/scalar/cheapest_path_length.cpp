@@ -1,4 +1,6 @@
 #include "duckdb/common/vector_operations/vector_operations.hpp"
+#include "duckdb/common/operator/multiply.hpp"
+#include "duckdb/common/vector_operations/binary_executor.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckpgq/common.hpp"
@@ -463,6 +465,38 @@ static void CostZeroResolveTypes(ResolveScalarFunctionTypesInput &input) {
 	input.GetBoundFunction().SetReturnType(PGQCostType(input.GetArgumentType(0)));
 }
 
+//! pgq_repeat_cost(c, n): the cost of a path of n steps that each cost c, added left to right as the searches add
+//! the costs of a path (for DOUBLE, n additions; for BIGINT, overflow is an error). NULL n (no path) gives NULL.
+static void RepeatCostFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	if (result.GetType().id() == LogicalTypeId::BIGINT) {
+		BinaryExecutor::Execute<int64_t, int64_t, int64_t>(args.data[0], args.data[1], result, args.size(),
+		                                                   [](int64_t cost, int64_t steps) {
+			                                                   int64_t total = 0;
+			                                                   if (steps > 0 && !TryMultiplyOperator::Operation(
+			                                                                        cost, steps, total)) {
+				                                                   throw ConstraintException(
+				                                                       "A CHEAPEST path cost exceeds the BIGINT range");
+			                                                   }
+			                                                   return total;
+		                                                   });
+		return;
+	}
+	BinaryExecutor::Execute<double, int64_t, double>(args.data[0], args.data[1], result, args.size(),
+	                                                 [](double cost, int64_t steps) {
+		                                                 double total = 0;
+		                                                 for (int64_t i = 0; i < steps; i++) {
+			                                                 total += cost;
+		                                                 }
+		                                                 return total;
+	                                                 });
+}
+
+static void RepeatCostResolveTypes(ResolveScalarFunctionTypesInput &input) {
+	auto type = PGQCostType(input.GetArgumentType(0));
+	input.GetBoundFunction().GetArguments()[0] = type;
+	input.GetBoundFunction().SetReturnType(type);
+}
+
 } // namespace
 
 //------------------------------------------------------------------------------
@@ -500,6 +534,12 @@ void CoreScalarFunctions::RegisterCheapestPathLengthScalarFunction(ExtensionLoad
 	// It refuses some inputs, so the optimizer must not evaluate it on rows the query does not produce.
 	cost.SetFallible();
 	loader.RegisterFunction(cost);
+
+	ScalarFunction repeat("pgq_repeat_cost", {LogicalType::ANY, LogicalType::BIGINT}, LogicalType::BIGINT,
+	                      RepeatCostFunction);
+	repeat.SetResolveTypesCallback(RepeatCostResolveTypes);
+	repeat.SetFallible();
+	loader.RegisterFunction(repeat);
 
 	ScalarFunction zero("pgq_cost_zero", {LogicalType::ANY}, LogicalType::BIGINT, CostZeroFunction);
 	zero.SetResolveTypesCallback(CostZeroResolveTypes);

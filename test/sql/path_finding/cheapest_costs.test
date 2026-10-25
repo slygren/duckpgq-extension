@@ -346,11 +346,15 @@ FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)<-[e:Link COST e.w]-+(b:Per
 ----
 CHEAPEST without an upper bound supports a right-directed edge
 
-# COST(p) of a constant cost is a search over those costs, without bounds
-statement error
-FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 1]->{2,}(b:Person) COLUMNS (COST(p)));
+# COST(p) of a constant cost within other bounds: the constant once per step of the shortest path within them
+query TTIT
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 1]->{2,}(b:Person)
+    COLUMNS (a.name, b.name, COST(p), vertices(p))) ORDER BY ALL;
 ----
-COST(p) of a constant COST supports one right-directed edge
+A	D	2	[0, 1, 3]
+A	E	2	[0, 3, 4]
+B	E	2	[1, 3, 4]
+C	E	2	[2, 3, 4]
 
 # A COST reads its own edge; an element WHERE on the costed edge is not supported
 statement error
@@ -436,10 +440,19 @@ C	0.5
 D	0.5
 E	1.0
 
-statement error
-FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 0.5]->{1,3}(b:Person) COLUMNS (COST(p) AS c));
+query TTR
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 0.5]->{1,3}(b:Person) COLUMNS (a.name, b.name, COST(p) AS c))
+ORDER BY ALL;
 ----
-COST(p) of a constant COST supports one right-directed edge
+A	B	0.5
+A	C	0.5
+A	D	0.5
+A	E	1.0
+B	D	0.5
+B	E	1.0
+C	D	0.5
+C	E	1.0
+D	E	0.5
 
 # A cost that varies is traversed, artifacts or not, and answers the same
 query TR

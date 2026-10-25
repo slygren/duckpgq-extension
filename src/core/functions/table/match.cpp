@@ -5004,6 +5004,7 @@ static unique_ptr<ParsedExpression> ReplaceCostCalls(unique_ptr<ParsedExpression
 }
 
 static bool UsesPathOutsideCost(ParsedExpression &expression, const string &path_variable);
+static bool ConstantCostSearch(const SubPath &edge, OneRowPerMode one_row_per);
 
 void PGQMatchFunction::CheckNamedSubpath(SubPath &subpath, MatchExpression &original_ref,
                                          CreatePropertyGraphInfo &pg_table, unique_ptr<SelectNode> &final_select_node,
@@ -5042,6 +5043,22 @@ void PGQMatchFunction::CheckNamedSubpath(SubPath &subpath, MatchExpression &orig
 			                      subpath.path_variable);
 		}
 		auto edge_table = ResolveTable(edge_elem->label, edge_elem->match_type, pg_table);
+		if (!edge_sub->cheapest && IsConstantPositiveCost(*edge_sub->cost_expr) &&
+		    !ConstantCostSearch(*edge_sub, original_ref.one_row_per)) {
+			// A constant COST: the matched paths are the shortest ones, and each step costs the constant.
+			auto path = CreatePathFindingFunction(subpath.path_list, pg_table, subpath.path_variable, final_select_node,
+			                                      conditions, csr_id_counter, csr_slot, all_shortest, any_shortest,
+			                                      original_ref.where_clause.get());
+			vector<unique_ptr<ParsedExpression>> len_children;
+			len_children.push_back(std::move(path));
+			vector<unique_ptr<ParsedExpression>> div_children;
+			div_children.push_back(make_uniq<FunctionExpression>("len", std::move(len_children)));
+			div_children.push_back(ConstantExpression::FromValue(Value::BIGINT(2)));
+			vector<unique_ptr<ParsedExpression>> repeat_children;
+			repeat_children.push_back(edge_sub->cost_expr->Copy());
+			repeat_children.push_back(make_uniq<FunctionExpression>("//", std::move(div_children)));
+			return make_uniq<FunctionExpression>("pgq_repeat_cost", std::move(repeat_children));
+		}
 		// Where the paths themselves are materialised (bounds, ALL CHEAPEST, ONE ROW PER, the other path functions),
 		// the cost is the materialised path's, so that it always describes the same path.
 		bool materialised = edge_sub->cheapest &&
@@ -11132,6 +11149,15 @@ static bool CostReadsOnlyEdge(const ParsedExpression &expression, const string &
 	return only_edge;
 }
 
+//! Whether COST(p) of a constant COST over this quantified edge is the search over the constant costs
+//! (cheapest_path_length over a weighted CSR): one right-directed edge quantified with + or *, no element WHERE, no
+//! ONE ROW PER. Elsewhere it is the constant added once per step of the path the pattern matched.
+static bool ConstantCostSearch(const SubPath &edge, OneRowPerMode one_row_per) {
+	auto &element = reinterpret_cast<const PathElement &>(*edge.path_list[0]);
+	return edge.lower <= 1 && edge.upper >= (1 << 30) && !edge.where_clause &&
+	       element.match_type == PGQMatchType::MATCH_EDGE_RIGHT && one_row_per == OneRowPerMode::NONE;
+}
+
 //! CHEAPEST and COST(p) in one MATCH block, checked before the translation. A COST that is the same positive constant
 //! on every edge makes the cheapest paths the shortest ones, and the pattern is answered as SHORTEST; COST(p) is then
 //! a search over the constant costs. Any other COST marks its edge `cheapest`: the paths are chosen by cost, by a
@@ -11187,20 +11213,24 @@ static void PrepareCheapest(MatchExpression &match, bool shared_union_columns) {
 			if (!costed) {
 				continue;
 			}
-			// COST(p) of a constant cost is a search over those costs: the cheapest cost over any number of hops, the
-			// pattern's own only for one right-directed edge quantified with + or *.
-			if (!edge || edge->lower > 1 || edge->upper < (1 << 30) || edge->where_clause ||
-			    edge_element->match_type != PGQMatchType::MATCH_EDGE_RIGHT) {
-				throw NotImplementedException("COST(%s) of a constant COST supports one right-directed edge, without "
-				                              "an element WHERE, quantified with + or * between two vertices, e.g. %s",
+			// The paths are the shortest ones, and COST(p) is the constant added once per step of the path
+			// (ConstantPathCost). One right-directed edge quantified with + or * keeps its search over the constant
+			// costs (cheapest_path_length), which shares the block's CSR.
+			if (!edge) {
+				throw NotImplementedException("COST(%s) of a constant COST supports one quantified edge between two "
+				                              "vertices, e.g. %s",
 				                              path_variable, kExample);
 			}
-			if (!match.optional_match_patterns.empty() || match.one_row_per != OneRowPerMode::NONE) {
-				throw NotImplementedException("COST(%s) of a constant COST is not supported with OPTIONAL MATCH or ONE "
-				                              "ROW PER",
+			if (edge->where_clause) {
+				throw NotImplementedException("COST(%s) of a constant COST is not supported with an element WHERE on "
+				                              "the costed edge",
 				                              path_variable);
 			}
-			constant_cost_search = true;
+			if (!match.optional_match_patterns.empty()) {
+				throw NotImplementedException("COST(%s) of a constant COST is not supported with OPTIONAL MATCH",
+				                              path_variable);
+			}
+			constant_cost_search = constant_cost_search || ConstantCostSearch(*edge, match.one_row_per);
 		} else {
 			if (!edge) {
 				throw NotImplementedException("ANY / ALL CHEAPEST with a COST that is not the same positive constant on "
@@ -12886,22 +12916,26 @@ static PGQNativePathSearch NativePathSearchFor(PathPattern &pattern) {
 	if (!search.edge || search.edge->match_type == PGQMatchType::MATCH_VERTEX) {
 		return refuse("the edge is not quantified");
 	}
-	if (search.quantifier->where_clause || search.quantifier->cost_expr) {
+	// CHEAPEST with one positive constant COST is SHORTEST (PrepareCheapest leaves its edge unmarked).
+	const bool constant_cost = pattern.cheapest && search.quantifier->cost_expr && !search.quantifier->cheapest &&
+	                           IsConstantPositiveCost(*search.quantifier->cost_expr);
+	if (search.quantifier->where_clause || (search.quantifier->cost_expr && !constant_cost)) {
 		return refuse("the quantified edge has an element predicate or a cost");
 	}
 	if (search.quantifier->path_mode != PGQPathMode::NONE) {
 		mode = search.quantifier->path_mode;
 	}
 	const bool unbounded = search.quantifier->upper >= static_cast<int64_t>(1 << 30);
+	const bool shortest = pattern.shortest || constant_cost;
 	if (topk) {
 		search.k = pattern.topk;
 		search.mode = PathModeName(mode);
-	} else if (pattern.cheapest || !unbounded) {
+	} else if ((pattern.cheapest && !constant_cost) || !unbounded) {
 		return search;
-	} else if (!pattern.shortest && mode > PGQPathMode::WALK) {
+	} else if (!shortest && mode > PGQPathMode::WALK) {
 		search.k = -1;
 		search.mode = "acyclic";
-	} else if (pattern.shortest && search.quantifier->lower > 1) {
+	} else if (shortest && search.quantifier->lower > 1) {
 		search.k = 1;
 		search.all_shortest = pattern.all;
 		search.mode = "acyclic";
