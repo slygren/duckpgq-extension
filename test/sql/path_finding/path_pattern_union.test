@@ -1,0 +1,515 @@
+# name: test/sql/path_finding/path_pattern_union.test
+# description: Path pattern union (|, duplicate bindings removed) and multiset alternation (|+|, kept) inside MATCH,
+#              each checked against the explicit UNION / UNION ALL of the separate GRAPH_TABLE queries
+# group: [path_finding]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE P(id BIGINT PRIMARY KEY, name VARCHAR, age INTEGER);
+
+statement ok
+INSERT INTO P VALUES (10, 'a', 1), (20, 'b', 2), (30, 'c', 3), (40, 'd', 4);
+
+# R has a parallel edge (10 -> 20 twice) and a self-loop (30 -> 30); S overlaps R on 10 -> 20.
+statement ok
+CREATE TABLE R(src BIGINT, dst BIGINT, w INTEGER);
+
+statement ok
+INSERT INTO R VALUES (10, 20, 5), (10, 20, 6), (20, 30, 7), (10, 30, 1), (30, 40, 2), (30, 30, 9);
+
+statement ok
+CREATE TABLE S(src BIGINT, dst BIGINT, w DOUBLE);
+
+statement ok
+INSERT INTO S VALUES (10, 20, 0.5), (20, 40, 1.5);
+
+statement ok
+CREATE PROPERTY GRAPH g
+VERTEX TABLES (P)
+EDGE TABLES (
+    R SOURCE KEY (src) REFERENCES P (id) DESTINATION KEY (dst) REFERENCES P (id),
+    S SOURCE KEY (src) REFERENCES P (id) DESTINATION KEY (dst) REFERENCES P (id)
+);
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Operands that cannot match the same path (different edge tables): | and |+| are both UNION ALL
+# ---------------------------------------------------------------------------------------------------------------------
+
+query II rowsort
+FROM GRAPH_TABLE (g MATCH (a:P)-[:R]->(b:P) | (a:P)-[:S]->(b:P) COLUMNS (a.id AS a, b.id AS b));
+----
+10	20
+10	20
+10	20
+10	30
+20	30
+20	40
+30	30
+30	40
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:P)-[:R]->(b:P) | (a:P)-[:S]->(b:P) COLUMNS (a.id AS a, b.id AS b, a.name));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT * FROM (FROM GRAPH_TABLE (g MATCH (a:P)-[:R]->(b:P) COLUMNS (a.id AS a, b.id AS b, a.name))
+      UNION ALL
+      FROM GRAPH_TABLE (g MATCH (a:P)-[:S]->(b:P) COLUMNS (a.id AS a, b.id AS b, a.name)));
+
+query II
+SELECT (SELECT count(*) FROM actual) > 0, count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+true	0
+
+query II rowsort
+FROM GRAPH_TABLE (g MATCH (a:P)-[:R]->(b:P) |+| (a:P)-[:S]->(b:P) COLUMNS (a.id AS a, b.id AS b));
+----
+10	20
+10	20
+10	20
+10	30
+20	30
+20	40
+30	30
+30	40
+
+# The union is a set of path bindings, not of output rows: (10, 20) over R twice and over S once are three paths,
+# though COLUMNS shows the same row for each
+query I
+FROM GRAPH_TABLE (g MATCH (a:P)-[:R]->(b:P) | (a:P)-[:S]->(b:P) WHERE a.id = 10 AND b.id = 20 COLUMNS (a.id AS a))
+SELECT count(*);
+----
+3
+
+# Variable-length operands over different edge tables cannot match the same walk either
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:P)-[:R]->{1,3}(b:P) | (a:P)-[:S]->{1,2}(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT * FROM (FROM GRAPH_TABLE (g MATCH (a:P)-[:R]->{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b))
+      UNION ALL
+      FROM GRAPH_TABLE (g MATCH (a:P)-[:S]->{1,2}(b:P) COLUMNS (a.id AS a, b.id AS b)));
+
+query II
+SELECT (SELECT count(*) FROM actual) > 0, count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+true	0
+
+# ... nor operands of different lengths
+query II rowsort
+FROM GRAPH_TABLE (g MATCH (a:P)-[:S]->(b:P) | (a:P)-[:S]->(:P)-[:S]->(b:P) COLUMNS (a.id AS a, b.id AS b));
+----
+10	20
+10	40
+20	40
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Operands that can match the same path: | removes the duplicate bindings, |+| keeps them
+# ---------------------------------------------------------------------------------------------------------------------
+
+# The same pattern twice is the pattern once with |, twice with |+| (the parallel edges stay two paths)
+query II rowsort
+FROM GRAPH_TABLE (g MATCH (a:P)-[:R]->(b:P) | (a:P)-[:R]->(b:P) COLUMNS (a.id AS a, b.id AS b));
+----
+10	20
+10	20
+10	30
+20	30
+30	30
+30	40
+
+query II rowsort
+FROM GRAPH_TABLE (g MATCH (a:P)-[:R]->(b:P) |+| (a:P)-[:R]->(b:P) COLUMNS (a.id AS a, b.id AS b));
+----
+10	20
+10	20
+10	20
+10	20
+10	30
+10	30
+20	30
+20	30
+30	30
+30	30
+30	40
+30	40
+
+# Overlapping element predicates: the bindings of both, each once. Reference: UNION ALL of the two queries, made
+# distinct on the element ids.
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:P WHERE a.age < 3)-[e:R]->(b:P) | (a:P)-[e:R]->(b:P WHERE b.age > 2)
+                       COLUMNS (a.id AS a, e.w AS w, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT a, w, b FROM (
+         SELECT DISTINCT ka, ke, kb, a, w, b FROM (
+             FROM GRAPH_TABLE (g MATCH (a:P WHERE a.age < 3)-[e:R]->(b:P)
+                               COLUMNS (element_id(a) AS ka, element_id(e) AS ke, element_id(b) AS kb,
+                                        a.id AS a, e.w AS w, b.id AS b))
+             UNION ALL
+             FROM GRAPH_TABLE (g MATCH (a:P)-[e:R]->(b:P WHERE b.age > 2)
+                               COLUMNS (element_id(a) AS ka, element_id(e) AS ke, element_id(b) AS kb,
+                                        a.id AS a, e.w AS w, b.id AS b))));
+
+query II
+SELECT (SELECT count(*) FROM actual) > 0, count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+true	0
+
+query III rowsort
+FROM GRAPH_TABLE (g MATCH (a:P WHERE a.age < 3)-[e:R]->(b:P) | (a:P)-[e:R]->(b:P WHERE b.age > 2)
+                  COLUMNS (a.id AS a, e.w AS w, b.id AS b));
+----
+10	1	30
+10	5	20
+10	6	20
+20	7	30
+30	2	40
+30	9	30
+
+# The same edge read in both directions binds a and b the other way round, so both stay; only the self-loop
+# binds the same elements either way
+query II rowsort
+FROM GRAPH_TABLE (g MATCH (a:P)-[e:R]->(b:P) | (a:P)<-[e:R]-(b:P) COLUMNS (a.id AS a, b.id AS b));
+----
+10	20
+10	20
+10	30
+20	10
+20	10
+20	30
+30	10
+30	20
+30	30
+30	40
+40	30
+
+# An undirected edge pattern holds every binding of the directed one, but removing those duplicates needs the edge's
+# row, which the undirected traversal does not bind
+statement error
+FROM GRAPH_TABLE (g MATCH (a:P)-[e:R]-(b:P) | (a:P)-[e:R]->(b:P) COLUMNS (a.id AS a, e.w AS w, b.id AS b));
+----
+edge 'e' is undirected
+
+# Undirected operands that cannot coincide are fine
+query II rowsort
+FROM GRAPH_TABLE (g MATCH (a:P)-[:R]-(b:P WHERE b.id = 20) | (a:P)-[:S]->(b:P WHERE b.id = 20) COLUMNS (a.id AS a, b.id AS b));
+----
+10	20
+10	20
+10	20
+30	20
+
+# Anonymous edges: the path is the identity, so the R-path 10 -> 20 that both operands match counts once per edge
+query II rowsort
+FROM GRAPH_TABLE (g MATCH (a:P)-[:R]->(b:P) | (a:P WHERE a.id = 10)-[:R]->(b:P) COLUMNS (a.id AS a, b.id AS b));
+----
+10	20
+10	20
+10	30
+20	30
+30	30
+30	40
+
+# Two-hop operands that share the first hop
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:P)-[:R]->(m:P)-[:R]->(b:P) | (a:P)-[:R]->(m:P)-[:R]->(b:P WHERE b.id = 40)
+                       COLUMNS (a.id AS a, m.id AS m, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT * FROM (FROM GRAPH_TABLE (g MATCH (a:P)-[:R]->(m:P)-[:R]->(b:P) COLUMNS (a.id AS a, m.id AS m, b.id AS b)));
+
+query II
+SELECT (SELECT count(*) FROM actual) > 0, count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+true	0
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Variables an operand does not bind are NULL there
+# ---------------------------------------------------------------------------------------------------------------------
+
+query IIIRR rowsort
+FROM GRAPH_TABLE (g MATCH (a:P)-[e:R]->(b:P) | (a:P)-[f:S]->(c:P) WHERE a.id = 10
+                  COLUMNS (a.id AS a, b.id AS b, c.id AS c, e.w AS ew, f.w AS fw));
+----
+10	20	NULL	5.0	NULL
+10	20	NULL	6.0	NULL
+10	30	NULL	1.0	NULL
+10	NULL	20	NULL	0.5
+
+# Same paths, different variables: the bindings differ (b is NULL in one), so both stay
+query III rowsort
+FROM GRAPH_TABLE (g MATCH (a:P)-[:S]->(b:P) | (a:P)-[:S]->(c:P) COLUMNS (a.id AS a, b.id AS b, c.id AS c));
+----
+10	20	NULL
+10	NULL	20
+20	40	NULL
+20	NULL	40
+
+# A WHERE on a variable an operand does not bind is NULL there, so that operand contributes nothing
+query II rowsort
+FROM GRAPH_TABLE (g MATCH (a:P)-[e:R]->(b:P) | (a:P)-[f:S]->(b:P) WHERE f.w > 1 COLUMNS (a.id AS a, b.id AS b));
+----
+20	40
+
+query II rowsort
+FROM GRAPH_TABLE (g MATCH (a:P)-[e:R]->(b:P) | (a:P)-[f:S]->(b:P) WHERE f.w IS NULL AND a.id = 10
+                  COLUMNS (a.id AS a, element_id(f) AS f));
+----
+10	NULL
+10	NULL
+10	NULL
+
+query TT rowsort
+FROM GRAPH_TABLE (g MATCH (a:P)-[e:R]->(b:P) | (a:P)-[f:S]->(b:P) WHERE a.id = 20 COLUMNS (label(e), label(f)));
+----
+NULL	S
+R	NULL
+
+# Without COLUMNS, the vertices of every operand, once each
+query IIIIII rowsort
+FROM GRAPH_TABLE (g MATCH (a:P)-[:R]->(b:P) | (a:P)-[:S]->(b:P) WHERE a.id = 20);
+----
+2	20	b	3	30	c
+2	20	b	4	40	d
+
+statement error
+FROM GRAPH_TABLE (g MATCH (a:P)-[:R]->(b:P) | (a:P)-[:S]->(c:P));
+----
+b.* cannot be returned by a path pattern union whose operands do not all bind 'b'
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Path variables, path modes, several patterns, UNION of MATCH blocks, EXISTS
+# ---------------------------------------------------------------------------------------------------------------------
+
+# The path variable names the path of whichever operand matched
+query IIT rowsort
+FROM GRAPH_TABLE (g MATCH p = (a:P)-[:R]->{2,2}(b:P) | (a:P)-[:S]->(b:P) WHERE a.id = 10
+                  COLUMNS (a.id AS a, path_length(p) AS hops, edge_labels(p) AS labels));
+----
+10	1	[S]
+10	2	[R, R]
+10	2	[R, R]
+10	2	[R, R]
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH TRAIL (a:P)-[:R]->{1,3}(b:P) | (a:P)-[:S]->(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT * FROM (FROM GRAPH_TABLE (g MATCH TRAIL (a:P)-[:R]->{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b))
+      UNION ALL
+      FROM GRAPH_TABLE (g MATCH (a:P)-[:S]->(b:P) COLUMNS (a.id AS a, b.id AS b)));
+
+query II
+SELECT (SELECT count(*) FROM actual) > 0, count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+true	0
+
+# A union pattern next to an ordinary one: one MATCH per operand, each joined with the other pattern
+query III rowsort
+FROM GRAPH_TABLE (g MATCH (a:P)-[:R]->(b:P) | (a:P)-[:S]->(b:P), (b)-[:S]->(c:P) COLUMNS (a.id AS a, b.id AS b, c.id AS c));
+----
+10	20	40
+10	20	40
+10	20	40
+
+# Two union patterns: four combinations. The first pattern's operands overlap (the second is a subset), the second
+# pattern's do not: R(a, b) joined with R(b, c) (8 paths) and with S(b, c) (2), each once
+query I
+FROM GRAPH_TABLE (g MATCH (a:P)-[:R]->(b:P) | (a:P)-[:R]->(b:P WHERE b.age > 2),
+                          (b)-[:R]->(c:P) | (b)-[:S]->(c:P)
+                  COLUMNS (a.id AS a, b.id AS b, c.id AS c))
+SELECT count(*);
+----
+10
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:P)-[:R]->(b:P) | (a:P)-[:R]->(b:P WHERE b.age > 2),
+                               (b)-[:R]->(c:P) | (b)-[:S]->(c:P)
+                       COLUMNS (a.id AS a, b.id AS b, c.id AS c));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT * FROM (FROM GRAPH_TABLE (g MATCH (a:P)-[:R]->(b:P), (b)-[:R]->(c:P) COLUMNS (a.id AS a, b.id AS b, c.id AS c))
+      UNION ALL
+      FROM GRAPH_TABLE (g MATCH (a:P)-[:R]->(b:P), (b)-[:S]->(c:P) COLUMNS (a.id AS a, b.id AS b, c.id AS c)));
+
+query II
+SELECT (SELECT count(*) FROM actual) > 0, count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+true	0
+
+# |+| in one pattern keeps its duplicates while | in the other removes its own: twice the 8 paths of R(a, b), R(b, c)
+query I
+FROM GRAPH_TABLE (g MATCH (a:P)-[:R]->(b:P) |+| (a:P)-[:R]->(b:P),
+                          (b)-[:R]->(c:P) | (b)-[:R]->(c:P)
+                  COLUMNS (a.id AS a, b.id AS b, c.id AS c))
+SELECT count(*);
+----
+16
+
+query I
+FROM GRAPH_TABLE (g MATCH (a:P)-[:R]->(b:P), (b)-[:R]->(c:P) COLUMNS (a.id AS a)) SELECT count(*);
+----
+8
+
+# MATCH blocks combined with UNION ALL, one of them with a path pattern union
+query II rowsort
+FROM GRAPH_TABLE (g
+    MATCH (a:P)-[:S]->(b:P) | (a:P)-[:S]->(:P)-[:S]->(b:P)
+    UNION ALL
+    MATCH (a:P)-[:R]->(b:P WHERE b.id = 40)
+    COLUMNS (a.id AS a, b.id AS b));
+----
+10	20
+10	40
+20	40
+30	40
+
+# EXISTS { A | B } holds when either operand matches
+query I rowsort
+FROM GRAPH_TABLE (g MATCH (a:P) WHERE EXISTS { (a)-[:S]->(:P) | (a)-[:R]->(:P WHERE id = 40) } COLUMNS (a.id AS a));
+----
+10
+20
+30
+
+query I rowsort
+FROM GRAPH_TABLE (g MATCH (a:P) WHERE NOT EXISTS { (a)-[:S]->(:P) | (a)-[:R]->(:P WHERE id = 40) } COLUMNS (a.id AS a));
+----
+40
+
+statement error
+FROM GRAPH_TABLE (g MATCH (a:P) WHERE EXISTS { (a)-[:S]->(b:P) | (a)-[:R]->(c:P) WHERE b.age > 1 } COLUMNS (a.id));
+----
+needs every operand of the union to bind the same variables
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Answered from ABI artifacts: operands that cannot coincide keep their artifact; duplicates need the traversal
+# ---------------------------------------------------------------------------------------------------------------------
+
+statement ok
+CREATE SCHEMA graph;
+
+statement ok
+FROM pgq_abi_build('g', exclude_self_referential := false);
+
+query II rowsort
+FROM GRAPH_TABLE (g MATCH (a:P)-[:R]->(b:P) | (a:P)-[:S]->(b:P) COLUMNS (a.id AS a, b.id AS b));
+----
+10	20
+10	20
+10	20
+10	30
+20	30
+20	40
+30	30
+30	40
+
+query T
+SELECT list(DISTINCT path_kind) FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+[edge]
+
+query II rowsort
+FROM GRAPH_TABLE (g MATCH (a:P)-[:R]->(b:P) | (a:P)-[:R]->(b:P) COLUMNS (a.id AS a, b.id AS b));
+----
+10	20
+10	20
+10	30
+20	30
+30	30
+30	40
+
+statement ok
+SET pgq_require_abi_paths = true;
+
+# (R holds a parallel edge, so its edge artifact does not preserve multiplicity and is not used; S's is)
+query II rowsort
+FROM GRAPH_TABLE (g MATCH (a:P)-[:S]->(b:P) |+| (a:P)-[:S]->(b:P) COLUMNS (a.id AS a, b.id AS b));
+----
+10	20
+10	20
+20	40
+20	40
+
+query II rowsort
+FROM GRAPH_TABLE (g MATCH (a:P)-[:S]->(b:P) | (a:P)-[:S]->(:P)-[:S]->(b:P) COLUMNS (a.id AS a, b.id AS b));
+----
+10	20
+10	40
+20	40
+
+statement error
+FROM GRAPH_TABLE (g MATCH (a:P)-[:S]->(b:P) | (a:P)-[:S]->(b:P) COLUMNS (a.id AS a, b.id AS b));
+----
+this path pattern union is traversed
+
+statement ok
+SET pgq_require_abi_paths = false;
+
+# ---------------------------------------------------------------------------------------------------------------------
+# What is not supported says so
+# ---------------------------------------------------------------------------------------------------------------------
+
+statement error
+FROM GRAPH_TABLE (g MATCH ((a:P)-[:R]->(b:P) | (a:P)-[:S]->(b:P)){1,3} COLUMNS (a.id));
+----
+Parenthesized path patterns are not supported
+
+statement error
+FROM GRAPH_TABLE (g MATCH (x:P)-[:R]->((a:P)-[:R]->(b:P) | (a:P)-[:S]->(b:P)) COLUMNS (x.id));
+----
+Parenthesized path patterns are not supported
+
+statement error
+FROM GRAPH_TABLE (g MATCH (a:P)-[:R]->(b:P) | (a:P)-[:S]->(b:P) |+| (a:P)-[:S]->(b:P) COLUMNS (a.id));
+----
+cannot mix the union '|' and the multiset alternation '|+|'
+
+statement error
+FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[:R]->+(b:P) | (a:P)-[:S]->+(b:P) COLUMNS (a.id));
+----
+A search prefix (ANY / ALL SHORTEST, SHORTEST k, ANY / ALL CHEAPEST) over a path pattern union is not supported
+
+# Variable-length operands that can match the same walk: duplicates cannot be removed by element identity
+statement error
+FROM GRAPH_TABLE (g MATCH (a:P)-[:R]->{1,2}(b:P) | (a:P)-[:R]->{2,3}(b:P) COLUMNS (a.id));
+----
+one of them is variable-length
+
+# ... with |+| they are simply both kept
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:P)-[:R]->{1,2}(b:P) |+| (a:P)-[:R]->{2,3}(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT * FROM (FROM GRAPH_TABLE (g MATCH (a:P)-[:R]->{1,2}(b:P) COLUMNS (a.id AS a, b.id AS b))
+      UNION ALL
+      FROM GRAPH_TABLE (g MATCH (a:P)-[:R]->{2,3}(b:P) COLUMNS (a.id AS a, b.id AS b)));
+
+query II
+SELECT (SELECT count(*) FROM actual) > 0, count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+true	0
+
+statement error
+FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH (a)-[:R]->(b:P) | (a)-[:S]->(b:P) COLUMNS (a.id));
+----
+not supported in OPTIONAL MATCH
+
+statement error
+FROM GRAPH_TABLE (g MATCH p = (a:P)-[:R]->{1,2}(b:P) | (a:P)-[:S]->(b:P) ONE ROW PER VERTEX (v) COLUMNS (v.id));
+----
+ONE ROW PER cannot be combined with a path pattern union
+
+# '|' between labels is still a label disjunction, and '|' in expressions is still bitwise OR
+query I rowsort
+FROM GRAPH_TABLE (g MATCH (a:P)-[:R]->(b:P WHERE b.age | 1 = 3) COLUMNS (a.id AS a));
+----
+10
+10
+10
+20
+30

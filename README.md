@@ -10,7 +10,7 @@ documentation for the upstream project is at [duckpgq.org](https://duckpgq.org/)
 
 | Added here | In short | More |
 | --- | --- | --- |
-| PGQL-style patterns | label expressions, `OPTIONAL MATCH`, `EXISTS { }`, `UNION` of MATCH blocks, `ONE ROW PER …`, path functions, property projection | [Query language](#query-language) |
+| PGQL-style patterns | label expressions, `OPTIONAL MATCH`, `EXISTS { }`, `UNION` of MATCH blocks, path pattern unions (`\|`, `\|+\|`), `ONE ROW PER …`, path functions, property projection | [Query language](#query-language) |
 | ABI path tables | precomputed path tables that `GRAPH_TABLE` reads instead of traversing; the extension builds them, checks they are fresh and reports which one a query used | [ABI path tables](#abi-path-tables) |
 | Server and browser use | a setting that turns the grammar on for every connection, so a [Quack](#serving-graphs-over-quack) server can serve graphs; a wasm build | [Deployment](#deployment) |
 | Planner work | factorized joins for counts over n:m paths, vertex-join elimination, a frontier semi-join for bounded context expansion | [docs/FACTORIZED_JOINS.md](docs/FACTORIZED_JOINS.md), [docs/duckdb_v2.md](docs/duckdb_v2.md) |
@@ -131,7 +131,15 @@ put over DuckLake catalogs. A graph is stored in the database it is created in a
 | `OPTIONAL MATCH …` | left-joined pattern (fixed-length, directed) |
 | `WHERE EXISTS { (t)-[:HAS_WORKORDER]->() }`, `NOT EXISTS { … }` | correlated pattern existence |
 | `MATCH … UNION [ALL] MATCH …` | several MATCH blocks, one shared `COLUMNS` |
+| `MATCH (a)-[:R]->(b) \| (a)-[:S]->(b)`, `… \|+\| …` | path pattern union: either operand; `\|` removes duplicate path bindings, `\|+\|` (multiset alternation) keeps them. A variable an operand does not bind is NULL in its rows |
 | `ONE ROW PER VERTEX (v)`, `ONE ROW PER EDGE (e)`, `ONE ROW PER STEP (v1, e, v2)` | one output row per element of each matched path |
+
+A path pattern union is a set of path bindings, not of output rows: two operands give the same binding only when
+they match the same elements in the same order and bind the same variables to them. Operands that cannot (a
+different vertex or edge table at some position, different lengths, different variables) are combined with UNION ALL
+and each keeps its ABI artifact. Between the others, `|` removes the duplicates by element identity, which needs
+fixed-length, directed operands and the traversal. The path variable and path mode in front of a union apply to
+every operand, and `EXISTS { A | B }` holds when either operand matches.
 
 A quantified pattern without a search prefix returns **every walk** (SQL/PGQ semantics), not one row per endpoint;
 use `ANY SHORTEST` for one per endpoint, `ALL SHORTEST` for every shortest path. A walk visits no vertex twice, so
@@ -382,9 +390,13 @@ building in [abi_build.cpp](src/core/functions/table/abi_build.cpp); vertex-join
 ## Limitations
 
 - **One DuckDB version per binary**, and unsigned (see [Deployment](#deployment)).
-- **Patterns not supported:** bracketed sub-path groups `[ … ]{n,m}`, path unions `|` / `|+|` inside a pattern,
-  Cypher's `[:R*1..5]` (write `-[:R]->{1,5}`), `LATERAL` inside `MATCH`, horizontal aggregation along a path,
-  graph updates (`INSERT`/`DELETE` of vertices or edges; the graph is a view over tables).
+- **Patterns not supported:** bracketed sub-path groups `[ … ]{n,m}` and parenthesized path patterns (a quantified
+  or nested union such as `((a)-[:R]->(b) | (a)-[:S]->(b)){1,3}`), Cypher's `[:R*1..5]` (write `-[:R]->{1,5}`),
+  `LATERAL` inside `MATCH`, horizontal aggregation along a path, graph updates (`INSERT`/`DELETE` of vertices or
+  edges; the graph is a view over tables).
+- **Path pattern unions** (`|`, `|+|`) stand at the top level of a MATCH pattern, and take no search prefix
+  (`ANY SHORTEST … | …`), OPTIONAL MATCH or ONE ROW PER. `|` removes duplicates only between fixed-length, directed
+  operands; operands that may match the same variable-length walk need `|+|` or disjoint labels.
 - **Parsed, not implemented:** top-k shortest (`SHORTEST k`).
 - **`OPTIONAL MATCH`** is fixed-length and directed only. `ONE ROW PER` does not cover unbounded left-directed or
   bidirectional variable-length patterns.

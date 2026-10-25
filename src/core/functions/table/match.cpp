@@ -10113,6 +10113,12 @@ static void NormalizePatterns(vector<unique_ptr<PathPattern>> &patterns) {
 				CheckUnboundedWalk(*reference, PGQPathMode::NONE);
 			}
 		}
+		for (auto &operand : pattern->union_operands) {
+			for (auto &reference : operand) {
+				NormalizeQuantifiers(*reference);
+				CheckUnboundedWalk(*reference, PGQPathMode::NONE);
+			}
+		}
 	}
 }
 
@@ -10124,6 +10130,669 @@ static void NormalizeMatchExpression(MatchExpression &match) {
 	for (auto &branch : match.union_matches) {
 		NormalizeMatchExpression(*branch);
 	}
+}
+
+//------------------------------------------------------------------------------
+// Path pattern unions
+//------------------------------------------------------------------------------
+// Lowered onto MATCH blocks without them, so every route (traversal and ABI artifacts) answers them unchanged:
+// `A | B` and `A |+| B` become one MATCH per choice of operand ("leaf"), combined with UNION ALL. For `|`,
+// operands that may match the same path binding are deduplicated on the identity of every element instead.
+
+static bool HasPathPatternUnion(const vector<unique_ptr<PathPattern>> &patterns) {
+	for (auto &pattern : patterns) {
+		if (!pattern->union_operands.empty()) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool NeedsLoweredMatch(const MatchExpression &ref) {
+	if (HasPathPatternUnion(ref.path_patterns)) {
+		return true;
+	}
+	for (auto &branch : ref.union_matches) {
+		if (HasPathPatternUnion(branch->path_patterns)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//! One element position of a union operand: a vertex, a single edge, or a quantified edge.
+struct PGQUnionPosition {
+	PathElement *element = nullptr;
+	bool variable_length = false;
+	int64_t lower = 1;
+	int64_t upper = 1;
+};
+
+//! The positions of an operand in path order, or false when its shape is not a plain alternating sequence.
+static bool FlattenUnionOperand(const vector<unique_ptr<PathReference>> &references,
+                                vector<PGQUnionPosition> &positions) {
+	for (auto &reference : references) {
+		if (auto *element = PGQMatchFunction::GetPathElement(reference)) {
+			PGQUnionPosition position;
+			position.element = element;
+			positions.push_back(position);
+			continue;
+		}
+		auto *subpath = PGQMatchFunction::GetSubPath(reference);
+		if (!subpath) {
+			return false;
+		}
+		auto *single = subpath->path_list.size() == 1 ? PGQMatchFunction::GetPathElement(subpath->path_list[0])
+		                                              : nullptr;
+		if (single && subpath->path_variable.empty()) {
+			// An element with an element-local WHERE / COST, or a quantified edge.
+			PGQUnionPosition position;
+			position.element = single;
+			position.variable_length = subpath->lower != 1 || subpath->upper != 1;
+			position.lower = subpath->lower;
+			position.upper = subpath->upper;
+			positions.push_back(position);
+			continue;
+		}
+		if (subpath->lower != 1 || subpath->upper != 1) {
+			return false;
+		}
+		// A named path or a path mode wraps the whole sequence.
+		if (!FlattenUnionOperand(subpath->path_list, positions)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static void CollectUnionNamedVariables(const PathReference &reference, case_insensitive_set_t &element_names,
+                                       case_insensitive_set_t &path_names) {
+	if (reference.path_reference_type == PGQPathReferenceType::SUBPATH) {
+		auto &subpath = static_cast<const SubPath &>(reference);
+		if (!subpath.path_variable.empty()) {
+			path_names.insert(subpath.path_variable);
+		}
+		for (auto &child : subpath.path_list) {
+			CollectUnionNamedVariables(*child, element_names, path_names);
+		}
+		return;
+	}
+	auto &element = static_cast<const PathElement &>(reference);
+	if (!StringUtil::StartsWith(element.variable_binding, "_anon_")) {
+		element_names.insert(element.variable_binding);
+	}
+}
+
+// A small evaluator for the label strings the grammar writes ("a|b", "a&(b|c)", "!a", ...), used to decide which
+// tables an element can bind. Conservative: a table with sub-labels counts as a candidate for any label expression,
+// since a row can carry several of its labels at once.
+struct PGQLabelExpressionReader {
+	explicit PGQLabelExpressionReader(const string &text_p) : text(text_p) {
+	}
+	const string &text;
+	idx_t pos = 0;
+
+	bool Or(const string &label) {
+		bool result = And(label);
+		while (pos < text.size() && text[pos] == '|') {
+			pos++;
+			result = And(label) || result;
+		}
+		return result;
+	}
+	bool And(const string &label) {
+		bool result = Factor(label);
+		while (pos < text.size() && text[pos] == '&') {
+			pos++;
+			result = Factor(label) && result;
+		}
+		return result;
+	}
+	bool Factor(const string &label) {
+		if (pos < text.size() && text[pos] == '!') {
+			pos++;
+			return !Factor(label);
+		}
+		if (pos < text.size() && text[pos] == '(') {
+			pos++;
+			bool result = Or(label);
+			if (pos < text.size() && text[pos] == ')') {
+				pos++;
+			}
+			return result;
+		}
+		idx_t start = pos;
+		while (pos < text.size() && text[pos] != '|' && text[pos] != '&' && text[pos] != ')') {
+			pos++;
+		}
+		auto name = text.substr(start, pos - start);
+		StringUtil::Trim(name);
+		return StringUtil::CIEquals(name, label);
+	}
+};
+
+//! The tables an element with this label expression can bind to (lower-case qualified names).
+static case_insensitive_set_t UnionCandidateTables(const PathElement &element, CreatePropertyGraphInfo &pg_table) {
+	const bool vertex = element.match_type == PGQMatchType::MATCH_VERTEX;
+	case_insensitive_set_t result;
+	for (auto &table : vertex ? pg_table.vertex_tables : pg_table.edge_tables) {
+		bool candidate = element.label.empty() || !table->sub_labels.empty();
+		if (!candidate) {
+			PGQLabelExpressionReader reader(element.label);
+			candidate = reader.Or(PGQStr(table->main_label));
+		}
+		if (candidate) {
+			result.insert(QualifiedTableName(PGQStr(table->catalog_name), PGQStr(table->schema_name),
+			                                 PGQStr(table->table_name)));
+		}
+	}
+	return result;
+}
+
+static bool TablesIntersect(const case_insensitive_set_t &left, const case_insensitive_set_t &right) {
+	for (auto &name : left) {
+		if (right.find(name) != right.end()) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//! The candidate tables of the positions an operand starts with (or ends with, reversed), up to the first
+//! quantified edge; a quantified edge with at least one hop contributes its first (last) edge.
+static vector<case_insensitive_set_t> UnionOperandEnds(const vector<PGQUnionPosition> &positions, bool from_end,
+                                                       CreatePropertyGraphInfo &pg_table) {
+	vector<case_insensitive_set_t> result;
+	for (idx_t i = 0; i < positions.size(); i++) {
+		auto &position = positions[from_end ? positions.size() - 1 - i : i];
+		if (position.variable_length && position.lower < 1) {
+			break;
+		}
+		result.push_back(UnionCandidateTables(*position.element, pg_table));
+		if (position.variable_length) {
+			break;
+		}
+	}
+	return result;
+}
+
+//! True when no path can match both operands: their lengths differ, or some position at the start or the end
+//! can only bind elements of different tables.
+static bool UnionOperandsDisjoint(const vector<PGQUnionPosition> &left, const vector<PGQUnionPosition> &right,
+                                  CreatePropertyGraphInfo &pg_table) {
+	auto hop_range = [](const vector<PGQUnionPosition> &positions, int64_t &min_hops, int64_t &max_hops) {
+		min_hops = 0;
+		max_hops = 0;
+		for (auto &position : positions) {
+			if (position.element->match_type == PGQMatchType::MATCH_VERTEX) {
+				continue;
+			}
+			min_hops += position.lower;
+			max_hops = MinValue<int64_t>(max_hops + position.upper, NumericLimits<int32_t>::Maximum());
+		}
+	};
+	int64_t left_min, left_max, right_min, right_max;
+	hop_range(left, left_min, left_max);
+	hop_range(right, right_min, right_max);
+	if (left_max < right_min || right_max < left_min) {
+		return true;
+	}
+	for (bool from_end : {false, true}) {
+		auto left_ends = UnionOperandEnds(left, from_end, pg_table);
+		auto right_ends = UnionOperandEnds(right, from_end, pg_table);
+		for (idx_t i = 0; i < MinValue(left_ends.size(), right_ends.size()); i++) {
+			if (!TablesIntersect(left_ends[i], right_ends[i])) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+//! The main label of the one table a fixed-length element binds, from its label or from the edge next to it.
+static string UnionPositionLabel(const vector<PGQUnionPosition> &positions, idx_t index,
+                                 CreatePropertyGraphInfo &pg_table) {
+	auto &element = *positions[index].element;
+	if (!element.label.empty()) {
+		return PGQStr(ResolveTable(element.label, element.match_type, pg_table)->main_label);
+	}
+	if (element.match_type != PGQMatchType::MATCH_VERTEX) {
+		return PGQStr(ResolveTable(element.label, element.match_type, pg_table)->main_label);
+	}
+	for (idx_t neighbour : {index + 1, index - 1}) {
+		if (neighbour >= positions.size()) {
+			continue;
+		}
+		auto &edge = *positions[neighbour].element;
+		auto edge_table = ResolveTable(edge.label, edge.match_type, pg_table);
+		auto implied = EdgeEndTable(*edge_table, edge.match_type, /*far_end=*/neighbour < index);
+		if (implied) {
+			return PGQStr(implied->main_label);
+		}
+	}
+	if (pg_table.vertex_tables.size() == 1) {
+		return PGQStr(pg_table.vertex_tables[0]->main_label);
+	}
+	throw BinderException("This path pattern union needs to remove duplicate paths, which needs vertex '%s' to have "
+	                      "one table: give it a label",
+	                      element.variable_binding);
+}
+
+//! Replace references to variables an operand does not bind with NULL: a property, or a graph function of it.
+static unique_ptr<ParsedExpression> NullMissingVariables(unique_ptr<ParsedExpression> expression,
+                                                         const case_insensitive_set_t &missing) {
+	if (!expression || missing.empty()) {
+		return expression;
+	}
+	auto is_missing_reference = [&](const ParsedExpression &candidate, bool bare_only) {
+		if (candidate.GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+			return false;
+		}
+		auto &names = candidate.Cast<ColumnRefExpression>().ColumnNames();
+		if (bare_only && names.size() != 1) {
+			return false;
+		}
+		return !names.empty() && missing.find(PGQStr(names[0])) != missing.end();
+	};
+	bool replace = is_missing_reference(*expression, false);
+	if (!replace && expression->GetExpressionClass() == ExpressionClass::FUNCTION) {
+		for (auto &argument : expression->Cast<FunctionExpression>().GetArguments()) {
+			replace = replace || is_missing_reference(argument.GetExpression(), true);
+		}
+	}
+	if (replace) {
+		auto null_value = ConstantExpression::FromValue(Value());
+		null_value->SetAlias(expression->GetAlias());
+		return std::move(null_value);
+	}
+	ParsedExpressionIterator::EnumerateChildren(*expression, [&](unique_ptr<ParsedExpression> &child) {
+		child = NullMissingVariables(std::move(child), missing);
+	});
+	return expression;
+}
+
+static void CheckExistsReferences(const ParsedExpression *expression, const case_insensitive_set_t &missing) {
+	if (!expression || missing.empty()) {
+		return;
+	}
+	if (auto inner = DuckPGQGetExistsPattern(*expression)) {
+		case_insensitive_set_t names;
+		case_insensitive_set_t path_names;
+		for (auto &pattern : inner->path_patterns) {
+			for (auto &reference : pattern->path_elements) {
+				CollectUnionNamedVariables(*reference, names, path_names);
+			}
+		}
+		for (auto &name : names) {
+			if (missing.find(name) != missing.end()) {
+				throw BinderException("EXISTS { ... } in the WHERE of a path pattern union refers to '%s', which not "
+				                      "every operand binds",
+				                      name);
+			}
+		}
+		return;
+	}
+	ParsedExpressionIterator::EnumerateChildren(
+	    *expression, [&](const ParsedExpression &child) { CheckExistsReferences(&child, missing); });
+}
+
+//! The label an element variable has in a leaf, or empty when the leaf does not bind it.
+static bool FindVariableLabel(const vector<unique_ptr<PathReference>> &references, const string &variable,
+                              string &label) {
+	for (auto &reference : references) {
+		if (auto *element = PGQMatchFunction::GetPathElement(reference)) {
+			if (StringUtil::CIEquals(element->variable_binding, variable)) {
+				label = element->label;
+				return true;
+			}
+			continue;
+		}
+		auto *subpath = PGQMatchFunction::GetSubPath(reference);
+		if (subpath && FindVariableLabel(subpath->path_list, variable, label)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static unique_ptr<SelectNode> ParseGeneratedSelect(const string &sql) {
+	auto statement = ParseSelectStatement(sql);
+	if (statement->node->type != QueryNodeType::SELECT_NODE) {
+		throw InternalException("Expected a generated SELECT node");
+	}
+	return unique_ptr_cast<QueryNode, SelectNode>(std::move(statement->node));
+}
+
+//! A CTE named `name` holding `node`, placed before the CTEs `select` already declares.
+static void PrependCTE(SelectNode &select, const string &name, unique_ptr<QueryNode> node) {
+	CommonTableExpressionMap ctes;
+	auto info = make_uniq<CommonTableExpressionInfo>();
+	info->query_node = std::move(node);
+	ctes.map.insert(Identifier(name), std::move(info));
+	for (auto &entry : select.cte_map.map) {
+		ctes.map.insert(entry.first, std::move(entry.second));
+	}
+	select.cte_map = std::move(ctes);
+}
+
+static unique_ptr<QueryNode> CombineUnionAll(vector<unique_ptr<QueryNode>> nodes) {
+	D_ASSERT(!nodes.empty());
+	auto result = std::move(nodes[0]);
+	for (idx_t i = 1; i < nodes.size(); i++) {
+		auto set_op = make_uniq<SetOperationNode>();
+		set_op->setop_type = SetOperationType::UNION;
+		set_op->setop_all = true;
+		set_op->children.push_back(std::move(result));
+		set_op->children.push_back(std::move(nodes[i]));
+		result = std::move(set_op);
+	}
+	return result;
+}
+
+static unique_ptr<QueryNode> BuildMatchLeafNode(ClientContext &context, MatchExpression &leaf, bool allow_abi) {
+	return PGQMatchFunction::BuildMatchQueryNode(context, &leaf, allow_abi);
+}
+
+//------------------------------------------------------------------------------
+// Path pattern unions
+//------------------------------------------------------------------------------
+struct PGQUnionLeaf {
+	unique_ptr<MatchExpression> match;
+	vector<idx_t> choice;
+	//! Positions of every pattern of the leaf, per pattern.
+	vector<vector<PGQUnionPosition>> positions;
+	bool flattened = true;
+	case_insensitive_set_t element_variables;
+	case_insensitive_set_t path_variables;
+};
+
+static unique_ptr<QueryNode> BuildMatchBlockNode(ClientContext &context, MatchExpression &block) {
+	if (!HasPathPatternUnion(block.path_patterns)) {
+		return BuildMatchLeafNode(context, block, true);
+	}
+	if (block.one_row_per != OneRowPerMode::NONE) {
+		throw BinderException("ONE ROW PER cannot be combined with a path pattern union ('|' or '|+|')");
+	}
+	auto duckpgq_state = GetDuckPGQState(context);
+	QualifiedName graph_name(Identifier(block.pg_catalog), Identifier(block.pg_schema), Identifier(block.pg_name));
+	auto &pg_table = *duckpgq_state->GetPropertyGraph(context, graph_name);
+
+	// One leaf per choice of operand in each pattern.
+	vector<idx_t> operand_counts;
+	idx_t leaf_count = 1;
+	for (auto &pattern : block.path_patterns) {
+		operand_counts.push_back(1 + pattern->union_operands.size());
+		leaf_count *= operand_counts.back();
+		if (leaf_count > 256) {
+			throw BinderException("This MATCH expands to more than 256 combinations of path pattern union operands");
+		}
+	}
+	vector<PGQUnionLeaf> leaves;
+	for (idx_t combination = 0; combination < leaf_count; combination++) {
+		PGQUnionLeaf leaf;
+		leaf.match = unique_ptr_cast<ParsedExpression, MatchExpression>(block.Copy());
+		leaf.match->path_patterns.clear();
+		idx_t rest = combination;
+		for (idx_t p = 0; p < block.path_patterns.size(); p++) {
+			auto &pattern = *block.path_patterns[p];
+			const idx_t operand = rest % operand_counts[p];
+			rest /= operand_counts[p];
+			leaf.choice.push_back(operand);
+			auto chosen = pattern.Copy();
+			chosen->union_operands.clear();
+			chosen->union_multiset = false;
+			if (operand > 0) {
+				chosen->path_elements.clear();
+				for (auto &reference : pattern.union_operands[operand - 1]) {
+					chosen->path_elements.push_back(reference->Copy());
+				}
+			}
+			vector<PGQUnionPosition> positions;
+			leaf.flattened = FlattenUnionOperand(chosen->path_elements, positions) && leaf.flattened;
+			leaf.positions.push_back(std::move(positions));
+			for (auto &reference : chosen->path_elements) {
+				CollectUnionNamedVariables(*reference, leaf.element_variables, leaf.path_variables);
+			}
+			leaf.match->path_patterns.push_back(std::move(chosen));
+		}
+		leaves.push_back(std::move(leaf));
+	}
+	case_insensitive_set_t all_variables;
+	for (auto &leaf : leaves) {
+		all_variables.insert(leaf.element_variables.begin(), leaf.element_variables.end());
+		all_variables.insert(leaf.path_variables.begin(), leaf.path_variables.end());
+	}
+
+	// x.* needs x bound to the same label everywhere, or the leaves' columns would not line up.
+	for (auto &column : block.column_list) {
+		if (column->GetExpressionClass() != ExpressionClass::STAR) {
+			continue;
+		}
+		auto variable = column->Cast<StarExpression>().RelationName().GetIdentifierName();
+		if (variable.empty()) {
+			continue;
+		}
+		string first_label;
+		for (idx_t i = 0; i < leaves.size(); i++) {
+			string label;
+			bool bound = false;
+			for (auto &pattern : leaves[i].match->path_patterns) {
+				bound = bound || FindVariableLabel(pattern->path_elements, variable, label);
+			}
+			if (!bound) {
+				throw BinderException("%s.* cannot be returned by a path pattern union whose operands do not all bind "
+				                      "'%s'; list its properties in COLUMNS",
+				                      variable, variable);
+			}
+			if (i == 0) {
+				first_label = label;
+			} else if (!StringUtil::CIEquals(label, first_label)) {
+				throw BinderException("%s.* cannot be returned by a path pattern union whose operands give '%s' "
+				                      "different labels; list its properties in COLUMNS",
+				                      variable, variable);
+			}
+		}
+	}
+
+	// Two leaves can produce the same binding only if they bind the same variables and, in every pattern where
+	// they chose different operands of a '|' union, those operands can match the same path. Operands of a '|+|'
+	// alternation are kept apart: their duplicates stay.
+	auto may_coincide = [&](const PGQUnionLeaf &left, const PGQUnionLeaf &right) {
+		if (left.element_variables != right.element_variables || left.path_variables != right.path_variables) {
+			return false;
+		}
+		for (idx_t p = 0; p < block.path_patterns.size(); p++) {
+			if (left.choice[p] == right.choice[p]) {
+				continue;
+			}
+			if (block.path_patterns[p]->union_multiset) {
+				return false;
+			}
+			if (left.flattened && right.flattened &&
+			    UnionOperandsDisjoint(left.positions[p], right.positions[p], pg_table)) {
+				return false;
+			}
+		}
+		return true;
+	};
+	vector<idx_t> group(leaves.size());
+	for (idx_t i = 0; i < leaves.size(); i++) {
+		group[i] = i;
+	}
+	std::function<idx_t(idx_t)> find = [&](idx_t i) { return group[i] == i ? i : group[i] = find(group[i]); };
+	for (idx_t i = 0; i < leaves.size(); i++) {
+		for (idx_t j = i + 1; j < leaves.size(); j++) {
+			if (may_coincide(leaves[i], leaves[j])) {
+				group[find(j)] = find(i);
+			}
+		}
+	}
+
+	vector<unique_ptr<QueryNode>> nodes;
+	for (idx_t root = 0; root < leaves.size(); root++) {
+		if (find(root) != root) {
+			continue;
+		}
+		vector<idx_t> members;
+		for (idx_t i = 0; i < leaves.size(); i++) {
+			if (find(i) == root) {
+				members.push_back(i);
+			}
+		}
+		const bool deduplicate = members.size() > 1;
+		// Per member, when deduplicating: each position's (label, variable) and each named variable's position.
+		vector<vector<pair<string, string>>> member_positions;
+		vector<case_insensitive_map_t<idx_t>> member_named;
+		for (auto index : members) {
+			auto &leaf = leaves[index];
+			case_insensitive_set_t missing;
+			for (auto &variable : all_variables) {
+				if (leaf.element_variables.find(variable) == leaf.element_variables.end() &&
+				    leaf.path_variables.find(variable) == leaf.path_variables.end()) {
+					missing.insert(variable);
+				}
+			}
+			CheckExistsReferences(leaf.match->where_clause.get(), missing);
+			for (auto &column : leaf.match->column_list) {
+				const bool top_level_missing = column->GetAlias().empty();
+				auto name = column->GetName();
+				column = NullMissingVariables(std::move(column), missing);
+				if (top_level_missing && column->GetExpressionClass() == ExpressionClass::CONSTANT) {
+					column->SetAlias(name);
+				}
+			}
+			leaf.match->where_clause = NullMissingVariables(std::move(leaf.match->where_clause), missing);
+			if (!deduplicate) {
+				continue;
+			}
+			// Deduplicated on the binding itself: the table and row of every element in path order, and of every
+			// named element variable. That needs a fixed-length match with one table per element.
+			if (!leaf.flattened || !leaf.match->optional_match_patterns.empty()) {
+				throw BinderException("This path pattern union cannot remove duplicate paths: its operands can match "
+				                      "the same path, and the pattern is not a plain fixed-length one. Use '|+|' to "
+				                      "keep duplicates, or give the operands disjoint labels");
+			}
+			vector<pair<string, string>> positions_out;
+			case_insensitive_map_t<idx_t> named;
+			for (auto &positions : leaf.positions) {
+				for (idx_t k = 0; k < positions.size(); k++) {
+					if (positions[k].variable_length) {
+						throw BinderException(
+						    "This path pattern union cannot remove duplicate paths: its operands can match the same "
+						    "path, and one of them is variable-length. Use '|+|' to keep duplicates, or give the "
+						    "operands disjoint labels");
+					}
+					auto match_type = positions[k].element->match_type;
+					if (match_type == PGQMatchType::MATCH_EDGE_ANY ||
+					    match_type == PGQMatchType::MATCH_EDGE_LEFT_RIGHT) {
+						throw BinderException(
+						    "This path pattern union cannot remove duplicate paths: its operands can match the same "
+						    "path, and edge '%s' is undirected, which the traversal does not bind to a row. Use '|+|' "
+						    "to keep duplicates, or give the operands disjoint labels",
+						    positions[k].element->variable_binding);
+					}
+					auto &variable = positions[k].element->variable_binding;
+					if (leaf.element_variables.count(variable) && !named.count(variable)) {
+						named[variable] = positions_out.size();
+					}
+					positions_out.emplace_back(UnionPositionLabel(positions, k, pg_table), variable);
+				}
+			}
+			member_positions.push_back(std::move(positions_out));
+			member_named.push_back(std::move(named));
+		}
+		// The key: every position's row, its label where the members' labels differ there, and each named variable's
+		// row where the members bind it at different positions (elsewhere the path's rows already decide it).
+		vector<string> key_columns;
+		if (deduplicate) {
+			auto &first = member_positions[0];
+			vector<bool> label_differs(first.size(), false);
+			for (auto &positions : member_positions) {
+				D_ASSERT(positions.size() == first.size());
+				for (idx_t k = 0; k < first.size(); k++) {
+					label_differs[k] = label_differs[k] || !StringUtil::CIEquals(positions[k].first, first[k].first);
+				}
+			}
+			vector<string> named(leaves[members[0]].element_variables.begin(),
+			                     leaves[members[0]].element_variables.end());
+			std::sort(named.begin(), named.end(),
+			          [](const string &a, const string &b) { return StringUtil::Lower(a) < StringUtil::Lower(b); });
+			vector<string> keyed_named;
+			for (auto &variable : named) {
+				for (auto &positions : member_named) {
+					if (positions.at(variable) != member_named[0].at(variable)) {
+						keyed_named.push_back(variable);
+						break;
+					}
+				}
+			}
+			for (idx_t m = 0; m < members.size(); m++) {
+				auto &leaf = leaves[members[m]];
+				auto &positions = member_positions[m];
+				key_columns.clear();
+				auto add_key = [&](const string &name, unique_ptr<ParsedExpression> expression) {
+					expression->SetAlias(Identifier(name));
+					leaf.match->column_list.push_back(std::move(expression));
+					key_columns.push_back(name);
+				};
+				auto element_row = [](const string &variable) {
+					vector<unique_ptr<ParsedExpression>> arguments;
+					arguments.push_back(PGQColRef(variable));
+					return make_uniq<FunctionExpression>("element_id", std::move(arguments));
+				};
+				for (idx_t k = 0; k < positions.size(); k++) {
+					if (label_differs[k]) {
+						add_key("__pgq_uk" + to_string(k) + "_t",
+						        ConstantExpression::FromValue(Value(positions[k].first)));
+					}
+					add_key("__pgq_uk" + to_string(k) + "_r", element_row(positions[k].second));
+				}
+				for (idx_t v = 0; v < keyed_named.size(); v++) {
+					auto position = member_named[m].at(keyed_named[v]);
+					add_key("__pgq_ukv" + to_string(v) + "_t",
+					        ConstantExpression::FromValue(Value(positions[position].first)));
+					add_key("__pgq_ukv" + to_string(v) + "_r", element_row(keyed_named[v]));
+				}
+			}
+		}
+		vector<unique_ptr<QueryNode>> member_nodes;
+		for (auto index : members) {
+			member_nodes.push_back(BuildMatchLeafNode(context, *leaves[index].match, !deduplicate));
+		}
+		auto combined = CombineUnionAll(std::move(member_nodes));
+		if (!deduplicate) {
+			nodes.push_back(std::move(combined));
+			continue;
+		}
+		auto dedup = ParseGeneratedSelect("SELECT DISTINCT ON (" + StringUtil::Join(key_columns, ", ") +
+		                                  ") * EXCLUDE (" + StringUtil::Join(key_columns, ", ") +
+		                                  ") FROM __pgq_union_source");
+		PrependCTE(*dedup, "__pgq_union_source", std::move(combined));
+		nodes.push_back(std::move(dedup));
+	}
+	return CombineUnionAll(std::move(nodes));
+}
+
+unique_ptr<QueryNode> PGQMatchFunction::BuildLoweredMatchQueryNode(ClientContext &context, MatchExpression &ref) {
+	auto head = unique_ptr_cast<ParsedExpression, MatchExpression>(ref.Copy());
+	head->union_matches.clear();
+	head->union_all_flags.clear();
+	auto result = BuildMatchBlockNode(context, *head);
+	// UNION [ALL] MATCH branches share the head's COLUMNS.
+	for (idx_t i = 0; i < ref.union_matches.size(); i++) {
+		auto branch = unique_ptr_cast<ParsedExpression, MatchExpression>(ref.union_matches[i]->Copy());
+		branch->column_list.clear();
+		for (auto &column : ref.column_list) {
+			branch->column_list.push_back(column->Copy());
+		}
+		auto set_op = make_uniq<SetOperationNode>();
+		set_op->setop_type = SetOperationType::UNION;
+		set_op->setop_all = ref.union_all_flags[i];
+		set_op->children.push_back(std::move(result));
+		set_op->children.push_back(BuildMatchBlockNode(context, *branch));
+		result = std::move(set_op);
+	}
+	return result;
 }
 
 unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, TableFunctionBindInput &bind_input) {
@@ -10138,6 +10807,16 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	auto *ref = match_copy.get();
 	NormalizeMatchExpression(*ref);
 	duckpgq_state->BeginRewriteDiagnostics(context);
+	auto node = NeedsLoweredMatch(*ref) ? BuildLoweredMatchQueryNode(context, *ref)
+	                                    : BuildMatchQueryNode(context, ref, true);
+	auto subquery = make_uniq<SelectStatement>();
+	subquery->node = std::move(node);
+	return make_uniq<SubqueryRef>(std::move(subquery), PGQId(ref->alias));
+}
+
+unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &context, MatchExpression *ref,
+                                                            bool allow_abi) {
+	auto duckpgq_state = GetDuckPGQState(context);
 	QualifiedName graph_name(Identifier(ref->pg_catalog), Identifier(ref->pg_schema), Identifier(ref->pg_name));
 	auto *pg_table = duckpgq_state->GetPropertyGraph(context, graph_name);
 
@@ -10188,7 +10867,13 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 		// Tier 1: if a pre-computed path table covers this entire pattern, use it.
 		// Falls through to Tier 2/3 (ProcessPathList) when not applicable.
 		// Pass the MATCH WHERE clause for predicate pushdown (v0/v1 = constant).
-		if (!TryPathTableRewrite(context, *pg_table, path_pattern->path_elements, *ref, conditions,
+		if (!allow_abi && require_abi_paths && PathPatternRequiresABIPath(path_pattern->path_elements)) {
+			throw BinderException("pgq_require_abi_paths=true, but this path pattern union is traversed: its operands "
+			                      "can match the same path, and removing those duplicates needs every element's row. "
+			                      "Use '|+|' to keep duplicates, or give the operands disjoint labels");
+		}
+		if (!allow_abi ||
+		    !TryPathTableRewrite(context, *pg_table, path_pattern->path_elements, *ref, conditions,
 		                          final_select_node, alias_map, extra_alias_counter,
 		                          path_table_cache, referenced_bindings,
 		                          covered_columns,
@@ -10206,7 +10891,8 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 			}
 			ProcessPathList(context, path_pattern->path_elements, conditions, final_select_node, alias_map, *pg_table,
 			                extra_alias_counter, *ref, CSRIdCounter(context), cte1_slot, all_shortest, any_shortest,
-			                DisableABIRewrite(context) ? nullptr : &path_table_cache, MaxVLFallbackRows(context));
+			                !allow_abi || DisableABIRewrite(context) ? nullptr : &path_table_cache,
+			                MaxVLFallbackRows(context));
 		}
 	}
 
@@ -10333,9 +11019,7 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	PGQEliminateVertexJoins(context, *final_select_node, vertex_joins, alias_map, pg_table->verified);
 
 	if (ref->union_matches.empty()) {
-		auto subquery = make_uniq<SelectStatement>();
-		subquery->node = std::move(final_select_node);
-		return make_uniq<SubqueryRef>(std::move(subquery), PGQId(ref->alias));
+		return std::move(final_select_node);
 	}
 
 	// Build UNION chain: head branch then each union branch.
@@ -10454,9 +11138,7 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 		current_node = std::move(set_op);
 	}
 
-	auto subquery = make_uniq<SelectStatement>();
-	subquery->node = std::move(current_node);
-	return make_uniq<SubqueryRef>(std::move(subquery), PGQId(ref->alias));
+	return current_node;
 }
 
 //------------------------------------------------------------------------------

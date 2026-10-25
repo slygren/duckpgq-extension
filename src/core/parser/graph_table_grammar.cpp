@@ -4,6 +4,7 @@
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
@@ -343,32 +344,65 @@ unique_ptr<PathReference> TransformAbbreviatedEdge(PEGTransformer &transformer, 
 	return std::move(result);
 }
 
-// DuckPGQVertex DuckPGQEdgeVertex*
+[[noreturn]] void ThrowParenthesizedPath() {
+	throw ParserException(
+	    "Parenthesized path patterns are not supported: neither a quantified group such as "
+	    "((a)-[:R]->(b) | (a)-[:S]->(b)){1,3} nor a group inside a longer path. Write a path pattern union at the "
+	    "top level of a MATCH pattern instead, e.g. MATCH (a)-[:R]->(b) | (a)-[:S]->(b)");
+}
+
+// DuckPGQPathStart DuckPGQEdgeVertex*, with DuckPGQPathStart <- DuckPGQParenthesizedPath / DuckPGQVertex and
+// DuckPGQEdgeVertex <- (DuckPGQEdge DuckPGQPathStart) / DuckPGQParenthesizedPath
 unique_ptr<PathPattern> TransformPathSequence(PEGTransformer &transformer, ParseResult &parse_result,
                                               AnonymousNames &anon_names) {
 	auto &list = parse_result.Cast<ListParseResult>();
 	auto pattern = make_uniq<PathPattern>();
-	pattern->path_elements.push_back(
-	    TransformElement(transformer, list.GetChild(0), PGQMatchType::MATCH_VERTEX, anon_names));
+	auto &start = DuckPGQGetChoice(list.GetChild(0));
+	if (start.Name() == "DuckPGQParenthesizedPath") {
+		ThrowParenthesizedPath();
+	}
+	pattern->path_elements.push_back(TransformElement(transformer, start, PGQMatchType::MATCH_VERTEX, anon_names));
 	auto &repeat = list.Child<OptionalParseResult>(1);
 	if (!repeat.HasResult()) {
 		return pattern;
 	}
 	for (auto &edge_vertex : repeat.GetResult().Cast<RepeatParseResult>().GetChildren()) {
-		auto &pair = edge_vertex.get().Cast<ListParseResult>();
+		auto &step = DuckPGQGetChoice(edge_vertex.get());
+		if (step.Name() == "DuckPGQParenthesizedPath") {
+			ThrowParenthesizedPath();
+		}
+		auto &pair = step.Cast<ListParseResult>();
 		auto &edge = DuckPGQGetChoice(pair.GetChild(0));
 		if (edge.Name() == "DuckPGQAbbreviatedEdge") {
 			pattern->path_elements.push_back(TransformAbbreviatedEdge(transformer, edge, anon_names));
 		} else {
 			pattern->path_elements.push_back(TransformQuantifiedEdge(transformer, edge, anon_names));
 		}
-		pattern->path_elements.push_back(
-		    TransformElement(transformer, pair.GetChild(1), PGQMatchType::MATCH_VERTEX, anon_names));
+		auto &target = DuckPGQGetChoice(pair.GetChild(1));
+		if (target.Name() == "DuckPGQParenthesizedPath") {
+			ThrowParenthesizedPath();
+		}
+		pattern->path_elements.push_back(TransformElement(transformer, target, PGQMatchType::MATCH_VERTEX, anon_names));
 	}
 	return pattern;
 }
 
-// DuckPGQPathVariable? DuckPGQSearchPrefix? DuckPGQPathMode? DuckPGQPathSequence
+// A named or mode-restricted path wraps the whole element sequence in one subpath.
+vector<unique_ptr<PathReference>> WrapPathSequence(vector<unique_ptr<PathReference>> elements,
+                                                   const string &path_variable, PGQPathMode path_mode) {
+	if (path_variable.empty() && path_mode == PGQPathMode::NONE) {
+		return elements;
+	}
+	auto subpath = make_uniq<SubPath>(PGQPathReferenceType::SUBPATH);
+	subpath->path_variable = path_variable;
+	subpath->path_mode = path_mode;
+	subpath->path_list = std::move(elements);
+	vector<unique_ptr<PathReference>> result;
+	result.push_back(std::move(subpath));
+	return result;
+}
+
+// DuckPGQPathVariable? DuckPGQSearchPrefix? DuckPGQPathMode? DuckPGQPathSequence DuckPGQPathUnionOperand*
 unique_ptr<PathPattern> TransformPathPattern(PEGTransformer &transformer, ParseResult &parse_result,
                                              AnonymousNames &anon_names) {
 	auto &list = parse_result.Cast<ListParseResult>();
@@ -388,23 +422,46 @@ unique_ptr<PathPattern> TransformPathPattern(PEGTransformer &transformer, ParseR
 			pattern->topk = NumericCast<int32_t>(k);
 		}
 	}
-	auto &variable = list.Child<OptionalParseResult>(0);
-	auto &mode = list.Child<OptionalParseResult>(2);
-	if (!variable.HasResult() && !mode.HasResult()) {
-		return pattern;
+	// '|' (union) or '|+|' (multiset alternation) DuckPGQPathSequence, repeated
+	vector<vector<unique_ptr<PathReference>>> union_operands;
+	auto &union_tail = list.Child<OptionalParseResult>(4);
+	if (union_tail.HasResult()) {
+		string union_operator;
+		for (auto &operand : union_tail.GetResult().Cast<RepeatParseResult>().GetChildren()) {
+			auto &operand_list = operand.get().Cast<ListParseResult>();
+			auto operator_text = DuckPGQLiteralText(operand_list.GetChild(0));
+			if (!union_operator.empty() && operator_text != union_operator) {
+				throw ParserException("A path pattern cannot mix the union '|' and the multiset alternation '|+|'; "
+				                      "use one operator, or write the alternatives as separate MATCH blocks combined "
+				                      "with UNION / UNION ALL");
+			}
+			union_operator = operator_text;
+			union_operands.push_back(
+			    std::move(TransformPathSequence(transformer, operand_list.GetChild(1), anon_names)->path_elements));
+		}
+		if (prefix.HasResult()) {
+			throw ParserException("A search prefix (ANY / ALL SHORTEST, SHORTEST k, ANY / ALL CHEAPEST) over a path "
+			                      "pattern union is not supported: it would choose among the paths of all operands. "
+			                      "Write each alternative as its own MATCH block and combine them with UNION");
+		}
+		pattern->union_multiset = union_operator == "|+|";
 	}
-	// A named or mode-restricted path wraps the whole sequence in one subpath.
-	auto subpath = make_uniq<SubPath>(PGQPathReferenceType::SUBPATH);
+	string path_variable;
+	auto &variable = list.Child<OptionalParseResult>(0);
 	if (variable.HasResult()) {
 		auto &variable_list = variable.GetResult().Cast<ListParseResult>();
-		subpath->path_variable = transformer.Transform<Identifier>(variable_list.GetChild(0)).GetIdentifierName();
+		path_variable = transformer.Transform<Identifier>(variable_list.GetChild(0)).GetIdentifierName();
 	}
+	auto path_mode = PGQPathMode::NONE;
+	auto &mode = list.Child<OptionalParseResult>(2);
 	if (mode.HasResult()) {
-		subpath->path_mode = PathModeFromText(DuckPGQLiteralText(mode.GetResult()));
+		path_mode = PathModeFromText(DuckPGQLiteralText(mode.GetResult()));
 	}
-	subpath->path_list = std::move(pattern->path_elements);
-	pattern->path_elements.clear();
-	pattern->path_elements.push_back(std::move(subpath));
+	// The path variable and the path mode apply to every operand of a union.
+	pattern->path_elements = WrapPathSequence(std::move(pattern->path_elements), path_variable, path_mode);
+	for (auto &operand : union_operands) {
+		pattern->union_operands.push_back(WrapPathSequence(std::move(operand), path_variable, path_mode));
+	}
 	return pattern;
 }
 
@@ -419,6 +476,33 @@ void CollectVertexStars(PathReference &path_reference, vector<unique_ptr<ParsedE
 	if (element.match_type == PGQMatchType::MATCH_VERTEX) {
 		columns.push_back(make_uniq<StarExpression>(Identifier(element.variable_binding)));
 	}
+}
+
+// The user-named variables an element sequence binds: element variables and path variables, not generated ones.
+void CollectNamedVariables(const PathReference &path_reference, case_insensitive_set_t &names) {
+	if (path_reference.path_reference_type == PGQPathReferenceType::SUBPATH) {
+		auto &subpath = static_cast<const SubPath &>(path_reference);
+		if (!subpath.path_variable.empty()) {
+			names.insert(subpath.path_variable);
+		}
+		for (auto &child : subpath.path_list) {
+			CollectNamedVariables(*child, names);
+		}
+		return;
+	}
+	auto &element = static_cast<const PathElement &>(path_reference);
+	if (!StringUtil::StartsWith(element.variable_binding, "_anon_")) {
+		names.insert(element.variable_binding);
+	}
+}
+
+bool HasPathUnion(const vector<unique_ptr<PathPattern>> &patterns) {
+	for (auto &pattern : patterns) {
+		if (!pattern->union_operands.empty()) {
+			return true;
+		}
+	}
+	return false;
 }
 
 vector<unique_ptr<PathPattern>> TransformPatternList(PEGTransformer &transformer, ParseResult &parse_result,
@@ -458,8 +542,11 @@ void TransformMatchBlock(PEGTransformer &transformer, ParseResult &parse_result,
 	if (optional_matches.HasResult()) {
 		for (auto &optional_match : optional_matches.GetResult().Cast<RepeatParseResult>().GetChildren()) {
 			auto &optional_list = optional_match.get().Cast<ListParseResult>();
-			match.optional_match_patterns.push_back(
-			    TransformPatternList(transformer, optional_list.GetChild(2), anon_names));
+			auto optional_patterns = TransformPatternList(transformer, optional_list.GetChild(2), anon_names);
+			if (HasPathUnion(optional_patterns)) {
+				throw ParserException("A path pattern union ('|' or '|+|') is not supported in OPTIONAL MATCH");
+			}
+			match.optional_match_patterns.push_back(std::move(optional_patterns));
 		}
 	}
 	auto &one_row_per = list.Child<OptionalParseResult>(3);
@@ -507,6 +594,24 @@ arena_ptr<TransformResultValue> TransformGraphTable(PEGTransformer &transformer,
 				CollectVertexStars(*path_reference, match->column_list);
 			}
 		}
+		// The vertices only a later union operand binds come after those, once each.
+		case_insensitive_set_t exposed;
+		for (auto &column : match->column_list) {
+			exposed.insert(column->Cast<StarExpression>().RelationName().GetIdentifierName());
+		}
+		for (auto &path_pattern : match->path_patterns) {
+			for (auto &operand : path_pattern->union_operands) {
+				vector<unique_ptr<ParsedExpression>> operand_columns;
+				for (auto &path_reference : operand) {
+					CollectVertexStars(*path_reference, operand_columns);
+				}
+				for (auto &column : operand_columns) {
+					if (exposed.insert(column->Cast<StarExpression>().RelationName().GetIdentifierName()).second) {
+						match->column_list.push_back(std::move(column));
+					}
+				}
+			}
+		}
 	}
 
 	auto result = make_uniq<TableFunctionRef>();
@@ -545,6 +650,8 @@ arena_ptr<TransformResultValue> TransformIsLabeled(PEGTransformer &transformer, 
 // 'EXISTS' '{' List(DuckPGQPathPattern) WhereClause? '}'
 // Becomes EXISTS (SELECT 1 FROM duckpgq_exists_pattern()) carrying the pattern in bind_info. Inside a GRAPH_TABLE
 // the MATCH expansion rewrites it into a correlated subquery; anywhere else the table function rejects it.
+unique_ptr<ParsedExpression> MakeExistsPattern(unique_ptr<MatchExpression> match);
+
 arena_ptr<TransformResultValue> TransformExistsPattern(PEGTransformer &transformer, ParseResult &parse_result) {
 	auto &list = parse_result.Cast<ListParseResult>();
 	auto match = make_uniq<MatchExpression>();
@@ -555,6 +662,63 @@ arena_ptr<TransformResultValue> TransformExistsPattern(PEGTransformer &transform
 	if (where_clause.HasResult()) {
 		match->where_clause = transformer.Transform<unique_ptr<ParsedExpression>>(where_clause.GetResult());
 	}
+	if (!HasPathUnion(match->path_patterns)) {
+		auto result = MakeExistsPattern(std::move(match));
+		return transformer.MakeResult<unique_ptr<ParsedExpression>>(std::move(result));
+	}
+	// EXISTS { A | B } holds when either operand matches: one EXISTS per choice of operand, joined with OR. Set and
+	// multiset semantics agree here. A variable an operand does not bind does not constrain that operand, which is
+	// only right while no inner WHERE reads it, so with an inner WHERE every operand must bind the same variables.
+	vector<unique_ptr<MatchExpression>> choices;
+	choices.push_back(make_uniq<MatchExpression>());
+	for (auto &pattern : match->path_patterns) {
+		vector<vector<unique_ptr<PathReference>>> operands;
+		operands.push_back(std::move(pattern->path_elements));
+		for (auto &operand : pattern->union_operands) {
+			operands.push_back(std::move(operand));
+		}
+		if (match->where_clause && operands.size() > 1) {
+			case_insensitive_set_t first_names;
+			for (auto &reference : operands[0]) {
+				CollectNamedVariables(*reference, first_names);
+			}
+			for (idx_t operand = 1; operand < operands.size(); operand++) {
+				case_insensitive_set_t names;
+				for (auto &reference : operands[operand]) {
+					CollectNamedVariables(*reference, names);
+				}
+				if (names != first_names) {
+					throw ParserException("EXISTS { A | B WHERE ... } needs every operand of the union to bind the "
+					                      "same variables; move the condition into the operands' elements");
+				}
+			}
+		}
+		vector<unique_ptr<MatchExpression>> extended;
+		for (auto &choice : choices) {
+			for (auto &operand : operands) {
+				auto next = unique_ptr_cast<ParsedExpression, MatchExpression>(choice->Copy());
+				auto next_pattern = make_uniq<PathPattern>();
+				for (auto &reference : operand) {
+					next_pattern->path_elements.push_back(reference->Copy());
+				}
+				next->path_patterns.push_back(std::move(next_pattern));
+				extended.push_back(std::move(next));
+			}
+		}
+		choices = std::move(extended);
+	}
+	unique_ptr<ParsedExpression> result;
+	for (auto &choice : choices) {
+		choice->where_clause = match->where_clause ? match->where_clause->Copy() : nullptr;
+		auto exists = MakeExistsPattern(std::move(choice));
+		result = result ? make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_OR, std::move(result),
+		                                                   std::move(exists))
+		                : std::move(exists);
+	}
+	return transformer.MakeResult<unique_ptr<ParsedExpression>>(std::move(result));
+}
+
+unique_ptr<ParsedExpression> MakeExistsPattern(unique_ptr<MatchExpression> match) {
 	auto pattern_ref = make_uniq<TableFunctionRef>();
 	pattern_ref->function = make_uniq<FunctionExpression>(Identifier(DUCKPGQ_EXISTS_PATTERN_FUNCTION),
 	                                                      vector<unique_ptr<ParsedExpression>>());
@@ -567,8 +731,7 @@ arena_ptr<TransformResultValue> TransformExistsPattern(PEGTransformer &transform
 	auto exists = make_uniq<SubqueryExpression>();
 	exists->GetSubqueryTypeMutable() = SubqueryType::EXISTS;
 	exists->SubqueryMutable() = std::move(select);
-	unique_ptr<ParsedExpression> result = std::move(exists);
-	return transformer.MakeResult<unique_ptr<ParsedExpression>>(std::move(result));
+	return std::move(exists);
 }
 
 // ColId DuckPGQProjectionLink? '.' '{' List(ColId) '}', with DuckPGQProjectionLink <- '.' ColId
