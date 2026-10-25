@@ -5,6 +5,7 @@
 
 #include <duckpgq/core/functions/scalar.hpp>
 #include <duckpgq/core/utils/duckpgq_utils.hpp>
+#include <duckpgq/core/utils/source_search.hpp>
 
 #include <functional>
 #include <queue>
@@ -109,6 +110,23 @@ static void AllShortestPathsFunction(DataChunk &args, ExpressionState &state, Ve
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto &result_validity = FlatVector::ValidityMutable(result);
 
+	// One search per source, kept for the thread (see iterativelength), instead of one per row: the same parents in
+	// the same order, so the same paths in the same order.
+	auto cache = PGQGetSourceSearchCache(state);
+	PGQRowsBySource by_source;
+	const bool by_search =
+	    cache && PGQGroupRowsBySource(args.size(), vdata_src, vdata_dst, *cache, *csr_found, v_size, by_source);
+	vector<vector<vector<int64_t>>> grouped_paths;
+	if (by_search) {
+		grouped_paths.resize(args.size());
+		for (auto &group : by_source.groups) {
+			auto &search = cache->Get(info.context, *csr_found, v_size, group.first, true);
+			for (auto row : group.second) {
+				grouped_paths[row] = search.AllPaths(dst_data[vdata_dst.sel->get_index(row)]);
+			}
+		}
+	}
+
 	for (idx_t i = 0; i < args.size(); i++) {
 		auto src_pos = vdata_src.sel->get_index(i);
 		auto dst_pos = vdata_dst.sel->get_index(i);
@@ -122,7 +140,12 @@ static void AllShortestPathsFunction(DataChunk &args, ExpressionState &state, Ve
 		int64_t dst_v = dst_data[dst_pos];
 
 		info.context.BlockingInterruptCheck();
-		auto all_paths = FindAllShortestPaths(src_v, dst_v, v, e, edge_ids, v_size);
+		vector<vector<int64_t>> all_paths;
+		if (by_search) {
+			all_paths = std::move(grouped_paths[i]);
+		} else {
+			all_paths = FindAllShortestPaths(src_v, dst_v, v, e, edge_ids, v_size);
+		}
 
 		// Build Value::LIST(LIST(BIGINT)) for this row
 		vector<Value> outer_list;
@@ -147,11 +170,12 @@ static void AllShortestPathsFunction(DataChunk &args, ExpressionState &state, Ve
 }
 
 void CoreScalarFunctions::RegisterAllShortestPathsScalarFunction(ExtensionLoader &loader) {
-	loader.RegisterFunction(
-	    ScalarFunction("allshortestpaths",
-	                   {LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT},
-	                   LogicalType::LIST(LogicalType::LIST(LogicalType::BIGINT)), AllShortestPathsFunction,
-	                   IterativeLengthFunctionData::IterativeLengthBind));
+	ScalarFunction function("allshortestpaths",
+	                        {LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT},
+	                        LogicalType::LIST(LogicalType::LIST(LogicalType::BIGINT)), AllShortestPathsFunction,
+	                        IterativeLengthFunctionData::IterativeLengthBind);
+	function.SetInitStateCallback(PGQSourceSearchCacheInit);
+	loader.RegisterFunction(function);
 }
 
 } // namespace duckdb

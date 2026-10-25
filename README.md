@@ -311,7 +311,9 @@ FROM local_clustering_coefficient('social', 'Person', 'Knows');
 ```
 
 Shortest-path searches inside `MATCH` (`ANY SHORTEST`, `CHEAPEST`) use upstream's CSR-based operators where no ABI
-artifact applies.
+artifact applies. A pattern seeded on a few vertices searches once from each seed and answers every destination from
+that search (`ANY SHORTEST (t)-[:H]->+(x) WHERE t.id = …` over a 1M-vertex tree: 53 s before, 0.07 s now); many
+distinct sources at once share the lane search, 512 sources per pass.
 
 ## Settings
 

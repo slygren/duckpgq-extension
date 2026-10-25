@@ -7,6 +7,7 @@
 
 #include <duckpgq/core/functions/scalar.hpp>
 #include <duckpgq/core/utils/duckpgq_utils.hpp>
+#include <duckpgq/core/utils/source_search.hpp>
 
 namespace duckdb {
 
@@ -73,6 +74,37 @@ static void ShortestPathFunction(DataChunk &args, ExpressionState &state, Vector
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto result_data = FlatVector::GetDataMutable<list_entry_t>(result);
 	ValidityMask &result_validity = FlatVector::ValidityMutable(result);
+
+	// One search per source, kept for the thread (see iterativelength). The paths are the lane search's: the search
+	// picks the same parent for every vertex.
+	auto cache = PGQGetSourceSearchCache(state);
+	PGQRowsBySource by_source;
+	if (cache && PGQGroupRowsBySource(args.size(), vdata_src, vdata_dst, *cache, *csr_found, v_size, by_source)) {
+		for (auto row : by_source.null_rows) {
+			result_validity.SetInvalid(row);
+			result_data[row] = list_entry_t(0, 0);
+		}
+		vector<int64_t> path;
+		idx_t list_size = ListVector::GetListSize(result);
+		for (auto &group : by_source.groups) {
+			auto &search = cache->Get(info.context, *csr_found, v_size, group.first, false);
+			for (auto row : group.second) {
+				if (!search.Path(dst_data[vdata_dst.sel->get_index(row)], path)) {
+					result_validity.SetInvalid(row);
+					result_data[row] = list_entry_t(list_size, 0);
+					continue;
+				}
+				ListVector::Reserve(result, list_size + path.size());
+				auto child_data = FlatVector::GetDataMutable<int64_t>(ListVector::GetChildMutable(result));
+				std::copy(path.begin(), path.end(), child_data + list_size);
+				result_data[row] = list_entry_t(list_size, path.size());
+				list_size += path.size();
+				ListVector::SetListSize(result, list_size);
+			}
+		}
+		duckpgq_state->csr_to_delete.insert(info.csr_id);
+		return;
+	}
 
 	// create temp SIMD arrays
 	vector<std::bitset<LANE_LIMIT>> seen(v_size);
@@ -212,10 +244,11 @@ static void ShortestPathFunction(DataChunk &args, ExpressionState &state, Vector
 // Register functions
 //------------------------------------------------------------------------------
 void CoreScalarFunctions::RegisterShortestPathScalarFunction(ExtensionLoader &loader) {
-	loader.RegisterFunction(ScalarFunction(
+	ScalarFunction function(
 	    "shortestpath", {LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT},
-	    LogicalType::LIST(LogicalType::BIGINT), ShortestPathFunction,
-	    IterativeLengthFunctionData::IterativeLengthBind));
+	    LogicalType::LIST(LogicalType::BIGINT), ShortestPathFunction, IterativeLengthFunctionData::IterativeLengthBind);
+	function.SetInitStateCallback(PGQSourceSearchCacheInit);
+	loader.RegisterFunction(function);
 }
 
 } // namespace duckdb

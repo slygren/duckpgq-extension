@@ -102,6 +102,8 @@ In every such case the old rows were wrong.
 - **Vertex-join elimination** where a FOREIGN KEY guarantees the vertex exists (`duckpgq_vertex_join_elimination`).
 - **Factorized joins** for counts and sums over n:m paths.
 - **A frontier semi-join** for context expansion on DuckDB 2.0.
+- **Seeded shortest-path searches** (`ANY` / `ALL SHORTEST` without a path table, `WHERE a.id = …`) search once per
+  source instead of once per (source, destination) row. Same paths, ties included.
 
 **Deployment**
 - **`duckpgq_default_grammar`** for servers and connection pools.

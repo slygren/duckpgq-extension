@@ -6,6 +6,7 @@
 
 #include <duckpgq/core/functions/scalar.hpp>
 #include <duckpgq/core/utils/duckpgq_utils.hpp>
+#include <duckpgq/core/utils/source_search.hpp>
 
 namespace duckdb {
 
@@ -63,6 +64,29 @@ static void IterativeLengthFunction(DataChunk &args, ExpressionState &state, Vec
 	// create result vector
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto result_data = FlatVector::GetDataMutable<int64_t>(result);
+
+	// One search per source, kept for the thread: a seeded pattern pairs its source with every candidate
+	// destination, and the lane search below would repeat that source's search for each of those rows.
+	auto cache = PGQGetSourceSearchCache(state);
+	PGQRowsBySource by_source;
+	if (cache && PGQGroupRowsBySource(args.size(), vdata_src, vdata_dst, *cache, *csr_found, v_size, by_source)) {
+		for (auto row : by_source.null_rows) {
+			result_validity.SetInvalid(row);
+			result_data[row] = -1;
+		}
+		for (auto &group : by_source.groups) {
+			auto &search = cache->Get(info.context, *csr_found, v_size, group.first, false);
+			for (auto row : group.second) {
+				const auto distance = search.Distance(dst_data[vdata_dst.sel->get_index(row)]);
+				result_data[row] = distance;
+				if (distance < 0) {
+					result_validity.SetInvalid(row);
+				}
+			}
+		}
+		duckpgq_state->csr_to_delete.insert(info.csr_id);
+		return;
+	}
 
 	// create temp SIMD arrays
 	vector<std::bitset<LANE_LIMIT>> seen(v_size);
@@ -144,9 +168,11 @@ static void IterativeLengthFunction(DataChunk &args, ExpressionState &state, Vec
 // Register functions
 //------------------------------------------------------------------------------
 void CoreScalarFunctions::RegisterIterativeLengthScalarFunction(ExtensionLoader &loader) {
-	loader.RegisterFunction(ScalarFunction(
+	ScalarFunction function(
 	    "iterativelength", {LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT},
-	    LogicalType::BIGINT, IterativeLengthFunction, IterativeLengthFunctionData::IterativeLengthBind));
+	    LogicalType::BIGINT, IterativeLengthFunction, IterativeLengthFunctionData::IterativeLengthBind);
+	function.SetInitStateCallback(PGQSourceSearchCacheInit);
+	loader.RegisterFunction(function);
 }
 
 } // namespace duckdb

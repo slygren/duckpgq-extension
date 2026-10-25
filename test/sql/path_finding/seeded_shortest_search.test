@@ -1,0 +1,228 @@
+# name: test/sql/path_finding/seeded_shortest_search.test
+# description: The path functions search once per source and reuse it for every row of that source (a seeded
+#              pattern pairs its seed with every candidate destination); the answers, ties included, are those of
+#              the per-row search (expected rows from the build before the change)
+# group: [path_finding]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE P AS SELECT i AS id FROM range(1, 21) t(i);
+
+statement ok
+CREATE TABLE K(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO K SELECT i, i + 1 FROM range(1, 20) t(i) UNION ALL SELECT i, i + 2 FROM range(1, 19) t(i) UNION ALL SELECT i, i + 3 FROM range(1, 18, 3) t(i) UNION ALL SELECT 5, 6 UNION ALL SELECT 20, 1;
+
+statement ok
+CREATE PROPERTY GRAPH g VERTEX TABLES (P LABEL P) EDGE TABLES (K SOURCE KEY (src) REFERENCES P (id) DESTINATION KEY (dst) REFERENCES P (id) LABEL K);
+
+statement ok
+CREATE TABLE T AS SELECT i AS id FROM range(5000) t(i);
+
+statement ok
+CREATE TABLE H AS SELECT i AS child, (i - 1) // 4 AS parent FROM range(1, 5000) t(i);
+
+statement ok
+CREATE PROPERTY GRAPH h VERTEX TABLES (T LABEL T) EDGE TABLES (H SOURCE KEY (child) REFERENCES T (id) DESTINATION KEY (parent) REFERENCES T (id) LABEL H);
+
+# One seed: every destination's shortest path, the same one among ties as before
+query IITT
+FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[:K]->+(b:P) WHERE a.id = 1 COLUMNS (b.id AS b, path_length(p) AS l, vertices(p) AS vs, edges(p) AS es)) ORDER BY ALL;
+----
+2	1	[0, 1]	[0]
+3	1	[0, 2]	[19]
+4	1	[0, 3]	[37]
+5	2	[0, 2, 4]	[19, 21]
+6	2	[0, 3, 5]	[37, 22]
+7	2	[0, 3, 6]	[37, 38]
+8	3	[0, 3, 5, 7]	[37, 22, 24]
+9	3	[0, 3, 6, 8]	[37, 38, 25]
+10	3	[0, 3, 6, 9]	[37, 38, 39]
+11	4	[0, 3, 6, 8, 10]	[37, 38, 25, 27]
+12	4	[0, 3, 6, 9, 11]	[37, 38, 39, 28]
+13	4	[0, 3, 6, 9, 12]	[37, 38, 39, 40]
+14	5	[0, 3, 6, 9, 11, 13]	[37, 38, 39, 28, 30]
+15	5	[0, 3, 6, 9, 12, 14]	[37, 38, 39, 40, 31]
+16	5	[0, 3, 6, 9, 12, 15]	[37, 38, 39, 40, 41]
+17	6	[0, 3, 6, 9, 12, 14, 16]	[37, 38, 39, 40, 31, 33]
+18	6	[0, 3, 6, 9, 12, 15, 17]	[37, 38, 39, 40, 41, 34]
+19	6	[0, 3, 6, 9, 12, 15, 18]	[37, 38, 39, 40, 41, 42]
+20	7	[0, 3, 6, 9, 12, 15, 17, 19]	[37, 38, 39, 40, 41, 34, 36]
+
+# Backwards from one seed
+query IT
+FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)<-[:K]-+(b:P) WHERE a.id = 17 COLUMNS (b.id AS b, vertices(p) AS vs)) ORDER BY ALL;
+----
+1	[16, 14, 12, 9, 6, 3, 0]
+2	[16, 14, 12, 9, 6, 3, 1]
+3	[16, 14, 12, 9, 6, 3, 2]
+4	[16, 14, 12, 9, 6, 3]
+5	[16, 14, 12, 9, 6, 4]
+6	[16, 14, 12, 9, 6, 5]
+7	[16, 14, 12, 9, 6]
+8	[16, 14, 12, 9, 7]
+9	[16, 14, 12, 9, 8]
+10	[16, 14, 12, 9]
+11	[16, 14, 12, 10]
+12	[16, 14, 12, 11]
+13	[16, 14, 12]
+14	[16, 14, 13]
+15	[16, 14]
+16	[16, 15]
+18	[16, 14, 12, 9, 6, 3, 0, 19, 17]
+19	[16, 14, 12, 9, 6, 3, 0, 19, 18]
+20	[16, 14, 12, 9, 6, 3, 0, 19]
+
+# A few seeds (each searched once)
+query IIT
+FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[:K]->+(b:P) WHERE a.id IN (2, 7, 11) COLUMNS (a.id AS a, b.id AS b, edges(p) AS es)) ORDER BY ALL;
+----
+2	1	[20, 38, 39, 40, 41, 34, 36, 44]
+2	3	[1]
+2	4	[20]
+2	5	[1, 21]
+2	6	[20, 22]
+2	7	[20, 38]
+2	8	[20, 22, 24]
+2	9	[20, 38, 25]
+2	10	[20, 38, 39]
+2	11	[20, 38, 25, 27]
+2	12	[20, 38, 39, 28]
+2	13	[20, 38, 39, 40]
+2	14	[20, 38, 39, 28, 30]
+2	15	[20, 38, 39, 40, 31]
+2	16	[20, 38, 39, 40, 41]
+2	17	[20, 38, 39, 40, 31, 33]
+2	18	[20, 38, 39, 40, 41, 34]
+2	19	[20, 38, 39, 40, 41, 42]
+2	20	[20, 38, 39, 40, 41, 34, 36]
+7	1	[39, 40, 41, 34, 36, 44]
+7	2	[39, 40, 41, 34, 36, 44, 0]
+7	3	[39, 40, 41, 34, 36, 44, 19]
+7	4	[39, 40, 41, 34, 36, 44, 37]
+7	5	[39, 40, 41, 34, 36, 44, 19, 21]
+7	6	[39, 40, 41, 34, 36, 44, 37, 22]
+7	8	[6]
+7	9	[25]
+7	10	[39]
+7	11	[25, 27]
+7	12	[39, 28]
+7	13	[39, 40]
+7	14	[39, 28, 30]
+7	15	[39, 40, 31]
+7	16	[39, 40, 41]
+7	17	[39, 40, 31, 33]
+7	18	[39, 40, 41, 34]
+7	19	[39, 40, 41, 42]
+7	20	[39, 40, 41, 34, 36]
+11	1	[29, 41, 34, 36, 44]
+11	2	[29, 41, 34, 36, 44, 0]
+11	3	[29, 41, 34, 36, 44, 19]
+11	4	[29, 41, 34, 36, 44, 37]
+11	5	[29, 41, 34, 36, 44, 19, 21]
+11	6	[29, 41, 34, 36, 44, 37, 22]
+11	7	[29, 41, 34, 36, 44, 37, 38]
+11	8	[29, 41, 34, 36, 44, 37, 22, 24]
+11	9	[29, 41, 34, 36, 44, 37, 38, 25]
+11	10	[29, 41, 34, 36, 44, 37, 38, 39]
+11	12	[10]
+11	13	[29]
+11	14	[10, 30]
+11	15	[29, 31]
+11	16	[29, 41]
+11	17	[29, 31, 33]
+11	18	[29, 41, 34]
+11	19	[29, 41, 42]
+11	20	[29, 41, 34, 36]
+
+# Every source: more distinct sources per chunk than are searched one by one
+query III
+SELECT count(*), sum(l), sum(hash(vs)) FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[:K]->+(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS vs));
+----
+380	1725	3474189566818772286650
+
+# Lower bound above 1
+query II
+FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[:K]->{3,}(b:P) WHERE a.id = 4 COLUMNS (b.id AS b, path_length(p) AS l)) ORDER BY ALL;
+----
+1	7
+2	8
+3	8
+5	9
+6	10
+7	3
+8	3
+9	3
+10	3
+11	3
+12	3
+13	3
+14	4
+15	4
+16	4
+17	5
+18	5
+19	5
+20	6
+
+# Zero hops included
+query IT
+FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[:K]->*(b:P) WHERE a.id = 19 COLUMNS (b.id AS b, vertices(p) AS vs)) ORDER BY ALL;
+----
+1	[18, 19, 0]
+2	[18, 19, 0, 1]
+3	[18, 19, 0, 2]
+4	[18, 19, 0, 3]
+5	[18, 19, 0, 2, 4]
+6	[18, 19, 0, 3, 5]
+7	[18, 19, 0, 3, 6]
+8	[18, 19, 0, 3, 5, 7]
+9	[18, 19, 0, 3, 6, 8]
+10	[18, 19, 0, 3, 6, 9]
+11	[18, 19, 0, 3, 6, 8, 10]
+12	[18, 19, 0, 3, 6, 9, 11]
+13	[18, 19, 0, 3, 6, 9, 12]
+14	[18, 19, 0, 3, 6, 9, 11, 13]
+15	[18, 19, 0, 3, 6, 9, 12, 14]
+16	[18, 19, 0, 3, 6, 9, 12, 15]
+17	[18, 19, 0, 3, 6, 9, 12, 14, 16]
+18	[18, 19, 0, 3, 6, 9, 12, 15, 17]
+19	[18]
+20	[18, 19]
+
+# ALL SHORTEST from one seed: every shortest path, in the same order
+query ITT
+FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[:K]->+(b:P) WHERE a.id = 1 AND b.id IN (6, 9, 13) COLUMNS (b.id AS b, vertices(p) AS vs, edges(p) AS es)) ORDER BY ALL;
+----
+6	[0, 3, 5]	[37, 22]
+9	[0, 3, 6, 8]	[37, 38, 25]
+13	[0, 3, 6, 9, 12]	[37, 38, 39, 40]
+
+# Tree, from a leaf: the path to every ancestor
+query IIT
+FROM GRAPH_TABLE (h MATCH p = ANY SHORTEST (t:T)-[:H]->+(x:T) WHERE t.id = 4999 COLUMNS (x.id AS x, path_length(p) AS l, vertices(p) AS vs)) ORDER BY ALL;
+----
+0	6	[4999, 1249, 312, 77, 19, 4, 0]
+4	5	[4999, 1249, 312, 77, 19, 4]
+19	4	[4999, 1249, 312, 77, 19]
+77	3	[4999, 1249, 312, 77]
+312	2	[4999, 1249, 312]
+1249	1	[4999, 1249]
+
+# Tree, from the root backwards: every vertex
+query III
+SELECT count(*), sum(l), max(l) FROM GRAPH_TABLE (h MATCH p = ANY SHORTEST (t:T)<-[:H]-+(x:T) WHERE t.id = 0 COLUMNS (x.id AS x, path_length(p) AS l));
+----
+4999	28182	6
+
+# Tree, two seeds on different sides
+query III
+SELECT t, count(*), sum(l) FROM GRAPH_TABLE (h MATCH p = ANY SHORTEST (t:T)<-[:H]-+(x:T) WHERE t.id IN (1, 2) COLUMNS (t.id AS t, x.id AS x, path_length(p) AS l)) GROUP BY t ORDER BY ALL;
+----
+1	1364	6372
+2	1364	6372
