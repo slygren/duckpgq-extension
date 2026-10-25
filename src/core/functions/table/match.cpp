@@ -12750,6 +12750,51 @@ static void NameColumns(MatchExpression &match) {
 	}
 }
 
+// ONE ROW PER rebuilds the FROM of its block from the path steps and re-joins only the endpoints of the quantified
+// edge, so a vertex's element WHERE -- (a:Person WHERE a.name = 'Ann') -- had no place in it: the element is a
+// one-element subpath the step locator did not see through, and the query failed. Such a WHERE says of its vertex
+// exactly what the same predicate in the MATCH WHERE says, so it is moved there, where ONE ROW PER already applies
+// it (and seeds the search with it). Under a selector only a pattern's endpoints move: they are what the selector
+// partitions by, so filtering them before or after the selection is the same; an interior vertex's predicate decides
+// which paths compete, and stays.
+static void HoistVertexElementWhere(MatchExpression &match) {
+	if (match.one_row_per != OneRowPerMode::NONE) {
+		for (auto &pattern : match.path_patterns) {
+			const bool selector = pattern->shortest || pattern->cheapest || pattern->topk || pattern->all;
+			auto *elements = &pattern->path_elements;
+			if (elements->size() == 1) {
+				auto *wrapper = PGQMatchFunction::GetSubPath((*elements)[0]);
+				if (wrapper && wrapper->path_list.size() > 1 && wrapper->lower == 1 && wrapper->upper == 1) {
+					elements = &wrapper->path_list;
+				}
+			}
+			for (idx_t i = 0; i < elements->size(); i += 2) {
+				auto *vertex = PGQMatchFunction::GetSubPath((*elements)[i]);
+				if (!vertex || !vertex->where_clause || vertex->path_list.size() != 1 || vertex->lower != 1 ||
+				    vertex->upper != 1 || !vertex->path_variable.empty() || vertex->path_mode != PGQPathMode::NONE ||
+				    vertex->cost_expr) {
+					continue;
+				}
+				auto *element = PGQMatchFunction::GetPathElement(vertex->path_list[0]);
+				if (!element || element->match_type != PGQMatchType::MATCH_VERTEX ||
+				    (selector && i != 0 && i + 1 != elements->size())) {
+					continue;
+				}
+				auto predicate = std::move(vertex->where_clause);
+				match.where_clause = match.where_clause
+				                         ? make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND,
+				                                                            std::move(predicate),
+				                                                            std::move(match.where_clause))
+				                         : std::move(predicate);
+				(*elements)[i] = std::move(vertex->path_list[0]);
+			}
+		}
+	}
+	for (auto &branch : match.union_matches) {
+		HoistVertexElementWhere(*branch);
+	}
+}
+
 unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, TableFunctionBindInput &bind_input) {
 	auto duckpgq_state = GetDuckPGQState(context);
 	duckpgq_state->graph_table_query = context.transaction.GetActiveQuery();
@@ -12763,6 +12808,7 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	auto *ref = match_copy.get();
 	NormalizeMatchExpression(*ref);
 	NameColumns(*ref);
+	HoistVertexElementWhere(*ref);
 	{
 		QualifiedName graph_name(Identifier(ref->pg_catalog), Identifier(ref->pg_schema), Identifier(ref->pg_name));
 		auto &pg_table = *duckpgq_state->GetPropertyGraph(context, graph_name);

@@ -354,7 +354,6 @@ The README covers each of these.
 Being worked on now:
 - **Cross-table label disjunction:** `(x:Person|City)` is refused; it works within one table's sub-labels.
 - **Unlabeled vertices with several vertex tables:** a vertex with no label, `(x)`, is refused when the graph has more than one vertex table.
-- **`ONE ROW PER` with element-level WHERE:** combined with a WHERE inside the element (`(a:Person WHERE …)`) it fails. Put the condition in the MATCH's WHERE clause instead, as in the example above.
 - **Graph definition:**
   - graphs over views;
   - several labels per table;

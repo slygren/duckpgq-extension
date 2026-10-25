@@ -130,6 +130,9 @@ with identical answers.
   with "Cannot compare VARCHAR and BIGINT".
 - **`edges(p)`** on an ABI route used to fail. It now traverses.
 - **Bounded CHEAPEST** used to fail with "CSR not found".
+- **`ONE ROW PER` over a quantifier whose endpoint has an element WHERE** (`(a:Person WHERE a.name = 'Ann')`) used
+  to fail with "could not locate quantified path element". It gives the rows of the same condition in the MATCH
+  WHERE.
 - **Unbounded ANY / ALL SHORTEST and CHEAPEST over an edge table with edges to missing vertices** (lake data has
   them) failed with "Non-existent/non-unique vertices detected". Such an edge is no edge of the graph, as everywhere
   else, and is skipped.
@@ -142,7 +145,6 @@ with identical answers.
 
 See README "Limitations". Work in progress for the next release:
 - **Patterns:** cross-table label disjunction and unlabeled vertices over several vertex tables.
-- **`ONE ROW PER` with element-level WHERE.**
 - **Graph definition:** graphs over views, several labels per table, a `KEY` clause, computed properties,
   `ALTER PROPERTY GRAPH`.
 - **Predicates:** `IS SOURCE/DESTINATION OF`, `SAME`, `PROPERTY_EXISTS`, `labels()`.
