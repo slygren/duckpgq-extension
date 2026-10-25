@@ -1,0 +1,404 @@
+# name: test/sql/path_finding/abi_measured_multiplicity.test
+# description: preserves_multiplicity of a catalog row pgq_abi_build did not write is measured by the binder, not trusted
+# group: [path_finding]
+
+# The layout compiler writes preserves_multiplicity = false for every closure without measuring it, and a
+# hand-made catalog may write anything. For such rows (no built_by = 'pgq_abi_build') the binder runs the
+# probes pgq_abi_build runs, once per path-table cache. Here each catalog is built by pgq_abi_build and then
+# rewritten to look like the layout compiler's: built_by cleared and preserves_multiplicity = false. Where the
+# data does preserve multiplicity the artifact route must still be taken; where it does not, the pattern
+# must be traversed; and either way the answer must be the traversal's.
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+# =====================================================================================================================
+# A hierarchy, depth 4: 8 -> 7 -> 6 -> 3 -> 1, 4 -> 2 -> 1, 5 -> 2
+# =====================================================================================================================
+
+statement ok
+CREATE TABLE tp(id BIGINT PRIMARY KEY, name VARCHAR);
+
+statement ok
+CREATE TABLE tk(child BIGINT, parent BIGINT);
+
+statement ok
+INSERT INTO tp SELECT i, 'n' || i FROM range(1, 9) t(i);
+
+statement ok
+INSERT INTO tk VALUES (2, 1), (3, 1), (4, 2), (5, 2), (6, 3), (7, 6), (8, 7);
+
+statement ok
+CREATE PROPERTY GRAPH tree_g VERTEX TABLES (tp LABEL Node)
+EDGE TABLES (tk SOURCE KEY (child) REFERENCES tp (id) DESTINATION KEY (parent) REFERENCES tp (id) LABEL HasParent);
+
+statement ok
+FROM pgq_abi_build('tree_g', exclude_self_referential := false, closures := ['HasParent']);
+
+statement ok
+UPDATE graph.__pgq_path_catalog SET built_by = NULL, preserves_multiplicity = false WHERE graph_name = 'tree_g';
+
+# The benchmark shape (Q3/Q4): ONE ROW PER STEP up the hierarchy, past the closure's deepest row (4) -- so the
+# completeness probe runs too -- answered from tc_chain
+query II rowsort
+FROM GRAPH_TABLE (tree_g MATCH (child:Node)-[:HasParent]->{1,5}(ancestor:Node) ONE ROW PER STEP (v1, e, v2)
+    WHERE child.id = 8 COLUMNS (v1.name AS from_tag, v2.name AS to_tag));
+----
+n3	n1
+n6	n3
+n6	n3
+n7	n6
+n7	n6
+n7	n6
+n8	n7
+n8	n7
+n8	n7
+n8	n7
+
+query T
+SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+tc_chain_one_row_per
+
+# The probes that ran are listed with what they cost
+query T
+SELECT count(*) > 0 FROM pgq_last_rewrite_diagnostics() WHERE rewrite_type = 'multiplicity_probe' AND status = 'exact';
+----
+true
+
+query TT
+SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (tree_g MATCH (child:Node)-[:HasParent]->{1,5}(ancestor:Node)
+    ONE ROW PER STEP (v1, e, v2) WHERE child.id = 8 COLUMNS (v1.name AS from_tag, v2.name AS to_tag))');
+----
+match	true
+
+statement ok
+FROM GRAPH_TABLE (tree_g MATCH p = (a:Node)-[:HasParent]->{1,3}(b:Node) COLUMNS (a.id AS a, path_length(p) AS l));
+
+query T
+SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+tc_chain_named_path
+
+statement ok
+FROM GRAPH_TABLE (tree_g MATCH (a:Node)-[:HasParent]->{1,3}(b:Node) COLUMNS (a.id AS a, b.id AS b));
+
+query T
+SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+transitive_closure
+
+query TT
+SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (tree_g MATCH p = ALL SHORTEST (a:Node)-[:HasParent]->{2,5}(b:Node)
+    COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l))');
+----
+match	true
+
+# The same lake read without the provenance column at all (as the layout compiler writes it)
+statement ok
+ALTER TABLE graph.__pgq_path_catalog DROP COLUMN built_by;
+
+statement ok
+FROM GRAPH_TABLE (tree_g MATCH (child:Node)-[:HasParent]->{1,5}(ancestor:Node) ONE ROW PER STEP (v1, e, v2)
+    WHERE child.id = 8 COLUMNS (v1.name AS from_tag, v2.name AS to_tag));
+
+query T
+SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+tc_chain_one_row_per
+
+statement ok
+ALTER TABLE graph.__pgq_path_catalog ADD COLUMN built_by VARCHAR;
+
+# ── a closure cut off at depth 2 ────────────────────────────────────────────────────────────────────────────────────
+
+statement ok
+FROM pgq_abi_build('tree_g', exclude_self_referential := false, closures := [{'relationship': 'HasParent', 'max_depth': 2}]);
+
+statement ok
+UPDATE graph.__pgq_path_catalog SET built_by = NULL, preserves_multiplicity = false WHERE graph_name = 'tree_g';
+
+# Within its depth it is complete, and answers
+statement ok
+FROM GRAPH_TABLE (tree_g MATCH (child:Node)-[:HasParent]->{1,2}(ancestor:Node) ONE ROW PER STEP (v1, e, v2)
+    WHERE child.id = 8 COLUMNS (v1.id AS x, v2.id AS y));
+
+query T
+SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+tc_chain_one_row_per
+
+# Past it, the chain from 8 is cut off: traversed, and the steps up to the root are all there
+query I
+SELECT count(*) FROM GRAPH_TABLE (tree_g MATCH (child:Node)-[:HasParent]->{1,5}(ancestor:Node) ONE ROW PER STEP (v1, e, v2)
+    WHERE child.id = 8 COLUMNS (v1.id AS x, v2.id AS y));
+----
+10
+
+query I
+SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected' AND rewrite_type LIKE 'tc%';
+----
+0
+
+# =====================================================================================================================
+# Not a hierarchy, but every pair still has one path: 1 -> 2, 1 -> 3, 2 -> 4
+# =====================================================================================================================
+
+statement ok
+CREATE TABLE fp(id BIGINT PRIMARY KEY);
+
+statement ok
+CREATE TABLE fk(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO fp VALUES (1), (2), (3), (4);
+
+statement ok
+INSERT INTO fk VALUES (1, 2), (1, 3), (2, 4);
+
+statement ok
+CREATE PROPERTY GRAPH fan_g VERTEX TABLES (fp LABEL P)
+EDGE TABLES (fk SOURCE KEY (src) REFERENCES fp (id) DESTINATION KEY (dst) REFERENCES fp (id) LABEL K);
+
+statement ok
+FROM pgq_abi_build('fan_g', exclude_self_referential := false, closures := ['K']);
+
+statement ok
+UPDATE graph.__pgq_path_catalog SET built_by = NULL, preserves_multiplicity = false WHERE graph_name = 'fan_g';
+
+# tc and tc_witness are exact (the general probe); tc_chain is not (1 has two out-edges)
+statement ok
+FROM GRAPH_TABLE (fan_g MATCH (a:P)-[:K]->{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+query T
+SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+transitive_closure
+
+statement ok
+FROM GRAPH_TABLE (fan_g MATCH p = (a:P)-[:K]->{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+query T
+SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+tc_witness_named_path
+
+query TT
+SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (fan_g MATCH p = (a:P)-[:K]->{1,3}(b:P)
+    COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l))');
+----
+match	true
+
+# =====================================================================================================================
+# A diamond (two paths 1 -> 4) and a cycle: no closure is exact, so walks are traversed
+# =====================================================================================================================
+
+statement ok
+CREATE TABLE dp(id BIGINT PRIMARY KEY);
+
+statement ok
+CREATE TABLE dk(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO dp VALUES (1), (2), (3), (4), (5);
+
+statement ok
+INSERT INTO dk VALUES (1, 2), (1, 3), (2, 4), (3, 4), (4, 5), (5, 1);
+
+statement ok
+CREATE PROPERTY GRAPH dia_g VERTEX TABLES (dp LABEL P)
+EDGE TABLES (dk SOURCE KEY (src) REFERENCES dp (id) DESTINATION KEY (dst) REFERENCES dp (id) LABEL K);
+
+statement ok
+FROM pgq_abi_build('dia_g', exclude_self_referential := false, closures := ['K']);
+
+statement ok
+UPDATE graph.__pgq_path_catalog SET built_by = NULL, preserves_multiplicity = false WHERE graph_name = 'dia_g';
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (dia_g MATCH (a:P)-[:K]->{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+----
+6
+
+query I
+SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected' AND rewrite_type LIKE '%closure%';
+----
+0
+
+query TT
+SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (dia_g MATCH (a:P)-[:K]->{1,3}(b:P)
+    ONE ROW PER STEP (v1, e, v2) WHERE a.id = 1 COLUMNS (b.id AS b, v1.id AS x, v2.id AS y))');
+----
+unverified	false
+
+# ANY SHORTEST from depth 1 needs no proof and still reads the closure
+statement ok
+FROM GRAPH_TABLE (dia_g MATCH ANY SHORTEST (a:P)-[:K]->{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+query T
+SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+transitive_closure
+
+# =====================================================================================================================
+# Edge artifacts
+# =====================================================================================================================
+
+statement ok
+CREATE TABLE ep(id BIGINT PRIMARY KEY);
+
+statement ok
+CREATE TABLE ek(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO ep VALUES (1), (2), (3);
+
+statement ok
+INSERT INTO ek VALUES (1, 2), (2, 3);
+
+statement ok
+CREATE PROPERTY GRAPH edge_g VERTEX TABLES (ep LABEL P)
+EDGE TABLES (ek SOURCE KEY (src) REFERENCES ep (id) DESTINATION KEY (dst) REFERENCES ep (id) LABEL K);
+
+statement ok
+FROM pgq_abi_build('edge_g', exclude_self_referential := false);
+
+statement ok
+UPDATE graph.__pgq_path_catalog SET built_by = NULL, preserves_multiplicity = false WHERE graph_name = 'edge_g';
+
+# No edge stored twice: the 1-hop and 2-hop artifacts answer
+query II rowsort
+FROM GRAPH_TABLE (edge_g MATCH (a:P)-[:K]->(b:P) COLUMNS (a.id AS a, b.id AS b));
+----
+1	2
+2	3
+
+query T
+SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+edge
+
+statement ok
+FROM GRAPH_TABLE (edge_g MATCH (a:P)-[:K]->(b:P)-[:K]->(c:P) COLUMNS (a.id AS a, c.id AS c));
+
+query T
+SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+fixed_path
+
+# 1 -> 2 stored twice: traversed, both matches returned
+statement ok
+INSERT INTO ek VALUES (1, 2);
+
+statement ok
+FROM pgq_abi_build('edge_g', exclude_self_referential := false);
+
+statement ok
+UPDATE graph.__pgq_path_catalog SET built_by = NULL, preserves_multiplicity = true WHERE graph_name = 'edge_g';
+
+query II rowsort
+FROM GRAPH_TABLE (edge_g MATCH (a:P)-[:K]->(b:P) COLUMNS (a.id AS a, b.id AS b));
+----
+1	2
+1	2
+2	3
+
+query I
+SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+0
+
+# ── a duplicate edge on no 2-hop chain: the 2-hop artifact lost nothing, the 1-hop one did ─────────────────────────
+
+statement ok
+CREATE TABLE cp(id BIGINT PRIMARY KEY);
+
+statement ok
+CREATE TABLE ck(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO cp VALUES (1), (2), (3), (5), (6);
+
+statement ok
+INSERT INTO ck VALUES (1, 2), (2, 3), (5, 6), (5, 6);
+
+statement ok
+CREATE PROPERTY GRAPH chain_g VERTEX TABLES (cp LABEL P)
+EDGE TABLES (ck SOURCE KEY (src) REFERENCES cp (id) DESTINATION KEY (dst) REFERENCES cp (id) LABEL K);
+
+statement ok
+FROM pgq_abi_build('chain_g', exclude_self_referential := false);
+
+statement ok
+UPDATE graph.__pgq_path_catalog SET built_by = NULL, preserves_multiplicity = false WHERE graph_name = 'chain_g';
+
+query II
+FROM GRAPH_TABLE (chain_g MATCH (a:P)-[:K]->(b:P)-[:K]->(c:P) COLUMNS (a.id AS a, c.id AS c));
+----
+1	3
+
+query T
+SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+fixed_path
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (chain_g MATCH (a:P)-[:K]->(b:P) COLUMNS (a.id AS a, b.id AS b));
+----
+4
+
+query I
+SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+0
+
+# ── a hand-made catalog whose artifact disagrees with the bridge, claiming exactness ────────────────────────────────
+
+statement ok
+CREATE TABLE graph.__pg_edge_g__lying AS SELECT 1 AS v0, hash('x') AS e1, 3 AS v1;
+
+statement ok
+UPDATE graph.__pgq_path_catalog SET path_table_name = '__pg_edge_g__lying', preserves_multiplicity = true
+WHERE graph_name = 'edge_g' AND path_kind = 'edge';
+
+query II rowsort
+FROM GRAPH_TABLE (edge_g MATCH (a:P)-[:K]->(b:P) COLUMNS (a.id AS a, b.id AS b));
+----
+1	2
+1	2
+2	3
+
+# ── a probe that cannot run is a no ─────────────────────────────────────────────────────────────────────────────────
+
+statement ok
+FROM pgq_abi_build('tree_g', exclude_self_referential := false, closures := ['HasParent']);
+
+statement ok
+UPDATE graph.__pgq_path_catalog SET built_by = NULL, preserves_multiplicity = false WHERE graph_name = 'tree_g';
+
+statement ok
+DROP TABLE graph.__pg_tree_g__tc__Node__HasParent;
+
+statement ok
+DROP TABLE graph.__pg_tree_g__tc_witness__Node__HasParent;
+
+statement ok
+DROP TABLE graph.__pg_tree_g__tc_chain__Node__HasParent;
+
+# The catalog still lists all three, so the probes run against missing tables, fail, and count as "no"
+query I
+SELECT count(*) FROM GRAPH_TABLE (tree_g MATCH p = (a:Node)-[:HasParent]->{1,5}(b:Node) COLUMNS (a.id AS a, path_length(p) AS l));
+----
+15
+
+query I
+SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected' AND rewrite_type LIKE 'tc%';
+----
+0
+
+query I
+SELECT count(*) > 0 FROM pgq_last_rewrite_diagnostics() WHERE rewrite_type = 'multiplicity_probe' AND status = 'not_exact';
+----
+true

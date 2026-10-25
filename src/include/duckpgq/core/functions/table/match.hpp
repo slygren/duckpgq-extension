@@ -63,6 +63,17 @@ struct PGQPathTableInfo {
 	//! Provenance recorded by pgq_abi_build for artifacts computed from DuckLake tables (see abi_build.hpp)
 	string source_snapshot;
 	string source_tables;
+	//! The builder that wrote the catalog row ('pgq_abi_build', or empty for the layout compiler and hand-made
+	//! catalogs, which carry no such column).
+	string built_by;
+};
+
+//! preserves_multiplicity measured by the binder for catalog rows that pgq_abi_build did not write (see
+//! PGQExactness in match.cpp), keyed by probe. Lives as long as the path-table cache it belongs to, so it is
+//! invalidated with it: a changed catalog (fingerprint) or a moved-on lake snapshot rebuilds both.
+struct PGQExactnessCache {
+	mutex lock;
+	case_insensitive_map_t<bool> results;
 };
 
 using PGQPathTableCatalog = case_insensitive_map_t<PGQPathTableInfo>;
@@ -144,6 +155,8 @@ struct PGQPathTableCache {
 	case_insensitive_map_t<int64_t> tracked_snapshots;
 	//! Artifacts left out because their sources changed after they were built
 	vector<string> stale_artifacts;
+	//! Shared (not copied) so a const cache can still record what the binder measured.
+	shared_ptr<PGQExactnessCache> exactness = make_shared_ptr<PGQExactnessCache>();
 };
 
 //! A resolved ABI artifact reference. For an `edge` artifact the vertex keys live in
@@ -328,7 +341,8 @@ public:
 	                                    const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &mandatory_alias_map,
 	                                    const PGQPathTableCache &path_table_cache,
 	                                    bool require_abi_paths = false,
-	                                    const ParsedExpression *where_hint = nullptr);
+	                                    const ParsedExpression *where_hint = nullptr,
+	                                    const std::function<bool(const PGQPathTableInfo &)> &counts_exactly = nullptr);
 
 	static void CheckNamedSubpath(SubPath &subpath, MatchExpression &original_ref, CreatePropertyGraphInfo &pg_table,
 	                              unique_ptr<SelectNode> &final_select_node,

@@ -73,6 +73,11 @@ SELECT * FROM (VALUES
     supports_one_row_per_step,is_deduplicated,estimated_rows,last_refreshed_at,is_sorted_by_v0,min_depth,max_depth,
     bridge_table_names,preserves_multiplicity);
 
+# A catalog standing in for pgq_abi_build's: the planted artifacts are the graph here (the bridges hold no
+# rows), so the binder takes preserves_multiplicity as stored instead of measuring it against the bridges.
+statement ok
+ALTER TABLE graph.__pgq_path_catalog ADD COLUMN built_by VARCHAR DEFAULT 'pgq_abi_build';
+
 statement ok
 CREATE PROPERTY GRAPH m
 VERTEX TABLES (

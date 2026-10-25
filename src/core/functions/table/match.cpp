@@ -45,6 +45,8 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckpgq/core/utils/materialized_result.hpp"
+
+#include <chrono>
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/parser.hpp"
 
@@ -225,6 +227,7 @@ static case_insensitive_set_t LatestPathCatalogColumns() {
 	columns.insert("preserves_multiplicity");
 	columns.insert("source_snapshot");
 	columns.insert("source_tables");
+	columns.insert("built_by");
 	return columns;
 }
 
@@ -450,7 +453,7 @@ static void LoadPathTableCatalogMetadata(Connection &connection, const string &c
 		    "       CAST(min_depth AS BIGINT) AS min_depth, "
 		    "       CAST(max_depth AS BIGINT) AS max_depth, "
 		    "       bridge_table_names, "
-		    "       %s, %s, %s, %s, %s, %s, %s, %s, %s, %s "
+		    "       %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s "
 		    "FROM %s WHERE lower(graph_name) = lower(%s)",
 		    OptionalStringCatalogColumn(columns, "semantic_grain", "identity"),
 		    OptionalStringCatalogColumn(columns, "temporal_mode", "snapshot"),
@@ -464,7 +467,10 @@ static void LoadPathTableCatalogMetadata(Connection &connection, const string &c
 		    // Erring to false costs performance; erring to true would change answers.
 		    OptionalBoolCatalogColumn(columns, "preserves_multiplicity", false),
 		    OptionalStringCatalogColumn(columns, "source_snapshot", ""),
-		    OptionalStringCatalogColumn(columns, "source_tables", ""), catalog_table,
+		    OptionalStringCatalogColumn(columns, "source_tables", ""),
+		    // Which builder wrote the row: only pgq_abi_build's preserves_multiplicity is measured for every
+		    // kind; for any other row the binder measures it itself (PGQExactness).
+		    OptionalStringCatalogColumn(columns, "built_by", ""), catalog_table,
 		    KeywordHelper::WriteQuoted(graph_name, '\''));
 	};
 
@@ -473,6 +479,7 @@ static void LoadPathTableCatalogMetadata(Connection &connection, const string &c
 		// A catalog written by the layout compiler or an older pgq_abi_build has no provenance columns.
 		columns.erase("source_snapshot");
 		columns.erase("source_tables");
+		columns.erase("built_by");
 		query_result = connection.Query(build_query(columns));
 	}
 	if (!query_result || query_result->HasError()) {
@@ -508,6 +515,7 @@ static void LoadPathTableCatalogMetadata(Connection &connection, const string &c
 		info.preserves_multiplicity = GetOptionalBool(materialized_result, 21, row_idx);
 		info.source_snapshot = GetOptionalString(materialized_result, 22, row_idx);
 		info.source_tables = GetOptionalString(materialized_result, 23, row_idx);
+		info.built_by = GetOptionalString(materialized_result, 24, row_idx);
 		info.from_metadata = true;
 		AddPathTableInfo(path_table_catalog, std::move(info));
 	}
@@ -5018,7 +5026,8 @@ void PGQMatchFunction::ProcessOptionalPathList(
     int32_t &extra_alias_counter,
     const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &mandatory_alias_map,
     const PGQPathTableCache &path_table_cache,
-    bool require_abi_paths, const ParsedExpression *where_hint) {
+    bool require_abi_paths, const ParsedExpression *where_hint,
+    const std::function<bool(const PGQPathTableInfo &)> &counts_exactly) {
 	const string &graph_name = pg_table.property_graph_name;
 
 	for (auto &path_pattern : opt_patterns) {
@@ -5265,7 +5274,7 @@ void PGQMatchFunction::ProcessOptionalPathList(
 				                                   {PGQStr(edge_table->main_label)});
 				// The LEFT JOIN yields one row per artifact row, so a collapsed duplicate edge would
 				// lose a match: only an artifact that preserves multiplicity may stand in for the bridge.
-				if (path_info && path_info->preserves_multiplicity) {
+				if (path_info && (counts_exactly ? counts_exactly(*path_info) : path_info->preserves_multiplicity)) {
 					const string pt_alias = "_pgq_pt_" + std::to_string(extra_alias_counter++);
 					// v0_binding: for right-directed = prev, for left-directed = next
 					// v1_binding: for right-directed = next, for left-directed = prev
@@ -5679,22 +5688,345 @@ static unique_ptr<CommonTableExpressionInfo> BuildORPStepsCTE(OneRowPerMode mode
 // only answerable shape is ANY SHORTEST from depth 1: a shortest walk never repeats a vertex, so
 // the closure's least depth per pair is the traversal's answer, as long as the artifact reaches
 // the upper bound.
-static bool ClosureAnswers(const PGQPathTableInfo &info, PGQPathSelector selector, int64_t lower, int64_t upper) {
+static bool ClosureAnswers(const PGQPathTableInfo &info, PGQPathSelector selector, int64_t lower, int64_t upper,
+                           const std::function<bool()> &exact) {
 	if (selector == PGQPathSelector::CHEAPEST || lower < 1) {
 		return false;
 	}
-	if (info.preserves_multiplicity) {
-		return true;
+	if (selector == PGQPathSelector::ANY_SHORTEST && lower <= 1 && info.max_depth > 0 && upper <= info.max_depth) {
+		return true; // needs no proof, so nothing is measured
 	}
-	return selector == PGQPathSelector::ANY_SHORTEST && lower <= 1 && info.max_depth > 0 && upper <= info.max_depth;
+	return exact();
 }
 
 // tc_chain keeps only the longest chain from each source. It can answer a pattern only when every
 // path from a source is a prefix of that chain, which the build proves (out-degree <= 1, acyclic,
 // complete) in preserves_multiplicity. Every selector then coincides: each pair has one path.
-static bool ChainAnswers(const PGQPathTableInfo &info, PGQPathSelector selector, int64_t lower) {
-	return info.preserves_multiplicity && selector != PGQPathSelector::CHEAPEST && lower >= 1;
+static bool ChainAnswers(PGQPathSelector selector, int64_t lower, const std::function<bool()> &exact) {
+	return selector != PGQPathSelector::CHEAPEST && lower >= 1 && exact();
 }
+
+// Whether an artifact can stand in for the traversal where rows are counted -- preserves_multiplicity -- as
+// measured, not as declared. pgq_abi_build measures it for every artifact kind and its rows are taken as they
+// are. Other builders do not (the layout compiler measures edge and fixed_path artifacts but writes false for
+// every closure; a hand-made catalog may write anything), so for their rows the binder runs the same probes
+// itself, once per path-table cache, and caches the answer next to it. A probe that fails is a "no": the
+// pattern is traversed.
+//
+// Cost: almost every probe is a count(*) of a table, which DuckLake and DuckDB answer from metadata. The
+// exceptions, each run at most once per cache: a bridge without a 1-hop artifact (count DISTINCT over its
+// key columns), a hierarchy closure queried past its deepest row (a key self-join of tc_chain), and a closure
+// that is not a hierarchy (one join of tc with the bridge).
+class PGQExactness {
+public:
+	PGQExactness(ClientContext &context, const PGQPathTableCache &cache, CreatePropertyGraphInfo &pg_table)
+	    : context(context), cache(cache), pg_table(pg_table) {
+	}
+
+	// An edge or fixed_path artifact is SELECT DISTINCT over its chain of bridges, so it holds every chain
+	// exactly when no bridge on it stores an edge twice.
+	bool CountsExactly(const PGQPathTableInfo &info) {
+		if (!StringUtil::CIEquals(info.path_kind, "edge") && !StringUtil::CIEquals(info.path_kind, "fixed_path")) {
+			return info.preserves_multiplicity;
+		}
+		if (BuiltByAbiBuild(info)) {
+			return info.preserves_multiplicity;
+		}
+		const auto vertices = SplitCatalogSequence(info.vertex_label_sequence);
+		const auto edges = SplitCatalogSequence(info.edge_label_sequence);
+		if (edges.empty() || vertices.size() != edges.size() + 1) {
+			return false;
+		}
+		bool all_bridges_distinct = true;
+		for (idx_t idx = 0; idx < edges.size() && all_bridges_distinct; idx++) {
+			all_bridges_distinct = BridgeHasNoDuplicates(vertices[idx], edges[idx], vertices[idx + 1]);
+		}
+		if (all_bridges_distinct || edges.size() == 1) {
+			return all_bridges_distinct;
+		}
+		// A duplicate edge only loses rows if a chain goes through it: the layout compiler's own probe, the
+		// artifact against the number of chains, counted one hop at a time (paths reaching each vertex) rather
+		// than by the join itself.
+		vector<string> ctes;
+		for (idx_t idx = 0; idx < edges.size(); idx++) {
+			string bridge, src_col, dst_col;
+			if (!Bridge(edges[idx], bridge, src_col, dst_col)) {
+				return false;
+			}
+			const string name = "__c" + std::to_string(idx + 1);
+			if (idx == 0) {
+				ctes.push_back(StringUtil::Format("%s AS (SELECT e.%s AS v, count(*) AS n FROM %s e GROUP BY 1)", name,
+				                                  dst_col, bridge));
+			} else {
+				ctes.push_back(StringUtil::Format("%s AS (SELECT e.%s AS v, sum(p.n) AS n FROM %s e JOIN __c%llu p "
+				                                  "ON e.%s = p.v GROUP BY 1)",
+				                                  name, dst_col, bridge, static_cast<unsigned long long>(idx), src_col));
+			}
+		}
+		return Probe("chains|" + Table(info),
+		             StringUtil::Format("WITH %s SELECT (SELECT count(*) FROM %s) = (SELECT coalesce(sum(n), 0) FROM __c%llu)",
+		                                StringUtil::Join(ctes, ", "), Table(info),
+		                                static_cast<unsigned long long>(edges.size())));
+	}
+
+	// A closure (tc, tc_witness, tc_chain) of one self-referential edge holds exactly the traversal's paths up
+	// to `upper` hops.
+	bool ClosureExact(const PGQPathTableInfo &info, int64_t upper) {
+		if (BuiltByAbiBuild(info) && info.preserves_multiplicity) {
+			return true;
+		}
+		const auto vertices = SplitCatalogSequence(info.vertex_label_sequence);
+		const auto edges = SplitCatalogSequence(info.edge_label_sequence);
+		if (vertices.size() != 2 || edges.size() != 1) {
+			return false;
+		}
+		const string &label = vertices[0];
+		const string &edge_label = edges[0];
+		const auto *tc = Closure("transitive_closure", "__tc__", label, edge_label);
+		const auto *witness = Closure("tc_witness", "__tc_witness__", label, edge_label);
+		const auto *chain = Closure("tc_chain", "__tc_chain__", label, edge_label);
+		const auto *edge = EdgeArtifact(label, edge_label, label);
+		string bridge;
+		string src_col;
+		string dst_col;
+		if (!Bridge(edge_label, bridge, src_col, dst_col)) {
+			return false;
+		}
+		// A hierarchy: no edge stored twice, at most one out-edge per vertex, no cycle. Then every closure
+		// kind is exact -- each path from a vertex is a prefix of its one chain -- as far as it reaches. Counted
+		// from metadata where the tables exist, from the bridge where they do not:
+		//   no duplicates    |bridge| = pairs        pairs: |1-hop artifact| (it is DISTINCT pairs), or
+		//                                             count(DISTINCT (src, dst)) of the bridge
+		//   out-degree <= 1  sources = pairs         sources: |tc_chain| (one chain per vertex with an
+		//                                             out-edge), or count(DISTINCT src) of the bridge
+		//   acyclic          |tc| = |tc_witness|     (with out-degree <= 1, a pair reached at two depths means
+		//                                             the walk came round again), or no witness / tc row
+		//                                             closing on its start
+		const auto *any_closure = witness ? witness : (tc ? tc : chain);
+		if (any_closure) {
+			const string pairs = edge ? StringUtil::Format("(SELECT count(*) FROM %s)", Table(*edge))
+			                          : StringUtil::Format("(SELECT count(DISTINCT (%s, %s)) FROM %s)", src_col,
+			                                               dst_col, bridge);
+			const string sources = chain ? StringUtil::Format("(SELECT count(*) FROM %s)", Table(*chain))
+			                             : StringUtil::Format("(SELECT count(DISTINCT %s) FROM %s)", src_col, bridge);
+			const string acyclic =
+			    (tc && witness)
+			        ? StringUtil::Format("(SELECT count(*) FROM %s) = (SELECT count(*) FROM %s)", Table(*tc),
+			                             Table(*witness))
+			        : StringUtil::Format("NOT EXISTS (SELECT 1 FROM %s WHERE v0 = v1)", Table(*any_closure));
+			const bool hierarchy = Probe(
+			    "hierarchy|" + Table(*any_closure),
+			    StringUtil::Format("SELECT (SELECT count(*) FROM %s) = %s AND %s = %s AND %s", bridge, pairs, sources,
+			                       pairs, acyclic));
+			if (hierarchy) {
+				// A closure stops at its builder's depth cap. Up to its deepest row nothing is missing; past it,
+				// it is complete exactly when no deepest path can be extended by another edge.
+				if (any_closure->max_depth > 0 && upper <= any_closure->max_depth) {
+					return true;
+				}
+				if (chain) {
+					return Probe("complete|" + Table(*chain),
+					             StringUtil::Format("SELECT NOT EXISTS (SELECT 1 FROM %s c JOIN %s n ON n.v0 = c.v1)",
+					                                Table(*chain), Table(*chain)));
+				}
+				return Probe("complete|" + Table(*any_closure),
+				             StringUtil::Format("SELECT NOT EXISTS (SELECT 1 FROM %s w JOIN %s e ON e.%s = w.v1 "
+				                                "WHERE w.depth = (SELECT max(depth) FROM %s))",
+				                                Table(*any_closure), bridge, src_col, Table(*any_closure)));
+			}
+		}
+		if (StringUtil::CIEquals(info.path_kind, "tc_chain") || !tc) {
+			return false;
+		}
+		// Not a hierarchy: the general probe pgq_abi_build runs. Extending every tc row by one edge (and taking
+		// the edges themselves as depth 1) yields each tc row once, and nothing beyond the deepest, exactly when
+		// every row is one walk and the cap was never reached; no row closing on its start rules out cycles.
+		const bool general = Probe(
+		    "general|" + Table(*tc),
+		    StringUtil::Format("SELECT NOT EXISTS (SELECT 1 FROM %s WHERE v0 = v1) AND (SELECT count(*) FROM %s) + "
+		                       "(SELECT count(*) FROM %s t JOIN %s e ON e.%s = t.v1) = (SELECT count(*) FROM %s)",
+		                       Table(*tc), bridge, Table(*tc), bridge, src_col, Table(*tc)));
+		if (!general || StringUtil::CIEquals(info.path_kind, "transitive_closure")) {
+			return general;
+		}
+		// tc_witness keeps one path per pair: exact when no pair has paths of two lengths.
+		return witness && Probe("witness|" + Table(*witness),
+		                        StringUtil::Format("SELECT (SELECT count(*) FROM %s) = (SELECT count(*) FROM %s)",
+		                                           Table(*witness), Table(*tc)));
+	}
+
+private:
+	static bool BuiltByAbiBuild(const PGQPathTableInfo &info) {
+		return StringUtil::CIEquals(info.built_by, "pgq_abi_build");
+	}
+
+	static string Table(const PGQPathTableInfo &info) {
+		return QualifiedTableName(info.catalog_name, info.schema_name, info.table_name);
+	}
+
+	const PGQPathTableInfo *Closure(const char *kind, const char *infix, const string &label, const string &edge_label) {
+		return FindPathTableInfo(cache, "__pg_" + pg_table.property_graph_name + infix + label + "__" + edge_label,
+		                         kind, {label, label}, {edge_label});
+	}
+
+	const PGQPathTableInfo *EdgeArtifact(const string &src_label, const string &edge_label, const string &dst_label) {
+		return FindPathTableInfo(cache,
+		                         "__pg_" + pg_table.property_graph_name + "__" + src_label + "__" + edge_label + "__" +
+		                             dst_label,
+		                         "edge", {src_label, dst_label}, {edge_label});
+	}
+
+	bool Bridge(const string &edge_label, string &table, string &src_col, string &dst_col) {
+		shared_ptr<PropertyGraphTable> edge_table;
+		try {
+			edge_table = ResolveTable(edge_label, PGQMatchType::MATCH_EDGE_RIGHT, pg_table);
+		} catch (...) {
+			return false;
+		}
+		if (!edge_table || edge_table->source_fk.empty() || edge_table->destination_fk.empty()) {
+			return false;
+		}
+		table = QualifiedTableName(PGQStr(edge_table->catalog_name), PGQStr(edge_table->schema_name),
+		                           PGQStr(edge_table->table_name));
+		src_col = KeywordHelper::WriteOptionallyQuoted(PGQStr(edge_table->source_fk[0]));
+		dst_col = KeywordHelper::WriteOptionallyQuoted(PGQStr(edge_table->destination_fk[0]));
+		return true;
+	}
+
+	bool BridgeHasNoDuplicates(const string &src_label, const string &edge_label, const string &dst_label) {
+		string bridge;
+		string src_col;
+		string dst_col;
+		if (!Bridge(edge_label, bridge, src_col, dst_col)) {
+			return false;
+		}
+		// The 1-hop artifact is the DISTINCT (src, dst) pairs, so equal counts mean no pair is stored twice --
+		// two metadata counts. Without one, count the distinct pairs of the bridge itself.
+		if (const auto *edge = EdgeArtifact(src_label, edge_label, dst_label)) {
+			return Probe("nodup|" + bridge,
+			             StringUtil::Format("SELECT (SELECT count(*) FROM %s) = (SELECT count(*) FROM %s)", bridge,
+			                                Table(*edge)));
+		}
+		return Probe("nodup|" + bridge,
+		             StringUtil::Format("SELECT count(*) = count(DISTINCT (%s, %s)) FROM %s", src_col, dst_col, bridge));
+	}
+
+public:
+	// Measures, in one query of metadata counts, each given 1-hop artifact's bridge not measured yet. An expansion over many edge families would otherwise open a
+	// connection per family. If the batch fails (one unreadable table), the probes run one by one later.
+	void PrimeEdgeProbes(const vector<const PGQPathTableInfo *> &infos) {
+		auto &store = *cache.exactness;
+		vector<string> selects;
+		case_insensitive_set_t seen;
+		for (const auto *info_ptr : infos) {
+			const auto &info = *info_ptr;
+			if (info.is_sorted_by_v1 || !StringUtil::CIEquals(info.path_kind, "edge") || BuiltByAbiBuild(info)) {
+				continue;
+			}
+			const auto edges = SplitCatalogSequence(info.edge_label_sequence);
+			string bridge, src_col, dst_col;
+			if (edges.size() != 1 || !Bridge(edges[0], bridge, src_col, dst_col)) {
+				continue;
+			}
+			const string key = "nodup|" + bridge;
+			if (!seen.insert(key).second) {
+				continue;
+			}
+			{
+				lock_guard<mutex> guard(store.lock);
+				if (store.results.find(key) != store.results.end()) {
+					continue;
+				}
+			}
+			selects.push_back(StringUtil::Format("SELECT %s AS k, (SELECT count(*) FROM %s) = (SELECT count(*) FROM %s) AS v",
+			                                     KeywordHelper::WriteQuoted(key, '\''), bridge, Table(info)));
+		}
+		if (selects.empty()) {
+			return;
+		}
+		const auto started = std::chrono::steady_clock::now();
+		case_insensitive_map_t<bool> measured;
+		try {
+			Connection connection(*context.db);
+			auto result = connection.Query(StringUtil::Join(selects, " UNION ALL "));
+			if (!result || result->HasError()) {
+				return;
+			}
+			PGQMaterializedResult rows(*result);
+			for (idx_t row = 0; row < rows.RowCount(); row++) {
+				auto cell = rows.GetValue(1, row);
+				measured[rows.GetValue(0, row).ToString()] = !cell.IsNull() && cell.GetValue<bool>();
+			}
+		} catch (...) {
+			return;
+		}
+		const auto elapsed_ms =
+		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
+		idx_t exact = 0;
+		{
+			lock_guard<mutex> guard(store.lock);
+			for (auto &entry : measured) {
+				store.results[entry.first] = entry.second;
+				exact += entry.second ? 1 : 0;
+			}
+		}
+		PGQRewriteDiagnostic diagnostic;
+		diagnostic.graph_name = pg_table.property_graph_name;
+		diagnostic.rewrite_type = "multiplicity_probe";
+		diagnostic.status = "measured";
+		diagnostic.reason = StringUtil::Format("%llu bridges, %llu without duplicates, measured in %lld ms",
+		                                       static_cast<unsigned long long>(measured.size()),
+		                                       static_cast<unsigned long long>(exact), static_cast<long long>(elapsed_ms));
+		RecordRewriteDiagnostic(context, std::move(diagnostic));
+	}
+
+private:
+	// Runs one boolean probe, once per cache. Anything but a clean TRUE -- an error, NULL, a missing table --
+	// is false, which keeps the pattern on the traversal.
+	bool Probe(const string &key, const string &sql) {
+		auto &store = *cache.exactness;
+		{
+			lock_guard<mutex> guard(store.lock);
+			auto entry = store.results.find(key);
+			if (entry != store.results.end()) {
+				return entry->second;
+			}
+		}
+		bool value = false;
+		const auto started = std::chrono::steady_clock::now();
+		try {
+			Connection connection(*context.db);
+			auto result = connection.Query(sql);
+			if (result && !result->HasError()) {
+				PGQMaterializedResult rows(*result);
+				if (rows.RowCount() == 1) {
+					auto cell = rows.GetValue(0, 0);
+					value = !cell.IsNull() && cell.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
+				}
+			}
+		} catch (...) {
+			value = false;
+		}
+		const auto elapsed_ms =
+		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
+		{
+			lock_guard<mutex> guard(store.lock);
+			store.results[key] = value;
+		}
+		// Visible in pgq_last_rewrite_diagnostics, once per cache, so the cost of a measurement can be seen.
+		PGQRewriteDiagnostic diagnostic;
+		diagnostic.graph_name = pg_table.property_graph_name;
+		diagnostic.rewrite_type = "multiplicity_probe";
+		diagnostic.status = value ? "exact" : "not_exact";
+		diagnostic.reason = key + " measured in " + std::to_string(elapsed_ms) + " ms";
+		RecordRewriteDiagnostic(context, std::move(diagnostic));
+		return value;
+	}
+
+	ClientContext &context;
+	const PGQPathTableCache &cache;
+	CreatePropertyGraphInfo &pg_table;
+};
 
 // A path mode (TRAIL, ACYCLIC, ...) or a COST on any element changes which paths match; the
 // artifact routes implement neither, so such patterns are left to the traversal.
@@ -6841,7 +7173,8 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
                                                         string &src_pk_out, string &dst_pk_out,
                                                         bool include_vertex_properties,
                                                         bool require_multiplicity_preserving,
-                                                        int64_t vl_fallback_budget, PGQPathSelector selector) {
+                                                        int64_t vl_fallback_budget, PGQPathSelector selector,
+                                                        PGQExactness &exactness) {
 	if (upper >= static_cast<idx_t>(1 << 30)) {
 		return nullptr;
 	}
@@ -6877,6 +7210,7 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 		//! estimate is a floor rather than a bound. No default initializer: it would make
 		//! the struct a non-aggregate and break the braced construction used below.
 		int64_t estimated_rows;
+		const PGQPathTableInfo *info;
 	};
 
 	vector<ContextEdgeTable> edge_tables;
@@ -6899,9 +7233,6 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 		// than skipping the artifact is deliberate: dropping one family from the union
 		// would silently lose edges, which is worse than falling back to the bridge.
 		// ANY SHORTEST is multiplicity-insensitive and imposes no such requirement.
-		if (require_multiplicity_preserving && !info.preserves_multiplicity) {
-			return nullptr;
-		}
 		const auto vertex_parts = SplitCatalogSequence(info.vertex_label_sequence);
 		const auto edge_parts = SplitCatalogSequence(info.edge_label_sequence);
 		if (vertex_parts.size() != 2 || edge_parts.size() != 1) {
@@ -6922,7 +7253,7 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 		edge_tables.push_back({vertex_parts[0], vertex_parts[1], edge_parts[0], PGQStr(info.table_name),
 		                       PGQStr(info.catalog_name), PGQStr(info.schema_name), PGQStr(edge_table->source_pk[0]),
 		                       edge_table->destination_pk.empty() ? string() : PGQStr(edge_table->destination_pk[0]),
-		                       info.estimated_rows});
+		                       info.estimated_rows, &info});
 	}
 	if (edge_tables.empty()) {
 		return nullptr;
@@ -6944,6 +7275,7 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 		//! length-k walks over its label path, which is what makes it a real estimate of
 		//! the expansion's output at that depth rather than a guess.
 		int64_t estimated_rows = -1;
+		const PGQPathTableInfo *info = nullptr;
 	};
 	vector<ContextPathArtifact> path_artifacts;
 	case_insensitive_set_t path_artifact_keys;
@@ -6967,9 +7299,6 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 		// artifact that is merely *present* for a label path may still be partial -- from a
 		// generator policy filter, say -- and substituting it would silently drop paths.
 		// ANY SHORTEST being multiplicity-insensitive does not excuse incompleteness.
-		if (!info.preserves_multiplicity) {
-			continue;
-		}
 		bool edges_allowed = true;
 		for (const auto &edge_label : edge_parts) {
 			if (!LabelExpressionAllows(edge_label_expr, edge_label)) {
@@ -6988,7 +7317,7 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 		artifact.schema_name = info.schema_name;
 		artifact.table_name = info.table_name;
 		artifact.estimated_rows = info.estimated_rows;
-		path_artifact_keys.insert(PathSemanticKey("fixed_path", vertex_parts, edge_parts));
+		artifact.info = &info;
 		path_artifacts.push_back(std::move(artifact));
 	}
 
@@ -7002,6 +7331,45 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 	}
 	if (src_pk_out.empty()) {
 		return nullptr;
+	}
+
+	// Walk semantics count every edge, so each family the expansion can step through must hold one row per
+	// bridge row (preserves_multiplicity, measured if its builder did not). Only the families reachable from the
+	// source label within the bound matter -- the others never contribute a row -- so only those are measured.
+	{
+		case_insensitive_set_t reachable {canonical_src_label};
+		case_insensitive_set_t frontier_labels {canonical_src_label};
+		for (idx_t depth = 1; depth < upper && !frontier_labels.empty(); depth++) {
+			case_insensitive_set_t next_labels;
+			for (const auto &edge_table : edge_tables) {
+				if (frontier_labels.count(edge_table.src_label) && reachable.insert(edge_table.dst_label).second) {
+					next_labels.insert(edge_table.dst_label);
+				}
+			}
+			frontier_labels = std::move(next_labels);
+		}
+		vector<const PGQPathTableInfo *> stepped;
+		for (const auto &edge_table : edge_tables) {
+			if (reachable.count(edge_table.src_label)) {
+				stepped.push_back(edge_table.info);
+			}
+		}
+		if (require_multiplicity_preserving) {
+			exactness.PrimeEdgeProbes(stepped);
+			for (const auto *info : stepped) {
+				if (!exactness.CountsExactly(*info)) {
+					return nullptr;
+				}
+			}
+		}
+	}
+	// A k-hop artifact read as a whole depth must hold exactly the paths composing k steps would give (see above);
+	// only those starting at the source label are ever read.
+	for (const auto &artifact : path_artifacts) {
+		if (StringUtil::CIEquals(artifact.vertex_labels.front(), canonical_src_label) &&
+		    exactness.CountsExactly(*artifact.info)) {
+			path_artifact_keys.insert(PathSemanticKey("fixed_path", artifact.vertex_labels, artifact.edge_labels));
+		}
 	}
 
 	// Key of the destination vertex, when the pattern pins it to exactly one label. The
@@ -7099,7 +7467,8 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 	vector<vector<ContextPathArtifact>> artifacts_by_depth(upper + 1);
 	if (!include_vertex_properties && !path_artifacts.empty() && !canonical_src_label.empty()) {
 		for (const auto &artifact : path_artifacts) {
-			if (StringUtil::CIEquals(artifact.vertex_labels.front(), canonical_src_label)) {
+			if (StringUtil::CIEquals(artifact.vertex_labels.front(), canonical_src_label) &&
+			    path_artifact_keys.count(PathSemanticKey("fixed_path", artifact.vertex_labels, artifact.edge_labels))) {
 				artifacts_by_depth[artifact.hops].push_back(artifact);
 			}
 		}
@@ -8236,8 +8605,12 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 	// counts two paths. preserves_multiplicity is the build-time probe of exactly that (artifact rows ==
 	// chain rows). Wherever the answer counts paths an artifact that failed it is treated as absent; only an
 	// existence test (counts_paths = false) may read it anyway.
+	PGQExactness exactness(context, path_table_cache, pg_table);
 	auto counts_exactly = [&](const PGQPathTableInfo *info) {
-		return info && (!counts_paths || info->preserves_multiplicity);
+		return info && (!counts_paths || exactness.CountsExactly(*info));
+	};
+	auto closure_exact = [&](const PGQPathTableInfo *info, int64_t upper) {
+		return [&exactness, info, upper]() { return exactness.ClosureExact(*info, upper); };
 	};
 	// Verification/diagnostic escape hatch: force the fallback traversal so
 	// pgq_verify_abi_rewrite() can compare the two paths.
@@ -8335,7 +8708,8 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 							const PGQPathTableInfo *tc_chain_info =
 							    find_path_table(tc_chain_tname, "tc_chain", {tc_src->label, tc_dst->label},
 							                    {tc_edge->label});
-							if (tc_chain_info && ChainAnswers(*tc_chain_info, selector, tc_sp->lower)) {
+							if (tc_chain_info &&
+							    ChainAnswers(selector, tc_sp->lower, closure_exact(tc_chain_info, tc_sp->upper))) {
 								vector<string> endpoint_filters;
 								vector<MaterializedSQLFilter> materialized_endpoint_filters;
 								PushConstraintToTCChainFilter(where_constraints, tc_src->variable_binding,
@@ -8373,7 +8747,8 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 							}
 						}
 						if (!tc_witness_info ||
-						    !ClosureAnswers(*tc_witness_info, selector, tc_sp->lower, tc_sp->upper)) {
+						    !ClosureAnswers(*tc_witness_info, selector, tc_sp->lower, tc_sp->upper,
+						                    closure_exact(tc_witness_info, tc_sp->upper))) {
 							return false;
 						}
 						vector<string> endpoint_filters;
@@ -8427,9 +8802,11 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 						    !tc_dst->variable_binding.empty() &&
 						    where_referenced_bindings.find(tc_dst->variable_binding) != where_referenced_bindings.end();
 						const bool chain_answers =
-						    tc_chain_info && ChainAnswers(*tc_chain_info, selector, tc_sp->lower);
+						    tc_chain_info &&
+						    ChainAnswers(selector, tc_sp->lower, closure_exact(tc_chain_info, tc_sp->upper));
 						const bool witness_answers =
-						    tc_witness_info && ClosureAnswers(*tc_witness_info, selector, tc_sp->lower, tc_sp->upper);
+						    tc_witness_info && ClosureAnswers(*tc_witness_info, selector, tc_sp->lower, tc_sp->upper,
+						                                      closure_exact(tc_witness_info, tc_sp->upper));
 						const bool use_witness =
 						    witness_answers && (dst_key_constrained || dst_where_referenced || !chain_answers);
 
@@ -8497,7 +8874,8 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 					    find_path_table(tc_tname, "transitive_closure", {tc_src->label, tc_dst->label}, {tc_edge->label});
 					// Named path functions need a path, which this endpoint-only artifact does not have.
 					if (tc_info && !HasTopLevelNamedPathFunction(match_ref, named_path_variable) &&
-					    ClosureAnswers(*tc_info, selector, tc_sp->lower, tc_sp->upper)) {
+					    ClosureAnswers(*tc_info, selector, tc_sp->lower, tc_sp->upper,
+					                   closure_exact(tc_info, tc_sp->upper))) {
 						shared_ptr<PropertyGraphTable> vtable, etbl;
 						try {
 							vtable = ResolveTable(tc_src->label,  PGQMatchType::MATCH_VERTEX,     pg_table);
@@ -8681,7 +9059,7 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 				                                            // duplicate edge cannot change it; every other
 				                                            // selector counts paths.
 				                                            /*require_multiplicity_preserving=*/!any_shortest,
-				                                            MaxVLFallbackRows(context), selector);
+				                                            MaxVLFallbackRows(context), selector, exactness);
 				if (!path_ref || src_pk.empty()) {
 					return false;
 				}
@@ -9484,6 +9862,9 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	auto path_table_cache_ptr = GetPathTableCache(context, *duckpgq_state, pg_table->property_graph_name,
 	                                              pg_table);
 	auto &path_table_cache = *path_table_cache_ptr;
+	PGQExactness optional_exactness(context, path_table_cache, *pg_table);
+	const std::function<bool(const PGQPathTableInfo &)> optional_counts_exactly =
+	    [&optional_exactness](const PGQPathTableInfo &info) { return optional_exactness.CountsExactly(info); };
 	const ReferencedBindings referenced_bindings = CollectReferencedBindings(*ref);
 	const bool require_abi_paths = RequireABIPaths(context);
 	CoveredBindingMap covered_columns;
@@ -9564,7 +9945,7 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	case_insensitive_map_t<shared_ptr<PropertyGraphTable>> optional_alias_map;
 	for (auto &opt_group : ref->optional_match_patterns) {
 		ProcessOptionalPathList(opt_group, final_select_node, optional_alias_map, *pg_table, extra_alias_counter, alias_map,
-		                        path_table_cache, require_abi_paths, ref->where_clause.get());
+		                        path_table_cache, require_abi_paths, ref->where_clause.get(), optional_counts_exactly);
 	}
 
 	// Maps from table alias to table, including vertex and edge tables.
@@ -9735,7 +10116,8 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 		case_insensitive_map_t<shared_ptr<PropertyGraphTable>> branch_opt_alias_map;
 		for (auto &opt_group : branch.optional_match_patterns) {
 			ProcessOptionalPathList(opt_group, branch_select, branch_opt_alias_map, *pg_table, branch_counter,
-			                        branch_alias_map, path_table_cache, require_abi_paths, branch.where_clause.get());
+			                        branch_alias_map, path_table_cache, require_abi_paths, branch.where_clause.get(),
+			                        optional_counts_exactly);
 		}
 
 		case_insensitive_set_t branch_stub_bindings;

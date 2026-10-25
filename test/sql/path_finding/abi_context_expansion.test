@@ -116,6 +116,11 @@ SELECT 'test_graph', '__pg_test_graph__Notification__NotifiedOperation__Operatio
        (SELECT count(*) FROM graph.__pg_test_graph__Notification__NotifiedOperation__Operation),
        current_timestamp, true, 1, 1, 'notified_operation', true;
 
+# A catalog standing in for pgq_abi_build's: the planted artifacts are the graph here (the bridges hold no
+# rows), so the binder takes preserves_multiplicity as stored instead of measuring it against the bridges.
+statement ok
+ALTER TABLE graph.__pgq_path_catalog ADD COLUMN built_by VARCHAR DEFAULT 'pgq_abi_build';
+
 statement ok
 CREATE PROPERTY GRAPH test_graph
 VERTEX TABLES (
