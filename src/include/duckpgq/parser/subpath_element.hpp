@@ -28,6 +28,10 @@ public:
 	//! Set during translation on the quantified edge of an ANY / ALL CHEAPEST pattern whose COST varies by edge:
 	//! its paths are chosen by that cost, not by hop count.
 	bool cheapest = false;
+	//! A parenthesized (or bracketed) path pattern `( body [WHERE cond] ){lower,upper}`: path_list is the body, a
+	//! sequence that starts and ends with a vertex, where_clause the group's own WHERE (per iteration). Lowered
+	//! before translation; see the quantified group section of match.cpp.
+	bool quantified_group = false;
 public:
 	explicit SubPath(PGQPathReferenceType path_reference_type) : PathReference(path_reference_type) {
 		path_mode = PGQPathMode::NONE;

@@ -33,12 +33,18 @@ DuckPGQAllCheapest <- 'ALL' 'CHEAPEST'
 DuckPGQAnyCheapest <- 'ANY' 'CHEAPEST'
 DuckPGQPathMode <- 'WALK' / 'TRAIL' / 'SIMPLE' / 'ACYCLIC'
 DuckPGQPathSequence <- DuckPGQPathStart DuckPGQEdgeVertex*
-DuckPGQPathStart <- DuckPGQParenthesizedPath / DuckPGQVertex
-DuckPGQEdgeVertex <- DuckPGQEdgeVertexStep / DuckPGQParenthesizedPath
+DuckPGQPathStart <- DuckPGQGroupStep / DuckPGQVertex
+DuckPGQEdgeVertex <- DuckPGQEdgeVertexStep / DuckPGQGroupStep
+# A group may be followed directly by a vertex pattern: (t) ((a)-[e]->(b)){1,3} (z).
+DuckPGQGroupStep <- DuckPGQParenthesizedPath DuckPGQVertex?
 DuckPGQEdgeVertexStep <- DuckPGQEdge DuckPGQPathStart
-# A parenthesized path pattern, e.g. a quantified union ((a)-[:R]->(b) | (a)-[:S]->(b)){1,3}. Parsed only to be
-# rejected with an explanation: sub-path groups are not supported.
-DuckPGQParenthesizedPath <- '(' DuckPGQPathPattern ')' DuckPGQQuantifier?
+# A parenthesized path pattern with an optional WHERE and quantifier: ((a)-[e]->(b) WHERE e.w > 1){1,3}, also
+# written with brackets [(a)-[e]->(b)]{1,3}. Adjacent vertex patterns are one vertex, so the group continues the
+# path from the vertex before it.
+DuckPGQParenthesizedPath <- DuckPGQPathGroupBody DuckPGQQuantifier?
+DuckPGQPathGroupBody <- DuckPGQPathGroupParens / DuckPGQPathGroupBrackets
+DuckPGQPathGroupParens <- '(' DuckPGQPathPattern WhereClause? ')'
+DuckPGQPathGroupBrackets <- '[' DuckPGQPathPattern WhereClause? ']'
 DuckPGQEdge <- DuckPGQQuantifiedEdge / DuckPGQAbbreviatedEdge
 
 # Edges with optional quantifiers. The tokenizer reads "->*", "->?", "-*" and "-?" as one operator token, so those

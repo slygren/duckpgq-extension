@@ -26,6 +26,7 @@ unique_ptr<PathReference> SubPath::Copy() {
 	result->default_value = default_value;
 	result->has_default = has_default;
 	result->cheapest = cheapest;
+	result->quantified_group = quantified_group;
 
 	return std::move(result);
 }
@@ -75,6 +76,9 @@ bool SubPath::Equals(const PathReference *other_p) const {
 	    has_default != other->has_default || cheapest != other->cheapest) {
 		return false;
 	}
+	if (quantified_group != other->quantified_group) {
+		return false;
+	}
 	return true;
 }
 void SubPath::Serialize(Serializer &serializer) const {
@@ -88,6 +92,7 @@ void SubPath::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault(107, "cost_expr", cost_expr);
 	serializer.WritePropertyWithDefault(108, "default_value", default_value, 1.0);
 	serializer.WritePropertyWithDefault(109, "has_default", has_default, false);
+	serializer.WritePropertyWithDefault(110, "quantified_group", quantified_group, false);
 }
 
 unique_ptr<PathReference> SubPath::Deserialize(Deserializer &deserializer) {
@@ -104,10 +109,26 @@ unique_ptr<PathReference> SubPath::Deserialize(Deserializer &deserializer) {
 	deserializer.ReadPropertyWithDefault(107, "cost_expr", result->cost_expr);
 	deserializer.ReadPropertyWithExplicitDefault(108, "default_value", result->default_value, 1.0);
 	deserializer.ReadPropertyWithExplicitDefault(109, "has_default", result->has_default, false);
+	deserializer.ReadPropertyWithExplicitDefault(110, "quantified_group", result->quantified_group, false);
 	return std::move(result);
 }
 string SubPath::ToString() const {
 	string result;
+	if (quantified_group) {
+		result += "(";
+		for (idx_t i = 0; i < path_list.size(); i++) {
+			result += (i ? " " : "") + path_list[i]->ToString();
+		}
+		if (where_clause) {
+			result += " WHERE " + where_clause->ToString();
+		}
+		result += ")";
+		if (lower != 1 || upper != 1) {
+			result += "{" + std::to_string(lower) + "," +
+			          (upper >= (int64_t(1) << 30) ? string() : std::to_string(upper)) + "}";
+		}
+		return result;
+	}
 	path_variable.empty() ? result += "" : result += path_variable + " = ";
 	if (path_list.size() == 1) {
 		switch (path_list[0]->path_reference_type) {
