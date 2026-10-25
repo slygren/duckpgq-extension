@@ -9,7 +9,6 @@ struct CoreTableFunctions {
 		RegisterMatchTableFunction(loader);
 		RegisterDropPropertyGraphTableFunction(loader);
 		RegisterDescribePropertyGraphTableFunction(loader);
-		RegisterLocalClusteringCoefficientTableFunction(loader);
 		RegisterScanTableFunctions(loader);
 		RegisterSummarizePropertyGraphTableFunction(loader);
 		RegisterParseMatchTableFunction(loader);
@@ -24,7 +23,6 @@ private:
 	static void RegisterMatchTableFunction(ExtensionLoader &loader);
 	static void RegisterDropPropertyGraphTableFunction(ExtensionLoader &loader);
 	static void RegisterDescribePropertyGraphTableFunction(ExtensionLoader &loader);
-	static void RegisterLocalClusteringCoefficientTableFunction(ExtensionLoader &loader);
 	static void RegisterScanTableFunctions(ExtensionLoader &loader);
 	static void RegisterSummarizePropertyGraphTableFunction(ExtensionLoader &loader);
 	static void RegisterParseMatchTableFunction(ExtensionLoader &loader);

@@ -130,7 +130,10 @@ struct GraphAlgorithmSpec {
 	string name;
 	//! Name of the result column.
 	string column;
-	//! BIGINT or DOUBLE.
+	//! The name the call's rows go by when the query gives it none (default: the function name). Upstream named the
+	//! connected-component and clustering results wcc and lcc, and queries refer to those.
+	string alias;
+	//! BIGINT (from GraphAlgorithmResult::ints), DOUBLE or FLOAT (from ::doubles).
 	LogicalType result_type;
 	vector<GraphAlgorithmNamedParameter> named_parameters;
 	//! shortest_path_lengths: a 4th positional argument, the source vertex's key; rows with a NULL result are
@@ -186,6 +189,7 @@ private:
 	static void RegisterDegree(ExtensionLoader &loader);
 	static void RegisterPageRank(ExtensionLoader &loader);
 	static void RegisterWeaklyConnectedComponent(ExtensionLoader &loader);
+	static void RegisterLocalClusteringCoefficient(ExtensionLoader &loader);
 };
 
 } // namespace duckdb

@@ -27,10 +27,13 @@ EDGE TABLES (
             DESTINATION KEY ( dst ) REFERENCES IsolatedStudent ( id )
     );
 
-statement error
-select id, local_clustering_coefficient from local_clustering_coefficient(no_edge_pg, isolatedstudent, noedgeknow);
+# No edges: 0 everywhere, as networkx.clustering gives (this used to fail with "CSR not found").
+query II
+select id, local_clustering_coefficient from local_clustering_coefficient(no_edge_pg, isolatedstudent, noedgeknow) ORDER BY id;
 ----
-Constraint Error: CSR not found. Is the graph populated?
+0	0.0
+1	0.0
+2	0.0
 
 
 # Test with an empty graph
@@ -261,3 +264,30 @@ select id, local_clustering_coefficient from local_clustering_coefficient(varied
 3	0.33333334
 4	0.0
 5	0.0
+
+
+# Self-loops and parallel edges: a vertex is not its own neighbour and a neighbour counts once, as in
+# networkx.clustering. The triangle 0 - 1 - 2 plus 2 - 3: before, the self-loops and the doubled 0 -> 1 inflated
+# the coefficients past 1 (1.5, 1.5, 0.833, 2.0).
+statement ok
+CREATE TABLE LoopStudent(id BIGINT);
+
+statement ok
+INSERT INTO LoopStudent VALUES (0), (1), (2), (3);
+
+statement ok
+CREATE TABLE LoopKnow(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO LoopKnow VALUES (0, 1), (0, 1), (1, 2), (2, 0), (2, 3), (2, 2), (3, 3);
+
+statement ok
+CREATE PROPERTY GRAPH loop_pg VERTEX TABLES (LoopStudent) EDGE TABLES (LoopKnow SOURCE KEY (src) REFERENCES LoopStudent (id) DESTINATION KEY (dst) REFERENCES LoopStudent (id));
+
+query II
+select id, round(local_clustering_coefficient, 6) from local_clustering_coefficient(loop_pg, loopstudent, loopknow) ORDER BY id;
+----
+0	1.0
+1	1.0
+2	0.333333
+3	0.0

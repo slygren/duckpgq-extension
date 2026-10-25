@@ -43,6 +43,7 @@ void CoreGraphAlgorithms::RegisterWeaklyConnectedComponent(ExtensionLoader &load
 	GraphAlgorithmSpec spec;
 	spec.name = "weakly_connected_component";
 	spec.column = "componentId";
+	spec.alias = "wcc";
 	spec.result_type = LogicalType::BIGINT;
 	spec.compute = WeaklyConnectedComponents;
 	spec.isolated = [](int64_t rowid, const GraphAlgorithmParams &) {

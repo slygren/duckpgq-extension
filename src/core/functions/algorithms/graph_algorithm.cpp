@@ -322,8 +322,8 @@ void ComputeOnce(GraphAlgorithmFunctionData &info, DataChunk &args) {
 	state.done.store(true, std::memory_order_release);
 }
 
-template <class T>
-void WriteResults(GraphAlgorithmFunctionData &info, const vector<T> &values, DataChunk &args, Vector &result) {
+template <class T, class SOURCE = T>
+void WriteResults(GraphAlgorithmFunctionData &info, const vector<SOURCE> &values, DataChunk &args, Vector &result) {
 	auto &state = *info.state;
 	auto &res = state.result;
 	UnifiedVectorFormat rowid_data;
@@ -344,7 +344,7 @@ void WriteResults(GraphAlgorithmFunctionData &info, const vector<T> &values, Dat
 			if (!res.null_mask.empty() && res.null_mask[rowid]) {
 				validity.SetInvalid(i);
 			} else {
-				out[i] = values[rowid];
+				out[i] = static_cast<T>(values[rowid]);
 			}
 			continue;
 		}
@@ -371,6 +371,8 @@ void GraphAlgorithmExecute(DataChunk &args, ExpressionState &state, Vector &resu
 	ComputeOnce(info, args);
 	if (info.spec->result_type.id() == LogicalTypeId::DOUBLE) {
 		WriteResults<double>(info, info.state->result.doubles, args, result);
+	} else if (info.spec->result_type.id() == LogicalTypeId::FLOAT) {
+		WriteResults<float, double>(info, info.state->result.doubles, args, result);
 	} else {
 		WriteResults<int64_t>(info, info.state->result.ints, args, result);
 	}
@@ -435,7 +437,7 @@ unique_ptr<TableRef> GraphAlgorithmBindReplace(ClientContext &context, TableFunc
 	auto select_node = unique_ptr_cast<QueryNode, SelectNode>(std::move(select_statement->node));
 	return CreateTableFunctionSubquery(std::move(select_node),
 	                                   CreateDirectedCSRCTE(edge_pg_entry, "src", "edge", "dst", csr_id), "csr_cte",
-	                                   spec.name);
+	                                   spec.alias.empty() ? spec.name : spec.alias);
 }
 
 } // namespace
@@ -492,6 +494,7 @@ void CoreGraphAlgorithms::Register(ExtensionLoader &loader) {
 	RegisterDegree(loader);
 	RegisterPageRank(loader);
 	RegisterWeaklyConnectedComponent(loader);
+	RegisterLocalClusteringCoefficient(loader);
 }
 
 } // namespace duckdb

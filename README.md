@@ -318,6 +318,7 @@ How each function reads the edges (n vertices, m edges):
 | --- | --- | --- | --- | --- | --- |
 | `pagerank(g, v, e, damping, max_iterations, tolerance)` | directed | out-edge to itself | each counts | `pagerank DOUBLE` | O(n + m) per iteration |
 | `weakly_connected_component(g, v, e)` | undirected | no effect | no effect | `componentId BIGINT` | O(m α(n)) |
+| `local_clustering_coefficient(g, v, e)` | undirected | ignored | count once | `local_clustering_coefficient FLOAT` | O(m^1.5) |
 | `strongly_connected_component(g, v, e)` | directed | no effect | no effect | `componentId BIGINT` | O(n + m) |
 | `triangle_count(g, v, e)` | undirected | ignored | count once | `triangle_count BIGINT` | O(m^1.5) |
 | `total_triangle_count(g, v, e)` | undirected | ignored | count once | one row, `triangle_count BIGINT` | O(m^1.5) |
@@ -336,6 +337,9 @@ How each function reads the edges (n vertices, m edges):
 - **`weakly_connected_component`**: union-find over the edges, ignoring direction. The `componentId` is the smallest
   rowid among the component's vertices, as for `strongly_connected_component`. Matches
   `networkx.weakly_connected_components`.
+- **`local_clustering_coefficient`**: 2 T / (d (d - 1)), where T counts the triangles through the vertex and d
+  its distinct neighbours other than itself. It is 0 below two neighbours. Matches `networkx.clustering`. The result
+  stays FLOAT, as upstream had it.
 - **`strongly_connected_component`**: Tarjan's algorithm, iterative, so long chains are no problem. Two vertices
   share a `componentId` when each reaches the other. The id is the smallest rowid among the component's vertices,
   so it depends only on the partition and the table's row order. Matches `networkx.strongly_connected_components`.

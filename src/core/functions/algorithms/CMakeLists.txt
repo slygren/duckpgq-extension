@@ -11,4 +11,5 @@ set(EXTENSION_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/degree.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/pagerank.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/weakly_connected_component.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/local_clustering_coefficient.cpp
     PARENT_SCOPE)
