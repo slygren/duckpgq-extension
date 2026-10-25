@@ -3,12 +3,14 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/types/hash.hpp"
+#include "duckdb/function/pragma_function.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/qualified_name.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 #include "duckpgq/core/utils/duckpgq_identifier.hpp"
 #include "duckpgq/core/utils/duckpgq_utils.hpp"
 #include "duckpgq/core/utils/materialized_result.hpp"
@@ -832,11 +834,26 @@ private:
 		return snapshot;
 	}
 
-	optional_ptr<TableCatalogEntry> ExistingCatalogTable() {
-		return Catalog::GetEntry<TableCatalogEntry>(
-		    context, QualifiedName(Identifier(plan.target_catalog), Identifier(plan.target_schema),
-		                          Identifier("__pgq_path_catalog")),
-		    OnEntryNotFound::RETURN_NULL);
+	//! The columns of the target's __pgq_path_catalog; empty when there is none yet. Read on an internal connection,
+	//! not through the caller's context: a catalog lookup there opens the caller's transaction on the target, and
+	//! on a DuckLake whose metadata is a SQLite file that transaction's read lock keeps every statement of the
+	//! build from committing.
+	const case_insensitive_set_t &ExistingCatalogColumns() {
+		if (!catalog_columns_loaded) {
+			catalog_columns_loaded = true;
+			Connection connection(*context.db);
+			auto result = connection.Query(
+			    "SELECT column_name FROM information_schema.columns WHERE lower(table_catalog) = lower(" +
+			    Literal(plan.target_catalog) + ") AND lower(table_schema) = lower(" + Literal(plan.target_schema) +
+			    ") AND lower(table_name) = '__pgq_path_catalog'");
+			if (result && !result->HasError()) {
+				PGQMaterializedResult rows(*result);
+				for (idx_t i = 0; i < rows.RowCount(); i++) {
+					catalog_columns.insert(rows.GetValue(0, i).ToString());
+				}
+			}
+		}
+		return catalog_columns;
 	}
 
 	void AddCatalog() {
@@ -850,10 +867,10 @@ private:
 		                          "\n)");
 		// The catalog is shared by every graph built into this schema. One created by an older generator lacks the
 		// provenance columns; add them instead of rebuilding the table, which would drop the other graphs' rows.
-		auto existing = ExistingCatalogTable();
-		if (existing) {
+		auto &existing = ExistingCatalogColumns();
+		if (!existing.empty()) {
 			for (auto &column : PathCatalogColumns()) {
-				if (!existing->ColumnExists(Identifier(column.first))) {
+				if (!existing.count(column.first)) {
 					step.statements.push_back("ALTER TABLE " + catalog_table + " ADD COLUMN " + Ident(column.first) +
 					                          " " + column.second);
 				}
@@ -901,7 +918,7 @@ private:
 
 	//! Artifacts a previous build registered for this graph that this one no longer produces.
 	void AddOrphanDrops() {
-		if (!ExistingCatalogTable()) {
+		if (ExistingCatalogColumns().empty()) {
 			return;
 		}
 		Connection connection(*context.db);
@@ -946,6 +963,8 @@ private:
 	PGQAbiPlan plan;
 	unique_ptr<Connection> estimate_connection;
 	case_insensitive_map_t<string> snapshot_cache;
+	bool catalog_columns_loaded = false;
+	case_insensitive_set_t catalog_columns;
 };
 
 //------------------------------------------------------------------------------
@@ -1356,8 +1375,32 @@ unique_ptr<FunctionData> AbiBuildBind(ClientContext &context, TableFunctionBindI
 	return std::move(result);
 }
 
+//! True when the target is a DuckLake whose metadata is a SQLite file and the calling statement already has a
+//! transaction on that lake. SQLite lets one connection write only once no other holds a read lock, and the caller
+//! keeps its read until its statement ends: every commit of the internal connection would wait out the busy timeout
+//! and fail. PRAGMA pgq_abi_build runs the same statements on the caller's connection instead.
+static bool CallerHoldsSQLiteLake(ClientContext &context, const string &catalog) {
+	auto &manager = DatabaseManager::Get(context);
+	auto lake = manager.GetDatabase(context, Identifier(catalog));
+	if (!lake || !StringUtil::CIEquals(lake->GetCatalog().GetCatalogType(), "ducklake")) {
+		return false;
+	}
+	auto metadata = manager.GetDatabase(context, Identifier("__ducklake_metadata_" + catalog));
+	if (!metadata || !StringUtil::CIEquals(metadata->GetCatalog().GetCatalogType(), "sqlite")) {
+		return false;
+	}
+	return MetaTransaction::Get(context).TryGetTransaction(*lake) != nullptr;
+}
+
 //! Execute a plan; one result row per artifact (artifact, kind, status, row_count, seconds, detail).
 vector<vector<Value>> RunAbiPlan(ClientContext &context, const string &graph_name, const PGQAbiPlan &plan) {
+	if (CallerHoldsSQLiteLake(context, plan.target_catalog)) {
+		throw InvalidInputException(
+		    "ABI build of %s: %s is a DuckLake with a SQLite catalog, which this statement already reads, so the "
+		    "build's own connection cannot commit there. Run PRAGMA pgq_abi_build('%s', ...) instead: it builds on "
+		    "this connection, in one transaction. (Without a USE of the lake, FROM pgq_abi_build works too.)",
+		    graph_name, plan.target_catalog, graph_name);
+	}
 	vector<vector<Value>> rows;
 	auto connection = InternalConnection(context);
 	for (auto &skipped : plan.skipped) {
@@ -1406,6 +1449,33 @@ void AbiBuildFunc(ClientContext &context, TableFunctionInput &data, DataChunk &o
 	EmitRows(state.rows, state, output);
 }
 
+// ── PRAGMA pgq_abi_build ─────────────────────────────────────────────────────
+//! The build's statements, to run in place of the PRAGMA on the caller's connection. DuckDB runs the statements a
+//! PRAGMA expands to as one query in one transaction, so the build is atomic: if any statement fails nothing of it
+//! remains, and the artifacts and catalog rows from before are untouched. No second connection writes, which is
+//! what a DuckLake on a SQLite catalog needs (and what any catalog that allows one writer at a time needs). The
+//! result is the graph's catalog rows as this transaction wrote them (pgq_abi_status reads on its own connection,
+//! which does not see them before the commit).
+string AbiBuildPragmaQuery(ClientContext &context, const FunctionParameters &parameters) {
+	auto &pg_info = BindGraph(context, parameters.values[0]);
+	vector<pair<string, Value>> overrides;
+	for (auto &entry : parameters.named_parameters) {
+		overrides.emplace_back(PGQStr(entry.first), entry.second);
+	}
+	auto plan = PGQPlanAbiBuild(context, pg_info, PGQAbiOptionsForGraph(context, pg_info, overrides));
+	string script;
+	for (auto &step : plan.steps) {
+		for (auto &statement : step.statements) {
+			script += statement + ";\n";
+		}
+	}
+	// The artifact list loaded for the graph is dropped now and rebuilt by its next query, after this transaction.
+	InvalidateArtifactCache(context, pg_info.property_graph_name);
+	return script + "SELECT path_table_name AS artifact, path_kind AS kind, hop_count, estimated_rows AS row_count FROM " +
+	       TableSql(plan.target_catalog, plan.target_schema, "__pgq_path_catalog") + " WHERE lower(graph_name) = lower(" +
+	       Literal(pg_info.property_graph_name) + ") ORDER BY path_table_name";
+}
+
 // ── pgq_abi_drop ─────────────────────────────────────────────────────────────
 struct AbiDropBindData : public TableFunctionData {
 	string graph_name;
@@ -1429,6 +1499,15 @@ void AbiDropFunc(ClientContext &context, TableFunctionInput &data, DataChunk &ou
 	if (!state.executed) {
 		state.executed = true;
 		auto &bind_data = data.bind_data->Cast<AbiDropBindData>();
+		for (auto &location : bind_data.catalogs) {
+			if (CallerHoldsSQLiteLake(context, location.catalog)) {
+				throw InvalidInputException(
+				    "Dropping the ABI artifacts of %s: %s is a DuckLake with a SQLite catalog, which this statement "
+				    "already reads, so a second connection cannot commit there. Run PRAGMA pgq_abi_drop('%s') "
+				    "instead: it drops on this connection, in one transaction.",
+				    bind_data.graph_name, location.catalog, bind_data.graph_name);
+			}
+		}
 		auto connection = InternalConnection(context);
 		const auto prefix = StringUtil::Lower("__pg_" + bind_data.graph_name + "__");
 		for (auto &location : bind_data.catalogs) {
@@ -1458,6 +1537,40 @@ void AbiDropFunc(ClientContext &context, TableFunctionInput &data, DataChunk &ou
 		InvalidateArtifactCache(context, bind_data.graph_name);
 	}
 	EmitRows(state.rows, state, output);
+}
+
+//! PRAGMA pgq_abi_drop: the drops and catalog deletes of pgq_abi_drop, run on the caller's connection in one
+//! transaction (see PRAGMA pgq_abi_build). Returns the artifacts it drops.
+string AbiDropPragmaQuery(ClientContext &context, const FunctionParameters &parameters) {
+	auto &pg_info = BindGraph(context, parameters.values[0]);
+	const auto &graph_name = pg_info.property_graph_name;
+	const auto prefix = StringUtil::Lower("__pg_" + graph_name + "__");
+	Connection connection(*context.db);
+	string script;
+	vector<string> dropped;
+	for (auto &location : GraphArtifactCatalogs(context, connection, pg_info)) {
+		auto catalog_table = TableSql(location.catalog, location.schema, "__pgq_path_catalog");
+		auto listed = connection.Query("SELECT path_table_name FROM " + catalog_table +
+		                               " WHERE lower(graph_name) = lower(" + Literal(graph_name) + ")");
+		if (!listed || listed->HasError()) {
+			continue;
+		}
+		PGQMaterializedResult names(*listed);
+		for (idx_t i = 0; i < names.RowCount(); i++) {
+			auto name = names.GetValue(0, i).ToString();
+			// Only ever drop tables that carry this graph's artifact prefix, as pgq_abi_drop does.
+			if (StringUtil::StartsWith(StringUtil::Lower(name), prefix)) {
+				script += "DROP TABLE IF EXISTS " + TableSql(location.catalog, location.schema, name) + ";\n";
+				dropped.push_back("(" + Literal(name) + ")");
+			}
+		}
+		script += "DELETE FROM " + catalog_table + " WHERE lower(graph_name) = lower(" + Literal(graph_name) + ");\n";
+	}
+	InvalidateArtifactCache(context, graph_name);
+	if (dropped.empty()) {
+		return script + "SELECT NULL::VARCHAR AS artifact WHERE false";
+	}
+	return script + "SELECT artifact FROM (VALUES " + StringUtil::Join(dropped, ", ") + ") t(artifact) ORDER BY 1";
 }
 
 // ── pgq_abi_status ───────────────────────────────────────────────────────────
@@ -1758,9 +1871,13 @@ void CoreTableFunctions::RegisterAbiBuildTableFunctions(ExtensionLoader &loader)
 	TableFunction build_function("pgq_abi_build", {LogicalType::VARCHAR}, AbiBuildFunc, AbiBuildBind, AbiBuildInit);
 	AddAbiNamedParameters(build_function);
 	loader.RegisterFunction(build_function);
+	// The same options: the table function's signature
+	loader.RegisterFunction(
+	    PragmaFunction::PragmaCall("pgq_abi_build", AbiBuildPragmaQuery, build_function.GetSignature()));
 
 	loader.RegisterFunction(
 	    TableFunction("pgq_abi_drop", {LogicalType::VARCHAR}, AbiDropFunc, AbiDropBind, AbiBuildInit));
+	loader.RegisterFunction(PragmaFunction::PragmaCall("pgq_abi_drop", AbiDropPragmaQuery, {LogicalType::VARCHAR}));
 	loader.RegisterFunction(
 	    TableFunction("pgq_abi_status", {LogicalType::VARCHAR}, AbiSqlFunc, AbiStatusBind, AbiEmitInit));
 }

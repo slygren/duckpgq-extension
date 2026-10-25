@@ -46,6 +46,7 @@ FROM pgq_abi_drop('g');                                   -- drop the artifacts 
 
 - **Where they go:** schema `graph` in the database of the graph's first vertex table, or `schema := 'catalog.schema'`. They must be in a database the graph reads tables from: the rewrite ignores artifacts anywhere else.
 - **How it runs:** one statement at a time, each in its own transaction, on an internal connection, and only when the call executes (DESCRIBE or EXPLAIN of it build nothing). A failed build removes the graph's catalog rows, so its queries traverse instead of failing on a dropped table. A rebuild drops the artifacts it no longer produces.
+- **In one transaction:** `PRAGMA pgq_abi_build('g', max_hops = 3)` runs the same statements on the caller's connection as one transaction (DuckDB runs the statements a PRAGMA expands to that way): atomic, and no second connection writes. For a DuckLake whose catalog is a SQLite file this is the form that works while the statement reads the lake (`USE lake`); the table function refuses there with a message naming it. It returns the graph's catalog rows. `PRAGMA pgq_abi_drop('g')` likewise.
 
 | Option | Default | Builds |
 | --- | --- | --- |

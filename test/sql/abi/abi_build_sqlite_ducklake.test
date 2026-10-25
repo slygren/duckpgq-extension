@@ -1,0 +1,187 @@
+# name: test/sql/abi/abi_build_sqlite_ducklake.test
+# description: pgq_abi_build into a DuckLake whose catalog is a SQLite file: the table function where the calling
+#              statement holds no transaction on the lake, PRAGMA pgq_abi_build (one transaction on the caller's
+#              connection, atomic) everywhere. Needs the ducklake and sqlite extensions: set
+#              DUCKPGQ_TEST_EXTENSION_DIR to a directory holding ducklake.duckdb_extension and
+#              sqlite_scanner.duckdb_extension for DuckDB v2.0.0 (e.g. ~/.duckdb/extensions/v2.0.0/osx_arm64).
+# group: [abi]
+
+require duckpgq
+
+require parquet
+
+require-env DUCKPGQ_TEST_EXTENSION_DIR
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+LOAD '${DUCKPGQ_TEST_EXTENSION_DIR}/ducklake.duckdb_extension';
+
+statement ok
+LOAD '${DUCKPGQ_TEST_EXTENSION_DIR}/sqlite_scanner.duckdb_extension';
+
+statement ok
+ATTACH 'ducklake:sqlite:__TEST_DIR__/abi_sqlite_meta.sqlite' AS lake (DATA_PATH '__TEST_DIR__/abi_sqlite_data/');
+
+statement ok
+CREATE TABLE lake.P (id BIGINT, name VARCHAR);
+
+statement ok
+INSERT INTO lake.P VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd');
+
+statement ok
+CREATE TABLE lake.K (src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO lake.K VALUES (1, 2), (2, 3), (3, 4), (2, 4);
+
+statement ok
+CREATE PROPERTY GRAPH g VERTEX TABLES (lake.P LABEL P) EDGE TABLES (
+    lake.K SOURCE KEY (src) REFERENCES lake.P (id) DESTINATION KEY (dst) REFERENCES lake.P (id) LABEL K);
+
+# ── The table function: the calling statement holds no transaction on the lake, so the build's commits succeed ──
+
+query TTTI
+SELECT artifact, kind, status, row_count FROM pgq_abi_build('g', max_hops := 1) ORDER BY artifact;
+----
+__pg_g__P__K__P	edge	built	4
+__pgq_path_catalog	catalog	built	1
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH (a:P)-[:K]->(b:P) COLUMNS (a.id AS a, b.id AS b));
+----
+4
+
+query T
+SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+edge
+
+# ── With the lake in use, the statement itself reads the lake's SQLite catalog: a clear error, not a busy wait ──
+
+statement ok
+USE lake;
+
+statement error
+FROM pgq_abi_build('g', max_hops := 1);
+----
+Run PRAGMA pgq_abi_build('g', ...) instead
+
+# ── PRAGMA pgq_abi_build: the same build on this connection, in one transaction; it returns the catalog rows ──
+
+query TTII
+PRAGMA pgq_abi_build('g', max_hops = 2, exclude_self_referential = false, reverse_twins = ['K']);
+----
+__pg_g__P__K__P	edge	1	4
+__pg_g__P__K__P__K__P	fixed_path	2	3
+__pg_g__P__K__P__rev	edge	1	4
+
+# The next query sees the new artifacts
+query II
+FROM GRAPH_TABLE (g MATCH (a:P)-[:K]->(b:P)-[:K]->(c:P) COLUMNS (a.id AS a, c.id AS c)) ORDER BY ALL;
+----
+1	3
+1	4
+2	4
+
+query T
+SELECT path_table_name FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+__pg_g__P__K__P__K__P
+
+query TT
+SELECT artifact, fresh FROM pgq_abi_status('g') ORDER BY artifact;
+----
+__pg_g__P__K__P	true
+__pg_g__P__K__P__K__P	true
+__pg_g__P__K__P__rev	true
+
+# ── Atomic: a statement that fails leaves nothing of the build, and the artifacts from before stand ──
+
+statement ok
+PRAGMA pgq_abi_build('g', max_hops = 1);
+
+# Something that is not a table where the build puts the reverse twin, which comes after the 2-hop artifact
+statement ok
+CREATE VIEW lake.graph.__pg_g__P__K__P__rev AS SELECT 1 AS x;
+
+statement error
+PRAGMA pgq_abi_build('g', max_hops = 2, exclude_self_referential = false, reverse_twins = ['K']);
+----
+is of type View
+
+query TI
+SELECT path_table_name, estimated_rows FROM lake.graph.__pgq_path_catalog ORDER BY ALL;
+----
+__pg_g__P__K__P	4
+
+query T
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'lake' AND schema_name = 'graph' ORDER BY ALL;
+----
+__pg_g__P__K__P
+__pgq_path_catalog
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH (a:P)-[:K]->(b:P) COLUMNS (a.id AS a, b.id AS b));
+----
+4
+
+query T
+SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+edge
+
+statement ok
+DROP VIEW lake.graph.__pg_g__P__K__P__rev;
+
+# The script itself, for running elsewhere, is unchanged: pgq_abi_sql
+query I
+SELECT count(*) > 0 FROM pgq_abi_sql('g', max_hops := 2);
+----
+true
+
+# ── Dropping: the same holds ──
+
+statement error
+FROM pgq_abi_drop('g');
+----
+Run PRAGMA pgq_abi_drop('g') instead
+
+query T
+PRAGMA pgq_abi_drop('g');
+----
+__pg_g__P__K__P
+
+query I
+SELECT count(*) FROM lake.graph.__pgq_path_catalog;
+----
+0
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH (a:P)-[:K]->(b:P) COLUMNS (a.id AS a, b.id AS b));
+----
+4
+
+query T
+SELECT coalesce(string_agg(rewrite_type, ','), 'traversal') FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+traversal
+
+statement ok
+USE memory;
+
+# Without a USE of the lake, both table functions work on the SQLite catalog
+query TT
+SELECT artifact, status FROM pgq_abi_build('g', max_hops := 1) ORDER BY ALL;
+----
+__pg_g__P__K__P	built
+__pgq_path_catalog	built
+
+query TT
+SELECT artifact, status FROM pgq_abi_drop('g') ORDER BY ALL;
+----
+__pg_g__P__K__P	dropped
+
+statement ok
+DETACH lake;

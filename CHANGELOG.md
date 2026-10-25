@@ -87,6 +87,8 @@ In every such case the old rows were wrong.
 - **The extension builds them itself:** `pgq_abi_build`, `pgq_abi_sql`, `pgq_abi_status` and `pgq_abi_drop`
   produce edge, fixed-path, transitive-closure, witness, chain, branch-summary and reverse tables. Parity with the
   dwh layout compiler is proven statement by statement.
+- **`PRAGMA pgq_abi_build` / `PRAGMA pgq_abi_drop`** build and drop in one transaction on the caller's connection:
+  atomic, and the way to build into a DuckLake with a SQLite catalog.
 - **`CREATE PROPERTY GRAPH … WITH ABI (…)`** declares the build on the graph.
 - **`pgq_abi_mode`** (`consume` by default, `auto`, `off`) decides whether `CREATE` builds tables implicitly.
 - **Freshness against DuckLake snapshots:** a table built from data that changed since is left out

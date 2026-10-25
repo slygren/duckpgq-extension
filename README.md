@@ -216,6 +216,12 @@ FROM pgq_abi_drop('social');        -- drop the artifacts and their catalog rows
 - **How a build runs:** statement by statement, each in its own transaction, on an internal connection. A failed
   build removes the graph's catalog rows, so queries traverse instead of failing on a missing table; a rebuild drops
   artifacts it no longer produces.
+- **In one transaction, on your connection:** `PRAGMA pgq_abi_build('social', max_hops = 3)` (named options with `=`)
+  runs the same statements in place of the PRAGMA, as one transaction: a failure leaves nothing of the build, and the
+  artifacts and catalog rows from before stand. It returns the graph's catalog rows. Use it where a second connection
+  cannot write while yours reads: a DuckLake whose catalog is a SQLite file, when the lake is in use (`USE lake`,
+  where the table function refuses with a message naming the PRAGMA; without the USE the table function works there
+  too). `PRAGMA pgq_abi_drop('social')` is the same for dropping.
 - **Options** (`max_hops`, `closures`, `exclude_paths`, `branch_summaries`, `reverse_twins`, `cover`, `max_rows`,
   metadata, DuckLake row-group size and partitioning) are documented in
   [docs/duckdb_v2.md](docs/duckdb_v2.md#abi-artifacts).
@@ -418,7 +424,10 @@ extensions the repository does not publish.
 | wasm extension (`make wasm_eh`) | `build/wasm_eh/extension/duckpgq/duckpgq.duckdb_extension.wasm` |
 
 The SQL logic tests are in [test/sql](test/sql) (127 files, about 7,500 assertions); each activates the grammar
-itself. ABI building is covered by [test/sql/abi/abi_build.test](test/sql/abi/abi_build.test). One test:
+itself. ABI building is covered by [test/sql/abi/abi_build.test](test/sql/abi/abi_build.test); building into a
+DuckLake with a SQLite catalog by [abi_build_sqlite_ducklake.test](test/sql/abi/abi_build_sqlite_ducklake.test), which
+runs only with `DUCKPGQ_TEST_EXTENSION_DIR` set to a directory holding the v2.0.0 `ducklake` and `sqlite_scanner`
+extensions (e.g. `~/.duckdb/extensions/v2.0.0/osx_arm64` after `INSTALL ducklake; INSTALL sqlite`). One test:
 `make test T=test/sql/pattern_matching/undirected_edges.test`. Lint: `make tidy-check`.
 
 Source layout: the grammar is in [src/core/parser](src/core/parser) (`grammar/*.gram` plus the transformers); the
@@ -446,8 +455,8 @@ building in [abi_build.cpp](src/core/functions/table/abi_build.cpp); vertex-join
 - **ABI rewrites** cover the common path shapes, not every pattern. Fixed-length chains longer than three hops, and
   chains with an undirected hop between two different vertex tables or an edge variable on an undirected hop,
   traverse. Choosing between several matching artifacts is simple.
-- **`pgq_abi_build` on a SQLite-backed DuckLake catalog** fails (the build's connection and the caller's contend
-  for the file); run the statements from `pgq_abi_sql` on the caller's connection instead.
+- **`FROM pgq_abi_build` on a DuckLake with a SQLite catalog** refuses while the calling statement reads that lake
+  (after `USE lake`): use `PRAGMA pgq_abi_build`, which builds in one transaction on the caller's connection.
 - **CHEAPEST with a cost that varies by edge** takes one quantified edge between two vertices, whose `COST` reads
   only that edge's properties and that has no element `WHERE`. Without an upper bound the edge must be
   right-directed and quantified with `+` or `*`; with one (`{1,3}`, `{2,5}`, …) any direction works.
