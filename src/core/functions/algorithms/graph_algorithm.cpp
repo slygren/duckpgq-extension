@@ -480,6 +480,7 @@ void CoreGraphAlgorithms::Register(ExtensionLoader &loader) {
 	RegisterLabelPropagation(loader);
 	RegisterLouvain(loader);
 	RegisterKCore(loader);
+	RegisterShortestPathLengths(loader);
 }
 
 } // namespace duckdb

@@ -177,6 +177,7 @@ private:
 	static void RegisterLabelPropagation(ExtensionLoader &loader);
 	static void RegisterLouvain(ExtensionLoader &loader);
 	static void RegisterKCore(ExtensionLoader &loader);
+	static void RegisterShortestPathLengths(ExtensionLoader &loader);
 };
 
 } // namespace duckdb

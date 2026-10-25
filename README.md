@@ -308,6 +308,7 @@ FROM betweenness_centrality('social', 'Person', 'Knows', k := 256, seed := 7, no
 FROM label_propagation('social', 'Person', 'Knows', seed := 7, max_iterations := 100);
 FROM louvain('social', 'Person', 'Knows', resolution := 1.0, seed := 7);
 FROM k_core('social', 'Person', 'Knows');
+FROM shortest_path_lengths('social', 'Person', 'Knows', 42, directed := true);   -- 42 = the source's key
 ```
 
 How each function reads the edges (n vertices, m edges):
@@ -321,6 +322,7 @@ How each function reads the edges (n vertices, m edges):
 | `label_propagation(g, v, e, seed, max_iterations)` | undirected | ignored | count once | `community BIGINT` | O(m) per round |
 | `louvain(g, v, e, resolution, seed)` | undirected, unweighted | ignored | count once | `community BIGINT` | O(m) per pass, typically O(m log n) |
 | `k_core(g, v, e)` | undirected | ignored | count once | `core_number BIGINT` | O(n + m) |
+| `shortest_path_lengths(g, v, e, source, directed)` | directed (default) or undirected | no effect | no effect | `distance BIGINT`, reachable vertices only | O(n + m) |
 
 - **`strongly_connected_component`**: Tarjan's algorithm, iterative, so long chains are no problem. Two vertices
   share a `componentId` when each reaches the other. The id is the smallest rowid among the component's vertices,
@@ -354,6 +356,10 @@ How each function reads the edges (n vertices, m edges):
   has at least k neighbours, computed by Batagelj-Zaversnik bucket peeling. The k-core is
   `WHERE core_number >= k`. `networkx.core_number` refuses graphs with self-loops; here they are dropped, which gives
   NetworkX's answer for the graph without them.
+- **`shortest_path_lengths`**: hop distances by BFS from the vertex whose key is `source`, of any key type. Only
+  vertices the source reaches are returned, the source itself at 0, as in
+  `networkx.single_source_shortest_path_length`. `directed := false` ignores edge direction. An unknown or NULL
+  source key is an error. For paths themselves, or weighted costs, use `MATCH ... ANY SHORTEST` / `CHEAPEST`.
 
 `scripts/compare_graph_algorithms.py` compares every function with NetworkX (or a brute force) on generated graphs:
 directed and undirected readings, disconnected parts, self-loops, parallel and reciprocal edges, empty edge and vertex
