@@ -157,6 +157,33 @@ FROM GRAPH_TABLE (bad_g MATCH p = ANY CHEAPEST (a:Person)-[e:Bad COST CAST(e.w A
 ----
 costs that are not negative
 
+# The bounded search refuses them too
+statement error
+FROM GRAPH_TABLE (bad_g MATCH p = ANY CHEAPEST (a:Person)-[e:Bad COST e.w]->{1,3}(b:Person) COLUMNS (COST(p) AS c));
+----
+costs that are not negative
+
+statement error
+FROM GRAPH_TABLE (bad_g MATCH p = ALL CHEAPEST (a:Person)-[e:Bad COST e.w]->{1,3}(b:Person) COLUMNS (b.id));
+----
+costs that are not negative
+
+# A zero cost is a cost
+statement ok
+UPDATE bad SET w = 0 WHERE src = 1;
+
+query III rowsort
+FROM GRAPH_TABLE (bad_g MATCH p = ANY CHEAPEST (a:Person)-[e:Bad COST e.w]->+(b:Person) COLUMNS (a.id, b.id, COST(p) AS c));
+----
+0	1	1.0
+1	0	0.0
+
+query III rowsort
+FROM GRAPH_TABLE (bad_g MATCH p = ANY CHEAPEST (a:Person)-[e:Bad COST e.w]->{1,2}(b:Person) COLUMNS (a.id, b.id, COST(p) AS c));
+----
+0	1	1.0
+1	0	0.0
+
 statement ok
 UPDATE bad SET w = 'nan'::DOUBLE WHERE src = 1;
 
@@ -165,11 +192,21 @@ FROM GRAPH_TABLE (bad_g MATCH p = ANY CHEAPEST (a:Person)-[e:Bad COST e.w]->+(b:
 ----
 finite costs
 
+statement error
+FROM GRAPH_TABLE (bad_g MATCH p = ANY CHEAPEST (a:Person)-[e:Bad COST e.w]->{1,2}(b:Person) COLUMNS (COST(p) AS c));
+----
+finite costs
+
 statement ok
 UPDATE bad SET w = 'inf'::DOUBLE WHERE src = 1;
 
 statement error
 FROM GRAPH_TABLE (bad_g MATCH p = ANY CHEAPEST (a:Person)-[e:Bad COST e.w]->+(b:Person) COLUMNS (COST(p) AS c));
+----
+finite costs
+
+statement error
+FROM GRAPH_TABLE (bad_g MATCH p = ANY CHEAPEST (a:Person)-[e:Bad COST e.w]->{1,2}(b:Person) COLUMNS (COST(p) AS c));
 ----
 finite costs
 
@@ -228,9 +265,9 @@ FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST 1]->+(b:Perso
 ----
 E	[0, 3, 4]
 
-# ── Shapes a cost that varies cannot answer, refused rather than answered by the hop-count search ────────────────
+# ── The path is the cheapest one, whatever is asked of it (see cheapest_paths.test for the brute-force checks) ──────
 
-# Endpoint pairs alone are right
+# Endpoint pairs alone
 query T
 FROM GRAPH_TABLE (g MATCH ANY CHEAPEST (a:Person)-[e:Link COST e.w]->{2,3}(b:Person) WHERE a.name = 'A' COLUMNS (b.name))
 ORDER BY ALL;
@@ -238,27 +275,39 @@ ORDER BY ALL;
 D
 E
 
-statement error
-FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person) COLUMNS (vertices(p)));
+# A->D directly (0.6) is cheaper than A->B->D (0.9) and A->C->D (1.5)
+query TRIT
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person) WHERE a.name = 'A'
+    COLUMNS (b.name, round(COST(p), 9) AS c, path_length(p) AS len, vertices(p) AS vs)) ORDER BY ALL;
 ----
-Only COST(p) is supported
+B	0.45	1	[0, 1]
+C	1.4	1	[0, 2]
+D	0.6	1	[0, 3]
+E	2.85	2	[0, 3, 4]
 
-statement error
-FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person) COLUMNS (path_length(p)));
+# In two or three hops, A->B->D (0.9) is the cheapest to D
+query TRT
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->{2,3}(b:Person) WHERE a.name = 'A'
+    COLUMNS (b.name, round(COST(p), 9) AS c, vertices(p) AS vs)) ORDER BY ALL;
 ----
-Only COST(p) is supported
+D	0.9	[0, 1, 3]
+E	2.85	[0, 3, 4]
 
-statement error
-FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person) COLUMNS (b.name));
+query TT
+FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST e.i]->+(b:Person) WHERE a.name = 'A' AND b.name = 'E'
+    COLUMNS (b.name, vertices(p) AS vs)) ORDER BY ALL;
 ----
-ALL CHEAPEST with a COST that is not the same positive constant
+E	[0, 3, 4]
 
-statement error
-FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person) ONE ROW PER VERTEX (v) COLUMNS (v.name));
+query T
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person) ONE ROW PER VERTEX (v)
+    WHERE a.name = 'A' AND b.name = 'E' COLUMNS (v.name));
 ----
-ONE ROW PER is not supported
+A
+D
+E
 
-# Two edges, or two different constants: the cost is not one search
+# Two edges, or two different constants: not one search
 statement error
 FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->(m:Person)-[f:Link COST f.w]->+(b:Person)
     COLUMNS (COST(p)));
@@ -271,26 +320,33 @@ FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 1]->(m:Person
 ----
 supports one quantified edge between two vertices
 
-# COST(p) is the cheapest cost over any number of hops from at most one hop up
-statement error
-FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->{1,2}(b:Person) COLUMNS (COST(p)));
-----
-COST(p) supports one right-directed edge
-
+# Without an upper bound the search goes forward from at most one hop up
 statement error
 FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->{2,}(b:Person) COLUMNS (COST(p)));
 ----
-COST(p) supports one right-directed edge
-
-statement error
-FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 1]->{2,}(b:Person) COLUMNS (COST(p)));
-----
-COST(p) supports one right-directed edge
+CHEAPEST without an upper bound supports a right-directed edge
 
 statement error
 FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)<-[e:Link COST e.w]-+(b:Person) COLUMNS (COST(p)));
 ----
-COST(p) supports one right-directed edge
+CHEAPEST without an upper bound supports a right-directed edge
+
+# COST(p) of a constant cost is a search over those costs, without bounds
+statement error
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 1]->{2,}(b:Person) COLUMNS (COST(p)));
+----
+COST(p) of a constant COST supports one right-directed edge
+
+# A COST reads its own edge; an element WHERE on the costed edge is not supported
+statement error
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST a.id]->+(b:Person) COLUMNS (COST(p)));
+----
+may only read properties of its own edge
+
+statement error
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link WHERE e.i > 1 COST e.w]->+(b:Person) COLUMNS (COST(p)));
+----
+element WHERE on the costed edge
 
 # COST(p) of a path that is not chosen by cost
 statement error
@@ -319,7 +375,7 @@ FROM GRAPH_TABLE (g MATCH
     q = ANY CHEAPEST (c:Person)-[f:Link COST 1]->+(d:Person)
     COLUMNS (COST(p) AS cp, COST(q) AS cq));
 ----
-must search the same edge label with the same COST
+<REGEX>:.*(must search the same edge label|must be the only variable-length pattern).*
 
 # COST belongs on edges
 statement error
@@ -368,7 +424,7 @@ E	1.0
 statement error
 FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 0.5]->{1,3}(b:Person) COLUMNS (COST(p) AS c));
 ----
-COST(p) supports one right-directed edge
+COST(p) of a constant COST supports one right-directed edge
 
 # A cost that varies is traversed, artifacts or not, and answers the same
 query TR
@@ -385,3 +441,35 @@ SELECT count(*) FROM pgq_last_rewrite_diagnostics()
 WHERE status = 'selected' AND (rewrite_type LIKE 'tc%' OR rewrite_type = 'transitive_closure');
 ----
 0
+
+# ── A search honours max_execution_time ─────────────────────────────────────────────────────────────────────────────
+# A chain stored against the vertex order makes every pass of the search, and every BFS level, advance one vertex.
+
+statement ok
+CREATE TABLE chain_v(id BIGINT);
+
+statement ok
+INSERT INTO chain_v SELECT i FROM range(30000) r(i);
+
+statement ok
+CREATE TABLE chain_e(src BIGINT, dst BIGINT, w BIGINT);
+
+statement ok
+INSERT INTO chain_e SELECT i + 1, i, 1 FROM range(29999) r(i);
+
+statement ok
+CREATE PROPERTY GRAPH chain
+VERTEX TABLES (chain_v LABEL V)
+EDGE TABLES (chain_e SOURCE KEY (src) REFERENCES chain_v (id) DESTINATION KEY (dst) REFERENCES chain_v (id) LABEL E);
+
+statement ok
+SET max_execution_time = 500;
+
+statement error
+SELECT count(*) FROM GRAPH_TABLE (chain MATCH p = ANY CHEAPEST (a:V)-[e:E COST e.w]->+(b:V) WHERE a.id >= 29000 AND b.id = 0
+    COLUMNS (vertices(p) AS vs, COST(p) AS c));
+----
+maximum execution time
+
+statement ok
+SET max_execution_time = 0;

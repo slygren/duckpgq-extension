@@ -2841,6 +2841,74 @@ static unique_ptr<ParsedExpression> CreatePathModeCondition(PGQPathMode mode, co
 	}
 }
 
+//! The COST of an edge, with its DEFAULT where it is NULL. An integer DEFAULT keeps integer costs integers.
+static unique_ptr<ParsedExpression> CostWithDefault(const SubPath &edge) {
+	auto cost = edge.cost_expr->Copy();
+	if (!edge.has_default) {
+		return cost;
+	}
+	auto value = edge.default_value;
+	auto integral = value == std::floor(value) && std::fabs(value) < 9.0e18;
+	auto result = make_uniq<OperatorExpression>(ExpressionType::OPERATOR_COALESCE);
+	result->GetChildrenMutable().push_back(std::move(cost));
+	result->GetChildrenMutable().push_back(ConstantExpression::FromValue(
+	    integral ? Value::BIGINT(static_cast<int64_t>(value)) : Value::DOUBLE(value)));
+	return std::move(result);
+}
+
+static unique_ptr<ParsedExpression> RebindColumnAlias(unique_ptr<ParsedExpression> expr, const string &from_alias,
+                                                      const string &to_alias);
+
+//! pgq_cost(<the edge's COST, over the edge row named alias>): one step's cost, BIGINT or DOUBLE, validated.
+static unique_ptr<ParsedExpression> EdgeCostExpr(const SubPath &edge, const string &alias) {
+	auto &element = reinterpret_cast<const PathElement &>(*edge.path_list[0]);
+	vector<unique_ptr<ParsedExpression>> children;
+	children.push_back(RebindColumnAlias(CostWithDefault(edge), element.variable_binding, alias));
+	return make_uniq<FunctionExpression>("pgq_cost", std::move(children));
+}
+
+//! A zero of the type the edge's costs have, for the anchor of a recursive CTE, which types the cost column:
+//! pgq_cost_zero((SELECT <cost> FROM <edges> LIMIT 0)). The probe holds the raw COST: DuckDB may compute a scalar
+//! subquery's select list over the rows the LIMIT then drops, and a NULL row besides, so nothing in it may refuse one.
+static unique_ptr<ParsedExpression> ZeroCostExpr(const SubPath &edge, const shared_ptr<PropertyGraphTable> &edge_table) {
+	auto &element = reinterpret_cast<const PathElement &>(*edge.path_list[0]);
+	auto probe = make_uniq<SelectNode>();
+	probe->select_list.push_back(RebindColumnAlias(CostWithDefault(edge), element.variable_binding, "__pgq_cost_probe"));
+	probe->from_table = edge_table->CreateBaseTableRef("__pgq_cost_probe");
+	auto no_rows = make_uniq<LimitModifier>();
+	no_rows->limit = ConstantExpression::FromValue(Value::BIGINT(0));
+	probe->modifiers.push_back(std::move(no_rows));
+	auto statement = make_uniq<SelectStatement>();
+	statement->node = std::move(probe);
+	auto subquery = make_uniq<SubqueryExpression>();
+	subquery->GetSubqueryTypeMutable() = SubqueryType::SCALAR;
+	subquery->SubqueryMutable() = std::move(statement);
+	vector<unique_ptr<ParsedExpression>> children;
+	children.push_back(std::move(subquery));
+	return make_uniq<FunctionExpression>("pgq_cost_zero", std::move(children));
+}
+
+//! (SELECT <cost> FROM <the costed edges> LIMIT 0): no rows, but the COST's type, which makes cheapest_path_length's
+//! result a BIGINT (integer costs) or a DOUBLE.
+static unique_ptr<ParsedExpression> CostTypeProbe(const SubPath &edge, const shared_ptr<PropertyGraphTable> &edge_table,
+                                                  const PathElement &edge_element, const string &prev_binding,
+                                                  const string &next_binding) {
+	auto probe = make_uniq<SelectNode>();
+	probe->select_list.push_back(CostWithDefault(edge));
+	probe->from_table = ::duckdb::GetJoinRef(edge_table, edge_element.variable_binding,
+	                                         EdgeLabelRowFilter(edge_element.label, edge_table), prev_binding,
+	                                         next_binding);
+	auto no_rows = make_uniq<LimitModifier>();
+	no_rows->limit = ConstantExpression::FromValue(Value::BIGINT(0));
+	probe->modifiers.push_back(std::move(no_rows));
+	auto probe_statement = make_uniq<SelectStatement>();
+	probe_statement->node = std::move(probe);
+	auto probe_subquery = make_uniq<SubqueryExpression>();
+	probe_subquery->GetSubqueryTypeMutable() = SubqueryType::SCALAR;
+	probe_subquery->SubqueryMutable() = std::move(probe_statement);
+	return std::move(probe_subquery);
+}
+
 unique_ptr<CommonTableExpressionInfo>
 PGQMatchFunction::GenerateShortestPathCTE(CreatePropertyGraphInfo &pg_table, SubPath *edge_subpath,
                                           PathElement *previous_vertex_element, PathElement *next_vertex_element,
@@ -2865,17 +2933,35 @@ PGQMatchFunction::GenerateShortestPathCTE(CreatePropertyGraphInfo &pg_table, Sub
 	pathfinding_children.push_back(std::move(src_row_id));
 	pathfinding_children.push_back(std::move(dst_row_id));
 
+	// CHEAPEST: the weighted search over the same CSR, and the paths' cost.
+	unique_ptr<ParsedExpression> cost_column;
+	if (edge_subpath->cheapest) {
+		vector<unique_ptr<ParsedExpression>> cost_children;
+		for (auto &child : pathfinding_children) {
+			cost_children.push_back(child->Copy());
+		}
+		cost_children.push_back(CostTypeProbe(*edge_subpath, edge_table, *edge_element,
+		                                      previous_vertex_element->variable_binding,
+		                                      next_vertex_element->variable_binding));
+		cost_column = make_uniq<FunctionExpression>("cheapest_path_length", std::move(cost_children));
+		cost_column->SetAlias(Identifier("cost"));
+	}
+	const string all_function = edge_subpath->cheapest ? "allcheapestpaths" : "allshortestpaths";
+	const string any_function = edge_subpath->cheapest ? "cheapestpath" : "shortestpath";
 	if (all_shortest) {
-		auto all_sp_function = make_uniq<FunctionExpression>("allshortestpaths", std::move(pathfinding_children));
+		auto all_sp_function = make_uniq<FunctionExpression>(Identifier(all_function), std::move(pathfinding_children));
 		vector<unique_ptr<ParsedExpression>> unnest_children;
 		unnest_children.push_back(std::move(all_sp_function));
 		auto unnest_function = make_uniq<FunctionExpression>("unnest", std::move(unnest_children));
 		unnest_function->SetAlias(Identifier("path"));
 		select_node->select_list.push_back(std::move(unnest_function));
 	} else {
-		auto shortest_path_function = make_uniq<FunctionExpression>("shortestpath", std::move(pathfinding_children));
+		auto shortest_path_function = make_uniq<FunctionExpression>(Identifier(any_function), std::move(pathfinding_children));
 		shortest_path_function->SetAlias(Identifier("path"));
 		select_node->select_list.push_back(std::move(shortest_path_function));
+	}
+	if (cost_column) {
+		select_node->select_list.push_back(std::move(cost_column));
 	}
 	auto src_rowid_outer_select = PGQColRef("rowid", previous_vertex_element->variable_binding);
 	src_rowid_outer_select->SetAlias(Identifier("src_rowid"));
@@ -2921,7 +3007,7 @@ static void AddBoundedORPRecursiveCTE(unique_ptr<SelectNode> &select_node, const
                                       const shared_ptr<PropertyGraphTable> &edge_table, idx_t lower, idx_t upper,
                                       unique_ptr<ParsedExpression> anchor_filter, bool reverse = false,
                                       PGQPathSelector selector = PGQPathSelector::WALK, bool undirected = false,
-                                      const string &edge_label = string());
+                                      const string &edge_label = string(), const SubPath *cost_edge = nullptr);
 
 unique_ptr<ParsedExpression> PGQMatchFunction::CreatePathFindingFunction(
     vector<unique_ptr<PathReference>> &path_list, CreatePropertyGraphInfo &pg_table, const string &path_variable,
@@ -2962,7 +3048,8 @@ unique_ptr<ParsedExpression> PGQMatchFunction::CreatePathFindingFunction(
 		auto edge_element = GetPathElement(path_list[idx_i]);
 		if (!edge_element) {
 			auto edge_subpath = reinterpret_cast<SubPath *>(path_list[idx_i].get());
-			if (edge_subpath->upper > 1) {
+			// A single hop chosen by cost is a path search too: it picks the cheapest of the parallel edges.
+			if (edge_subpath->upper > 1 || edge_subpath->cheapest) {
 				// (un)bounded shortest path
 				// Add the shortest path UDF as a CTE
 				// The source's own predicates, from its element WHERE and the MATCH WHERE: they seed the path
@@ -2996,7 +3083,9 @@ unique_ptr<ParsedExpression> PGQMatchFunction::CreatePathFindingFunction(
 				// The undirected CSR merges parallel edges (a pair stored twice, or once each way), which
 				// changes the number of shortest paths but not whether one exists: ALL SHORTEST needs
 				// a directed CSR, ANY SHORTEST takes either.
+				// CHEAPEST: the weighted CSR search has no hop bounds, so a bounded quantifier enumerates its paths.
 				const bool csr_exact =
+				    edge_subpath->cheapest ? edge_subpath->upper >= static_cast<int64_t>(1 << 30) :
 				    edge_subpath->lower <= 1 &&
 				    ((selector == PGQPathSelector::ANY_SHORTEST &&
 				      (edge_element->match_type == PGQMatchType::MATCH_EDGE_RIGHT ||
@@ -3026,7 +3115,7 @@ unique_ptr<ParsedExpression> PGQMatchFunction::CreatePathFindingFunction(
 						                          static_cast<idx_t>(edge_subpath->upper), std::move(anchor_filter),
 						                          edge_element->match_type == PGQMatchType::MATCH_EDGE_LEFT, selector,
 						                          edge_element->match_type == PGQMatchType::MATCH_EDGE_ANY,
-						                          edge_element->label);
+						                          edge_element->label, edge_subpath->cheapest ? edge_subpath : nullptr);
 						auto path_ref = make_uniq<BaseTableRef>();
 						path_ref->SetTable(Identifier("shortest_path_cte"));
 						if (!final_select_node->from_table) {
@@ -3066,7 +3155,12 @@ unique_ptr<ParsedExpression> PGQMatchFunction::CreatePathFindingFunction(
 				ClaimCSRSlot(csr_slot, CSREdgeKey(sp_edge_table, edge_element->match_type, edge_element->label),
 				             csr_id_counter);
 				if (final_select_node->cte_map.map.find("cte1") == final_select_node->cte_map.map.end()) {
-					if (edge_element->match_type == PGQMatchType::MATCH_EDGE_RIGHT) {
+					if (edge_subpath->cheapest) {
+						final_select_node->cte_map.map["cte1"] = CreateWeightedDirectedCSRCTE(
+						    sp_edge_table, previous_vertex_element->variable_binding, edge_element->variable_binding,
+						    next_vertex_element->variable_binding, CostWithDefault(*edge_subpath), csr_slot.slot,
+						    sp_edge_filter);
+					} else if (edge_element->match_type == PGQMatchType::MATCH_EDGE_RIGHT) {
 						final_select_node->cte_map.map["cte1"] = CreateDirectedCSRCTE(
 						    sp_edge_table, previous_vertex_element->variable_binding, edge_element->variable_binding,
 						    next_vertex_element->variable_binding, csr_slot.slot, sp_edge_filter);
@@ -3273,7 +3367,16 @@ static PGQStepEdges StepEdges(const shared_ptr<PropertyGraphTable> &edge_table, 
 
 // The selector, applied to enumerated paths of one endpoint pair: ANY SHORTEST keeps one of the
 // shortest, ALL SHORTEST every shortest, a walk pattern every path.
-static string SelectorQualify(PGQPathSelector selector, const string &src_col, const string &dst_col) {
+static string SelectorQualify(PGQPathSelector selector, const string &src_col, const string &dst_col,
+                              bool by_cost = false) {
+	// CHEAPEST: the selector by cost. Ties of ANY are broken by length, then by path, so the answer is stable.
+	if (by_cost && selector == PGQPathSelector::ANY_SHORTEST) {
+		return StringUtil::Format(" QUALIFY row_number() OVER (PARTITION BY %s, %s ORDER BY cost, depth, path) = 1",
+		                          src_col, dst_col);
+	}
+	if (by_cost && selector == PGQPathSelector::ALL_SHORTEST) {
+		return StringUtil::Format(" QUALIFY cost = min(cost) OVER (PARTITION BY %s, %s)", src_col, dst_col);
+	}
 	if (selector == PGQPathSelector::ANY_SHORTEST) {
 		return StringUtil::Format(" QUALIFY row_number() OVER (PARTITION BY %s, %s ORDER BY depth) = 1", src_col,
 		                          dst_col);
@@ -3295,7 +3398,8 @@ static void AddBoundedORPRecursiveCTE(unique_ptr<SelectNode> &select_node, const
                                       const string &next_binding,
                                       const shared_ptr<PropertyGraphTable> &edge_table, idx_t lower, idx_t upper,
                                       unique_ptr<ParsedExpression> anchor_filter, bool reverse,
-                                      PGQPathSelector selector, bool undirected, const string &edge_label) {
+                                      PGQPathSelector selector, bool undirected, const string &edge_label,
+                                      const SubPath *cost_edge) {
 	// ONE ROW PER cannot be made key-based the way the reachability CTE was. Its `path` is
 	// an interleaved list of rowids that BuildORPStepsCTE unnests and rejoins to the vertex
 	// and edge tables BY ROWID, and for a cross-table edge the v1 and v2 of ONE ROW PER STEP
@@ -3357,6 +3461,12 @@ static void AddBoundedORPRecursiveCTE(unique_ptr<SelectNode> &select_node, const
 		auto a_path = make_uniq<FunctionExpression>("list_value", std::move(lv));
 		a_path->SetAlias(Identifier("path"));
 		anchor->select_list.push_back(std::move(a_path));
+	}
+	if (cost_edge) {
+		// CHEAPEST: the cost of the path so far, typed by the edges' costs.
+		auto a_cost = ZeroCostExpr(*cost_edge, edge_table);
+		a_cost->SetAlias(Identifier("cost"));
+		anchor->select_list.push_back(std::move(a_cost));
 	}
 	if (anchor_filter) {
 		anchor->where_clause = std::move(anchor_filter);
@@ -3451,6 +3561,14 @@ static void AddBoundedORPRecursiveCTE(unique_ptr<SelectNode> &select_node, const
 		r_path->SetAlias(Identifier("path"));
 		recursive->select_list.push_back(std::move(r_path));
 	}
+	if (cost_edge) {
+		vector<unique_ptr<ParsedExpression>> add_args;
+		add_args.push_back(PGQColRef("cost", rec_alias));
+		add_args.push_back(EdgeCostExpr(*cost_edge, e_alias));
+		auto r_cost = make_uniq<FunctionExpression>("+", std::move(add_args));
+		r_cost->SetAlias(Identifier("cost"));
+		recursive->select_list.push_back(std::move(r_cost));
+	}
 	{
 		vector<unique_ptr<ParsedExpression>> rec_where;
 		rec_where.push_back(make_uniq<ComparisonExpression>(
@@ -3471,6 +3589,9 @@ static void AddBoundedORPRecursiveCTE(unique_ptr<SelectNode> &select_node, const
 	rec_cte->left = std::move(anchor);
 	rec_cte->right = std::move(recursive);
 	rec_cte->aliases = {"src_rowid", "cur_rowid", "depth", "visited", "path"};
+	if (cost_edge) {
+		rec_cte->aliases.push_back(Identifier("cost"));
+	}
 
 	auto cte_stmt = make_uniq<SelectStatement>();
 	cte_stmt->node = std::move(rec_cte);
@@ -3483,9 +3604,9 @@ static void AddBoundedORPRecursiveCTE(unique_ptr<SelectNode> &select_node, const
 	// "shortest_path_cte" with columns (path, src_rowid, dst_rowid): the paths within the bounds,
 	// then the selector per endpoint pair.
 	const string wrapper_sql = StringUtil::Format(
-	    "SELECT path, src_rowid, cur_rowid AS dst_rowid FROM %s WHERE depth BETWEEN %d AND %d%s",
-	    KeywordHelper::WriteOptionallyQuoted(cte_name), static_cast<int32_t>(lower), static_cast<int32_t>(upper),
-	    SelectorQualify(selector, "src_rowid", "cur_rowid"));
+	    "SELECT path, src_rowid, cur_rowid AS dst_rowid%s FROM %s WHERE depth BETWEEN %d AND %d%s",
+	    cost_edge ? ", cost" : "", KeywordHelper::WriteOptionallyQuoted(cte_name), static_cast<int32_t>(lower),
+	    static_cast<int32_t>(upper), SelectorQualify(selector, "src_rowid", "cur_rowid", cost_edge != nullptr));
 	auto wrapper_info = make_uniq<CommonTableExpressionInfo>();
 	wrapper_info->query_node = std::move(ParseSelectStatement(wrapper_sql)->node);
 	wrapper_info->materialized = CTEMaterialize::CTE_MATERIALIZE_ALWAYS;
@@ -3537,7 +3658,8 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
                                             const shared_ptr<PropertyGraphTable> &edge_table, idx_t lower, idx_t upper,
                                             unique_ptr<ParsedExpression> anchor_filter, PGQPathSelector selector,
                                             bool reverse = false, const PGQABIArtifactScan *abi_edge = nullptr,
-                                            const string &edge_label = string(), bool undirected = false) {
+                                            const string &edge_label = string(), bool undirected = false,
+                                            const SubPath *cost_edge = nullptr) {
 	const bool any_shortest = selector == PGQPathSelector::ANY_SHORTEST;
 	// reverse=true walks edges backwards (for left-directed patterns like
 	// (a)<-[e]-{1,3}(b)): the anchor sits on the edge's *destination* side and each
@@ -3571,6 +3693,9 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 	// of length >= 2 may revisit a vertex where no simple path of that length exists. From a
 	// lower bound of 2 the walk CTE is grouped instead.
 	const bool lean = any_shortest && lower <= 1;
+	// CHEAPEST needs the costs only to pick ALL CHEAPEST's paths: for ANY CHEAPEST every pair with a path within the
+	// bounds is an answer, whichever path is the cheapest.
+	const bool costed = cost_edge && selector == PGQPathSelector::ALL_SHORTEST;
 
 	const auto cte_idx = select_node->cte_map.map.size();
 	const string cte_name = "__rvl_" + std::to_string(cte_idx);
@@ -3606,6 +3731,11 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 		auto a_visited = make_uniq<FunctionExpression>("list_value", std::move(lv));
 		a_visited->SetAlias(Identifier("visited"));
 		anchor->select_list.push_back(std::move(a_visited));
+	}
+	if (costed) {
+		auto a_cost = ZeroCostExpr(*cost_edge, edge_table);
+		a_cost->SetAlias(Identifier("cost"));
+		anchor->select_list.push_back(std::move(a_cost));
 	}
 
 	if (anchor_filter) {
@@ -3659,7 +3789,7 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 	// An ABI artifact holds ONE label path, and it was chosen from the stripped leaf -- so for
 	// `!X` it is X's own artifact. When the expression actually restricts, walk the edge table
 	// and apply the predicate instead of trusting an artifact picked for the wrong label.
-	const bool use_abi_edge = abi_edge && abi_edge->valid && !edge_label_cond && !undirected;
+	const bool use_abi_edge = abi_edge && abi_edge->valid && !edge_label_cond && !undirected && !costed;
 	string step_out_col = use_abi_edge ? (reverse ? "v1" : "v0") : src_fk;
 	string step_in_col = use_abi_edge ? (reverse ? "v0" : "v1") : dst_fk;
 
@@ -3727,6 +3857,14 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 		r_visited->SetAlias(Identifier("visited"));
 		recursive->select_list.push_back(std::move(r_visited));
 	}
+	if (costed) {
+		vector<unique_ptr<ParsedExpression>> add_args;
+		add_args.push_back(PGQColRef("cost", rec_alias));
+		add_args.push_back(EdgeCostExpr(*cost_edge, e_alias));
+		auto r_cost = make_uniq<FunctionExpression>("+", std::move(add_args));
+		r_cost->SetAlias(Identifier("cost"));
+		recursive->select_list.push_back(std::move(r_cost));
+	}
 
 	{
 		vector<unique_ptr<ParsedExpression>> rec_where;
@@ -3754,6 +3892,9 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 	rec_cte->right = std::move(recursive);
 	rec_cte->aliases = lean ? vector<Identifier> {"src_key", "dst_key", "depth"}
 	                        : vector<Identifier> {"src_key", "dst_key", "depth", "visited"};
+	if (costed) {
+		rec_cte->aliases.push_back(Identifier("cost"));
+	}
 
 	auto cte_stmt = make_uniq<SelectStatement>();
 	cte_stmt->node = std::move(rec_cte);
@@ -3831,7 +3972,7 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 		const string sql = StringUtil::Format(
 		    "SELECT src_key, dst_key, depth FROM %s WHERE depth BETWEEN %d AND %d%s",
 		    KeywordHelper::WriteOptionallyQuoted(cte_name), static_cast<int32_t>(lower), static_cast<int32_t>(upper),
-		    SelectorQualify(selector, "src_key", "dst_key"));
+		    SelectorQualify(selector, "src_key", "dst_key", costed));
 		auto asp_info = make_uniq<CommonTableExpressionInfo>();
 		asp_info->query_node = std::move(ParseSelectStatement(sql)->node);
 		select_node->cte_map.map[Identifier(scan_name)] = std::move(asp_info);
@@ -3956,7 +4097,8 @@ static void AddBoundedVLPathFinding(unique_ptr<SelectNode> &select_node,
                                     idx_t lower, idx_t upper, unique_ptr<ParsedExpression> anchor_filter,
                                     PGQPathSelector selector, bool reverse = false,
                                     const PGQABITraversalPlan *abi_plan = nullptr,
-                                    const string &edge_label = string(), bool undirected = false) {
+                                    const string &edge_label = string(), bool undirected = false,
+                                    const SubPath *cost_edge = nullptr) {
 	// An exact-length quantifier backed by a k-hop artifact needs no recursion at all.
 	const string scan_name =
 	    (abi_plan && abi_plan->exact.valid)
@@ -3964,7 +4106,7 @@ static void AddBoundedVLPathFinding(unique_ptr<SelectNode> &select_node,
 	                                     std::move(anchor_filter), reverse)
 	        : BuildBoundedVLReachabilityCTE(select_node, prev_binding, edge_table, lower, upper,
 	                                        std::move(anchor_filter), selector, reverse,
-	                                        abi_plan ? &abi_plan->step : nullptr, edge_label, undirected);
+	                                        abi_plan ? &abi_plan->step : nullptr, edge_label, undirected, cost_edge);
 	const string cte_alias = scan_name + "_scan";
 
 	// ── Add CTE to FROM (cross join) ─────────────────────────────────────────────
@@ -4106,15 +4248,23 @@ void PGQMatchFunction::AddPathFinding(unique_ptr<SelectNode> &select_node,
 	     undirected_one_table) &&
 	    subpath->upper < static_cast<idx_t>(1 << 30)) {
 		// Left-directed (a)<-[e]-{lo,hi}(b): same recursive CTE walked in reverse.
+		// ALL CHEAPEST counts paths by cost, which no artifact holds.
+		const bool all_cheapest = subpath->cheapest && selector == PGQPathSelector::ALL_SHORTEST;
 		AddBoundedVLPathFinding(select_node, conditions, prev_binding, next_binding, edge_table, subpath->lower,
 		                        subpath->upper, std::move(anchor_filter), selector,
-		                        edge_type == PGQMatchType::MATCH_EDGE_LEFT, undirected_one_table ? nullptr : abi_plan,
-		                        edge_label, undirected_one_table);
+		                        edge_type == PGQMatchType::MATCH_EDGE_LEFT,
+		                        undirected_one_table || all_cheapest ? nullptr : abi_plan, edge_label,
+		                        undirected_one_table, subpath->cheapest ? subpath : nullptr);
 		return;
 	}
 
 	// Fallback: CSR+iterativelength for unbounded paths or non-directed edges. The CSR
 	// collides id spaces at ANY depth, not just >= 2, so it is guarded unconditionally.
+	if (subpath->cheapest && (subpath->upper < static_cast<int64_t>(1 << 30) || edge_type != PGQMatchType::MATCH_EDGE_RIGHT)) {
+		// The weighted CSR search knows neither hop bounds nor these directions.
+		throw NotImplementedException("CHEAPEST with an upper bound is not supported over this edge (an undirected "
+		                              "edge between two vertex tables)");
+	}
 	RejectCrossTableCSR(edge_table, subpath->lower, subpath->upper);
 	const auto edge_filter = EdgeLabelRowFilter(edge_label, edge_table);
 	// One slot per select node, shared with the iterativelength() call below and with any
@@ -4123,7 +4273,13 @@ void PGQMatchFunction::AddPathFinding(unique_ptr<SelectNode> &select_node,
 	// table is refused rather than silently answered from this one's CSR.
 	ClaimCSRSlot(csr_slot, CSREdgeKey(edge_table, edge_type, edge_label), csr_id_counter);
 	if (select_node->cte_map.map.find("cte1") == select_node->cte_map.map.end()) {
-		if (edge_type == PGQMatchType::MATCH_EDGE_RIGHT) {
+		if (subpath->cheapest) {
+			// CHEAPEST: the CSR carries the costs (and refuses invalid ones) even where reachability is all that is
+			// asked, so every CHEAPEST query sees the same costs.
+			select_node->cte_map.map["cte1"] = CreateWeightedDirectedCSRCTE(
+			    edge_table, prev_binding, edge_binding, next_binding, CostWithDefault(*subpath), csr_slot.slot,
+			    edge_filter);
+		} else if (edge_type == PGQMatchType::MATCH_EDGE_RIGHT) {
 			select_node->cte_map.map["cte1"] = CreateDirectedCSRCTE(edge_table, prev_binding, edge_binding,
 			                                                       next_binding, csr_slot.slot, edge_filter);
 		} else if (edge_type == PGQMatchType::MATCH_EDGE_ANY) {
@@ -4637,21 +4793,6 @@ static void FoldStaticPathFunctions(MatchExpression &match_ref, vector<unique_pt
 }
 
 // True when an expression still reads the named path itself: p, or a function of p.
-//! The COST of an edge, with its DEFAULT where it is NULL. An integer DEFAULT keeps integer costs integers.
-static unique_ptr<ParsedExpression> CostWithDefault(const SubPath &edge) {
-	auto cost = edge.cost_expr->Copy();
-	if (!edge.has_default) {
-		return cost;
-	}
-	auto value = edge.default_value;
-	auto integral = value == std::floor(value) && std::fabs(value) < 9.0e18;
-	auto result = make_uniq<OperatorExpression>(ExpressionType::OPERATOR_COALESCE);
-	result->GetChildrenMutable().push_back(std::move(cost));
-	result->GetChildrenMutable().push_back(ConstantExpression::FromValue(
-	    integral ? Value::BIGINT(static_cast<int64_t>(value)) : Value::DOUBLE(value)));
-	return std::move(result);
-}
-
 static bool ReferencesPathVariable(const ParsedExpression &expression, const string &path_variable) {
 	auto *column_ref = dynamic_cast<const ColumnRefExpression *>(&expression);
 	if (column_ref) {
@@ -4692,6 +4833,8 @@ static unique_ptr<ParsedExpression> ReplaceCostCalls(unique_ptr<ParsedExpression
 	return expression;
 }
 
+static bool UsesPathOutsideCost(ParsedExpression &expression, const string &path_variable);
+
 void PGQMatchFunction::CheckNamedSubpath(SubPath &subpath, MatchExpression &original_ref,
                                          CreatePropertyGraphInfo &pg_table, unique_ptr<SelectNode> &final_select_node,
                                          vector<unique_ptr<ParsedExpression>> &conditions, int32_t &csr_id_counter,
@@ -4727,6 +4870,24 @@ void PGQMatchFunction::CheckNamedSubpath(SubPath &subpath, MatchExpression &orig
 			                      subpath.path_variable);
 		}
 		auto edge_table = ResolveTable(edge_elem->label, edge_elem->match_type, pg_table);
+		// Where the paths themselves are materialised (bounds, ALL CHEAPEST, ONE ROW PER, the other path functions),
+		// the cost is the materialised path's, so that it always describes the same path.
+		bool materialised = edge_sub->cheapest &&
+		                    (edge_sub->upper < static_cast<int64_t>(1 << 30) || all_shortest ||
+		                     original_ref.one_row_per != OneRowPerMode::NONE ||
+		                     (original_ref.where_clause &&
+		                      UsesPathOutsideCost(*original_ref.where_clause, subpath.path_variable)));
+		for (auto &column : original_ref.column_list) {
+			// The column being rewritten has been moved out of the list.
+			materialised = materialised ||
+			               (edge_sub->cheapest && column && UsesPathOutsideCost(*column, subpath.path_variable));
+		}
+		if (materialised) {
+			CreatePathFindingFunction(subpath.path_list, pg_table, subpath.path_variable, final_select_node,
+			                          conditions, csr_id_counter, csr_slot, all_shortest, any_shortest,
+			                          original_ref.where_clause.get());
+			return PGQColRef("cost", "shortest_path_cte");
+		}
 		// Build weighted CSR CTE if not already built.
 		if (final_select_node->cte_map.map.find("cte1") == final_select_node->cte_map.map.end()) {
 			if (edge_elem->match_type != PGQMatchType::MATCH_EDGE_RIGHT) {
@@ -4749,22 +4910,8 @@ void PGQMatchFunction::CheckNamedSubpath(SubPath &subpath, MatchExpression &orig
 		                                 PGQStr(edge_table->source_pk[0])));
 		cpl_args.push_back(PGQColRef("rowid", prev_elem->variable_binding));
 		cpl_args.push_back(PGQColRef("rowid", next_elem->variable_binding));
-		// (SELECT <cost> FROM <the costed edges> LIMIT 0): no rows, but the COST's type, which is what makes the
-		// cost a BIGINT (integer costs) or a DOUBLE.
-		auto probe = make_uniq<SelectNode>();
-		probe->select_list.push_back(CostWithDefault(*edge_sub));
-		probe->from_table =
-		    ::duckdb::GetJoinRef(edge_table, edge_elem->variable_binding, EdgeLabelRowFilter(edge_elem->label, edge_table),
-		               prev_elem->variable_binding, next_elem->variable_binding);
-		auto no_rows = make_uniq<LimitModifier>();
-		no_rows->limit = ConstantExpression::FromValue(Value::BIGINT(0));
-		probe->modifiers.push_back(std::move(no_rows));
-		auto probe_statement = make_uniq<SelectStatement>();
-		probe_statement->node = std::move(probe);
-		auto probe_subquery = make_uniq<SubqueryExpression>();
-		probe_subquery->GetSubqueryTypeMutable() = SubqueryType::SCALAR;
-		probe_subquery->SubqueryMutable() = std::move(probe_statement);
-		cpl_args.push_back(std::move(probe_subquery));
+		cpl_args.push_back(CostTypeProbe(*edge_sub, edge_table, *edge_elem, prev_elem->variable_binding,
+		                                 next_elem->variable_binding));
 		return make_uniq<FunctionExpression>("cheapest_path_length", std::move(cpl_args));
 	};
 	for (auto &column : original_ref.column_list) {
@@ -5034,7 +5181,7 @@ void PGQMatchFunction::ProcessPathList(ClientContext &context, vector<unique_ptr
 				                        next_vertex_element->variable_binding, previous_vertex_table,
 				                        next_vertex_table, edge_tbls, undirected, edge_subpath->lower,
 				                        edge_subpath->upper);
-			} else if (edge_subpath->upper > 1) {
+			} else if (edge_subpath->upper > 1 || edge_subpath->cheapest) {
 				if (original_ref.one_row_per != OneRowPerMode::NONE) {
 					// ONE ROW PER: produce path lists for per-step unnesting.
 					// For finite bounded directed edges use a recursive CTE (avoids full CSR read).
@@ -5068,14 +5215,28 @@ void PGQMatchFunction::ProcessPathList(ClientContext &context, vector<unique_ptr
 							                          edge_element->match_type == PGQMatchType::MATCH_EDGE_LEFT,
 							                          orp_selector,
 							                          edge_element->match_type == PGQMatchType::MATCH_EDGE_ANY,
-							                          edge_element->label);
+							                          edge_element->label,
+							                          edge_subpath->cheapest ? edge_subpath : nullptr);
 						} else {
 							// CSR fallback for unbounded or undirected ONE ROW PER.
 							if (final_select_node->cte_map.map.find("cte1") ==
 							    final_select_node->cte_map.map.end()) {
 								const auto orp_edge_filter =
 								    EdgeLabelRowFilter(edge_element->label, edge_table);
-								if (edge_element->match_type == PGQMatchType::MATCH_EDGE_RIGHT) {
+								if (edge_subpath->cheapest) {
+									if (edge_element->match_type != PGQMatchType::MATCH_EDGE_RIGHT ||
+									    edge_subpath->upper < static_cast<int64_t>(1 << 30)) {
+										throw NotImplementedException(
+										    "ONE ROW PER with CHEAPEST is not supported for this edge direction");
+									}
+									ClaimCSRSlot(csr_slot,
+									             CSREdgeKey(edge_table, edge_element->match_type, edge_element->label),
+									             csr_id_counter);
+									final_select_node->cte_map.map["cte1"] = CreateWeightedDirectedCSRCTE(
+									    edge_table, previous_vertex_element->variable_binding,
+									    edge_element->variable_binding, next_vertex_element->variable_binding,
+									    CostWithDefault(*edge_subpath), csr_slot.slot, orp_edge_filter);
+								} else if (edge_element->match_type == PGQMatchType::MATCH_EDGE_RIGHT) {
 									ClaimCSRSlot(csr_slot,
 									             CSREdgeKey(edge_table, edge_element->match_type, edge_element->label),
 									             csr_id_counter);
@@ -10322,12 +10483,28 @@ static SubPath *SingleQuantifiedEdge(const vector<unique_ptr<PathReference>> &el
 	return element && element->match_type != PGQMatchType::MATCH_VERTEX ? edge : nullptr;
 }
 
+//! Whether every column the COST reads is a property of its own edge (constants and functions of them aside).
+static bool CostReadsOnlyEdge(const ParsedExpression &expression, const string &edge_variable) {
+	if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY ||
+	    expression.GetExpressionClass() == ExpressionClass::LAMBDA ||
+	    expression.GetExpressionClass() == ExpressionClass::STAR) {
+		return false;
+	}
+	if (expression.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+		auto &names = expression.Cast<ColumnRefExpression>().ColumnNames();
+		return names.size() == 2 && StringUtil::CIEquals(PGQStr(names[0]), edge_variable);
+	}
+	bool only_edge = true;
+	ParsedExpressionIterator::EnumerateChildren(expression, [&](const ParsedExpression &child) {
+		only_edge = only_edge && CostReadsOnlyEdge(child, edge_variable);
+	});
+	return only_edge;
+}
+
 //! CHEAPEST and COST(p) in one MATCH block, checked before the translation. A COST that is the same positive constant
-//! on every edge makes the cheapest paths the shortest ones, and the pattern is answered as SHORTEST. With any other
-//! COST, only the endpoint pairs come from the pattern's search, which counts hops: refused is whatever would show
-//! which path that search picked (the path functions, ONE ROW PER, ALL CHEAPEST's one row per cheapest path).
-//! COST(p) is a Bellman-Ford search over the costed edges: the cheapest cost from the source to the destination over
-//! any number of hops, which is the pattern's cost only for one right-directed edge quantified with + or *.
+//! on every edge makes the cheapest paths the shortest ones, and the pattern is answered as SHORTEST; COST(p) is then
+//! a search over the constant costs. Any other COST marks its edge `cheapest`: the paths are chosen by cost, by a
+//! weighted search over the CSR without an upper bound, and by enumerating the paths within the bounds with one.
 static void PrepareCheapest(MatchExpression &match, bool shared_union_columns) {
 	vector<string> cost_calls;
 	for (auto &column : match.column_list) {
@@ -10349,10 +10526,16 @@ static void PrepareCheapest(MatchExpression &match, bool shared_union_columns) {
 	}
 	static constexpr const char *kExample = "MATCH p = ANY CHEAPEST (a)-[e:Link COST e.weight]->+(b)";
 	case_insensitive_set_t costed_paths;
-	string cost_signature;
+	// The patterns of one MATCH block share one CSR and one path CTE: what each searches must agree.
+	string search_signature;
+	idx_t searches = 0;
+	bool needs_path_cte = false;
+	idx_t variable_length = 0;
+	bool constant_cost_search = false;
 	for (auto &pattern : match.path_patterns) {
 		string path_variable;
 		auto &elements = PatternPath(*pattern, path_variable);
+		variable_length += PatternHasVariableLength(pattern->path_elements) ? 1 : 0;
 		bool costed = false;
 		for (auto &call : cost_calls) {
 			costed |= !path_variable.empty() && StringUtil::CIEquals(call, path_variable);
@@ -10372,58 +10555,76 @@ static void PrepareCheapest(MatchExpression &match, bool shared_union_columns) {
 		bool found = false;
 		const bool constant = AllCostsConstant(pattern->path_elements, found) && found;
 		auto *edge = SingleQuantifiedEdge(elements);
-		if (!constant) {
-			if (pattern->all) {
-				throw NotImplementedException("ALL CHEAPEST with a COST that is not the same positive constant on "
-				                              "every edge is not supported; use ANY CHEAPEST");
+		auto *edge_element = edge ? dynamic_cast<PathElement *>(edge->path_list[0].get()) : nullptr;
+		if (constant) {
+			if (!costed) {
+				continue;
 			}
+			// COST(p) of a constant cost is a search over those costs: the cheapest cost over any number of hops, the
+			// pattern's own only for one right-directed edge quantified with + or *.
+			if (!edge || edge->lower > 1 || edge->upper < (1 << 30) || edge->where_clause ||
+			    edge_element->match_type != PGQMatchType::MATCH_EDGE_RIGHT) {
+				throw NotImplementedException("COST(%s) of a constant COST supports one right-directed edge, without "
+				                              "an element WHERE, quantified with + or * between two vertices, e.g. %s",
+				                              path_variable, kExample);
+			}
+			if (!match.optional_match_patterns.empty() || match.one_row_per != OneRowPerMode::NONE) {
+				throw NotImplementedException("COST(%s) of a constant COST is not supported with OPTIONAL MATCH or ONE "
+				                              "ROW PER",
+				                              path_variable);
+			}
+			constant_cost_search = true;
+		} else {
 			if (!edge) {
-				throw NotImplementedException("ANY CHEAPEST with a COST that is not the same positive constant on every "
-				                              "edge supports one quantified edge between two vertices, e.g. %s",
+				throw NotImplementedException("ANY / ALL CHEAPEST with a COST that is not the same positive constant on "
+				                              "every edge supports one quantified edge between two vertices, e.g. %s",
 				                              kExample);
 			}
-			if (match.one_row_per != OneRowPerMode::NONE) {
-				throw NotImplementedException("ONE ROW PER is not supported with ANY CHEAPEST and a COST that is not "
-				                              "the same positive constant on every edge: only its cost, COST(p), is "
-				                              "computed, not its path");
+			if (!CostReadsOnlyEdge(*edge->cost_expr, edge_element->variable_binding)) {
+				throw NotImplementedException("A COST may only read properties of its own edge (%s.<property>): %s",
+				                              edge_element->variable_binding, edge->cost_expr->ToString());
 			}
+			if (edge->where_clause) {
+				throw NotImplementedException("An element WHERE on the costed edge of a CHEAPEST pattern is not "
+				                              "supported; filter the edges with a label, or the endpoints with WHERE");
+			}
+			if (edge_element->match_type == PGQMatchType::MATCH_EDGE_LEFT_RIGHT) {
+				throw NotImplementedException("CHEAPEST is not supported for <-> edges");
+			}
+			if (edge->upper >= (1 << 30) &&
+			    (edge->lower > 1 || edge_element->match_type != PGQMatchType::MATCH_EDGE_RIGHT)) {
+				throw NotImplementedException(
+				    "CHEAPEST without an upper bound supports a right-directed edge quantified with + or *; give the "
+				    "quantifier an upper bound for other directions or a lower bound above 1, e.g. ->{2,10}");
+			}
+			if (!match.optional_match_patterns.empty()) {
+				throw NotImplementedException("CHEAPEST with a COST that varies by edge is not supported with OPTIONAL "
+				                              "MATCH");
+			}
+			edge->cheapest = true;
+			auto canonical = RebindColumnAlias(edge->cost_expr->Copy(), edge_element->variable_binding, "__pgq_edge");
+			auto signature = StringUtil::Lower(edge_element->label) + "|" + std::to_string(edge->lower) + "|" +
+			                 std::to_string(edge->upper) + "|" + canonical->ToString() + "|" +
+			                 (edge->has_default ? std::to_string(edge->default_value) : string());
+			if (searches > 0 && signature != search_signature) {
+				throw NotImplementedException("Several CHEAPEST patterns in one MATCH block must search the same edge "
+				                              "label, bounds and COST; put %s in a GRAPH_TABLE of its own",
+				                              path_variable.empty() ? string("one of them") : path_variable);
+			}
+			search_signature = signature;
+			searches++;
+			bool uses_path = match.one_row_per != OneRowPerMode::NONE || pattern->all || edge->upper < (1 << 30);
 			if (!path_variable.empty()) {
-				bool uses_path = match.where_clause && UsesPathOutsideCost(*match.where_clause, path_variable);
+				uses_path = uses_path || (match.where_clause && UsesPathOutsideCost(*match.where_clause, path_variable));
 				for (auto &column : match.column_list) {
-					uses_path = uses_path || UsesPathOutsideCost(*column, path_variable);
-				}
-				if (uses_path) {
-					throw NotImplementedException("Only COST(%s) is supported for ANY CHEAPEST with a COST that is not "
-					                              "the same positive constant on every edge: its cost is computed, not "
-					                              "its path (vertices, edges, path_length, ...)",
-					                              path_variable);
+					uses_path = uses_path || UsesPathOutsideCost(*column, path_variable) ||
+					            (costed && edge->upper < (1 << 30));
 				}
 			}
+			needs_path_cte = needs_path_cte || uses_path;
 		}
-		if (!costed) {
-			continue;
-		}
-		auto *edge_element = edge ? dynamic_cast<PathElement *>(edge->path_list[0].get()) : nullptr;
-		if (!edge || edge->lower > 1 || edge->upper < (1 << 30) || edge->where_clause ||
-		    edge_element->match_type != PGQMatchType::MATCH_EDGE_RIGHT) {
-			throw NotImplementedException("COST(%s) supports one right-directed edge, without an element WHERE, "
-			                              "quantified with + or * between two vertices, e.g. %s",
-			                              path_variable, kExample);
-		}
-		if (!match.optional_match_patterns.empty() || match.one_row_per != OneRowPerMode::NONE) {
-			throw NotImplementedException("COST(%s) is not supported with OPTIONAL MATCH or ONE ROW PER", path_variable);
-		}
-		// The patterns of one MATCH block share one CSR, built for the first COST(p): every COST(p) must be the
-		// search over the same edges with the same cost.
-		auto canonical_cost = RebindColumnAlias(edge->cost_expr->Copy(), edge_element->variable_binding, "__pgq_edge");
-		auto signature = StringUtil::Lower(edge_element->label) + "|" + canonical_cost->ToString() + "|" +
-		                 (edge->has_default ? std::to_string(edge->default_value) : string());
-		if (cost_signature.empty()) {
-			cost_signature = signature;
-		} else if (signature != cost_signature) {
-			throw NotImplementedException("The COST(p) of several ANY CHEAPEST patterns in one MATCH block must search "
-			                              "the same edge label with the same COST; put %s in a GRAPH_TABLE of its own",
-			                              path_variable);
+		if (costed && !constant && !match.optional_match_patterns.empty()) {
+			throw NotImplementedException("COST(%s) is not supported with OPTIONAL MATCH", path_variable);
 		}
 	}
 	for (auto &call : cost_calls) {
@@ -10432,17 +10633,12 @@ static void PrepareCheapest(MatchExpression &match, bool shared_union_columns) {
 			                      call, call);
 		}
 	}
-	if (costed_paths.empty()) {
-		return;
-	}
-	// The other variable-length patterns of the block would traverse the CSR the COST(p) search built.
-	for (auto &pattern : match.path_patterns) {
-		string path_variable;
-		PatternPath(*pattern, path_variable);
-		if (!costed_paths.count(path_variable) && PatternHasVariableLength(pattern->path_elements)) {
-			throw NotImplementedException("COST(p) needs every variable-length pattern of its MATCH block to compute "
-			                              "its COST(...) too; put the others in a GRAPH_TABLE of their own");
-		}
+	// A cost search shares the block's CSR with every other variable-length pattern, and a path CTE is one per block.
+	if ((searches > 0 && variable_length > searches) || (searches > 1 && needs_path_cte) ||
+	    (constant_cost_search && variable_length > costed_paths.size())) {
+		throw NotImplementedException("A CHEAPEST pattern searched by cost must be the only variable-length pattern of "
+		                              "its MATCH block (or all of them must be ANY CHEAPEST over the same edges and "
+		                              "COST, with nothing but COST(p)); put the others in a GRAPH_TABLE of their own");
 	}
 }
 

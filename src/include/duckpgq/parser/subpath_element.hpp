@@ -25,6 +25,9 @@ public:
 	unique_ptr<ParsedExpression> cost_expr;
 	double default_value = 1.0;
 	bool has_default = false;
+	//! Set during translation on the quantified edge of an ANY / ALL CHEAPEST pattern whose COST varies by edge:
+	//! its paths are chosen by that cost, not by hop count.
+	bool cheapest = false;
 public:
 	explicit SubPath(PGQPathReferenceType path_reference_type) : PathReference(path_reference_type) {
 		path_mode = PGQPathMode::NONE;

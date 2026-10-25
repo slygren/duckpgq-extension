@@ -442,6 +442,27 @@ static void CostFunction(DataChunk &args, ExpressionState &state, Vector &result
 	});
 }
 
+//! pgq_cost_zero(x): a zero of the type pgq_cost(x) has, whatever x holds (it is the always-NULL probe of a COST's
+//! type, typing the cost column of a recursive CTE's anchor).
+static void CostZeroFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	if (result.GetType().id() == LogicalTypeId::BIGINT) {
+		auto writer = FlatVector::ScatterWriter<int64_t>(result);
+		for (idx_t row = 0; row < args.size(); row++) {
+			writer[row] = 0;
+		}
+	} else {
+		auto writer = FlatVector::ScatterWriter<double>(result);
+		for (idx_t row = 0; row < args.size(); row++) {
+			writer[row] = 0;
+		}
+	}
+}
+
+static void CostZeroResolveTypes(ResolveScalarFunctionTypesInput &input) {
+	input.GetBoundFunction().SetReturnType(PGQCostType(input.GetArgumentType(0)));
+}
+
 } // namespace
 
 //------------------------------------------------------------------------------
@@ -476,7 +497,14 @@ void CoreScalarFunctions::RegisterCheapestPathLengthScalarFunction(ExtensionLoad
 	ScalarFunction cost("pgq_cost", {LogicalType::ANY}, LogicalType::BIGINT, CostFunction);
 	cost.SetResolveTypesCallback(CostResolveTypes);
 	cost.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	// It refuses some inputs, so the optimizer must not evaluate it on rows the query does not produce.
+	cost.SetFallible();
 	loader.RegisterFunction(cost);
+
+	ScalarFunction zero("pgq_cost_zero", {LogicalType::ANY}, LogicalType::BIGINT, CostZeroFunction);
+	zero.SetResolveTypesCallback(CostZeroResolveTypes);
+	zero.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	loader.RegisterFunction(zero);
 }
 
 } // namespace duckdb

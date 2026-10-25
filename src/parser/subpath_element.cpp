@@ -25,6 +25,7 @@ unique_ptr<PathReference> SubPath::Copy() {
 	}
 	result->default_value = default_value;
 	result->has_default = has_default;
+	result->cheapest = cheapest;
 
 	return std::move(result);
 }
@@ -71,7 +72,7 @@ bool SubPath::Equals(const PathReference *other_p) const {
 		return false;
 	}
 	if (!ParsedExpression::Equals(cost_expr, other->cost_expr) || default_value != other->default_value ||
-	    has_default != other->has_default) {
+	    has_default != other->has_default || cheapest != other->cheapest) {
 		return false;
 	}
 	return true;

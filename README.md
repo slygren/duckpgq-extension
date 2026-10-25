@@ -127,7 +127,7 @@ put over DuckLake catalogs. A graph is stored in the database it is created in a
 | `-[:R*1..5]->`, `-[:R*]->`, `-[:R*2]->`, `-[:R*..3]->`, `-[:R*0..]->` | Cypher's quantifier inside the edge, with Cypher's meaning (see below) |
 | `MATCH (t)-[:A]->(a), (t)-[:B]->(b)` | several patterns sharing a variable |
 | `MATCH p = …` | path variable |
-| `ANY SHORTEST`, `ALL SHORTEST`, `ANY CHEAPEST`, `ALL CHEAPEST` | path search; `COST expr [DEFAULT n]` on an edge gives its weight, a number (`DEFAULT` where `expr` is NULL). A NULL cost without `DEFAULT`, and a negative or non-finite one, is an error |
+| `ANY SHORTEST`, `ALL SHORTEST`, `ANY CHEAPEST`, `ALL CHEAPEST` | path search; `COST expr [DEFAULT n]` on an edge gives its weight, a number (`DEFAULT` where `expr` is NULL). A NULL cost without `DEFAULT`, and a negative or non-finite one, is an error. CHEAPEST returns the path(s) of the least total cost within the quantifier's bounds (`ALL`: every tied path), and the path functions, `ONE ROW PER` and `cost(p)` all describe them |
 | `WALK`, `TRAIL`, `SIMPLE`, `ACYCLIC` | path mode |
 | `OPTIONAL MATCH …` | left-joined pattern (fixed-length, directed) |
 | `WHERE EXISTS { (t)-[:HAS_WORKORDER]->() }`, `NOT EXISTS { … }` | correlated pattern existence |
@@ -407,11 +407,13 @@ building in [abi_build.cpp](src/core/functions/table/abi_build.cpp); vertex-join
   traverse. Choosing between several matching artifacts is simple.
 - **`pgq_abi_build` on a SQLite-backed DuckLake catalog** fails (the build's connection and the caller's contend
   for the file); run the statements from `pgq_abi_sql` on the caller's connection instead.
-- **CHEAPEST with a cost that varies by edge** finds the cheapest cost, not the path: `cost(p)` and the endpoints
-  are answered, the path functions (`vertices(p)`, `path_length(p)`, …), `ONE ROW PER` and `ALL CHEAPEST` are refused.
-  `cost(p)` needs one right-directed edge quantified with `+` or `*`, and is not available in the MATCH's `WHERE`
-  (filter on it outside the `GRAPH_TABLE`). The same positive constant on every edge is `SHORTEST` and has none of
-  these limits, except those on `cost(p)`.
+- **CHEAPEST with a cost that varies by edge** takes one quantified edge between two vertices, whose `COST` reads
+  only that edge's properties and that has no element `WHERE`. Without an upper bound the edge must be
+  right-directed and quantified with `+` or `*`; with one (`{1,3}`, `{2,5}`, …) any direction works.
+  It is not supported with `OPTIONAL MATCH`. It must be the only variable-length pattern of its MATCH block, or every
+  one of them must search the same edges and `COST` with nothing but `cost(p)`. `cost(p)` is not available in the
+  MATCH's `WHERE` (filter on it outside the `GRAPH_TABLE`). With the same positive constant on every edge the pattern
+  is `SHORTEST`, and `cost(p)` there needs an unbounded `+` or `*`.
 
 ## Documentation map
 

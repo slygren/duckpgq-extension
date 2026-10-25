@@ -128,7 +128,7 @@ These were verified against the fork's build:
 
 - **Walk semantics:** a bounded pattern without a selector returns one row per path that visits no vertex twice (so never back to the start), counting each edge row it takes. `ANY SHORTEST` keeps one shortest such path per endpoint pair, `ALL SHORTEST` every shortest one. The path variable reports the row's own path. The fork reported a shortest witness for every walk, and returned every walk for `ALL SHORTEST` and for the shortest forms of `ONE ROW PER`; those are fixed (see test/sql/path_finding/traversal_selectors.test).
 - **Label case:** `label(x)`, `vertex_labels(p)` and `edge_labels(p)` return labels as declared, like DESCRIBE, whichever route answers the pattern. The fork returned `label(x)` lower-cased when the pattern was traversed, so a `WHERE label(x) = 'person'` written against the fork needs the declared case now, or `x IS LABELED person`, which ignores case.
-- **CHEAPEST costs** are numbers: `cost(p)` is BIGINT for integer costs and DOUBLE for any other number, DECIMAL included. A COST that varies by edge is searched by cost only for `cost(p)`; see the README's Limitations.
+- **CHEAPEST costs** are numbers: `cost(p)` is BIGINT for integer costs and DOUBLE for any other number, DECIMAL included. With a COST that varies by edge, the paths are chosen by cost: a Bellman-Ford search over a weighted CSR without an upper bound (`cheapestpath`, `allcheapestpaths`, `cheapest_path_length`), an enumeration of the paths within the bounds with one. Ties are decided on the costs as summed in path order. The same positive constant on every edge is SHORTEST, closures included. See the README's Limitations for the shapes.
 
 ## Vertex-join elimination
 
