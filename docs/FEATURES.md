@@ -293,7 +293,7 @@ SELECT * FROM pagerank('social', 'Person', 'Knows') ORDER BY 1;
 SELECT * FROM weakly_connected_component('social', 'Person', 'Knows') ORDER BY 1;
 SELECT * FROM local_clustering_coefficient('social', 'Person', 'Knows') ORDER BY 1;
 ```
-PageRank rises along the chain (Ann 0.071 … Eve 0.267). All five people are in one weakly connected component.
+PageRank rises along the chain (Ann 0.083 … Eve 0.311, as `networkx.pagerank` gives). All five people are in one weakly connected component.
 
 ## 5. ABI path tables
 

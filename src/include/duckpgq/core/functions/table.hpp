@@ -13,7 +13,6 @@ struct CoreTableFunctions {
 		RegisterScanTableFunctions(loader);
 		RegisterSummarizePropertyGraphTableFunction(loader);
 		RegisterWeaklyConnectedComponentTableFunction(loader);
-		RegisterPageRankTableFunction(loader);
 		RegisterParseMatchTableFunction(loader);
 		RegisterExplainABIPathTableFunction(loader);
 		RegisterLastRewriteDiagnosticsTableFunction(loader);
@@ -29,7 +28,6 @@ private:
 	static void RegisterLocalClusteringCoefficientTableFunction(ExtensionLoader &loader);
 	static void RegisterScanTableFunctions(ExtensionLoader &loader);
 	static void RegisterWeaklyConnectedComponentTableFunction(ExtensionLoader &loader);
-	static void RegisterPageRankTableFunction(ExtensionLoader &loader);
 	static void RegisterSummarizePropertyGraphTableFunction(ExtensionLoader &loader);
 	static void RegisterParseMatchTableFunction(ExtensionLoader &loader);
 	static void RegisterExplainABIPathTableFunction(ExtensionLoader &loader);

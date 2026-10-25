@@ -398,8 +398,8 @@ def check_case(chk, case, workdir, only, log):
 
     if "pagerank" in only and n:
         mg = case.multidigraph()
-        want = nx.pagerank(mg, tol=1e-13, max_iter=10000)
-        compare_values(chk, case, "pagerank", res["pagerank"], want, tol=2e-6)
+        # The same iteration and stopping rule as networkx.pagerank's defaults: the same numbers up to rounding.
+        compare_values(chk, case, "pagerank", res["pagerank"], nx.pagerank(mg), tol=1e-12)
     if "weakly_connected_component" in only:
         compare_partition(chk, case, "weakly_connected_component", res["weakly_connected_component"],
                           nx.weakly_connected_components(case.multidigraph()), ids_are_min_rowid=False)

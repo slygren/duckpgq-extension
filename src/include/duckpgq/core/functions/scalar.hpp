@@ -18,7 +18,6 @@ struct CoreScalarFunctions {
 		RegisterShortestPathScalarFunction(loader);
 		RegisterShortestKPathsScalarFunction(loader);
 		RegisterWeaklyConnectedComponentScalarFunction(loader);
-		RegisterPageRankScalarFunction(loader);
 		RegisterGraphPredicateScalarFunctions(loader);
 		RegisterGraphTreeJsonScalarFunction(loader);
 	}
@@ -38,7 +37,6 @@ private:
 	static void RegisterShortestPathScalarFunction(ExtensionLoader &loader);
 	static void RegisterShortestKPathsScalarFunction(ExtensionLoader &loader);
 	static void RegisterWeaklyConnectedComponentScalarFunction(ExtensionLoader &loader);
-	static void RegisterPageRankScalarFunction(ExtensionLoader &loader);
 	static void RegisterGraphTreeJsonScalarFunction(ExtensionLoader &loader);
 };
 

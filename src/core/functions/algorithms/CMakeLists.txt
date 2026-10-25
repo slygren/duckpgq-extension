@@ -9,4 +9,5 @@ set(EXTENSION_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/k_core.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/shortest_path_lengths.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/degree.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/pagerank.cpp
     PARENT_SCOPE)

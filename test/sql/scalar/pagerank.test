@@ -24,14 +24,17 @@ EDGE TABLES (
             DESTINATION KEY ( dst ) REFERENCES Student ( id )
     );
 
+# networkx.pagerank (same iteration, damping 0.85, tolerance 1e-6) gives these values. Before the shared machinery
+# the iteration also ran over the CSR's two padding slots, as two phantom dangling vertices, and every value came out
+# 0.943 of these (0.0283 for vertex 4).
 query II
-select id, pagerank from pagerank(pg, student, know);
+select id, round(pagerank, 10) from pagerank(pg, student, know) ORDER BY id;
 ----
-0	0.30722555839452875
-1	0.11534940106637968
-2	0.16437299553018173
-3	0.32814638463154105
-4	0.028301886792456276
+0	0.3256587646
+1	0.1222702859
+2	0.1742354796
+3	0.3478354698
+4	0.03
 
 
 statement ok
@@ -82,10 +85,59 @@ EDGE TABLES (
     );
 
 query II
-select id, pagerank from pagerank(pg, student, know);
+select id, round(pagerank, 10) from pagerank(pg, student, know) ORDER BY id;
 ----
-0	0.19672392385442233
-1	0.19672392385442233
-2	0.19672392385442233
-3	0.26797750004549203
-4	0.08524695480585476
+0	0.208527312
+1	0.208527312
+2	0.208527312
+3	0.2840563912
+4	0.0903616729
+
+# Options, as networkx.pagerank's alpha / max_iter / tol.
+query I
+select round(sum(pagerank), 10) from pagerank(pg, student, know, damping := 0.5, tolerance := 1e-10);
+----
+1.0
+
+query II
+select id, round(pagerank, 10) from pagerank(pg, student, know, damping := 0) ORDER BY id;
+----
+0	0.2
+1	0.2
+2	0.2
+3	0.2
+4	0.2
+
+statement error
+select * from pagerank(pg, student, know, max_iterations := 3);
+----
+Invalid Input Error: pagerank: did not converge within 3 iterations
+
+statement error
+select * from pagerank(pg, student, know, damping := 1.5);
+----
+Invalid Input Error: pagerank: damping must be between 0 and 1, not 1.5
+
+# Deleted vertex rows leave rowid gaps, which are not vertices: the ranks still sum to 1 over the 4 left.
+statement ok
+DELETE FROM Student WHERE id = 4;
+
+statement ok
+DELETE FROM know WHERE src = 4 OR dst = 4;
+
+query II
+select count(*), round(sum(pagerank), 10) from pagerank(pg, student, know);
+----
+4	1.0
+
+# No edges: uniform.
+statement ok
+DELETE FROM know;
+
+query II
+select id, pagerank from pagerank(pg, student, know) ORDER BY id;
+----
+0	0.25
+1	0.25
+2	0.25
+3	0.25

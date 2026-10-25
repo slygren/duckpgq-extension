@@ -10,7 +10,7 @@
 //   SELECT v.<key>, add(__x.temp, <algorithm>(csr_id, v.rowid, <params>)) AS <column>
 //   FROM <vertex table> v CROSS JOIN (SELECT 0 * count(temp) FROM csr_cte) __x
 //
-// exactly like pagerank: csr_cte builds the directed CSR of the edge table, and
+// as upstream's pagerank did: csr_cte builds the directed CSR of the edge table, and
 // the scalar computes the algorithm once over that CSR (the first row to arrive
 // does the work, under a lock) and answers every row by its rowid.
 //
@@ -184,6 +184,7 @@ private:
 	static void RegisterKCore(ExtensionLoader &loader);
 	static void RegisterShortestPathLengths(ExtensionLoader &loader);
 	static void RegisterDegree(ExtensionLoader &loader);
+	static void RegisterPageRank(ExtensionLoader &loader);
 };
 
 } // namespace duckdb
