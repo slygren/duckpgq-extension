@@ -2,9 +2,8 @@
 # description: Named paths, ONE ROW PER and unnamed patterns for unbounded left-directed and bidirectional quantifiers, and the unbounded shapes the native path search answers
 # group: [path_finding]
 
-# A bidirectional step (a)<-[e]->(b) is what the fixed-length pattern matches: e runs from b back to a, with an edge
-# from a to b beside it, and each such pair is one step (e is the edge it reports). Reference semantics as in
-# traversal_selectors.test: simple paths (no vertex twice, never back to the start), one per edge taken; ANY
+# A bidirectional edge (a)<-[e]->(b) is an edge in either direction (SQL/PGQ "left or right"), the same as -[e]-.
+# Reference semantics as in traversal_selectors.test: simple paths (no vertex twice, never back to the start), one per edge taken; ANY
 # SHORTEST one shortest per endpoint pair, ALL SHORTEST every shortest. The named paths are compared both ways
 # (EXCEPT ALL) with a brute-force enumeration (ref_paths); ONE ROW PER and the unnamed pattern with the named path
 # of the same query, unnested. Each side is materialised in its own statement.
@@ -14,7 +13,7 @@ require duckpgq
 statement ok
 SET active_grammar_extensions = ['duckpgq'];
 
-# 1 -> 2 (twice), 2 -> 3, 1 -> 3, 3 -> 4, 2 -> 4, 4 -> 1, 2 -> 1, 3 -> 5, 3 -> 2; reciprocal pairs: 1 <-> 2, 2 <-> 3
+# 1 -> 2 (twice), 2 -> 3, 1 -> 3, 3 -> 4, 2 -> 4, 4 -> 1, 2 -> 1, 3 -> 5, 3 -> 2
 statement ok
 CREATE TABLE P(id BIGINT PRIMARY KEY);
 
@@ -39,7 +38,8 @@ WITH RECURSIVE steps(dir, s, t, e) AS (
     UNION ALL SELECT '<-', dst, src, rowid FROM K
     UNION ALL SELECT '-', src, dst, rowid FROM K
     UNION ALL SELECT '-', dst, src, rowid FROM K WHERE src <> dst
-    UNION ALL SELECT '<->', k.dst, k.src, k.rowid FROM K k JOIN K r ON r.src = k.dst AND r.dst = k.src),
+    UNION ALL SELECT '<->', src, dst, rowid FROM K
+    UNION ALL SELECT '<->', dst, src, rowid FROM K WHERE src <> dst),
 w(dir, src, cur, depth, vs, es) AS (
     SELECT d, id, id, 0, [id], []::BIGINT[] FROM P, (VALUES ('->'), ('<-'), ('-'), ('<->')) t(d)
     UNION ALL
@@ -4632,9 +4632,9 @@ SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), 
 ----
 0	0
 
-# The fixed-length bidirectional pattern and the {1,1} quantifier are the same matches
+# The fixed-length bidirectional pattern and the {1,1} quantifier are the same matches: every edge, either way
 statement ok
-CREATE OR REPLACE TABLE fixed AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P)<-[e:K]->(b:P) COLUMNS (a.id AS a, b.id AS b, e.rowid AS e));
+CREATE OR REPLACE TABLE fixed AS SELECT a, b, es[1] FROM GRAPH_TABLE (g MATCH p = (a:P)<-[e:K]->(b:P) COLUMNS (a.id AS a, b.id AS b, edges(p) AS es));
 
 statement ok
 CREATE OR REPLACE TABLE quantified AS SELECT a, b, es[1] FROM GRAPH_TABLE (g MATCH p = (a:P)<-[e:K]->{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b, edges(p) AS es));
@@ -4642,7 +4642,7 @@ CREATE OR REPLACE TABLE quantified AS SELECT a, b, es[1] FROM GRAPH_TABLE (g MAT
 query III
 SELECT (SELECT count(*) FROM fixed), (SELECT count(*) FROM (FROM fixed EXCEPT ALL FROM quantified)), (SELECT count(*) FROM (FROM quantified EXCEPT ALL FROM fixed));
 ----
-6	0	0
+20	0	0
 
 # Hand-checked: 2 <- 1 <- 4 <- 3 <- {1, 2} against the edges from 4; ONE ROW PER STEP in traversal order
 query IIII

@@ -67,7 +67,7 @@ FROM GRAPH_TABLE (pg
 4	3	3
 4	4	0
 
-# Bidirectional: a step needs an edge each way; the only reciprocal pair is 0 <-> 3, so 4 reaches only itself
+# <-> is either direction (SQL/PGQ): the same paths as -[e:know]- above
 query III
 FROM GRAPH_TABLE (pg
     MATCH
@@ -76,6 +76,10 @@ FROM GRAPH_TABLE (pg
     ) study
     ORDER BY a_id, b_id;
 ----
+4	0	2
+4	1	2
+4	2	1
+4	3	1
 4	4	0
 
 query III
@@ -87,7 +91,10 @@ FROM GRAPH_TABLE (pg
     ORDER BY a_id, b_id;
 ----
 0	0	0
+0	1	1
+0	2	1
 0	3	1
+0	4	2
 
 # The pattern names no path 'o'. path_length(o) used to vanish from the output without a word, and this
 # test expected the two remaining columns; it is refused now.

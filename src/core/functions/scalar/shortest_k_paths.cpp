@@ -189,8 +189,9 @@ public:
 
 		AddNode({src, -1, -1, 0});
 		vector<int64_t> frontier {0};
-		// Each node's rank among its level's distinct edge sequences: a step that repeats (a reciprocal pair, once
-		// per edge beside it) gives equal sequences, and their children must interleave by sequence, not by parent.
+		// Each node's rank among its level's distinct edge sequences: should a CSR hold a step twice (the same edge
+		// to the same vertex), the two give equal sequences, and their children must interleave by sequence, not by
+		// parent.
 		vector<int64_t> rank {0};
 		Admit(0, info.lower);
 		offer(0);

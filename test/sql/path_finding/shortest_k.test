@@ -37,7 +37,8 @@ WITH RECURSIVE steps(dir, s, t, e) AS (
     UNION ALL SELECT '<-', dst, src, rowid FROM K
     UNION ALL SELECT '-', src, dst, rowid FROM K
     UNION ALL SELECT '-', dst, src, rowid FROM K WHERE src <> dst
-    UNION ALL SELECT '<->', k.dst, k.src, k.rowid FROM K k JOIN K r ON r.src = k.dst AND r.dst = k.src),
+    UNION ALL SELECT '<->', src, dst, rowid FROM K
+    UNION ALL SELECT '<->', dst, src, rowid FROM K WHERE src <> dst),
 w(dir, mode, src, cur, depth, vs, es) AS (
     SELECT d, m, id, id, 0, [id], []::BIGINT[] FROM P, (VALUES ('->'), ('<-'), ('-'), ('<->')) t(d),
         (VALUES ('WALK'), ('TRAIL'), ('ACYCLIC'), ('SIMPLE')) u(m)

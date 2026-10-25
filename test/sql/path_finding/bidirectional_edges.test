@@ -1,0 +1,535 @@
+# name: test/sql/path_finding/bidirectional_edges.test
+# description: <-[e]-> is an edge in either direction (SQL/PGQ "left or right"): the same matches as -[e]- in every form
+# group: [path_finding]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+# 1 -> 2 twice, 2 -> 1, 2 -> 3, 3 -> 4, 4 -> 1, a self-loop 5 -> 5; 6 isolated
+statement ok
+CREATE TABLE P(id BIGINT PRIMARY KEY, name VARCHAR);
+
+statement ok
+CREATE TABLE K(src BIGINT, dst BIGINT, w DOUBLE);
+
+statement ok
+INSERT INTO P VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e'), (6, 'f');
+
+statement ok
+INSERT INTO K VALUES (1, 2, 1), (1, 2, 4), (2, 1, 2), (2, 3, 1), (3, 4, 1), (4, 1, 5), (5, 5, 1);
+
+statement ok
+CREATE PROPERTY GRAPH g VERTEX TABLES (P LABEL P)
+EDGE TABLES (K SOURCE KEY (src) REFERENCES P (id) DESTINATION KEY (dst) REFERENCES P (id) LABEL K);
+
+# Brute force: every edge read from either end, a self-loop once, its columns oriented along the match
+statement ok
+CREATE TABLE either AS SELECT src AS a, dst AS b, src AS s, dst AS d FROM K
+UNION ALL SELECT dst, src, dst, src FROM K WHERE src <> dst;
+
+statement ok
+CREATE TABLE fixed AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P)<-[e:K]->(b:P) COLUMNS (a.id AS a, b.id AS b, e.src AS s, e.dst AS d));
+
+query III
+SELECT (SELECT count(*) FROM fixed), (SELECT count(*) FROM (FROM fixed EXCEPT ALL FROM either)), (SELECT count(*) FROM (FROM either EXCEPT ALL FROM fixed));
+----
+13	0	0
+
+# The anonymous form and the spaced forms are the same
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH (a:P)<->(b:P) COLUMNS (a.id AS a));
+----
+13
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH (a:P)< - >(b:P) COLUMNS (a.id AS a));
+----
+13
+
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+# (a:P)<-[e:K]->{1,3}(b:P)
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P)<-[e:K]->{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P)-[e:K]-{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+# p = (a:P)<-[e:K]->{0,2}(b:P)
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH p = (a:P)<-[e:K]->{0,2}(b:P) COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH p = (a:P)-[e:K]-{0,2}(b:P) COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs, edges(p) AS es));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+# p = ANY SHORTEST (a:P)<-[e:K]->+(b:P)
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)<-[e:K]->+(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[e:K]-+(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+# p = ALL SHORTEST (a:P)<-[e:K]->+(b:P)
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)<-[e:K]->+(b:P) COLUMNS (a.id AS a, b.id AS b, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[e:K]-+(b:P) COLUMNS (a.id AS a, b.id AS b, edges(p) AS es));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+# p = SHORTEST 3 (a:P)<-[e:K]->+(b:P)
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH p = SHORTEST 3 (a:P)<-[e:K]->+(b:P) COLUMNS (a.id AS a, b.id AS b, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH p = SHORTEST 3 (a:P)-[e:K]-+(b:P) COLUMNS (a.id AS a, b.id AS b, edges(p) AS es));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+# p = SHORTEST 2 TRAIL (a:P)<-[e:K]->{1,4}(b:P)
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH p = SHORTEST 2 TRAIL (a:P)<-[e:K]->{1,4}(b:P) COLUMNS (a.id AS a, b.id AS b, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH p = SHORTEST 2 TRAIL (a:P)-[e:K]-{1,4}(b:P) COLUMNS (a.id AS a, b.id AS b, edges(p) AS es));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+# ACYCLIC (a:P)<-[e:K]->+(b:P)
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)<-[e:K]->+(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)-[e:K]-+(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+# ANY SHORTEST (a:P)<-[e:K]->{2,}(b:P)
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]->{2,}(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]-{2,}(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+# (a:P)<-[e:K]->{1,3}(b:P) ONE ROW PER STEP (v1, x, v2)
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P)<-[e:K]->{1,3}(b:P) ONE ROW PER STEP (v1, x, v2) COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P)-[e:K]-{1,3}(b:P) ONE ROW PER STEP (v1, x, v2) COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, v2.id AS v2));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+# p = ANY CHEAPEST (a:P)<-[e:K COST e.w]->{1,3}(b:P)
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:P)<-[e:K COST e.w]->{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b, cost(p) AS c));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:P)-[e:K COST e.w]-{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b, cost(p) AS c));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+# p = ALL CHEAPEST (a:P)<-[e:K COST e.w]->{1,3}(b:P)
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:P)<-[e:K COST e.w]->{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:P)-[e:K COST e.w]-{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b, edges(p) AS es));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+# (a:P)<-[e:K]->(b:P)<-[f:K]->(c:P)
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P)<-[e:K]->(b:P)<-[f:K]->(c:P) COLUMNS (a.id AS a, b.id AS b, c.id AS c));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P)-[e:K]-(b:P)-[f:K]-(c:P) COLUMNS (a.id AS a, b.id AS b, c.id AS c));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+# (a:P) OPTIONAL MATCH (a)<-[e:K]->(b:P)
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH (a)<-[e:K]->(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH (a)-[e:K]-(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+# (a:P) OPTIONAL MATCH (a)<-[e:K]->{1,2}(b:P)
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH (a)<-[e:K]->{1,2}(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH (a)-[e:K]-{1,2}(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+# (a:P) OPTIONAL MATCH ANY SHORTEST (a)<-[e:K]->+(b:P)
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH ANY SHORTEST (a)<-[e:K]->+(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH ANY SHORTEST (a)-[e:K]-+(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+# (a:P) WHERE EXISTS { (a)<-[:K]->(:P) }
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P) WHERE EXISTS { (a)<-[:K]->(:P) } COLUMNS (a.id AS a));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P) WHERE EXISTS { (a)-[:K]-(:P) } COLUMNS (a.id AS a));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+# (a:P)<-[e:K]->(b:P) |+| (a:P)-[e:K]->(b:P)
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P)<-[e:K]->(b:P) |+| (a:P)-[e:K]->(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P)-[e:K]-(b:P) |+| (a:P)-[e:K]->(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+# ── With ABI artifacts built ─────────────────────────────────────────────────────────────────────────────
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('g', exclude_self_referential := false, closures := ['K']);
+
+# (a:P)<-[e:K]->{1,3}(b:P)
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P)<-[e:K]->{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P)-[e:K]-{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+query I
+SELECT status IN ('match', 'unverified') FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH (a:P)<-[e:K]->{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b))');
+----
+true
+
+# p = (a:P)<-[e:K]->{0,2}(b:P)
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH p = (a:P)<-[e:K]->{0,2}(b:P) COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH p = (a:P)-[e:K]-{0,2}(b:P) COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs, edges(p) AS es));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+query I
+SELECT status IN ('match', 'unverified') FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH p = (a:P)<-[e:K]->{0,2}(b:P) COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs, edges(p) AS es))');
+----
+true
+
+# p = ANY SHORTEST (a:P)<-[e:K]->+(b:P)
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)<-[e:K]->+(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[e:K]-+(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+query I
+SELECT status IN ('match', 'unverified') FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)<-[e:K]->+(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l))');
+----
+true
+
+# p = ALL SHORTEST (a:P)<-[e:K]->+(b:P)
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)<-[e:K]->+(b:P) COLUMNS (a.id AS a, b.id AS b, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[e:K]-+(b:P) COLUMNS (a.id AS a, b.id AS b, edges(p) AS es));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+query I
+SELECT status IN ('match', 'unverified') FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)<-[e:K]->+(b:P) COLUMNS (a.id AS a, b.id AS b, edges(p) AS es))');
+----
+true
+
+# p = SHORTEST 3 (a:P)<-[e:K]->+(b:P)
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH p = SHORTEST 3 (a:P)<-[e:K]->+(b:P) COLUMNS (a.id AS a, b.id AS b, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH p = SHORTEST 3 (a:P)-[e:K]-+(b:P) COLUMNS (a.id AS a, b.id AS b, edges(p) AS es));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+# p = SHORTEST 2 TRAIL (a:P)<-[e:K]->{1,4}(b:P)
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH p = SHORTEST 2 TRAIL (a:P)<-[e:K]->{1,4}(b:P) COLUMNS (a.id AS a, b.id AS b, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH p = SHORTEST 2 TRAIL (a:P)-[e:K]-{1,4}(b:P) COLUMNS (a.id AS a, b.id AS b, edges(p) AS es));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+# ACYCLIC (a:P)<-[e:K]->+(b:P)
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)<-[e:K]->+(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)-[e:K]-+(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+query I
+SELECT status IN ('match', 'unverified') FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)<-[e:K]->+(b:P) COLUMNS (a.id AS a, b.id AS b))');
+----
+true
+
+# ANY SHORTEST (a:P)<-[e:K]->{2,}(b:P)
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]->{2,}(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]-{2,}(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+query I
+SELECT status IN ('match', 'unverified') FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]->{2,}(b:P) COLUMNS (a.id AS a, b.id AS b))');
+----
+true
+
+# (a:P)<-[e:K]->{1,3}(b:P) ONE ROW PER STEP (v1, x, v2)
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P)<-[e:K]->{1,3}(b:P) ONE ROW PER STEP (v1, x, v2) COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P)-[e:K]-{1,3}(b:P) ONE ROW PER STEP (v1, x, v2) COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, v2.id AS v2));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+query I
+SELECT status IN ('match', 'unverified') FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH (a:P)<-[e:K]->{1,3}(b:P) ONE ROW PER STEP (v1, x, v2) COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, v2.id AS v2))');
+----
+true
+
+# p = ANY CHEAPEST (a:P)<-[e:K COST e.w]->{1,3}(b:P)
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:P)<-[e:K COST e.w]->{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b, cost(p) AS c));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:P)-[e:K COST e.w]-{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b, cost(p) AS c));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+# p = ALL CHEAPEST (a:P)<-[e:K COST e.w]->{1,3}(b:P)
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:P)<-[e:K COST e.w]->{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:P)-[e:K COST e.w]-{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b, edges(p) AS es));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+# (a:P)<-[e:K]->(b:P)<-[f:K]->(c:P)
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P)<-[e:K]->(b:P)<-[f:K]->(c:P) COLUMNS (a.id AS a, b.id AS b, c.id AS c));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P)-[e:K]-(b:P)-[f:K]-(c:P) COLUMNS (a.id AS a, b.id AS b, c.id AS c));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+query I
+SELECT status IN ('match', 'unverified') FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH (a:P)<-[e:K]->(b:P)<-[f:K]->(c:P) COLUMNS (a.id AS a, b.id AS b, c.id AS c))');
+----
+true
+
+# (a:P) OPTIONAL MATCH (a)<-[e:K]->(b:P)
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH (a)<-[e:K]->(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH (a)-[e:K]-(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+query I
+SELECT status IN ('match', 'unverified') FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH (a)<-[e:K]->(b:P) COLUMNS (a.id AS a, b.id AS b))');
+----
+true
+
+# (a:P) OPTIONAL MATCH (a)<-[e:K]->{1,2}(b:P)
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH (a)<-[e:K]->{1,2}(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH (a)-[e:K]-{1,2}(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+query I
+SELECT status IN ('match', 'unverified') FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH (a)<-[e:K]->{1,2}(b:P) COLUMNS (a.id AS a, b.id AS b))');
+----
+true
+
+# (a:P) OPTIONAL MATCH ANY SHORTEST (a)<-[e:K]->+(b:P)
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH ANY SHORTEST (a)<-[e:K]->+(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH ANY SHORTEST (a)-[e:K]-+(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+query I
+SELECT status IN ('match', 'unverified') FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH ANY SHORTEST (a)<-[e:K]->+(b:P) COLUMNS (a.id AS a, b.id AS b))');
+----
+true
+
+# (a:P) WHERE EXISTS { (a)<-[:K]->(:P) }
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P) WHERE EXISTS { (a)<-[:K]->(:P) } COLUMNS (a.id AS a));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P) WHERE EXISTS { (a)-[:K]-(:P) } COLUMNS (a.id AS a));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+query I
+SELECT status IN ('match', 'unverified') FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH (a:P) WHERE EXISTS { (a)<-[:K]->(:P) } COLUMNS (a.id AS a))');
+----
+true
+
+# (a:P)<-[e:K]->(b:P) |+| (a:P)-[e:K]->(b:P)
+statement ok
+CREATE OR REPLACE TABLE bi AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P)<-[e:K]->(b:P) |+| (a:P)-[e:K]->(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE un AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P)-[e:K]-(b:P) |+| (a:P)-[e:K]->(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+query III
+SELECT (SELECT count(*) FROM bi) = (SELECT count(*) FROM un), (SELECT count(*) FROM (FROM bi EXCEPT ALL FROM un)), (SELECT count(*) FROM (FROM un EXCEPT ALL FROM bi));
+----
+true	0	0
+
+query I
+SELECT status IN ('match', 'unverified') FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH (a:P)<-[e:K]->(b:P) |+| (a:P)-[e:K]->(b:P) COLUMNS (a.id AS a, b.id AS b))');
+----
+true
+
+statement ok
+SET pgq_disable_abi_rewrite = false;

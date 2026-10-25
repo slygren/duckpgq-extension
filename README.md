@@ -121,8 +121,7 @@ put over DuckLake catalogs. A graph is stored in the database it is created in a
 | `(v)`, `()`, `(v:Label)` | vertex with any label, anonymous, labelled |
 | `(v:A\|B)`, `(v:A&B)`, `(v:!A)` | label disjunction, conjunction, negation (`!` binds tightest, then `&`, then `\|`) |
 | `(v:Person WHERE v.age > 30)` | element-level predicate |
-| `-[e:Knows]->`, `<-[e:Knows]-`, `-[e:Knows]-` | directed, reversed, either direction |
-| `<-[e:Knows]->` | both ways: `e` runs from the next vertex back, with an edge the other way beside it (each such pair is a match); quantified, each step is such a pair |
+| `-[e:Knows]->`, `<-[e:Knows]-`, `-[e:Knows]-`, `<-[e:Knows]->` | directed, reversed, either direction; `<-[ ]->` is SQL/PGQ's "left or right", which over directed edges is the same as `-[ ]-` |
 | `->`, `<-`, `-`, `<->` | anonymous edge of any label |
 | `-[:R]->{1,5}`, `{,3}`, `{2,}`, `{2}`, `*`, `+`, `?` | quantified (variable-length) edge, quantifier after the arrow |
 | `-[:R*1..5]->`, `-[:R*]->`, `-[:R*2]->`, `-[:R*..3]->`, `-[:R*0..]->` | Cypher's quantifier inside the edge, with Cypher's meaning (see below) |
@@ -430,7 +429,7 @@ building in [abi_build.cpp](src/core/functions/table/abi_build.cpp); vertex-join
 - **`OPTIONAL MATCH`** cannot use the path variable of its own pattern in `COLUMNS` or `WHERE`.
 - **`SHORTEST k`** takes one quantified edge between two vertices over one edge table (no element `WHERE` on the
   edge); longer patterns are refused. Inside a longer pattern, an unbounded quantifier with only a path mode or with a
-  lower bound above 1 is answered from the CSR, which finds one shortest path per pair (refused for `<-` and `<->`).
+  lower bound above 1 is answered from the CSR, which finds one shortest path per pair (refused for `<-`).
 - **ABI rewrites** cover the common path shapes, not every pattern; multi-hop undirected and mixed-direction chains
   traverse. Choosing between several matching artifacts is simple.
 - **`pgq_abi_build` on a SQLite-backed DuckLake catalog** fails (the build's connection and the caller's contend

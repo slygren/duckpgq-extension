@@ -141,6 +141,7 @@ Peter	David
 Peter	Gabor
 Peter	Tavneet
 
+# <-> is either direction (SQL/PGQ): every edge at Peter, as with -[k:Knows]- above
 query II
 SELECT study.a_name, study.b_name
 FROM GRAPH_TABLE (pg
@@ -148,9 +149,14 @@ FROM GRAPH_TABLE (pg
     (a:Person)<-[k:Knows]->(b:Person)
     WHERE a.name = 'Peter'
     COLUMNS (a.name as a_name, b.name as b_name)
-    ) study;
+    ) study
+    ORDER BY a_name, b_name;
 ----
 Peter	Daniel
+Peter	Daniel
+Peter	David
+Peter	Gabor
+Peter	Tavneet
 
 query II
 SELECT study.a_name, count(study.b_name)
