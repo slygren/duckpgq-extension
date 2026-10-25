@@ -1965,19 +1965,29 @@ static bool BindingSpansMultiplePatterns(const MatchExpression &ref, const strin
 	if (binding.empty()) {
 		return false;
 	}
+	// The element may sit inside the subpath a path variable or path mode wraps around the pattern, or inside the
+	// subpath that carries an element WHERE.
+	std::function<bool(const vector<unique_ptr<PathReference>> &)> contains =
+	    [&](const vector<unique_ptr<PathReference>> &elements) {
+		    for (const auto &element : elements) {
+			    if (auto *path_element = PGQMatchFunction::GetPathElement(element)) {
+				    if (StringUtil::CIEquals(path_element->variable_binding, binding)) {
+					    return true;
+				    }
+			    } else if (auto *subpath = PGQMatchFunction::GetSubPath(element)) {
+				    if (contains(subpath->path_list)) {
+					    return true;
+				    }
+			    }
+		    }
+		    return false;
+	    };
 	idx_t patterns_containing = 0;
 	for (const auto &pattern : ref.path_patterns) {
 		if (!pattern) {
 			continue;
 		}
-		bool found = false;
-		for (const auto &element : pattern->path_elements) {
-			auto *path_element = PGQMatchFunction::GetPathElement(element);
-			if (path_element && StringUtil::CIEquals(path_element->variable_binding, binding)) {
-				found = true;
-				break;
-			}
-		}
+		const bool found = contains(pattern->path_elements);
 		if (found && ++patterns_containing > 1) {
 			return true;
 		}

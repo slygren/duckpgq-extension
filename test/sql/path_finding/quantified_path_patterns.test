@@ -565,6 +565,50 @@ FROM GRAPH_TABLE (g MATCH (a:P)-[:K]->(b:P) | (a:P)-[:L]->(b:Q) WHERE a.id = 1 C
 2	branch
 2	branch
 
+# ---------------------------------------------------------------------------------------------------- ABI artifacts
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('g', max_hops := 3, closures := ['K']);
+
+# with artifacts the unrolled repetitions read fixed-path tables; a second pattern stays joined to the vertex after the group
+query TTTT rowsort
+FROM GRAPH_TABLE (g MATCH p = (a:P) ((x:P)-[e:L]->(m:Q)-[f:M]->(y)){0,2} (b), (b) -[k2:K]-> (c) WHERE a.id = 4 COLUMNS (a.id AS a, b.id AS b, c.id AS c, m.name AS ms));
+----
+4	1	2	[q3]
+4	1	2	[q3]
+4	3	1	[q3, q1]
+4	3	4	[q3, q1]
+4	4	4	[]
+4	4	5	[]
+4	5	2	[q3, q1]
+
+# the same without a group: a named path answered by a fixed-path table keeps its join to the second pattern
+query TTT rowsort
+FROM GRAPH_TABLE (g MATCH p = (a:P)-[e:L]->(m:Q)-[f:M]->(b:P), (b:P)-[k2:K]->(c) WHERE a.id = 4 COLUMNS (a.id AS a, b.id AS b, c.id AS c));
+----
+4	1	2
+4	1	2
+
+# a group over one edge with artifacts
+query TTT rowsort
+FROM GRAPH_TABLE (g MATCH (a:P) ((x)-[e:K]->(y)){1,3} (b) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, e.w AS ws));
+----
+1	2	[11]
+1	2	[21]
+1	3	[11, 31]
+1	3	[21, 31]
+1	4	[11, 31, 51]
+1	4	[11, 61]
+1	4	[21, 31, 51]
+1	4	[21, 61]
+1	5	[11, 61, 81]
+1	5	[21, 61, 81]
+
+statement ok
+SELECT count(*) FROM pgq_abi_drop('g');
+
 # ---------------------------------------------------------------------------------------------------- refused
 # nested quantified groups
 statement error
