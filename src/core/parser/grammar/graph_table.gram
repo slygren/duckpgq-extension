@@ -2,12 +2,13 @@
 # Built-in rules are referenced directly; no DuckDB grammar is copied here.
 # Keep each rule on one line; CMake embeds them in a header at configure time.
 
-DuckPGQGraphTable <- DuckPGQGraphTableKeyword '(' QualifiedName DuckPGQMatchBlock DuckPGQUnionBranch* DuckPGQColumns? ')' TableAlias?
+DuckPGQGraphTable <- DuckPGQGraphTableKeyword '(' QualifiedName DuckPGQMatchBlock DuckPGQColumns? DuckPGQUnionBranch* DuckPGQColumns? ')' TableAlias?
 # One MATCH block. Each OPTIONAL MATCH group left-joins onto the mandatory patterns; the WHERE follows all of them.
 DuckPGQMatchBlock <- 'MATCH' List(DuckPGQPathPattern) DuckPGQOptionalMatch* DuckPGQOneRowPer? WhereClause?
 DuckPGQOptionalMatch <- 'OPTIONAL' 'MATCH' List(DuckPGQPathPattern)
-# Further MATCH blocks combined with the first; all branches share the final COLUMNS.
-DuckPGQUnionBranch <- 'UNION' 'ALL'? DuckPGQMatchBlock
+# Further MATCH blocks combined with the first. Either each block has its own COLUMNS, or only the last one does and
+# all blocks share it.
+DuckPGQUnionBranch <- 'UNION' 'ALL'? DuckPGQMatchBlock DuckPGQColumns?
 
 # ONE ROW PER VERTEX (v), ONE ROW PER EDGE (e) or ONE ROW PER STEP (v1, e, v2) unnests the matched paths.
 DuckPGQOneRowPer <- 'ONE' 'ROW' 'PER' DuckPGQOneRowPerTarget

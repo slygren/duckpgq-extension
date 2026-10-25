@@ -529,7 +529,14 @@ void TransformMatchBlock(PEGTransformer &transformer, ParseResult &parse_result,
 	}
 }
 
-// DuckPGQGraphTableKeyword '(' QualifiedName DuckPGQMatchBlock DuckPGQUnionBranch* DuckPGQColumns? ')' TableAlias?
+// DuckPGQColumns <- 'COLUMNS' Parens(TargetList)
+vector<unique_ptr<ParsedExpression>> TransformColumns(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &target_list = PEGTransformerFactory::ExtractResultFromParens(parse_result.Cast<ListParseResult>().GetChild(1));
+	return transformer.Transform<vector<unique_ptr<ParsedExpression>>>(target_list);
+}
+
+// DuckPGQGraphTableKeyword '(' QualifiedName DuckPGQMatchBlock DuckPGQColumns? DuckPGQUnionBranch* DuckPGQColumns? ')'
+// TableAlias?
 arena_ptr<TransformResultValue> TransformGraphTable(PEGTransformer &transformer, ParseResult &parse_result) {
 	auto &list = parse_result.Cast<ListParseResult>();
 	auto match = make_uniq<MatchExpression>();
@@ -538,9 +545,13 @@ arena_ptr<TransformResultValue> TransformGraphTable(PEGTransformer &transformer,
 	match->pg_catalog = graph_name.Catalog().GetIdentifierName();
 	match->pg_schema = graph_name.Schema().GetIdentifierName();
 	TransformMatchBlock(transformer, list.GetChild(3), *match);
-	auto &union_branches = list.Child<OptionalParseResult>(4);
+	// The COLUMNS written after each MATCH block, in block order (null where a block has none), and after the last.
+	vector<optional_ptr<ParseResult>> block_columns;
+	auto &head_columns = list.Child<OptionalParseResult>(4);
+	block_columns.push_back(head_columns.HasResult() ? &head_columns.GetResult() : nullptr);
+	auto &union_branches = list.Child<OptionalParseResult>(5);
 	if (union_branches.HasResult()) {
-		// 'UNION' 'ALL'? DuckPGQMatchBlock
+		// 'UNION' 'ALL'? DuckPGQMatchBlock DuckPGQColumns?
 		for (auto &branch : union_branches.GetResult().Cast<RepeatParseResult>().GetChildren()) {
 			auto &branch_list = branch.get().Cast<ListParseResult>();
 			auto branch_match = make_uniq<MatchExpression>();
@@ -550,13 +561,38 @@ arena_ptr<TransformResultValue> TransformGraphTable(PEGTransformer &transformer,
 			TransformMatchBlock(transformer, branch_list.GetChild(2), *branch_match);
 			match->union_all_flags.push_back(branch_list.Child<OptionalParseResult>(1).HasResult());
 			match->union_matches.push_back(std::move(branch_match));
+			auto &branch_columns = branch_list.Child<OptionalParseResult>(3);
+			block_columns.push_back(branch_columns.HasResult() ? &branch_columns.GetResult() : nullptr);
 		}
 	}
-	auto &columns = list.Child<OptionalParseResult>(5);
-	if (columns.HasResult()) {
-		auto &target_list =
-		    PEGTransformerFactory::ExtractResultFromParens(columns.GetResult().Cast<ListParseResult>().GetChild(1));
-		match->column_list = transformer.Transform<vector<unique_ptr<ParsedExpression>>>(target_list);
+	auto &final_columns = list.Child<OptionalParseResult>(6);
+	if (final_columns.HasResult()) {
+		if (block_columns.back()) {
+			throw ParserException("GRAPH_TABLE takes one COLUMNS clause after its last MATCH block, not two");
+		}
+		block_columns.back() = &final_columns.GetResult();
+	}
+	// Branch-local COLUMNS: a COLUMNS clause before the last block means every block has its own. Otherwise the
+	// COLUMNS after the last block (if any) is shared by all of them.
+	bool branch_local = false;
+	for (idx_t i = 0; i + 1 < block_columns.size(); i++) {
+		branch_local |= block_columns[i] != nullptr;
+	}
+	if (branch_local) {
+		for (idx_t i = 0; i < block_columns.size(); i++) {
+			if (!block_columns[i]) {
+				throw ParserException("MATCH block %llu of the UNION has no COLUMNS: when one block of a UNION has its "
+				                      "own COLUMNS, every block needs one (or write a single COLUMNS after the last "
+				                      "block, shared by all)",
+				                      static_cast<unsigned long long>(i + 1));
+			}
+		}
+		match->column_list = TransformColumns(transformer, *block_columns[0]);
+		for (idx_t i = 0; i < match->union_matches.size(); i++) {
+			match->union_matches[i]->column_list = TransformColumns(transformer, *block_columns[i + 1]);
+		}
+	} else if (block_columns.back()) {
+		match->column_list = TransformColumns(transformer, *block_columns.back());
 	} else {
 		// Without COLUMNS, expose every column of every vertex binding in the pattern.
 		for (auto &path_pattern : match->path_patterns) {
@@ -567,7 +603,7 @@ arena_ptr<TransformResultValue> TransformGraphTable(PEGTransformer &transformer,
 	}
 
 	auto result = make_uniq<TableFunctionRef>();
-	auto &alias = list.Child<OptionalParseResult>(7);
+	auto &alias = list.Child<OptionalParseResult>(8);
 	if (alias.HasResult()) {
 		auto table_alias = transformer.Transform<TableAlias>(alias.GetResult());
 		match->alias = table_alias.name.GetIdentifierName();

@@ -131,7 +131,8 @@ put over DuckLake catalogs. A graph is stored in the database it is created in a
 | `WALK`, `TRAIL`, `SIMPLE`, `ACYCLIC` | path mode |
 | `OPTIONAL MATCH …` | left-joined pattern (fixed-length, directed) |
 | `WHERE EXISTS { (t)-[:HAS_WORKORDER]->() }`, `NOT EXISTS { … }` | correlated pattern existence |
-| `MATCH … UNION [ALL] MATCH …` | several MATCH blocks, one shared `COLUMNS` |
+| `MATCH … UNION [ALL] MATCH … COLUMNS (…)` | several MATCH blocks sharing the final `COLUMNS` |
+| `MATCH … COLUMNS (…) UNION [ALL] MATCH … COLUMNS (…)` | each MATCH block with its own `COLUMNS`, combined by position as in a SQL `UNION` |
 | `ONE ROW PER VERTEX (v)`, `ONE ROW PER EDGE (e)`, `ONE ROW PER STEP (v1, e, v2)` | one output row per element of each matched path |
 
 A quantified pattern without a search prefix returns **every walk** (SQL/PGQ semantics), not one row per endpoint;
@@ -389,7 +390,6 @@ building in [abi_build.cpp](src/core/functions/table/abi_build.cpp); vertex-join
 - **Parsed, not implemented:** top-k shortest (`SHORTEST k`).
 - **`OPTIONAL MATCH`** is fixed-length and directed only. `ONE ROW PER` does not cover unbounded left-directed or
   bidirectional variable-length patterns.
-- **`UNION` of MATCH blocks** shares one final `COLUMNS` clause.
 - **ABI rewrites** cover the common path shapes, not every pattern; multi-hop undirected and mixed-direction chains
   traverse. Choosing between several matching artifacts is simple.
 - **`pgq_abi_build` on a SQLite-backed DuckLake catalog** fails (the build's connection and the caller's contend

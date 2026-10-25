@@ -10126,6 +10126,18 @@ static void NormalizeMatchExpression(MatchExpression &match) {
 	}
 }
 
+static bool HasStarExpression(const vector<unique_ptr<ParsedExpression>> &columns) {
+	for (auto &column : columns) {
+		bool found = column->GetExpressionClass() == ExpressionClass::STAR;
+		ParsedExpressionIterator::VisitExpression<StarExpression>(*column,
+		                                                          [&](const StarExpression &) { found = true; });
+		if (found) {
+			return true;
+		}
+	}
+	return false;
+}
+
 unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, TableFunctionBindInput &bind_input) {
 	auto duckpgq_state = GetDuckPGQState(context);
 
@@ -10317,12 +10329,15 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 		conditions.push_back(std::move(where));
 	}
 
-	// Deep-copy the column list for each UNION branch before consuming it for the head branch.
+	// A UNION branch either has its own COLUMNS or shares the head's: deep-copy the shared list for each branch before
+	// it is consumed for the head branch.
 	vector<vector<unique_ptr<ParsedExpression>>> union_col_copies;
 	for (size_t ui = 0; ui < ref->union_matches.size(); ui++) {
 		vector<unique_ptr<ParsedExpression>> branch_cols;
-		for (auto &expr : ref->column_list) {
-			branch_cols.push_back(expr->Copy());
+		if (ref->union_matches[ui]->column_list.empty()) {
+			for (auto &expr : ref->column_list) {
+				branch_cols.push_back(expr->Copy());
+			}
 		}
 		union_col_copies.push_back(std::move(branch_cols));
 	}
@@ -10339,11 +10354,16 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	}
 
 	// Build UNION chain: head branch then each union branch.
+	const idx_t head_column_count = final_select_node->select_list.size();
+	const bool head_has_star = HasStarExpression(final_select_node->select_list);
 	unique_ptr<QueryNode> current_node = std::move(final_select_node);
 
 	for (size_t ui = 0; ui < ref->union_matches.size(); ui++) {
 		auto &branch = *ref->union_matches[ui];
 		bool all = ref->union_all_flags[ui];
+		// The branch's own COLUMNS, or its copy of the shared ones.
+		const bool own_columns = !branch.column_list.empty();
+		auto &branch_columns = own_columns ? branch.column_list : union_col_copies[ui];
 
 		auto branch_select = make_uniq<SelectNode>();
 		case_insensitive_map_t<shared_ptr<PropertyGraphTable>> branch_alias_map;
@@ -10386,7 +10406,7 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 			}
 		}
 
-		RewriteCoveredPathColumns(union_col_copies[ui], branch_covered_columns);
+		RewriteCoveredPathColumns(branch_columns, branch_covered_columns);
 		branch.where_clause = RewriteCoveredPathColumns(std::move(branch.where_clause), branch_covered_columns);
 
 		for (auto &entry : branch_alias_map) {
@@ -10420,7 +10440,7 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 		}
 
 		const auto branch_direct_link_rewrite_count =
-		    RewriteDirectLinkReferences(*pg_table, branch_select, union_col_copies[ui], branch.where_clause,
+		    RewriteDirectLinkReferences(*pg_table, branch_select, branch_columns, branch.where_clause,
 		                                branch_alias_to_ve, path_table_cache);
 		if (branch_direct_link_rewrite_count > 0) {
 			PGQRewriteDiagnostic diagnostic;
@@ -10442,9 +10462,21 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 			branch_conditions.push_back(std::move(where));
 		}
 
+		if (own_columns) {
+			CheckColumnBinding(*pg_table, branch, branch_alias_to_ve);
+		}
 		branch_select->where_clause = CreateWhereClause(branch_conditions);
 		branch_select->select_list =
-		    BuildFinalColumnList(std::move(union_col_copies[ui]), branch_alias_to_ve, branch_stub_bindings);
+		    BuildFinalColumnList(std::move(branch_columns), branch_alias_to_ve, branch_stub_bindings);
+		// Branches are combined by position, as in SQL. A star expands at bind time; DuckDB reports a mismatch there.
+		if (own_columns && !head_has_star && !HasStarExpression(branch_select->select_list) &&
+		    branch_select->select_list.size() != head_column_count) {
+			throw BinderException("The MATCH blocks of a UNION must have COLUMNS that match by position: MATCH block "
+			                      "%llu has %llu columns, the first block has %llu",
+			                      static_cast<unsigned long long>(ui + 2),
+			                      static_cast<unsigned long long>(branch_select->select_list.size()),
+			                      static_cast<unsigned long long>(head_column_count));
+		}
 
 		auto set_op = make_uniq<SetOperationNode>();
 		set_op->setop_type = SetOperationType::UNION;

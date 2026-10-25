@@ -132,22 +132,34 @@ string DumpMatchBlock(const MatchExpression &match) {
 	return result;
 }
 
-//! A canonical, deterministic rendering of everything the grammar put into a MatchExpression.
-string DumpMatch(const MatchExpression &match) {
-	string result = DumpMatchBlock(match);
-	for (idx_t i = 0; i < match.union_matches.size(); i++) {
-		result += match.union_all_flags[i] ? " UNION ALL " : " UNION ";
-		result += DumpMatchBlock(*match.union_matches[i]);
-	}
-	result += " COLUMNS (";
-	for (idx_t i = 0; i < match.column_list.size(); i++) {
-		auto &column = *match.column_list[i];
+string DumpColumns(const vector<unique_ptr<ParsedExpression>> &columns) {
+	string result = " COLUMNS (";
+	for (idx_t i = 0; i < columns.size(); i++) {
+		auto &column = *columns[i];
 		result += (i > 0 ? ", " : "") + column.ToString();
 		if (column.HasAlias()) {
 			result += " AS " + column.GetAlias().GetIdentifierName();
 		}
 	}
 	return result + ")";
+}
+
+//! A canonical, deterministic rendering of everything the grammar put into a MatchExpression.
+string DumpMatch(const MatchExpression &match) {
+	// UNION branches carry their own COLUMNS only when every block has one.
+	const bool branch_local = !match.union_matches.empty() && !match.union_matches[0]->column_list.empty();
+	string result = DumpMatchBlock(match);
+	if (branch_local) {
+		result += DumpColumns(match.column_list);
+	}
+	for (idx_t i = 0; i < match.union_matches.size(); i++) {
+		result += match.union_all_flags[i] ? " UNION ALL " : " UNION ";
+		result += DumpMatchBlock(*match.union_matches[i]);
+		if (branch_local) {
+			result += DumpColumns(match.union_matches[i]->column_list);
+		}
+	}
+	return branch_local ? result : result + DumpColumns(match.column_list);
 }
 
 // Called for every table ref; EnumerateQueryNodeChildren does the recursion itself.

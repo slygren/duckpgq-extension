@@ -1,0 +1,254 @@
+# name: test/sql/path_finding/union_branch_columns.test
+# description: MATCH ... COLUMNS (...) UNION [ALL] MATCH ... COLUMNS (...): each MATCH block projects its own columns
+# group: [path_finding]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE person(id BIGINT, name VARCHAR);
+
+statement ok
+INSERT INTO person VALUES (1, 'Ann'), (2, 'Bob'), (3, 'Cid');
+
+statement ok
+CREATE TABLE company(cid VARCHAR, title VARCHAR);
+
+statement ok
+INSERT INTO company VALUES ('c1', 'Acme'), ('c2', 'Initech');
+
+statement ok
+CREATE TABLE knows(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO knows VALUES (1, 2), (2, 3);
+
+statement ok
+CREATE TABLE works_at(pid BIGINT, cid VARCHAR);
+
+statement ok
+INSERT INTO works_at VALUES (1, 'c1'), (2, 'c1'), (3, 'c2');
+
+statement ok
+CREATE PROPERTY GRAPH g
+VERTEX TABLES (person LABEL Person, company LABEL Company)
+EDGE TABLES (
+    knows SOURCE KEY (src) REFERENCES person (id) DESTINATION KEY (dst) REFERENCES person (id) LABEL Knows,
+    works_at SOURCE KEY (pid) REFERENCES person (id) DESTINATION KEY (cid) REFERENCES company (cid) LABEL WorksAt
+);
+
+# ── Parsing ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->(b:Person) COLUMNS (a.name AS x) UNION ALL MATCH (a:Person)-[:WorksAt]->(c:Company) COLUMNS (c.title AS y))$$);
+----
+MATCH (a:Person) -[_anon_0:Knows]-> (b:Person) COLUMNS (a."name" AS x) UNION ALL MATCH (a:Person) -[_anon_0:WorksAt]-> (c:Company) COLUMNS (c.title AS y)
+
+# One COLUMNS after the last block is shared by all blocks, as before
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->(b:Person) UNION MATCH (a:Person)-[:Knows]->(b:Person) COLUMNS (a.name))$$);
+----
+MATCH (a:Person) -[_anon_0:Knows]-> (b:Person) UNION MATCH (a:Person) -[_anon_0:Knows]-> (b:Person) COLUMNS (a."name")
+
+# Without a UNION, COLUMNS is the GRAPH_TABLE's, written once
+query I
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a:Person) COLUMNS (a.name))$$);
+----
+MATCH (a:Person) COLUMNS (a."name")
+
+statement error
+SELECT pattern FROM pgq_parse_match($$FROM GRAPH_TABLE (g MATCH (a:Person) COLUMNS (a.name) COLUMNS (a.id))$$);
+----
+not two
+
+statement error
+FROM GRAPH_TABLE (g MATCH (a:Person) COLUMNS (a.name) UNION ALL MATCH (b:Person) COLUMNS (b.name) COLUMNS (b.id));
+----
+not two
+
+# A block of a branch-local UNION without COLUMNS
+statement error
+FROM GRAPH_TABLE (g MATCH (a:Person) COLUMNS (a.name) UNION ALL MATCH (b:Person));
+----
+MATCH block 2 of the UNION has no COLUMNS
+
+statement error
+FROM GRAPH_TABLE (g MATCH (a:Person) UNION ALL MATCH (b:Person) COLUMNS (b.name) UNION ALL MATCH (c:Person) COLUMNS (c.name));
+----
+MATCH block 1 of the UNION has no COLUMNS
+
+# ── Answers ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+# Each block projects its own variables; names come from the first block, as in SQL
+query TT rowsort
+SELECT src, dst FROM GRAPH_TABLE (g
+    MATCH (a:Person)-[:Knows]->(b:Person) COLUMNS (a.name AS src, b.name AS dst)
+    UNION ALL
+    MATCH (p:Person)-[:WorksAt]->(c:Company) COLUMNS (p.name, c.title));
+----
+Ann	Acme
+Ann	Bob
+Bob	Acme
+Bob	Cid
+Cid	Initech
+
+# UNION removes duplicates across blocks
+query T rowsort
+FROM GRAPH_TABLE (g
+    MATCH (a:Person)-[:Knows]->(b:Person) COLUMNS (a.name AS who)
+    UNION
+    MATCH (p:Person)-[:WorksAt]->(c:Company) COLUMNS (p.name));
+----
+Ann
+Bob
+Cid
+
+query T rowsort
+FROM GRAPH_TABLE (g
+    MATCH (a:Person)-[:Knows]->(b:Person) COLUMNS (a.name AS who)
+    UNION ALL
+    MATCH (p:Person)-[:WorksAt]->(c:Company) COLUMNS (p.name));
+----
+Ann
+Ann
+Bob
+Bob
+Cid
+
+# Three blocks, each with its own WHERE
+query TT rowsort
+FROM GRAPH_TABLE (g
+    MATCH (a:Person)-[:Knows]->(b:Person) WHERE a.id = 1 COLUMNS ('knows' AS kind, b.name AS other)
+    UNION ALL
+    MATCH (p:Person)-[:WorksAt]->(c:Company) WHERE p.id = 1 COLUMNS ('works', c.title)
+    UNION ALL
+    MATCH (q:Person) WHERE q.id = 1 COLUMNS ('self', q.name));
+----
+knows	Bob
+self	Ann
+works	Acme
+
+# The columns are combined by position with SQL UNION typing: BIGINT and VARCHAR give VARCHAR
+query TT rowsort
+SELECT typeof(k), k FROM GRAPH_TABLE (g
+    MATCH (a:Person) WHERE a.id = 1 COLUMNS (a.id AS k)
+    UNION ALL
+    MATCH (c:Company) WHERE c.cid = 'c2' COLUMNS (c.cid));
+----
+VARCHAR	1
+VARCHAR	c2
+
+# Path functions in a block's own COLUMNS describe that block's path
+query TI rowsort
+FROM GRAPH_TABLE (g
+    MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) COLUMNS (b.name AS reached, path_length(p) AS hops)
+    UNION ALL
+    MATCH q = (a:Person)-[:WorksAt]->(c:Company) WHERE a.id = 1 COLUMNS (c.title, path_length(q)));
+----
+Acme	1
+Bob	1
+Cid	1
+Cid	2
+
+# The shared form still projects one COLUMNS from every block
+query TT rowsort
+FROM GRAPH_TABLE (g
+    MATCH (a:Person)-[:Knows]->(b:Person)
+    UNION ALL
+    MATCH (a:Person)-[:Knows]->(b:Person) WHERE a.id = 1
+    COLUMNS (a.name, b.name));
+----
+Ann	Bob
+Ann	Bob
+Bob	Cid
+
+# Blocks whose COLUMNS do not match by position
+statement error
+FROM GRAPH_TABLE (g
+    MATCH (a:Person)-[:Knows]->(b:Person) COLUMNS (a.name, b.name)
+    UNION ALL
+    MATCH (p:Person)-[:WorksAt]->(c:Company) COLUMNS (c.title));
+----
+must have COLUMNS that match by position: MATCH block 2 has 1 columns, the first block has 2
+
+# Types that SQL cannot combine
+statement error
+FROM GRAPH_TABLE (g
+    MATCH (a:Person) COLUMNS (a.id)
+    UNION ALL
+    MATCH (p:Person) COLUMNS (DATE '2020-01-01'));
+----
+<REGEX>:.*(Conversion|Binder) Error.*
+
+# A block's COLUMNS can only use that block's variables
+statement error
+FROM GRAPH_TABLE (g
+    MATCH (a:Person)-[:Knows]->(b:Person) COLUMNS (a.name)
+    UNION ALL
+    MATCH (p:Person)-[:WorksAt]->(c:Company) COLUMNS (b.name));
+----
+<REGEX>:.*(b\.name|"b").*
+
+# ── The same answers from ABI artifacts ─────────────────────────────────────────────────────────────────────────────
+
+statement ok
+FROM pgq_abi_build('g', exclude_self_referential := false, closures := ['Knows']);
+
+query TT rowsort
+SELECT src, dst FROM GRAPH_TABLE (g
+    MATCH (a:Person)-[:Knows]->(b:Person) COLUMNS (a.name AS src, b.name AS dst)
+    UNION ALL
+    MATCH (p:Person)-[:WorksAt]->(c:Company) COLUMNS (p.name, c.title));
+----
+Ann	Acme
+Ann	Bob
+Bob	Acme
+Bob	Cid
+Cid	Initech
+
+query TT
+SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g
+    MATCH (a:Person)-[:Knows]->(b:Person) COLUMNS (a.name AS src, b.name AS dst)
+    UNION ALL
+    MATCH (p:Person)-[:WorksAt]->(c:Company) COLUMNS (p.name, c.title))');
+----
+match	true
+
+query TI rowsort
+FROM GRAPH_TABLE (g
+    MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) COLUMNS (b.name AS reached, path_length(p) AS hops)
+    UNION ALL
+    MATCH q = (a:Person)-[:WorksAt]->(c:Company) WHERE a.id = 1 COLUMNS (c.title, path_length(q)));
+----
+Acme	1
+Bob	1
+Cid	1
+Cid	2
+
+query TT
+SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g
+    MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) COLUMNS (b.name AS reached, path_length(p) AS hops)
+    UNION ALL
+    MATCH q = (a:Person)-[:WorksAt]->(c:Company) WHERE a.id = 1 COLUMNS (c.title, path_length(q)))');
+----
+match	true
+
+query T rowsort
+FROM GRAPH_TABLE (g
+    MATCH (a:Person)-[:Knows]->(b:Person) COLUMNS (a.name AS who)
+    UNION
+    MATCH (p:Person)-[:WorksAt]->(c:Company) COLUMNS (p.name));
+----
+Ann
+Bob
+Cid
+
+query TT
+SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g
+    MATCH (a:Person)-[:Knows]->(b:Person) COLUMNS (a.name AS who)
+    UNION
+    MATCH (p:Person)-[:WorksAt]->(c:Company) COLUMNS (p.name))');
+----
+match	true

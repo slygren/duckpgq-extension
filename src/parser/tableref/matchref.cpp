@@ -98,7 +98,7 @@ bool MatchExpression::Equals(const BaseExpression &other_p) const {
 		}
 	}
 
-	if (column_list.size() != column_list.size()) {
+	if (column_list.size() != other.column_list.size()) {
 		return false;
 	}
 
