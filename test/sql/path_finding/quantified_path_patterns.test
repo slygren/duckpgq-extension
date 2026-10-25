@@ -1,0 +1,663 @@
+# name: test/sql/path_finding/quantified_path_patterns.test
+# description: Quantified path patterns ( body [WHERE c] ){n,m} and [ body ]{n,m}, group variables, and the variables
+#              of quantified edges. Every expected result was produced by a brute-force matcher (vertex patterns test
+#              the current vertex, edge patterns step along an edge, a group runs its body k times), not by the engine.
+# group: [path_finding]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE P(id BIGINT, name VARCHAR);
+
+statement ok
+CREATE TABLE Q(id BIGINT, name VARCHAR);
+
+statement ok
+CREATE TABLE K(src BIGINT, dst BIGINT, w BIGINT, eid BIGINT);
+
+statement ok
+CREATE TABLE L(src BIGINT, dst BIGINT, w BIGINT, eid BIGINT);
+
+statement ok
+CREATE TABLE M(src BIGINT, dst BIGINT, w BIGINT, eid BIGINT);
+
+statement ok
+INSERT INTO P VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e'),(6,'f');
+
+statement ok
+INSERT INTO Q VALUES (1,'q1'),(2,'q2'),(3,'q3');
+
+statement ok
+INSERT INTO K VALUES (1,2,11,100),(1,2,21,101),(2,3,31,102),(3,1,41,103),(3,4,51,104),(2,4,61,105),(4,4,71,106),(4,5,81,107),(5,2,91,108),(6,6,101,109);
+
+statement ok
+INSERT INTO L VALUES (1,1,11,100),(2,1,21,101),(3,2,31,102),(4,3,41,103),(5,3,51,104);
+
+statement ok
+INSERT INTO M VALUES (1,3,11,100),(2,4,21,101),(3,1,31,102),(1,5,41,103);
+
+statement ok
+CREATE PROPERTY GRAPH g VERTEX TABLES (P LABEL P, Q LABEL Q) EDGE TABLES (K SOURCE KEY (src) REFERENCES P (id) DESTINATION KEY (dst) REFERENCES P (id) LABEL K, L SOURCE KEY (src) REFERENCES P (id) DESTINATION KEY (dst) REFERENCES Q (id) LABEL L, M SOURCE KEY (src) REFERENCES Q (id) DESTINATION KEY (dst) REFERENCES P (id) LABEL M);
+
+# ---------------------------------------------------------------------------------------------------- groups
+# a group continues the path from the vertex before it; its variables are lists in iteration order
+query TTTTT rowsort
+FROM GRAPH_TABLE (g MATCH (a:P) ((x)-[e:K]->(y)){1,3} (b) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, x.id AS xs, e.w AS ws, y.id AS ys));
+----
+1	2	[1]	[11]	[2]
+1	2	[1]	[21]	[2]
+1	3	[1, 2]	[11, 31]	[2, 3]
+1	3	[1, 2]	[21, 31]	[2, 3]
+1	4	[1, 2, 3]	[11, 31, 51]	[2, 3, 4]
+1	4	[1, 2, 3]	[21, 31, 51]	[2, 3, 4]
+1	4	[1, 2]	[11, 61]	[2, 4]
+1	4	[1, 2]	[21, 61]	[2, 4]
+1	5	[1, 2, 4]	[11, 61, 81]	[2, 4, 5]
+1	5	[1, 2, 4]	[21, 61, 81]	[2, 4, 5]
+
+# the same with brackets
+query TTTT rowsort
+FROM GRAPH_TABLE (g MATCH (a:P) [(x)-[e:K]->(y)]{1,3} (b) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, x.id AS xs, e.w AS ws));
+----
+1	2	[1]	[11]
+1	2	[1]	[21]
+1	3	[1, 2]	[11, 31]
+1	3	[1, 2]	[21, 31]
+1	4	[1, 2, 3]	[11, 31, 51]
+1	4	[1, 2, 3]	[21, 31, 51]
+1	4	[1, 2]	[11, 61]
+1	4	[1, 2]	[21, 61]
+1	5	[1, 2, 4]	[11, 61, 81]
+1	5	[1, 2, 4]	[21, 61, 81]
+
+# zero iterations: the vertices around the group are one vertex, the lists are empty; aggregates run along the list
+query TTTTTT rowsort
+FROM GRAPH_TABLE (g MATCH (a:P) ((x)-[e:K]->(y)){0,2} (b) WHERE a.id = 4 COLUMNS (a.id AS a, b.id AS b, e.w AS ws, sum(e.w) AS total, count(e) AS n, element_id(e) AS ids));
+----
+4	2	[81, 91]	172	2	[7, 8]
+4	4	[]	NULL	0	[]
+4	5	[81]	81	1	[7]
+
+# no vertex twice across the iterations (2 -> 3 -> 1 -> 2 is not a match), as for a quantified edge
+query TTT rowsort
+FROM GRAPH_TABLE (g MATCH (a:P) ((x)-[e:K]->(y)){3} (b) WHERE a.id = 2 COLUMNS (a.id AS a, b.id AS b, x.id AS xs));
+----
+2	5	[2, 3, 4]
+
+# the group WHERE applies to each iteration
+query TTT rowsort
+FROM GRAPH_TABLE (g MATCH (a:P) ((x)-[e:K]->(y) WHERE y.id > x.id){1,3} (b) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, x.id AS xs));
+----
+1	2	[1]
+1	2	[1]
+1	3	[1, 2]
+1	3	[1, 2]
+1	4	[1, 2, 3]
+1	4	[1, 2, 3]
+1	4	[1, 2]
+1	4	[1, 2]
+1	5	[1, 2, 4]
+1	5	[1, 2, 4]
+
+# element WHEREs inside the body
+query TTT rowsort
+FROM GRAPH_TABLE (g MATCH (a:P) ((x WHERE x.id <> 3)-[e:K WHERE e.w > 20]->(y)){1,3} (b) COLUMNS (a.id AS a, b.id AS b, e.w AS ws));
+----
+1	2	[21]
+1	3	[21, 31]
+1	4	[21, 61]
+1	5	[21, 61, 81]
+2	3	[31]
+2	4	[61]
+2	5	[61, 81]
+4	2	[81, 91]
+4	3	[81, 91, 31]
+4	5	[81]
+5	2	[91]
+5	3	[91, 31]
+5	4	[91, 61]
+
+# a body through two tables: P -L-> Q -M-> P, repeated
+query TTTTT rowsort
+FROM GRAPH_TABLE (g MATCH (a:P) ((x:P)-[e:L]->(m:Q)-[f:M]->(y)){0,3} (b) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, m.name AS ms, label(m) AS lm, f.w AS fs));
+----
+1	1	[]	[]	[]
+1	3	[q1]	[Q]	[11]
+1	4	[q1, q2]	[Q, Q]	[11, 21]
+1	5	[q1]	[Q]	[41]
+
+# a body that cannot repeat (it ends in Q, and L leaves P) matches once; the impossible counts are not an error
+query TTT rowsort
+FROM GRAPH_TABLE (g MATCH (a:P) ((x)-[e:L]->(y)){1,3} (b) COLUMNS (a.id AS a, b.id AS b, label(b) AS lb));
+----
+1	1	Q
+2	1	Q
+3	2	Q
+4	3	Q
+5	3	Q
+
+# the user example: a TAG-like start, two edges per iteration
+query TTTT rowsort
+FROM GRAPH_TABLE (g MATCH (a:P) ((x)-[e:K]->(m:P)-[f:K]->(y)){1,2} (b) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, m.id AS ms, x.id AS xs));
+----
+1	3	[2]	[1]
+1	3	[2]	[1]
+1	4	[2]	[1]
+1	4	[2]	[1]
+1	5	[2, 4]	[1, 3]
+1	5	[2, 4]	[1, 3]
+
+# a fixed part before and after the group
+query TTTTT rowsort
+FROM GRAPH_TABLE (g MATCH (a:P) -[k0:K]-> (s0) ((x)-[e:K]->(y)){0,2} (b) -[k1:K]-> (c) WHERE a.id = 3 COLUMNS (a.id AS a, s0.id AS s0, b.id AS b, c.id AS c, x.id AS xs));
+----
+3	1	1	2	[]
+3	1	1	2	[]
+3	1	2	3	[1]
+3	1	2	3	[1]
+3	1	2	4	[1]
+3	1	2	4	[1]
+3	1	3	1	[1, 2]
+3	1	3	1	[1, 2]
+3	1	3	4	[1, 2]
+3	1	3	4	[1, 2]
+3	1	4	4	[1, 2]
+3	1	4	4	[1, 2]
+3	1	4	5	[1, 2]
+3	1	4	5	[1, 2]
+3	4	2	3	[4, 5]
+3	4	2	4	[4, 5]
+3	4	4	4	[]
+3	4	4	5	[]
+3	4	5	2	[4]
+
+# the pattern can start with a group
+query TTT rowsort
+FROM GRAPH_TABLE (g MATCH ((x)-[e:K]->(y)){1,2} (b:P) WHERE b.id = 4 COLUMNS (b.id AS b, x.id AS xs, e.w AS ws));
+----
+4	[1, 2]	[11, 61]
+4	[1, 2]	[21, 61]
+4	[2, 3]	[31, 51]
+4	[2]	[61]
+4	[3]	[51]
+4	[5, 2]	[91, 61]
+
+# an undirected body
+query TTTT rowsort
+FROM GRAPH_TABLE (g MATCH (a:P) ((x)-[e:K]-(y)){1,2} (b) WHERE a.id = 5 COLUMNS (a.id AS a, b.id AS b, e.w AS ws, element_id(e) AS ids));
+----
+5	1	[91, 11]	[8, 0]
+5	1	[91, 21]	[8, 1]
+5	2	[81, 61]	[7, 5]
+5	2	[91]	[8]
+5	3	[81, 51]	[7, 4]
+5	3	[91, 31]	[8, 2]
+5	4	[81]	[7]
+5	4	[91, 61]	[8, 5]
+
+# two groups in one pattern
+query TTTT rowsort
+FROM GRAPH_TABLE (g MATCH (a:P) ((x)-[e:K]->(y)){1} (m) ((u)-[h:K]->(v)){0,2} (b) WHERE a.id = 1 COLUMNS (a.id AS a, m.id AS m, b.id AS b, h.w AS hs));
+----
+1	2	1	[31, 41]
+1	2	1	[31, 41]
+1	2	2	[]
+1	2	2	[]
+1	2	3	[31]
+1	2	3	[31]
+1	2	4	[31, 51]
+1	2	4	[31, 51]
+1	2	4	[61]
+1	2	4	[61]
+1	2	5	[61, 81]
+1	2	5	[61, 81]
+
+# a second pattern shares the vertex after the group
+query TTTT rowsort
+FROM GRAPH_TABLE (g MATCH (a:P) ((x)-[e:K]->(y)){1,2} (b), (b) -[k2:L]-> (c) WHERE a.id = 2 COLUMNS (a.id AS a, b.id AS b, c.name AS c, x.id AS xs));
+----
+2	1	q1	[2, 3]
+2	3	q2	[2]
+2	4	q3	[2, 3]
+2	4	q3	[2]
+2	5	q3	[2, 4]
+
+# the MATCH WHERE can read the lists
+query TTT rowsort
+FROM GRAPH_TABLE (g MATCH (a:P) ((x)-[e:K]->(y)){1,3} (b) WHERE list_contains(x.id, 3) AND len(e.w) >= 2 COLUMNS (a.id AS a, b.id AS b, x.id AS xs));
+----
+1	4	[1, 2, 3]
+1	4	[1, 2, 3]
+2	1	[2, 3]
+2	4	[2, 3]
+2	5	[2, 3, 4]
+3	2	[3, 1]
+3	2	[3, 1]
+3	2	[3, 4, 5]
+3	4	[3, 1, 2]
+3	4	[3, 1, 2]
+3	5	[3, 4]
+5	1	[5, 2, 3]
+5	4	[5, 2, 3]
+
+# upper bound 1: the variables are bound once, or NULL with zero iterations
+query TTTT rowsort
+FROM GRAPH_TABLE (g MATCH (a:P) ((x)-[e:K]->(y))? (b) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, x.id AS x, e.w AS w));
+----
+1	1	NULL	NULL
+1	2	1	11
+1	2	1	21
+
+# a group without a quantifier is just parentheses
+query TTT rowsort
+FROM GRAPH_TABLE (g MATCH (a:P) ((x)-[e:K]->(y)) (b) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, e.w AS w));
+----
+1	2	11
+1	2	21
+
+# path functions over the whole path, zero iterations included
+query TTTTT rowsort
+FROM GRAPH_TABLE (g MATCH p = (a:P) ((x)-[e:K]->(y)){0,2} (b) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs, edges(p) AS es, path_length(p) AS n));
+----
+1	1	[0]	[]	0
+1	2	[0, 1]	[0]	1
+1	2	[0, 1]	[1]	1
+1	3	[0, 1, 2]	[0, 2]	2
+1	3	[0, 1, 2]	[1, 2]	2
+1	4	[0, 1, 3]	[0, 5]	2
+1	4	[0, 1, 3]	[1, 5]	2
+
+# an aggregate over rows is computed once over every iteration count
+query TT rowsort
+FROM GRAPH_TABLE (g MATCH (a:P) ((x)-[e:K]->(y)){0,2} (b) WHERE a.id = 1 COLUMNS (count(*) AS n, sum(b.id) AS bs));
+----
+7	19
+
+# an aggregate over a group variable runs along its list, so len(e.w) there reads one edge
+statement error
+FROM GRAPH_TABLE (g MATCH (a:P) ((x)-[e:K]->(y)){0,2} (b) COLUMNS (sum(len(e.w)) AS hops));
+----
+len(BIGINT)
+
+# ---------------------------------------------------------------------------------------------------- ONE ROW PER
+# ONE ROW PER VERTEX: every vertex of the whole path, through both tables
+query TTT rowsort
+FROM GRAPH_TABLE (g MATCH p = (a:P) ((x:P)-[e:L]->(m:Q)-[f:M]->(y)){0,2} (b) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (b.id AS b, label(v) AS lv, v.name AS vn));
+----
+1	P	a
+3	P	a
+3	P	c
+3	Q	q1
+4	P	a
+4	P	c
+4	P	d
+4	Q	q1
+4	Q	q2
+5	P	a
+5	P	e
+5	Q	q1
+
+# ONE ROW PER EDGE
+query TTTT rowsort
+FROM GRAPH_TABLE (g MATCH p = (a:P) ((x:P)-[e:L]->(m:Q)-[f:M]->(y)){0,2} (b) ONE ROW PER EDGE (z) WHERE a.id = 1 COLUMNS (b.id AS b, label(z) AS lz, z.w AS zw, len(e.w) AS n));
+----
+3	L	11	1
+3	M	11	1
+4	L	11	2
+4	L	31	2
+4	M	11	2
+4	M	21	2
+5	L	11	1
+5	M	41	1
+
+# ONE ROW PER STEP; a zero-length path has no step
+query TTT rowsort
+FROM GRAPH_TABLE (g MATCH p = (a:P) ((x:P)-[e:L]->(m:Q)-[f:M]->(y)){0,2} (b) ONE ROW PER STEP (v1, st, v2) WHERE a.id = 1 COLUMNS (v1.name AS v1, st.w AS w, v2.name AS v2));
+----
+a	11	q1
+a	11	q1
+a	11	q1
+c	31	q2
+q1	11	c
+q1	11	c
+q1	41	e
+q2	21	d
+
+# ---------------------------------------------------------------------------------------------------- selectors
+# ANY SHORTEST over a group: per endpoint pair, by hop count (ties: the smallest edge sequence)
+query TTT rowsort
+FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P) ((x)-[e:K]->(m)-[f:K]->(y)){1,3} (b) WHERE a.id = 1 COLUMNS (b.id AS b, path_length(p) AS n, edges(p) AS es));
+----
+3	2	[0, 2]
+4	2	[0, 5]
+5	4	[0, 2, 4, 7]
+
+# ALL SHORTEST over a group: per endpoint pair, by hop count
+query TTT rowsort
+FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P) ((x)-[e:K]->(m)-[f:K]->(y)){1,3} (b) WHERE a.id = 1 COLUMNS (b.id AS b, path_length(p) AS n, edges(p) AS es));
+----
+3	2	[0, 2]
+3	2	[1, 2]
+4	2	[0, 5]
+4	2	[1, 5]
+5	4	[0, 2, 4, 7]
+5	4	[1, 2, 4, 7]
+
+# a condition on the path beyond its endpoints filters the chosen shortest paths (it does not choose longer ones)
+query TT rowsort
+FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P) ((x)-[e:K]->(y)){1,3} (b) WHERE a.id = 1 AND list_contains(e.w, 31) COLUMNS (b.id AS b, e.w AS ws));
+----
+3	[11, 31]
+3	[21, 31]
+
+# ---------------------------------------------------------------------------------------------------- quantified edges
+# the variable of a quantified edge is the list of its edges, as in the group (()-[e]->()){1,3}
+query TTTTTT rowsort
+FROM GRAPH_TABLE (g MATCH (a:P) -[e:K]->{1,3} (b) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, e.w AS ws, element_id(e) AS ids, sum(e.w) AS total, count(e) AS n));
+----
+1	2	[11]	[0]	11	1
+1	2	[21]	[1]	21	1
+1	3	[11, 31]	[0, 2]	42	2
+1	3	[21, 31]	[1, 2]	52	2
+1	4	[11, 31, 51]	[0, 2, 4]	93	3
+1	4	[11, 61]	[0, 5]	72	2
+1	4	[21, 31, 51]	[1, 2, 4]	103	3
+1	4	[21, 61]	[1, 5]	82	2
+1	5	[11, 61, 81]	[0, 5, 7]	153	3
+1	5	[21, 61, 81]	[1, 5, 7]	163	3
+
+# ... and the group form gives the same rows
+query TTTTTT rowsort
+FROM GRAPH_TABLE (g MATCH (a:P) (()-[e:K]->()){1,3} (b) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, e.w AS ws, element_id(e) AS ids, sum(e.w) AS total, count(e) AS n));
+----
+1	2	[11]	[0]	11	1
+1	2	[21]	[1]	21	1
+1	3	[11, 31]	[0, 2]	42	2
+1	3	[21, 31]	[1, 2]	52	2
+1	4	[11, 31, 51]	[0, 2, 4]	93	3
+1	4	[11, 61]	[0, 5]	72	2
+1	4	[21, 31, 51]	[1, 2, 4]	103	3
+1	4	[21, 61]	[1, 5]	82	2
+1	5	[11, 61, 81]	[0, 5, 7]	153	3
+1	5	[21, 61, 81]	[1, 5, 7]	163	3
+
+# the variable of a quantified edge is the list of its edges, as in the group (()-[e]->()){0,2}
+query TTTTTT rowsort
+FROM GRAPH_TABLE (g MATCH (a:P) -[e:K]->{0,2} (b) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, e.w AS ws, element_id(e) AS ids, sum(e.w) AS total, count(e) AS n));
+----
+1	1	[]	[]	NULL	0
+1	2	[11]	[0]	11	1
+1	2	[21]	[1]	21	1
+1	3	[11, 31]	[0, 2]	42	2
+1	3	[21, 31]	[1, 2]	52	2
+1	4	[11, 61]	[0, 5]	72	2
+1	4	[21, 61]	[1, 5]	82	2
+
+# ... and the group form gives the same rows
+query TTTTTT rowsort
+FROM GRAPH_TABLE (g MATCH (a:P) (()-[e:K]->()){0,2} (b) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, e.w AS ws, element_id(e) AS ids, sum(e.w) AS total, count(e) AS n));
+----
+1	1	[]	[]	NULL	0
+1	2	[11]	[0]	11	1
+1	2	[21]	[1]	21	1
+1	3	[11, 31]	[0, 2]	42	2
+1	3	[21, 31]	[1, 2]	52	2
+1	4	[11, 61]	[0, 5]	72	2
+1	4	[21, 61]	[1, 5]	82	2
+
+# a quantified edge inside a longer pattern; label(e) is then a list too
+query TTTT rowsort
+FROM GRAPH_TABLE (g MATCH (a:P) -[k0:K]-> (s0) <-[e:K]-{1,2} (b) WHERE a.id = 3 COLUMNS (a.id AS a, b.id AS b, e.w AS ws, label(e) AS ls));
+----
+3	1	[61, 11]	[K, K]
+3	1	[61, 21]	[K, K]
+3	2	[41, 31]	[K, K]
+3	2	[51, 31]	[K, K]
+3	2	[61]	[K]
+3	3	[41]	[K]
+3	3	[51]	[K]
+3	5	[61, 91]	[K, K]
+
+# an element WHERE on a quantified edge applies to each of its edges
+query TTT rowsort
+FROM GRAPH_TABLE (g MATCH (a:P) -[e:K WHERE e.w > 30]->{1,3} (b) COLUMNS (a.id AS a, b.id AS b, e.w AS ws));
+----
+2	1	[31, 41]
+2	3	[31]
+2	4	[31, 51]
+2	4	[61]
+2	5	[31, 51, 81]
+2	5	[61, 81]
+3	1	[41]
+3	2	[51, 81, 91]
+3	4	[51]
+3	5	[51, 81]
+4	2	[81, 91]
+4	3	[81, 91, 31]
+4	5	[81]
+5	1	[91, 31, 41]
+5	2	[91]
+5	3	[91, 31]
+5	4	[91, 31, 51]
+5	4	[91, 61]
+
+# in the MATCH WHERE
+query TTT rowsort
+FROM GRAPH_TABLE (g MATCH (a:P) -[e:K]->{1,3} (b) WHERE list_sum(e.w) > 100 COLUMNS (a.id AS a, b.id AS b, e.w AS ws));
+----
+1	4	[21, 31, 51]
+1	5	[11, 61, 81]
+1	5	[21, 61, 81]
+2	5	[31, 51, 81]
+2	5	[61, 81]
+3	2	[51, 81, 91]
+3	4	[41, 11, 61]
+3	4	[41, 21, 61]
+3	5	[51, 81]
+4	2	[81, 91]
+4	3	[81, 91, 31]
+5	1	[91, 31, 41]
+5	3	[91, 31]
+5	4	[91, 31, 51]
+5	4	[91, 61]
+
+# with ONE ROW PER, the list is the same on every row of a path
+query TTT rowsort
+FROM GRAPH_TABLE (g MATCH (a:P) -[e:K]->{1,2} (b) ONE ROW PER EDGE (z) WHERE a.id = 1 COLUMNS (b.id AS b, z.w AS zw, e.w AS ws));
+----
+2	11	[11]
+2	21	[21]
+3	11	[11, 31]
+3	21	[21, 31]
+3	31	[11, 31]
+3	31	[21, 31]
+4	11	[11, 61]
+4	21	[21, 61]
+4	61	[11, 61]
+4	61	[21, 61]
+
+# unbounded under ALL SHORTEST: the path search answers, e is read along each path
+query TTT rowsort
+FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P) -[e:K]->+ (b:P) WHERE a.id = 1 COLUMNS (b.id AS b, e.w AS ws, sum(e.w) AS total));
+----
+2	[11]	11
+2	[21]	21
+3	[11, 31]	42
+3	[21, 31]	52
+4	[11, 61]	72
+4	[21, 61]	82
+5	[11, 61, 81]	153
+5	[21, 61, 81]	163
+
+# every simple path of an unbounded quantifier with a path mode
+query TT rowsort
+FROM GRAPH_TABLE (g MATCH p = ACYCLIC (a:P) -[e:K]->+ (b:P) WHERE a.id = 2 COLUMNS (b.id AS b, e.w AS ws));
+----
+1	[31, 41]
+3	[31]
+4	[31, 51]
+4	[61]
+5	[31, 51, 81]
+5	[61, 81]
+
+# label(e) alone keeps its meaning: one value, the edge label
+query TT rowsort
+FROM GRAPH_TABLE (g MATCH (a:P)-[e:K]->{1,2}(b:P) WHERE a.id = 1 COLUMNS (b.id AS b, label(e) AS l));
+----
+2	K
+2	K
+3	K
+3	K
+4	K
+4	K
+
+# ---------------------------------------------------------------------------------------------------- UNION, budget
+# UNION ALL of MATCH blocks with groups
+query TTT rowsort
+FROM GRAPH_TABLE (g MATCH (a:P) ((x)-[e:K]->(y)){1,2} (b) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, len(x.id) AS n) UNION ALL MATCH (a:P) ((x)-[e:L]->(y)) (b) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, 1 AS n));
+----
+1	1	1
+1	2	1
+1	2	1
+1	3	2
+1	3	2
+1	4	2
+1	4	2
+
+statement ok
+SET pgq_max_vl_fallback_rows = 5;
+
+# without a condition on a vertex outside it, a quantified pattern over budget is refused
+statement error
+FROM GRAPH_TABLE (g MATCH (a:P) ((x)-[e:K]->(y)){1,3} (b) COLUMNS (a.id, b.id));
+----
+exceeding pgq_max_vl_fallback_rows
+
+# a condition on the vertex after the group seeds it
+query TT rowsort
+FROM GRAPH_TABLE (g MATCH (a:P) ((x)-[e:K]->(y)){1,3} (b) WHERE b.id = 4 COLUMNS (a.id AS a, b.id AS b));
+----
+1	4
+1	4
+1	4
+1	4
+2	4
+2	4
+3	4
+3	4
+3	4
+5	4
+5	4
+
+statement ok
+RESET pgq_max_vl_fallback_rows;
+
+# each UNION ALL block keeps its own COLUMNS when one of them is lowered (a group, or a path pattern union)
+query TT rowsort
+FROM GRAPH_TABLE (g MATCH (a:P)-[:K]->(b:P) | (a:P)-[:L]->(b:Q) WHERE a.id = 1 COLUMNS (a.id AS x, 'head' AS src) UNION ALL MATCH (a:P)-[:K]->(b:P) WHERE a.id = 1 COLUMNS (b.id AS x, 'branch' AS src));
+----
+1	head
+1	head
+1	head
+2	branch
+2	branch
+
+# ---------------------------------------------------------------------------------------------------- refused
+# nested quantified groups
+statement error
+FROM GRAPH_TABLE (g MATCH (a:P) (((x)-[:K]->(y)){2} (z)){1,2} (b) COLUMNS (a.id));
+----
+Nested quantified path patterns are not supported
+
+# a quantified edge inside a group
+statement error
+FROM GRAPH_TABLE (g MATCH (a:P) ((x)-[:K]->{1,2}(y)){1,2} (b) COLUMNS (a.id));
+----
+A quantified edge inside a quantified path pattern is not supported
+
+# a union inside a group
+statement error
+FROM GRAPH_TABLE (g MATCH (a:P) ((x)-[:K]->(y) | (x)-[:L]->(y)){1,2} (b) COLUMNS (a.id));
+----
+A path pattern union ('|' or '|+|') inside a parenthesized path pattern is not supported
+
+# a path variable inside a group
+statement error
+FROM GRAPH_TABLE (g MATCH (a:P) (q = (x)-[:K]->(y)){1,2} (b) COLUMNS (a.id));
+----
+A path variable inside a parenthesized path pattern
+
+# a search prefix inside a group
+statement error
+FROM GRAPH_TABLE (g MATCH (a:P) (ANY SHORTEST (x)-[:K]->(y)){1,2} (b) COLUMNS (a.id));
+----
+A search prefix (ANY / ALL SHORTEST, SHORTEST k, CHEAPEST) cannot be written inside a parenthesized path pattern
+
+# a group in OPTIONAL MATCH
+statement error
+FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH (a) ((x)-[:K]->(y)){1,2} (b) COLUMNS (a.id));
+----
+A parenthesized path pattern in OPTIONAL MATCH is not supported
+
+# a variable inside and outside a group
+statement error
+FROM GRAPH_TABLE (g MATCH (a:P) ((x)-[:K]->(y)){1,2} (x) COLUMNS (a.id));
+----
+is declared both inside a parenthesized path pattern and outside it
+
+# a group variable read as a whole
+statement error
+FROM GRAPH_TABLE (g MATCH (a:P) ((x)-[:K]->(y)){1,2} (b) COLUMNS (x));
+----
+is a group variable (declared in a quantified path pattern) and stands for a list of elements
+
+# x.* of a group variable
+statement error
+FROM GRAPH_TABLE (g MATCH (a:P) ((x)-[:K]->(y)){1,2} (b) COLUMNS (x.*));
+----
+cannot be returned
+
+# a group variable inside EXISTS
+statement error
+FROM GRAPH_TABLE (g MATCH (a:P) ((x)-[:K]->(y)){1,2} (b) WHERE EXISTS { (x)-[:L]->() } COLUMNS (a.id));
+----
+EXISTS { } cannot refer to
+
+# SHORTEST k over a group
+statement error
+FROM GRAPH_TABLE (g MATCH SHORTEST 2 (a:P) ((x)-[:K]->(y)){1,2} (b) COLUMNS (a.id));
+----
+SHORTEST k over a quantified path pattern is not supported
+
+# CHEAPEST over a group
+statement error
+FROM GRAPH_TABLE (g MATCH ANY CHEAPEST (a:P) ((x)-[:K]->(y)){1,2} (b) COLUMNS (a.id));
+----
+CHEAPEST over a parenthesized path pattern is not supported
+
+# an unbounded group without a path mode or selector
+statement error
+FROM GRAPH_TABLE (g MATCH (a:P) ((x)-[:K]->(y))+ (b) COLUMNS (a.id));
+----
+ALL unbounded with path mode WALK is not possible
+
+# more iterations than are unrolled
+statement error
+FROM GRAPH_TABLE (g MATCH (a:P) ((x)-[:K]->(y)){1,9} (b) COLUMNS (a.id));
+----
+parenthesized path patterns are unrolled, up to 8 iterations
+
+# a group that can match zero times with nothing around it
+statement error
+FROM GRAPH_TABLE (g MATCH ((x)-[:K]->(y)){0,2} COLUMNS (1));
+----
+needs a vertex pattern before or after it
+
+# ONE ROW PER with a second pattern
+statement error
+FROM GRAPH_TABLE (g MATCH (a:P) ((x)-[:K]->(y)){1,2} (b), (b)-[:L]->(c) ONE ROW PER VERTEX (v) COLUMNS (v.id));
+----
+ONE ROW PER over a quantified path pattern needs it to be the only path pattern

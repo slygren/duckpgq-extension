@@ -47,6 +47,8 @@ In every such case the old rows were wrong.
     now traverse unless the table is proven exact.
   - **Edge path tables built with duplicate edges collapsed** no longer answer counting patterns. They used to
     undercount.
+  - **UNION ALL of MATCH blocks, each with its own COLUMNS, where one block has a path pattern union:** the other
+    blocks returned the first block's COLUMNS. Each block now keeps its own.
 
 **Errors where there used to be silent wrong output**
 - **A path function on a name that isn't a path** (`path_length(o)` with no `o = …`) is an error. The column used to
@@ -55,6 +57,8 @@ In every such case the old rows were wrong.
   for ever.
 - **ANY / ALL CHEAPEST inside OPTIONAL MATCH** is refused for now; the next release lifts it.
 - **Hop-count searches honour cancellation and `max_execution_time` at every level.**
+- **A function without arguments in the COLUMNS of a MATCH with a path variable** (`COLUMNS (list_value())` next to
+  `p = …`) answers. It used to raise an INTERNAL error, which invalidates the database in DuckDB 2.0.
 
 ### Added
 
@@ -74,6 +78,11 @@ In every such case the old rows were wrong.
   - **path modes** `TRAIL`, `ACYCLIC`, `SIMPLE`;
   - **unbounded left-directed and either-direction quantifiers.**
 - **Cypher quantifier syntax** inside the edge: `-[:R*1..5]->`, `*`, `*..3`, `*2`, `*0..`.
+- **Quantified path patterns** `(t) ((a)-[e:R]->(b) WHERE …){1,3} (z)`, also bracketed (`[ … ]{n,m}`), with group
+  variables: outside the group they are lists in repetition order, and an aggregate over one runs along it
+  (`SUM(e.w)`, `COUNT(e)`). The variable of a quantified edge is such a list too (`-[e]->{1,3}`, then `e.w`). They
+  work with path variables, `ONE ROW PER`, `ANY` / `ALL SHORTEST`, an element `WHERE` on a quantified edge, and
+  `pgq_max_vl_fallback_rows`.
 - **Functions:**
   - path shape: `vertex_labels(p)`, `edge_labels(p)` on every route;
   - aggregation along a path: `vertex_property(p, 'x')` and `edge_property(p, 'x')`, used with `list_sum`,
