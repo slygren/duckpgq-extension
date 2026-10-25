@@ -103,6 +103,8 @@ static void IterativeLength2Function(DataChunk &args, ExpressionState &state, Ve
 
 		// make passes while a lane is still active
 		for (int64_t iter = 1; active; iter++) {
+			// One BFS level per iteration, at most v_size of them: cheap enough to honour cancellation every time.
+			info.context.BlockingInterruptCheck();
 			if (!IterativeLength2(v_size, v, e, seen, (iter & 1) ? visit1 : visit2, (iter & 1) ? visit2 : visit1)) {
 				break;
 			}

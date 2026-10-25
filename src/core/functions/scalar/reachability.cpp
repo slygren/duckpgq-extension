@@ -219,6 +219,7 @@ static void ReachabilityFunction(DataChunk &args, ExpressionState &state, Vector
 		int mode = 0;
 		bool exit_early = false;
 		while (!exit_early) {
+			info.context.BlockingInterruptCheck();
 			exit_early = true;
 			if (is_variant) {
 				mode = FindMode(mode, visit_list.size(), visit_limit, num_nodes_to_visit);

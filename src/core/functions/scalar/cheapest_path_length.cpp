@@ -77,7 +77,7 @@ static void Search(ClientContext &context, CSR &csr, const vector<T> &weights, i
 		if (pass > v_size) {
 			throw InternalException("Cheapest-path search did not converge");
 		}
-		context.InterruptCheck();
+		context.BlockingInterruptCheck();
 		changed = false;
 		for (int64_t v = 0; v < v_size; v++) {
 			if (!reached[static_cast<idx_t>(v)]) {
@@ -312,7 +312,7 @@ static void AllCheapestPaths(ClientContext &context, const CSR &csr, const vecto
 	idx_t steps = 0;
 	std::function<void(int64_t)> walk = [&](int64_t vertex) {
 		if (++steps % 4096 == 0) {
-			context.InterruptCheck();
+			context.BlockingInterruptCheck();
 		}
 		if (vertex == src) {
 			vector<Value> path;

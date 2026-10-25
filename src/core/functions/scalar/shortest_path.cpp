@@ -124,6 +124,8 @@ static void ShortestPathFunction(DataChunk &args, ExpressionState &state, Vector
 
 		//! make passes while a lane is still active
 		for (int64_t iter = 1; active; iter++) {
+			// One BFS level per iteration, at most v_size of them: cheap enough to honour cancellation every time.
+			info.context.BlockingInterruptCheck();
 			//! Perform one step of bfs exploration
 			if (!IterativeLength(v_size, v, e, edge_ids, parents_v, parents_e, seen, (iter & 1) ? visit1 : visit2,
 			                     (iter & 1) ? visit2 : visit1)) {

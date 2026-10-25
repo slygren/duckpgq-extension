@@ -121,6 +121,7 @@ static void AllShortestPathsFunction(DataChunk &args, ExpressionState &state, Ve
 		int64_t src_v = src_data[src_pos];
 		int64_t dst_v = dst_data[dst_pos];
 
+		info.context.BlockingInterruptCheck();
 		auto all_paths = FindAllShortestPaths(src_v, dst_v, v, e, edge_ids, v_size);
 
 		// Build Value::LIST(LIST(BIGINT)) for this row
