@@ -12824,12 +12824,244 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	return BuildMatchRef(context, *ref);
 }
 
+//! A search prefix over a pattern that mixes fixed hops with one variable-length edge, (a)-[e]->(b)-[f]->{1,3}(c):
+//! the variable-length part is searched between its own two ends (one shortest path, or all of them, per pair of
+//! them), which is exact for the whole pattern once the rows are compared by their total length -- every shortest
+//! path of the pattern is a shortest path between the ends of its variable-length part. BuildMatchRef does that
+//! comparison over the block's rows (MixedPathSelection); it is supported where those rows are the pattern's paths
+//! and nothing else: the only pattern of its block, without OPTIONAL MATCH, UNION branches or ONE ROW PER.
+static bool MixedPathSelectionSupported(const MatchExpression &block) {
+	return block.path_patterns.size() == 1 && block.optional_match_patterns.empty() && block.union_matches.empty() &&
+	       block.one_row_per == OneRowPerMode::NONE && block.path_patterns[0]->union_operands.empty();
+}
+
+static const char *const kSelectionStart = "__pgq_sel_start";
+static const char *const kSelectionEnd = "__pgq_sel_end";
+static const char *const kSelectionLength = "__pgq_sel_length";
+static const char *const kSelectionKey = "__pgq_sel_key";
+
+struct PGQMixedPathSelection {
+	bool applies = false;
+	bool all = false;
+};
+
+//! Prepares the block for the comparison: names the path (a path variable is what yields its length and its
+//! element ids on every route), and adds its endpoints, length and element ids as columns the wrapper reads.
+static PGQMixedPathSelection PrepareMixedPathSelection(MatchExpression &block) {
+	PGQMixedPathSelection selection;
+	if (!MixedPathSelectionSupported(block)) {
+		return selection;
+	}
+	auto &pattern = *block.path_patterns[0];
+	if (!pattern.shortest || pattern.cheapest || pattern.topk > 0) {
+		return selection;
+	}
+	SubPath *wrapper = nullptr;
+	auto *elements = &pattern.path_elements;
+	if (elements->size() == 1) {
+		wrapper = PGQMatchFunction::GetSubPath((*elements)[0]);
+		if (wrapper && wrapper->path_list.size() > 1 && wrapper->lower == 1 && wrapper->upper == 1) {
+			elements = &wrapper->path_list;
+		} else {
+			wrapper = nullptr;
+		}
+	}
+	idx_t fixed = 0;
+	idx_t variable = 0;
+	for (idx_t i = 1; i < elements->size(); i += 2) {
+		auto *subpath = PGQMatchFunction::GetSubPath((*elements)[i]);
+		if (subpath && !(subpath->lower == 1 && subpath->upper == 1)) {
+			variable++;
+		} else {
+			fixed++;
+		}
+	}
+	if (variable == 0 || fixed == 0) {
+		return selection;
+	}
+	if (!wrapper) {
+		auto named = make_uniq<SubPath>(PGQPathReferenceType::SUBPATH);
+		named->path_list = std::move(pattern.path_elements);
+		pattern.path_elements.clear();
+		pattern.path_elements.push_back(std::move(named));
+		wrapper = PGQMatchFunction::GetSubPath(pattern.path_elements[0]);
+		elements = &wrapper->path_list;
+	}
+	if (wrapper->path_variable.empty()) {
+		wrapper->path_variable = "__pgq_sel_path";
+	}
+	auto vertex_binding = [](const unique_ptr<PathReference> &reference) {
+		auto *element = PGQMatchFunction::GetPathElement(reference);
+		if (!element) {
+			auto *subpath = PGQMatchFunction::GetSubPath(reference);
+			element = subpath && subpath->path_list.size() == 1 ? PGQMatchFunction::GetPathElement(subpath->path_list[0])
+			                                                    : nullptr;
+		}
+		if (!element) {
+			throw NotImplementedException("A search prefix over this pattern is not supported");
+		}
+		return element->variable_binding;
+	};
+	auto call = [](const char *name, const string &argument, const char *alias) {
+		vector<unique_ptr<ParsedExpression>> arguments;
+		arguments.push_back(PGQColRef(argument));
+		auto function = make_uniq<FunctionExpression>(name, std::move(arguments));
+		function->SetAlias(Identifier(alias));
+		return function;
+	};
+	block.column_list.push_back(call("element_id", vertex_binding(elements->front()), kSelectionStart));
+	block.column_list.push_back(call("element_id", vertex_binding(elements->back()), kSelectionEnd));
+	block.column_list.push_back(call("path_length", wrapper->path_variable, kSelectionLength));
+	block.column_list.push_back(call("element_id", wrapper->path_variable, kSelectionKey));
+	selection.applies = true;
+	selection.all = pattern.all;
+	return selection;
+}
+
+//! Keeps, per pair of endpoints, the shortest of the block's paths: the first by element ids along the path (ANY
+//! SHORTEST), or every one of that length (ALL SHORTEST); the comparison columns are dropped again.
+static unique_ptr<QueryNode> ApplyMixedPathSelection(unique_ptr<QueryNode> node, const PGQMixedPathSelection &selection) {
+	auto outer = ParseSelectStatement(StringUtil::Format(
+	    "SELECT * EXCLUDE (%s, %s, %s, %s) FROM __pgq_sel QUALIFY %s OVER (PARTITION BY %s, %s ORDER BY %s%s) = 1",
+	    kSelectionStart, kSelectionEnd, kSelectionLength, kSelectionKey, selection.all ? "rank()" : "row_number()",
+	    kSelectionStart, kSelectionEnd, kSelectionLength, selection.all ? "" : string(", ") + kSelectionKey));
+	auto &outer_node = outer->node->Cast<SelectNode>();
+	auto inner = make_uniq<SelectStatement>();
+	inner->node = std::move(node);
+	outer_node.from_table = make_uniq<SubqueryRef>(std::move(inner), Identifier("__pgq_sel"));
+	return std::move(outer->node);
+}
+
 unique_ptr<TableRef> PGQMatchFunction::BuildMatchRef(ClientContext &context, MatchExpression &match) {
+	const auto selection = PrepareMixedPathSelection(match);
 	auto node = NeedsLoweredMatch(match) ? BuildLoweredMatchQueryNode(context, match)
 	                                     : BuildMatchQueryNode(context, &match, true);
+	if (selection.applies) {
+		node = ApplyMixedPathSelection(std::move(node), selection);
+	}
 	auto subquery = make_uniq<SelectStatement>();
 	subquery->node = std::move(node);
 	return make_uniq<SubqueryRef>(std::move(subquery), PGQId(match.alias));
+}
+
+//! ANY SHORTEST over a fixed-length pattern -- every edge plain or {1,1}, (a)-[e]->(b), (a)-[e]->{1,1}(b),
+//! (a)-[e]->(b)-[f]->(c) -- asks for one path per pair of endpoints. The pattern is joined like any fixed pattern,
+//! which gives every path (one row per parallel edge), and the selector was ignored. All its paths have the same
+//! length, so each is a shortest one; the first in the order of its element row ids along the path is kept, per
+//! pair of endpoints and per binding of the block's other patterns (they meet this one only at its endpoints, which
+//! the partition holds, so the choice does not depend on them). SQL/PGQ leaves the choice among tied paths to the
+//! implementation, so taking it among the paths the MATCH WHERE admits is one; the result is deterministic.
+//! ALL SHORTEST keeps every path, which the join already does. A pattern that mixes fixed hops with a variable-length
+//! one has paths of different lengths: BuildMatchRef compares them (PrepareMixedPathSelection), or it is refused.
+struct PGQFixedPathSelection {
+	bool applies = false;
+	unique_ptr<ParsedExpression> qualify;
+};
+
+static string SelectionIdentity(const PathElement &element) {
+	const string alias = KeywordHelper::WriteOptionallyQuoted(element.variable_binding);
+	if (element.match_type == PGQMatchType::MATCH_EDGE_ANY) {
+		return alias + "." + kUndirectedEdgeRowid + ", " + alias + "." + kUndirectedEdgeDirection;
+	}
+	return alias + ".rowid";
+}
+
+static void CollectSelectionElements(PathReference &reference, vector<PathElement *> &elements) {
+	if (auto *element = dynamic_cast<PathElement *>(&reference)) {
+		elements.push_back(element);
+		return;
+	}
+	for (auto &child : static_cast<SubPath &>(reference).path_list) {
+		CollectSelectionElements(*child, elements);
+	}
+}
+
+static PGQFixedPathSelection SelectorOverFixedPattern(PathPattern &pattern, MatchExpression &block) {
+	PGQFixedPathSelection selection;
+	if (!pattern.shortest || pattern.cheapest || pattern.topk > 0 || !pattern.union_operands.empty()) {
+		return selection;
+	}
+	auto *elements = &pattern.path_elements;
+	if (elements->size() == 1) {
+		auto *wrapper = PGQMatchFunction::GetSubPath((*elements)[0]);
+		if (wrapper && wrapper->path_list.size() > 1 && wrapper->lower == 1 && wrapper->upper == 1) {
+			elements = &wrapper->path_list;
+		}
+	}
+	if (elements->size() < 3) {
+		return selection;
+	}
+	idx_t fixed = 0;
+	idx_t variable = 0;
+	vector<PathElement *> path;
+	for (idx_t i = 0; i < elements->size(); i++) {
+		auto &reference = (*elements)[i];
+		if (i % 2 == 1) {
+			auto *subpath = PGQMatchFunction::GetSubPath(reference);
+			if (subpath && !(subpath->lower == 1 && subpath->upper == 1)) {
+				variable++;
+			} else {
+				fixed++;
+			}
+		}
+		CollectSelectionElements(*reference, path);
+	}
+	if (variable > 0) {
+		if (fixed > 0 && !MixedPathSelectionSupported(block)) {
+			throw NotImplementedException(
+			    "%s over a pattern that mixes fixed hops with a variable-length one is supported when it is the only "
+			    "pattern of its MATCH, without OPTIONAL MATCH, UNION or ONE ROW PER",
+			    pattern.all ? "ALL SHORTEST" : "ANY SHORTEST");
+		}
+		return selection;
+	}
+	if (pattern.all) {
+		return selection;
+	}
+	if (!block.optional_match_patterns.empty()) {
+		throw NotImplementedException("ANY SHORTEST over a fixed-length pattern is not supported in a MATCH with "
+		                              "OPTIONAL MATCH yet");
+	}
+	auto *start = path.front();
+	auto *end = path.back();
+	case_insensitive_set_t interior;
+	for (idx_t i = 1; i + 1 < path.size(); i++) {
+		interior.insert(path[i]->variable_binding);
+	}
+	interior.erase(start->variable_binding);
+	interior.erase(end->variable_binding);
+	vector<string> partition {SelectionIdentity(*start), SelectionIdentity(*end)};
+	case_insensitive_set_t others;
+	for (auto &other : block.path_patterns) {
+		if (other.get() == &pattern) {
+			continue;
+		}
+		vector<PathElement *> other_elements;
+		for (auto &reference : other->path_elements) {
+			CollectSelectionElements(*reference, other_elements);
+		}
+		for (auto *element : other_elements) {
+			if (interior.find(element->variable_binding) != interior.end()) {
+				throw NotImplementedException("ANY SHORTEST over a fixed-length pattern whose interior variable '%s' is "
+				                              "also used by another pattern of the MATCH is not supported",
+				                              element->variable_binding);
+			}
+			if (others.insert(element->variable_binding).second) {
+				partition.push_back(SelectionIdentity(*element));
+			}
+		}
+	}
+	vector<string> order;
+	for (idx_t i = 1; i + 1 < path.size(); i++) {
+		order.push_back(SelectionIdentity(*path[i]));
+	}
+	Parser parser(ParserOptions::Builtin());
+	auto expressions = parser.ParseExpressionList(
+	    StringUtil::Format("row_number() OVER (PARTITION BY %s ORDER BY %s) = 1", StringUtil::Join(partition, ", "),
+	                       StringUtil::Join(order, ", ")));
+	selection.applies = true;
+	selection.qualify = std::move(expressions[0]);
+	return selection;
 }
 
 //! A pattern the native path search answers (pgq_shortest_k_paths): one quantified edge between two vertices.
@@ -13091,6 +13323,8 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 	// and pointed iterativelength() at an empty registry entry -- while also cross-joining a
 	// second "__x". Same shape as the COST()/recursive-ProcessPathList slot bugs.
 	PGQCSRSlot cte1_slot;
+	// ANY SHORTEST over fixed-length patterns: the selection, as QUALIFY conditions of the head block
+	vector<unique_ptr<ParsedExpression>> selection_qualify;
 	// The vertex-edge joins of the head branch, for vertex-join elimination once the whole SELECT is built. Only
 	// the path patterns are recorded: joins emitted later (OPTIONAL MATCH, EXISTS, UNION branches) are never
 	// eliminated, and a vertex they reference keeps its join.
@@ -13110,6 +13344,15 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 			    "(e.g. -[e:Label COST e.weight]->). Without a cost the request is undefined; use SHORTEST.");
 		}
 		FoldStaticPathFunctions(*ref, path_pattern->path_elements, *pg_table);
+		auto fixed_selection = SelectorOverFixedPattern(*path_pattern, *ref);
+		if (fixed_selection.applies) {
+			// The selection reads every element's row: traversed (no artifact keeps the parallel edges apart).
+			selection_qualify.push_back(std::move(fixed_selection.qualify));
+			ProcessPathList(context, path_pattern->path_elements, conditions, final_select_node, alias_map, *pg_table,
+			                extra_alias_counter, *ref, CSRIdCounter(context), cte1_slot, all_shortest, any_shortest,
+			                nullptr, MaxVLFallbackRows(context));
+			continue;
+		}
 		// SHORTEST k, and the unbounded shapes the CSR path functions cannot answer exactly, take the native path
 		// search. No artifact holds k paths per pair; the other shapes try the artifacts first.
 		auto native_search = NativePathSearchFor(*path_pattern);
@@ -13294,6 +13537,9 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 	}
 
 	final_select_node->where_clause = CreateWhereClause(conditions);
+	if (!selection_qualify.empty()) {
+		final_select_node->qualify = CreateWhereClause(selection_qualify);
+	}
 	final_select_node->select_list =
 	    BuildFinalColumnList(std::move(ref->column_list), alias_to_vertex_and_edge_tables, stub_bindings);
 	PGQEliminateVertexJoins(context, *final_select_node, vertex_joins, alias_map);
@@ -13321,6 +13567,7 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 		const ReferencedBindings branch_referenced_bindings = CollectReferencedBindings(branch);
 		CoveredBindingMap branch_covered_columns;
 
+		vector<unique_ptr<ParsedExpression>> branch_selection_qualify;
 		for (auto &path_pattern : branch.path_patterns) {
 			bool all_shortest = path_pattern->all && path_pattern->shortest;
 			bool any_shortest = path_pattern->shortest && !path_pattern->all;
@@ -13330,6 +13577,15 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 				    "(e.g. -[e:Label COST e.weight]->). Without a cost the request is undefined; use SHORTEST.");
 			}
 			FoldStaticPathFunctions(branch, path_pattern->path_elements, *pg_table);
+			auto fixed_selection = SelectorOverFixedPattern(*path_pattern, branch);
+			if (fixed_selection.applies) {
+				branch_selection_qualify.push_back(std::move(fixed_selection.qualify));
+				PGQCSRSlot branch_cte1_slot;
+				ProcessPathList(context, path_pattern->path_elements, branch_conditions, branch_select,
+				                branch_alias_map, *pg_table, branch_counter, branch, CSRIdCounter(context),
+				                branch_cte1_slot, all_shortest, any_shortest, nullptr, MaxVLFallbackRows(context));
+				continue;
+			}
 			auto native_search = NativePathSearchFor(*path_pattern);
 			if (native_search.applies &&
 			    (path_pattern->topk > 0 ||
@@ -13443,6 +13699,9 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 			CheckColumnBinding(*pg_table, branch, branch_alias_to_ve);
 		}
 		branch_select->where_clause = CreateWhereClause(branch_conditions);
+		if (!branch_selection_qualify.empty()) {
+			branch_select->qualify = CreateWhereClause(branch_selection_qualify);
+		}
 		branch_select->select_list =
 		    BuildFinalColumnList(std::move(branch_columns), branch_alias_to_ve, branch_stub_bindings);
 		// Branches are combined by position, as in SQL. A star expands at bind time; DuckDB reports a mismatch there.

@@ -47,6 +47,10 @@ In every such case the old rows were wrong.
     now traverse unless the table is proven exact.
   - **Edge path tables built with duplicate edges collapsed** no longer answer counting patterns. They used to
     undercount.
+  - **ANY SHORTEST over a fixed-length pattern** (`-[e]->{1,1}`, a plain edge, several fixed hops) returns one path
+    per pair of endpoints, in every direction; it returned one row per parallel edge. Over a pattern that mixes fixed
+    hops with a variable-length one, ANY / ALL SHORTEST compare the whole paths: they returned the shortest
+    variable-length part per pair of its own ends, so longer paths and extra ties per endpoint pair.
   - **Column names do not depend on the route.** `COLUMNS (p.id)` was named `id` traversed and `v0` when an ABI
     artifact answered; it is `id` on every route (an expression without `AS` is named by its text).
   - **Several `GRAPH_TABLE`s in one statement** (a join, `EXCEPT`, two scalar subqueries over the same graph) give

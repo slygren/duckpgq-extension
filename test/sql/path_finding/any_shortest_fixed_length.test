@@ -1,0 +1,410 @@
+# name: test/sql/path_finding/any_shortest_fixed_length.test
+# description: ANY SHORTEST over a fixed-length pattern ({1,1}, a plain edge, several fixed hops) returns one path per
+#              pair of endpoints, in every direction; it returned one row per parallel edge (the selector was
+#              ignored). ALL SHORTEST keeps every path. Brute force over the edge table; traversed and with ABI
+#              artifacts built (the selection reads every element, so it traverses either way).
+# group: [path_finding]
+
+require duckpgq
+
+load __TEST_DIR__/any_shortest_fixed_length.db
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE P(id BIGINT, name VARCHAR);
+
+statement ok
+INSERT INTO P VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd');
+
+# Parallel edges 1->2 (three of them) and 2->3 (two), a reciprocal pair 1<->2, a self-loop on 3, an edge to a missing
+# vertex
+statement ok
+CREATE TABLE K(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO K VALUES (1, 2), (1, 2), (2, 1), (2, 3), (3, 3), (1, 2), (2, 3), (3, 4), (4, 9);
+
+statement ok
+CREATE PROPERTY GRAPH g VERTEX TABLES (P LABEL P)
+EDGE TABLES (K SOURCE KEY (src) REFERENCES P (id) DESTINATION KEY (dst) REFERENCES P (id) LABEL K);
+
+statement ok
+CREATE TABLE ke AS SELECT k.rowid AS r, src, dst FROM K k WHERE src IN (SELECT id FROM P) AND dst IN (SELECT id FROM P);
+
+statement ok
+CREATE TABLE ref_right AS SELECT DISTINCT src AS a, dst AS b FROM ke;
+
+statement ok
+CREATE TABLE ref_left AS SELECT DISTINCT dst AS a, src AS b FROM ke;
+
+statement ok
+CREATE TABLE ref_any AS FROM ref_right UNION FROM ref_left;
+
+statement ok
+CREATE TABLE ref_two AS SELECT DISTINCT x.src AS a, y.dst AS b FROM ke x JOIN ke y ON y.src = x.dst;
+
+statement ok
+CREATE TABLE ref_two_walks AS SELECT x.src AS a, y.dst AS b FROM ke x JOIN ke y ON y.src = x.dst;
+
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+# traversed: right plain
+query II
+SELECT (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]->(b:P) COLUMNS (a.id AS a, b.id AS b)) EXCEPT ALL FROM ref_right)
+                              UNION ALL (FROM ref_right EXCEPT ALL SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]->(b:P) COLUMNS (a.id AS a, b.id AS b))))),
+       (SELECT count(*) FROM ref_right);
+----
+0	5
+
+# traversed: right {1,1}
+query II
+SELECT (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]->{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b)) EXCEPT ALL FROM ref_right)
+                              UNION ALL (FROM ref_right EXCEPT ALL SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]->{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b))))),
+       (SELECT count(*) FROM ref_right);
+----
+0	5
+
+# traversed: right named
+query II
+SELECT (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[e:K]->{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b)) EXCEPT ALL FROM ref_right)
+                              UNION ALL (FROM ref_right EXCEPT ALL SELECT a, b FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[e:K]->{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b))))),
+       (SELECT count(*) FROM ref_right);
+----
+0	5
+
+# traversed: left plain
+query II
+SELECT (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]-(b:P) COLUMNS (a.id AS a, b.id AS b)) EXCEPT ALL FROM ref_left)
+                              UNION ALL (FROM ref_left EXCEPT ALL SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]-(b:P) COLUMNS (a.id AS a, b.id AS b))))),
+       (SELECT count(*) FROM ref_left);
+----
+0	5
+
+# traversed: left {1,1}
+query II
+SELECT (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]-{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b)) EXCEPT ALL FROM ref_left)
+                              UNION ALL (FROM ref_left EXCEPT ALL SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]-{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b))))),
+       (SELECT count(*) FROM ref_left);
+----
+0	5
+
+# traversed: left named
+query II
+SELECT (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)<-[e:K]-{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b)) EXCEPT ALL FROM ref_left)
+                              UNION ALL (FROM ref_left EXCEPT ALL SELECT a, b FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)<-[e:K]-{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b))))),
+       (SELECT count(*) FROM ref_left);
+----
+0	5
+
+# traversed: any plain
+query II
+SELECT (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]-(b:P) COLUMNS (a.id AS a, b.id AS b)) EXCEPT ALL FROM ref_any)
+                              UNION ALL (FROM ref_any EXCEPT ALL SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]-(b:P) COLUMNS (a.id AS a, b.id AS b))))),
+       (SELECT count(*) FROM ref_any);
+----
+0	7
+
+# traversed: any {1,1}
+query II
+SELECT (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]-{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b)) EXCEPT ALL FROM ref_any)
+                              UNION ALL (FROM ref_any EXCEPT ALL SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]-{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b))))),
+       (SELECT count(*) FROM ref_any);
+----
+0	7
+
+# traversed: any named
+query II
+SELECT (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[e:K]-{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b)) EXCEPT ALL FROM ref_any)
+                              UNION ALL (FROM ref_any EXCEPT ALL SELECT a, b FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[e:K]-{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b))))),
+       (SELECT count(*) FROM ref_any);
+----
+0	7
+
+# traversed: either plain
+query II
+SELECT (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]->(b:P) COLUMNS (a.id AS a, b.id AS b)) EXCEPT ALL FROM ref_any)
+                              UNION ALL (FROM ref_any EXCEPT ALL SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]->(b:P) COLUMNS (a.id AS a, b.id AS b))))),
+       (SELECT count(*) FROM ref_any);
+----
+0	7
+
+# traversed: either {1,1}
+query II
+SELECT (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]->{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b)) EXCEPT ALL FROM ref_any)
+                              UNION ALL (FROM ref_any EXCEPT ALL SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]->{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b))))),
+       (SELECT count(*) FROM ref_any);
+----
+0	7
+
+# traversed: either named
+query II
+SELECT (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)<-[e:K]->{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b)) EXCEPT ALL FROM ref_any)
+                              UNION ALL (FROM ref_any EXCEPT ALL SELECT a, b FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)<-[e:K]->{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b))))),
+       (SELECT count(*) FROM ref_any);
+----
+0	7
+
+# traversed: two hops
+query II
+SELECT (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]->(m:P)-[f:K]->(b:P) COLUMNS (a.id AS a, b.id AS b)) EXCEPT ALL FROM ref_two)
+                              UNION ALL (FROM ref_two EXCEPT ALL SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]->(m:P)-[f:K]->(b:P) COLUMNS (a.id AS a, b.id AS b))))),
+       (SELECT count(*) FROM ref_two);
+----
+0	7
+
+# traversed: two hops {1,1}
+query II
+SELECT (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]->{1,1}(m:P)-[f:K]->{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b)) EXCEPT ALL FROM ref_two)
+                              UNION ALL (FROM ref_two EXCEPT ALL SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]->{1,1}(m:P)-[f:K]->{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b))))),
+       (SELECT count(*) FROM ref_two);
+----
+0	7
+
+# traversed: the path chosen is one of the pair's edges, the first by row id
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[e:K]->{1,1}(b:P)
+                                  COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, edges(p) AS es)) t
+WHERE l <> 1 OR es[1] <> (SELECT min(r) FROM ke WHERE src = t.a AND dst = t.b);
+----
+0
+
+# traversed: ALL SHORTEST keeps every parallel edge and every two-hop walk
+query II
+SELECT (SELECT count(*) FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[e:K]->{1,1}(b:P) COLUMNS (a.id))),
+       (SELECT count(*) FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[e:K]->(m:P)-[f:K]->(b:P) COLUMNS (a.id)));
+----
+8	18
+
+# traversed: seeded, and with a predicate on the interior vertex (applied among the tied paths)
+query II
+SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]->(m:P)-[f:K]->(b:P) WHERE a.id = 1 AND m.name = 'b'
+                              COLUMNS (a.id AS a, b.id AS b)) ORDER BY ALL;
+----
+1	1
+1	3
+
+# traversed: another pattern meeting it at an endpoint multiplies the rows, one path per pair each time
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]->{1,1}(b:P), (b)-[f:K]->(c:P) COLUMNS (a.id, b.id, c.id));
+----
+10
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('g', exclude_self_referential := false, max_hops := 2);
+
+# artifacts: right plain
+query II
+SELECT (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]->(b:P) COLUMNS (a.id AS a, b.id AS b)) EXCEPT ALL FROM ref_right)
+                              UNION ALL (FROM ref_right EXCEPT ALL SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]->(b:P) COLUMNS (a.id AS a, b.id AS b))))),
+       (SELECT count(*) FROM ref_right);
+----
+0	5
+
+# artifacts: right {1,1}
+query II
+SELECT (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]->{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b)) EXCEPT ALL FROM ref_right)
+                              UNION ALL (FROM ref_right EXCEPT ALL SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]->{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b))))),
+       (SELECT count(*) FROM ref_right);
+----
+0	5
+
+# artifacts: right named
+query II
+SELECT (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[e:K]->{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b)) EXCEPT ALL FROM ref_right)
+                              UNION ALL (FROM ref_right EXCEPT ALL SELECT a, b FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[e:K]->{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b))))),
+       (SELECT count(*) FROM ref_right);
+----
+0	5
+
+# artifacts: left plain
+query II
+SELECT (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]-(b:P) COLUMNS (a.id AS a, b.id AS b)) EXCEPT ALL FROM ref_left)
+                              UNION ALL (FROM ref_left EXCEPT ALL SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]-(b:P) COLUMNS (a.id AS a, b.id AS b))))),
+       (SELECT count(*) FROM ref_left);
+----
+0	5
+
+# artifacts: left {1,1}
+query II
+SELECT (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]-{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b)) EXCEPT ALL FROM ref_left)
+                              UNION ALL (FROM ref_left EXCEPT ALL SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]-{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b))))),
+       (SELECT count(*) FROM ref_left);
+----
+0	5
+
+# artifacts: left named
+query II
+SELECT (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)<-[e:K]-{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b)) EXCEPT ALL FROM ref_left)
+                              UNION ALL (FROM ref_left EXCEPT ALL SELECT a, b FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)<-[e:K]-{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b))))),
+       (SELECT count(*) FROM ref_left);
+----
+0	5
+
+# artifacts: any plain
+query II
+SELECT (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]-(b:P) COLUMNS (a.id AS a, b.id AS b)) EXCEPT ALL FROM ref_any)
+                              UNION ALL (FROM ref_any EXCEPT ALL SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]-(b:P) COLUMNS (a.id AS a, b.id AS b))))),
+       (SELECT count(*) FROM ref_any);
+----
+0	7
+
+# artifacts: any {1,1}
+query II
+SELECT (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]-{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b)) EXCEPT ALL FROM ref_any)
+                              UNION ALL (FROM ref_any EXCEPT ALL SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]-{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b))))),
+       (SELECT count(*) FROM ref_any);
+----
+0	7
+
+# artifacts: any named
+query II
+SELECT (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[e:K]-{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b)) EXCEPT ALL FROM ref_any)
+                              UNION ALL (FROM ref_any EXCEPT ALL SELECT a, b FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[e:K]-{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b))))),
+       (SELECT count(*) FROM ref_any);
+----
+0	7
+
+# artifacts: either plain
+query II
+SELECT (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]->(b:P) COLUMNS (a.id AS a, b.id AS b)) EXCEPT ALL FROM ref_any)
+                              UNION ALL (FROM ref_any EXCEPT ALL SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]->(b:P) COLUMNS (a.id AS a, b.id AS b))))),
+       (SELECT count(*) FROM ref_any);
+----
+0	7
+
+# artifacts: either {1,1}
+query II
+SELECT (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]->{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b)) EXCEPT ALL FROM ref_any)
+                              UNION ALL (FROM ref_any EXCEPT ALL SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]->{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b))))),
+       (SELECT count(*) FROM ref_any);
+----
+0	7
+
+# artifacts: either named
+query II
+SELECT (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)<-[e:K]->{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b)) EXCEPT ALL FROM ref_any)
+                              UNION ALL (FROM ref_any EXCEPT ALL SELECT a, b FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)<-[e:K]->{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b))))),
+       (SELECT count(*) FROM ref_any);
+----
+0	7
+
+# artifacts: two hops
+query II
+SELECT (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]->(m:P)-[f:K]->(b:P) COLUMNS (a.id AS a, b.id AS b)) EXCEPT ALL FROM ref_two)
+                              UNION ALL (FROM ref_two EXCEPT ALL SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]->(m:P)-[f:K]->(b:P) COLUMNS (a.id AS a, b.id AS b))))),
+       (SELECT count(*) FROM ref_two);
+----
+0	7
+
+# artifacts: two hops {1,1}
+query II
+SELECT (SELECT count(*) FROM ((SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]->{1,1}(m:P)-[f:K]->{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b)) EXCEPT ALL FROM ref_two)
+                              UNION ALL (FROM ref_two EXCEPT ALL SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]->{1,1}(m:P)-[f:K]->{1,1}(b:P) COLUMNS (a.id AS a, b.id AS b))))),
+       (SELECT count(*) FROM ref_two);
+----
+0	7
+
+# artifacts: the path chosen is one of the pair's edges, the first by row id
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[e:K]->{1,1}(b:P)
+                                  COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, edges(p) AS es)) t
+WHERE l <> 1 OR es[1] <> (SELECT min(r) FROM ke WHERE src = t.a AND dst = t.b);
+----
+0
+
+# artifacts: ALL SHORTEST keeps every parallel edge and every two-hop walk
+query II
+SELECT (SELECT count(*) FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[e:K]->{1,1}(b:P) COLUMNS (a.id))),
+       (SELECT count(*) FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[e:K]->(m:P)-[f:K]->(b:P) COLUMNS (a.id)));
+----
+8	18
+
+# artifacts: seeded, and with a predicate on the interior vertex (applied among the tied paths)
+query II
+SELECT a, b FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]->(m:P)-[f:K]->(b:P) WHERE a.id = 1 AND m.name = 'b'
+                              COLUMNS (a.id AS a, b.id AS b)) ORDER BY ALL;
+----
+1	1
+1	3
+
+# artifacts: another pattern meeting it at an endpoint multiplies the rows, one path per pair each time
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]->{1,1}(b:P), (b)-[f:K]->(c:P) COLUMNS (a.id, b.id, c.id));
+----
+10
+
+# A pattern mixing fixed hops with a variable-length one: the shortest paths of the whole pattern, per pair of
+# endpoints. (On a DAG, where the variable-length part's paths are all walks.)
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE TABLE D(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO D VALUES (1, 2), (1, 3), (2, 3), (3, 4), (2, 4), (1, 4), (4, 5), (3, 5), (2, 5);
+
+statement ok
+CREATE PROPERTY GRAPH dg VERTEX TABLES (P LABEL P)
+EDGE TABLES (D SOURCE KEY (src) REFERENCES P (id) DESTINATION KEY (dst) REFERENCES P (id) LABEL D);
+
+statement ok
+INSERT INTO P VALUES (5, 'e');
+
+# walks: one fixed hop, then 1..2 hops
+statement ok
+CREATE TABLE mixed_walks AS
+SELECT x.src AS a, y.dst AS b, 2 AS l FROM D x JOIN D y ON y.src = x.dst
+UNION ALL
+SELECT x.src, z.dst, 3 FROM D x JOIN D y ON y.src = x.dst JOIN D z ON z.src = y.dst;
+
+statement ok
+CREATE TABLE mixed_ref AS SELECT a, b, min(l) AS l FROM mixed_walks GROUP BY a, b;
+
+statement ok
+CREATE TABLE mixed_all_ref AS SELECT w.a, w.b, w.l, count(*) AS paths FROM mixed_walks w JOIN mixed_ref r USING (a, b, l) GROUP BY ALL;
+
+query I
+SELECT count(*) FROM (
+  (SELECT a, b, l FROM GRAPH_TABLE (dg MATCH p = ANY SHORTEST (a:P)-[e:D]->(m:P)-[f:D]->{1,2}(b:P)
+                                    COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)) EXCEPT ALL FROM mixed_ref)
+  UNION ALL
+  (FROM mixed_ref EXCEPT ALL SELECT a, b, l FROM GRAPH_TABLE (dg MATCH p = ANY SHORTEST (a:P)-[e:D]->(m:P)-[f:D]->{1,2}(b:P)
+                                                               COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l))));
+----
+0
+
+# unnamed, and the variable-length part first
+query I
+SELECT count(*) FROM (
+  (SELECT a, b FROM GRAPH_TABLE (dg MATCH ANY SHORTEST (a:P)-[e:D]->(m:P)-[f:D]->{1,2}(b:P) COLUMNS (a.id AS a, b.id AS b))
+   EXCEPT ALL SELECT a, b FROM mixed_ref)
+  UNION ALL
+  (SELECT a, b FROM mixed_ref
+   EXCEPT ALL SELECT a, b FROM GRAPH_TABLE (dg MATCH ANY SHORTEST (a:P)-[f:D]->{1,2}(m:P)-[e:D]->(b:P) COLUMNS (a.id AS a, b.id AS b))));
+----
+0
+
+query I
+SELECT count(*) FROM (
+  (SELECT a, b, l, count(*) FROM GRAPH_TABLE (dg MATCH p = ALL SHORTEST (a:P)-[e:D]->(m:P)-[f:D]->{1,2}(b:P)
+                                              COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)) GROUP BY ALL
+   EXCEPT ALL FROM mixed_all_ref)
+  UNION ALL
+  (FROM mixed_all_ref
+   EXCEPT ALL SELECT a, b, l, count(*) FROM GRAPH_TABLE (dg MATCH p = ALL SHORTEST (a:P)-[e:D]->(m:P)-[f:D]->{1,2}(b:P)
+                                                         COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)) GROUP BY ALL));
+----
+0
+
+# Next to another pattern, or with ONE ROW PER, the rows are not the pattern's paths alone: refused
+statement error
+FROM GRAPH_TABLE (dg MATCH ANY SHORTEST (a:P)-[e:D]->(m:P)-[f:D]->{1,2}(b:P), (b)-[:D]->(c:P) COLUMNS (a.id, b.id));
+----
+supported when it is the only pattern of its MATCH
