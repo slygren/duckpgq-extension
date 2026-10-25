@@ -468,6 +468,7 @@ void RegisterGraphAlgorithm(ExtensionLoader &loader, const GraphAlgorithmSpec &s
 
 void CoreGraphAlgorithms::Register(ExtensionLoader &loader) {
 	RegisterStronglyConnectedComponent(loader);
+	RegisterTriangleCount(loader);
 }
 
 } // namespace duckdb

@@ -302,6 +302,8 @@ FROM pagerank('social', 'Person', 'Knows');
 FROM weakly_connected_component('social', 'Person', 'Knows');
 FROM local_clustering_coefficient('social', 'Person', 'Knows');
 FROM strongly_connected_component('social', 'Person', 'Knows');
+FROM triangle_count('social', 'Person', 'Knows');
+FROM total_triangle_count('social', 'Person', 'Knows');    -- one row
 ```
 
 How each function reads the edges (n vertices, m edges):
@@ -309,10 +311,16 @@ How each function reads the edges (n vertices, m edges):
 | Function | Graph | Self-loops | Parallel edges | Result | Time |
 | --- | --- | --- | --- | --- | --- |
 | `strongly_connected_component(g, v, e)` | directed | no effect | no effect | `componentId BIGINT` | O(n + m) |
+| `triangle_count(g, v, e)` | undirected | ignored | count once | `triangle_count BIGINT` | O(m^1.5) |
+| `total_triangle_count(g, v, e)` | undirected | ignored | count once | one row, `triangle_count BIGINT` | O(m^1.5) |
 
 - **`strongly_connected_component`**: Tarjan's algorithm, iterative, so long chains are no problem. Two vertices
   share a `componentId` when each reaches the other. The id is the smallest rowid among the component's vertices,
   so it depends only on the partition and the table's row order. Matches `networkx.strongly_connected_components`.
+- **`triangle_count`**: the number of triangles through each vertex in the undirected simple graph. Direction is
+  ignored, `a -> b` and `b -> a` are one edge, and parallel edges count once. Edges are oriented from lower to higher
+  (degree, rowid) and out-lists are intersected. `total_triangle_count` is the sum divided by 3. Matches
+  `networkx.triangles`.
 
 `scripts/compare_graph_algorithms.py` compares every function with NetworkX (or a brute force) on generated graphs:
 directed and undirected readings, disconnected parts, self-loops, parallel and reciprocal edges, empty edge and vertex

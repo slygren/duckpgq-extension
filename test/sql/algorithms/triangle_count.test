@@ -1,0 +1,101 @@
+# name: test/sql/algorithms/triangle_count.test
+# description: triangle_count / total_triangle_count over the undirected simple graph: direction is ignored,
+#              parallel edges and reciprocal pairs count once, self-loops are ignored (= networkx.triangles).
+# group: [algorithms]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE v (id INTEGER);
+
+statement ok
+INSERT INTO v VALUES (6), (5), (4), (3), (2), (1);
+
+# K4 on 1..4 (mixed directions, 1 -> 2 twice, 3 <-> 4 both ways), the triangle 1 - 2 - 5, a self-loop on 3, and an
+# isolated 6.
+statement ok
+CREATE TABLE e (src INTEGER, dst INTEGER);
+
+statement ok
+INSERT INTO e VALUES (1, 2), (1, 2), (3, 1), (1, 4), (2, 3), (4, 2), (3, 4), (4, 3), (5, 1), (2, 5), (3, 3);
+
+statement ok
+CREATE PROPERTY GRAPH g VERTEX TABLES (v) EDGE TABLES (e SOURCE KEY (src) REFERENCES v (id) DESTINATION KEY (dst) REFERENCES v (id));
+
+query II
+SELECT id, triangle_count FROM triangle_count('g', 'v', 'e') ORDER BY id;
+----
+1	4
+2	4
+3	3
+4	3
+5	1
+6	0
+
+query I
+FROM total_triangle_count('g', 'v', 'e');
+----
+5
+
+# Only self-loops: no triangles.
+statement ok
+CREATE TABLE le AS SELECT id AS src, id AS dst FROM v;
+
+statement ok
+CREATE PROPERTY GRAPH lg VERTEX TABLES (v) EDGE TABLES (le SOURCE KEY (src) REFERENCES v (id) DESTINATION KEY (dst) REFERENCES v (id));
+
+query I
+SELECT sum(triangle_count) FROM triangle_count('lg', 'v', 'le');
+----
+0
+
+# No edges, no vertices.
+statement ok
+CREATE TABLE ne (src INTEGER, dst INTEGER);
+
+statement ok
+CREATE PROPERTY GRAPH ng VERTEX TABLES (v) EDGE TABLES (ne SOURCE KEY (src) REFERENCES v (id) DESTINATION KEY (dst) REFERENCES v (id));
+
+query II
+SELECT count(*), sum(triangle_count) FROM triangle_count('ng', 'v', 'ne');
+----
+6	0
+
+query I
+FROM total_triangle_count('ng', 'v', 'ne');
+----
+0
+
+statement ok
+CREATE TABLE nv (id INTEGER);
+
+statement ok
+CREATE PROPERTY GRAPH nvg VERTEX TABLES (nv) EDGE TABLES (ne SOURCE KEY (src) REFERENCES nv (id) DESTINATION KEY (dst) REFERENCES nv (id));
+
+query I
+FROM total_triangle_count('nvg', 'nv', 'ne');
+----
+0
+
+# A complete graph on 60 vertices, every edge in both directions: C(60, 3) triangles, C(59, 2) through each vertex.
+statement ok
+CREATE TABLE kv AS SELECT range AS id FROM range(60);
+
+statement ok
+CREATE TABLE ke AS SELECT a.id AS src, b.id AS dst FROM kv a, kv b WHERE a.id <> b.id;
+
+statement ok
+CREATE PROPERTY GRAPH kg VERTEX TABLES (kv) EDGE TABLES (ke SOURCE KEY (src) REFERENCES kv (id) DESTINATION KEY (dst) REFERENCES kv (id));
+
+query III
+SELECT min(triangle_count), max(triangle_count), (FROM total_triangle_count('kg', 'kv', 'ke')) FROM triangle_count('kg', 'kv', 'ke');
+----
+1711	1711	34220
+
+statement error
+FROM total_triangle_count(NULL, 'v', 'e');
+----
+must not be NULL

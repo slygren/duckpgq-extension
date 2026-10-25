@@ -164,11 +164,15 @@ uint64_t SeededBelow(std::mt19937_64 &rng, uint64_t bound);
 //! visiting order beyond the partition itself.
 void CanonicalizeLabels(vector<int64_t> &labels);
 
+//! Triangles through each vertex of an undirected simple graph (sorted neighbour lists, no self-loops), O(m^1.5).
+vector<int64_t> TrianglesPerVertex(const GraphView &g, GraphInterrupt &interrupt);
+
 struct CoreGraphAlgorithms {
 	static void Register(ExtensionLoader &loader);
 
 private:
 	static void RegisterStronglyConnectedComponent(ExtensionLoader &loader);
+	static void RegisterTriangleCount(ExtensionLoader &loader);
 };
 
 } // namespace duckdb
