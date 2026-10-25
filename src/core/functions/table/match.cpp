@@ -5039,7 +5039,9 @@ void PGQMatchFunction::ProcessOptionalPathList(
 				    : vector<string> {PGQStr(prev_vertex_table->main_label), PGQStr(next_vertex_table->main_label)};
 				auto path_info = FindPathTableInfo(path_table_cache, pt_tname, "edge", vertex_sequence,
 				                                   {PGQStr(edge_table->main_label)});
-				if (path_info) {
+				// The LEFT JOIN yields one row per artifact row, so a collapsed duplicate edge would
+				// lose a match: only an artifact that preserves multiplicity may stand in for the bridge.
+				if (path_info && path_info->preserves_multiplicity) {
 					const string pt_alias = "_pgq_pt_" + std::to_string(extra_alias_counter++);
 					// v0_binding: for right-directed = prev, for left-directed = next
 					// v1_binding: for right-directed = next, for left-directed = prev
@@ -7332,7 +7334,7 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
                                  CoveredBindingMap &covered_columns,
                                  OneRowPerMode one_row_per_mode,
                                  const ParsedExpression *where_hint = nullptr,
-                                 PGQPathSelector selector = PGQPathSelector::WALK);
+                                 PGQPathSelector selector = PGQPathSelector::WALK, bool counts_paths = true);
 
 static unique_ptr<ParsedExpression> TryBuildBranchSummaryExistsSubquery(
     MatchExpression &inner_match, CreatePropertyGraphInfo &pg_table,
@@ -7461,7 +7463,8 @@ static unique_ptr<ParsedExpression> BuildExistsSubquery(
 		                         path_table_cache, referenced_bindings,
 		                         covered_columns,
 		                         inner_match.one_row_per,
-		                         inner_match.where_clause.get(), PatternSelector(*path_pattern))) {
+		                         inner_match.where_clause.get(), PatternSelector(*path_pattern),
+		                         /*counts_paths=*/false)) {
 			if (require_abi_paths && PathPatternRequiresABIPath(path_pattern->path_elements)) {
 				ThrowABIPathRequired();
 			}
@@ -8015,8 +8018,17 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
                                  const ReferencedBindings &referenced_bindings,
                                  CoveredBindingMap &covered_columns,
                                  OneRowPerMode one_row_per_mode,
-                                 const ParsedExpression *where_hint, PGQPathSelector selector) {
+                                 const ParsedExpression *where_hint, PGQPathSelector selector,
+                                 bool counts_paths) {
 	const bool any_shortest = selector == PGQPathSelector::ANY_SHORTEST;
+	// An edge or fixed_path artifact is SELECT DISTINCT over its chain, and an edge's artifact id is
+	// hash(label | src | dst), so an edge the bridge holds twice is ONE artifact row where the traversal
+	// counts two paths. preserves_multiplicity is the build-time probe of exactly that (artifact rows ==
+	// chain rows). Wherever the answer counts paths an artifact that failed it is treated as absent; only an
+	// existence test (counts_paths = false) may read it anyway.
+	auto counts_exactly = [&](const PGQPathTableInfo *info) {
+		return info && (!counts_paths || info->preserves_multiplicity);
+	};
 	// Verification/diagnostic escape hatch: force the fallback traversal so
 	// pgq_verify_abi_rewrite() can compare the two paths.
 	if (DisableABIRewrite(context)) {
@@ -8591,7 +8603,7 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 			                          "__" + s.edge->label + "__" + vtx_label;
 			const PGQPathTableInfo *fwd_info =
 			    find_path_table(fwd_tname, "edge", {vtx_label, vtx_label}, {s.edge->label});
-			if (!fwd_info) {
+			if (!counts_exactly(fwd_info)) {
 				return false;
 			}
 			shared_ptr<PropertyGraphTable> vtable, etbl;
@@ -8779,6 +8791,10 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 					const PGQPathTableInfo *path_info = find_path_table(tname, "edge", {sl, dl}, {el});
 					if (!path_info) {
 						continue;
+					}
+					// Skipping a lossy family would drop its edges from the union: decline instead.
+					if (!counts_exactly(path_info)) {
+						return false;
 					}
 					shared_ptr<PropertyGraphTable> src_vtable, dst_vtable;
 					try {
@@ -9054,7 +9070,7 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 	const PGQPathTableInfo *path_info = FindPathTableInfo(path_table_cache, tname,
 	                                                      n_hops == 1 ? "edge" : "fixed_path", vertex_sequence,
 	                                                      edge_sequence, prefer_reverse_sorted);
-	if (!path_info) {
+	if (!counts_exactly(path_info)) {
 		return false;
 	}
 

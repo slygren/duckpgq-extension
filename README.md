@@ -223,6 +223,11 @@ So a closure answers:
   hierarchy). Artifacts built elsewhere without that measurement are taken as `false`.
 - Never `CHEAPEST`, a lower bound of 0, a path mode or a `COST`.
 
+Edge and fixed_path artifacts are `SELECT DISTINCT`, so an edge stored twice in its table is one artifact row.
+Both builders measure that in `preserves_multiplicity` (artifact rows = bridge rows); where an answer counts
+matches (every fixed-length pattern, `OPTIONAL MATCH`, walks) an artifact that failed it is not used. `EXISTS` and
+`ANY SHORTEST` still read it.
+
 ### Seeing what the rewrite did
 
 ```sql

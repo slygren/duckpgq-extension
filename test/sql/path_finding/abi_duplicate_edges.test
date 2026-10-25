@@ -1,0 +1,197 @@
+# name: test/sql/path_finding/abi_duplicate_edges.test
+# description: An edge the bridge holds twice is two matches with artifacts built, as it is without them
+# group: [path_finding]
+
+# Edge and fixed_path artifacts are SELECT DISTINCT over their chain, and an artifact's edge id is
+# hash(label | src | dst), so two bridge rows with the same endpoints are one artifact row. The builders
+# measure that (preserves_multiplicity: artifact rows = chain rows), but the fixed-length rewrite and
+# OPTIONAL MATCH used the artifact regardless and returned one match where the traversal returns two.
+# Where rows are counted an artifact that failed the probe is now treated as absent; an existence test
+# still reads it.
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE Person(id BIGINT PRIMARY KEY);
+
+statement ok
+CREATE TABLE Tag(id BIGINT PRIMARY KEY);
+
+statement ok
+CREATE TABLE knows(src BIGINT, dst BIGINT);
+
+statement ok
+CREATE TABLE hasTag(p BIGINT, t BIGINT);
+
+statement ok
+INSERT INTO Person VALUES (1), (2), (3);
+
+statement ok
+INSERT INTO Tag VALUES (10), (11);
+
+# 1 -> 2 twice, and 3 -> 11 twice
+statement ok
+INSERT INTO knows VALUES (1, 2), (1, 2), (2, 3);
+
+statement ok
+INSERT INTO hasTag VALUES (2, 10), (3, 11), (3, 11);
+
+statement ok
+CREATE PROPERTY GRAPH g VERTEX TABLES (Person LABEL Person, Tag LABEL Tag)
+EDGE TABLES (
+    knows SOURCE KEY (src) REFERENCES Person (id) DESTINATION KEY (dst) REFERENCES Person (id) LABEL Knows,
+    hasTag SOURCE KEY (p) REFERENCES Person (id) DESTINATION KEY (t) REFERENCES Tag (id) LABEL HasTag
+);
+
+statement ok
+FROM pgq_abi_build('g', exclude_self_referential := false, closures := ['Knows'], reverse_twins := ['Knows']);
+
+# The probe saw the collapse, for every artifact over either bridge
+query TTT
+SELECT path_kind, path_table_name, preserves_multiplicity FROM graph.__pgq_path_catalog WHERE graph_name = 'g' ORDER BY ALL;
+----
+edge	__pg_g__Person__HasTag__Tag	false
+edge	__pg_g__Person__Knows__Person	false
+edge	__pg_g__Person__Knows__Person__rev	false
+fixed_path	__pg_g__Person__Knows__Person__HasTag__Tag	false
+fixed_path	__pg_g__Person__Knows__Person__Knows__Person	false
+tc_chain	__pg_g__tc_chain__Person__Knows	false
+tc_witness	__pg_g__tc_witness__Person__Knows	false
+transitive_closure	__pg_g__tc__Person__Knows	false
+
+# ── counted: every bridge row is a match ────────────────────────────────────────────────────────────────────────────
+
+query II rowsort
+FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->(b:Person) COLUMNS (a.id AS a, b.id AS b));
+----
+1	2
+1	2
+2	3
+
+query I
+SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+0
+
+# Destination-anchored: the reverse-sorted twin is the same rows, and as lossy
+query II rowsort
+FROM GRAPH_TABLE (g MATCH (b:Person)<-[:Knows]-(a:Person) WHERE b.id = 2 COLUMNS (a.id AS a, b.id AS b));
+----
+1	2
+1	2
+
+query II rowsort
+FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->(b:Person)-[:Knows]->(c:Person) COLUMNS (a.id AS a, c.id AS c));
+----
+1	3
+1	3
+
+query II rowsort
+FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->(b:Person)-[:HasTag]->(t:Tag) COLUMNS (a.id AS a, t.id AS t));
+----
+1	10
+1	10
+2	11
+2	11
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]-(b:Person) COLUMNS (a.id AS a, b.id AS b));
+----
+6
+
+query II rowsort
+FROM GRAPH_TABLE (g MATCH (a:Person) OPTIONAL MATCH (a)-[:Knows]->(b:Person) COLUMNS (a.id AS a, b.id AS b));
+----
+1	2
+1	2
+2	3
+3	NULL
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->{1,2}(b:Person) COLUMNS (a.id AS a, b.id AS b));
+----
+5
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:Person)-[:Knows]->{1,2}(b:Person) COLUMNS (a.id AS a, b.id AS b));
+----
+5
+
+# Each of these agrees with the bridge-only run
+query TT
+SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->(b:Person)-[:HasTag]->(t:Tag)
+    COLUMNS (a.id AS a, t.id AS t))');
+----
+unverified	false
+
+query TT
+SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH (a:Person)-[:HasTag]->(t:Tag) COLUMNS (a.id AS a, t.id AS t))');
+----
+unverified	false
+
+# ── not counted: existence and ANY SHORTEST may still read the artifacts ──────────────────────────────────────────────
+
+query I rowsort
+FROM GRAPH_TABLE (g MATCH (a:Person) WHERE EXISTS { (a)-[:Knows]->(:Person) } COLUMNS (a.id AS a));
+----
+1
+2
+
+query TT
+SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH (a:Person) WHERE EXISTS { (a)-[:Knows]->(:Person) }
+    COLUMNS (a.id AS a))');
+----
+match	true
+
+query TT
+SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:Person)-[:Knows]->{1,2}(b:Person)
+    COLUMNS (a.id AS a, b.id AS b))');
+----
+match	true
+
+# ── the same graph without the duplicates: the artifacts answer ─────────────────────────────────────────────────────
+
+statement ok
+DELETE FROM knows;
+
+statement ok
+INSERT INTO knows VALUES (1, 2), (2, 3);
+
+statement ok
+DELETE FROM hasTag;
+
+statement ok
+INSERT INTO hasTag VALUES (2, 10), (3, 11);
+
+statement ok
+FROM pgq_abi_build('g', exclude_self_referential := false, closures := ['Knows'], reverse_twins := ['Knows']);
+
+query I
+SELECT count(*) FROM graph.__pgq_path_catalog WHERE graph_name = 'g' AND NOT preserves_multiplicity;
+----
+0
+
+query TT
+SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->(b:Person)-[:HasTag]->(t:Tag)
+    COLUMNS (a.id AS a, t.id AS t))');
+----
+match	true
+
+query TT
+SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH (a:Person) OPTIONAL MATCH (a)-[:Knows]->(b:Person)
+    COLUMNS (a.id AS a, b.id AS b))');
+----
+unverified	false
+
+query II rowsort
+FROM GRAPH_TABLE (g MATCH (b:Person)<-[:Knows]-(a:Person) WHERE b.id = 2 COLUMNS (a.id AS a, b.id AS b));
+----
+1	2
+
+query T
+SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+edge

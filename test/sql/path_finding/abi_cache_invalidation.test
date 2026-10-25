@@ -48,6 +48,11 @@ SELECT * FROM (VALUES
 ) t(graph_name,path_table_name,path_kind,hop_count,src_label,dst_label,vertex_label_sequence,edge_label_sequence,
     supports_one_row_per_step,is_deduplicated,estimated_rows,last_refreshed_at,is_sorted_by_v0,min_depth,max_depth,bridge_table_names);
 
+# Hand-made catalog: declare what the builders measure. Each fixture artifact holds one row per bridge row,
+# and an edge or fixed_path artifact without that proof is not used where rows are counted.
+statement ok
+ALTER TABLE graph.__pgq_path_catalog ADD COLUMN preserves_multiplicity BOOLEAN DEFAULT true;
+
 statement ok con1
 CREATE PROPERTY GRAPH g
 VERTEX TABLES (person PROPERTIES (id, name) LABEL Person)
