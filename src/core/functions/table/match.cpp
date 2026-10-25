@@ -14273,6 +14273,243 @@ static unique_ptr<ParsedExpression> MarkGroupAggregates(ClientContext &context, 
 	return expression;
 }
 
+//------------------------------------------------------------------------------
+// Variables of quantified edges
+//------------------------------------------------------------------------------
+// The variable of a quantified edge -[e]->{n,m} (upper bound above 1) is a group variable too (SQL/PGQ: the edge is
+// the group (()-[e]->()){n,m}): e.x is the list of the path's edges' x values in path order. A pattern that reads e
+// is rewritten here; one that does not keeps its route unchanged. label(e) alone keeps the meaning it always had
+// (the edge's label, one value), so such a query is not touched either.
+//
+// - One quantified edge between two vertices, under a search prefix or with a bound the lowering does not unroll:
+//   the pattern keeps its path search and e's values are read along the path (edge_property, edges, edge_labels).
+// - Otherwise, with a bound it unrolls: the edge becomes that group.
+
+static bool IsLabelOfVariable(const ParsedExpression &expression, const string &variable) {
+	if (expression.GetExpressionClass() != ExpressionClass::FUNCTION) {
+		return false;
+	}
+	auto &function = expression.Cast<FunctionExpression>();
+	if (!StringUtil::CIEquals(PGQStr(function.FunctionName()), "label") || function.GetArguments().size() != 1 ||
+	    function.GetArguments()[0].GetExpression().GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+		return false;
+	}
+	auto &names = function.GetArguments()[0].GetExpression().Cast<ColumnRefExpression>().ColumnNames();
+	return names.size() == 1 && StringUtil::CIEquals(PGQStr(names[0]), variable);
+}
+
+//! True when the expression reads `variable` other than through label(variable).
+static bool ReadsEdgeVariable(const ParsedExpression &expression, const string &variable) {
+	if (IsLabelOfVariable(expression, variable)) {
+		return false;
+	}
+	if (expression.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+		auto &names = expression.Cast<ColumnRefExpression>().ColumnNames();
+		return !names.empty() && StringUtil::CIEquals(PGQStr(names[0]), variable);
+	}
+	if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		return false;
+	}
+	bool found = false;
+	ParsedExpressionIterator::EnumerateChildren(
+	    expression, [&](const ParsedExpression &child) { found = found || ReadsEdgeVariable(child, variable); });
+	return found;
+}
+
+static unique_ptr<ParsedExpression> PathCall(const char *name, const string &path) {
+	vector<unique_ptr<ParsedExpression>> arguments;
+	arguments.push_back(PGQColRef(path));
+	return make_uniq<FunctionExpression>(name, std::move(arguments));
+}
+
+static unique_ptr<ParsedExpression> EdgePropertyCall(const string &path, const string &property) {
+	vector<unique_ptr<ParsedExpression>> arguments;
+	arguments.push_back(PGQColRef(path));
+	arguments.push_back(ConstantExpression::FromValue(Value(property)));
+	return make_uniq<FunctionExpression>("edge_property", std::move(arguments));
+}
+
+//! e's references written as the values along path `path`, whose edges are exactly e's.
+static unique_ptr<ParsedExpression> RewriteEdgeVariableAlongPath(ClientContext &context,
+                                                                 unique_ptr<ParsedExpression> expression,
+                                                                 const string &variable, const string &path) {
+	if (!expression) {
+		return expression;
+	}
+	auto alias = expression->GetAlias();
+	auto keep_alias = [&](unique_ptr<ParsedExpression> result) {
+		result->SetAlias(alias.empty() ? expression->GetName() : alias);
+		return result;
+	};
+	if (IsAggregateCall(context, *expression) && ReadsEdgeVariable(*expression, variable)) {
+		auto &function = expression->Cast<FunctionExpression>();
+		const auto name = StringUtil::Lower(PGQStr(function.FunctionName()));
+		if (function.GetArguments().size() != 1 || function.Filter() ||
+		    (function.OrderBy() && !function.OrderBy()->orders.empty())) {
+			throw NotImplementedException("%s() over the variable of a quantified edge supports one argument, without "
+			                              "FILTER or ORDER BY",
+			                              name);
+		}
+		auto &argument = function.GetArguments()[0].GetExpression();
+		if (argument.GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+			throw NotImplementedException("%s() over an expression of the variable of a quantified edge with this bound "
+			                              "is not supported; aggregate one property, e.g. %s(%s.x)",
+			                              name, name, variable);
+		}
+		auto &names = argument.Cast<ColumnRefExpression>().ColumnNames();
+		if (names.size() == 1) {
+			if (name != "count") {
+				throw BinderException("%s(%s) needs a property of the edge, e.g. %s(%s.x)", name, variable, name, variable);
+			}
+			return keep_alias(PathCall("path_length", path));
+		}
+		unique_ptr<ParsedExpression> list = EdgePropertyCall(path, PGQStr(names[1]));
+		if (function.Distinct()) {
+			vector<unique_ptr<ParsedExpression>> distinct_args;
+			distinct_args.push_back(std::move(list));
+			list = make_uniq<FunctionExpression>("list_distinct", std::move(distinct_args));
+		}
+		vector<unique_ptr<ParsedExpression>> aggregate_args;
+		aggregate_args.push_back(std::move(list));
+		aggregate_args.push_back(ConstantExpression::FromValue(Value(name)));
+		return keep_alias(make_uniq<FunctionExpression>("list_aggregate", std::move(aggregate_args)));
+	}
+	if (expression->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+		auto &names = expression->Cast<ColumnRefExpression>().ColumnNames();
+		if (names.empty() || !StringUtil::CIEquals(PGQStr(names[0]), variable)) {
+			return expression;
+		}
+		if (names.size() == 1) {
+			throw BinderException("'%s' is the variable of a quantified edge and stands for a list of edges: read a "
+			                      "property (%s.x), element_id(%s) or an aggregate over it",
+			                      variable, variable, variable);
+		}
+		return keep_alias(EdgePropertyCall(path, PGQStr(names[1])));
+	}
+	if (expression->GetExpressionClass() == ExpressionClass::FUNCTION) {
+		auto &function = expression->Cast<FunctionExpression>();
+		auto name = StringUtil::Lower(PGQStr(function.FunctionName()));
+		if ((name == "element_id" || name == "label") && function.GetArguments().size() == 1 &&
+		    function.GetArguments()[0].GetExpression().GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			auto &names = function.GetArguments()[0].GetExpression().Cast<ColumnRefExpression>().ColumnNames();
+			if (names.size() == 1 && StringUtil::CIEquals(PGQStr(names[0]), variable)) {
+				return keep_alias(PathCall(name == "element_id" ? "edges" : "edge_labels", path));
+			}
+		}
+	}
+	if (expression->GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		return expression;
+	}
+	ParsedExpressionIterator::EnumerateChildren(*expression, [&](unique_ptr<ParsedExpression> &child) {
+		child = RewriteEdgeVariableAlongPath(context, std::move(child), variable, path);
+	});
+	return expression;
+}
+
+//! Rewrites the patterns of `block` whose quantified edges have a variable the query reads. `columns` are the
+//! COLUMNS that apply to the block; `owns_columns` is false when they are shared with other blocks.
+static void PromoteQuantifiedEdgeVariables(ClientContext &context, MatchExpression &block,
+                                           vector<unique_ptr<ParsedExpression>> &columns, bool owns_columns) {
+	case_insensitive_set_t orp_variables(block.one_row_per_vars.begin(), block.one_row_per_vars.end());
+	idx_t generated = 0;
+	for (auto &pattern : block.path_patterns) {
+		if (!pattern->union_operands.empty() || pattern->cheapest || pattern->topk) {
+			continue;
+		}
+		auto &sequence = PatternSequence(*pattern);
+		for (idx_t i = 0; i < sequence.size(); i++) {
+			auto *quantified = PGQMatchFunction::GetSubPath(sequence[i]);
+			if (!quantified || quantified->quantified_group || quantified->path_list.size() != 1 ||
+			    quantified->upper <= 1 || quantified->cost_expr) {
+				continue;
+			}
+			auto *edge = PGQMatchFunction::GetPathElement(quantified->path_list[0]);
+			if (!edge || edge->match_type == PGQMatchType::MATCH_VERTEX) {
+				continue;
+			}
+			const auto &variable = edge->variable_binding;
+			bool read = false;
+			if (!IsGeneratedVariable(variable) && !orp_variables.count(variable)) {
+				for (auto &column : columns) {
+					read = read || ReadsEdgeVariable(*column, variable);
+				}
+				read = read || (block.where_clause && ReadsEdgeVariable(*block.where_clause, variable));
+			}
+			const bool element_where = quantified->where_clause != nullptr;
+			if (!read && !element_where) {
+				continue;
+			}
+			const bool unrollable =
+			    quantified->upper < int64_t(1 << 30) && quantified->upper <= kGroupMaxUnrolledIterations;
+			const bool single_segment = sequence.size() == 3 && i == 1;
+			if (read && single_segment && !element_where && block.one_row_per == OneRowPerMode::NONE &&
+			    (pattern->shortest || !unrollable) && owns_columns) {
+				// Keep the path search; read e along the path.
+				auto *wrapper = PatternSequenceWrapper(*pattern);
+				string path;
+				if (wrapper && !wrapper->path_variable.empty()) {
+					path = wrapper->path_variable;
+				} else {
+					path = "__pgq_qe_path" + std::to_string(generated++);
+					if (wrapper) {
+						wrapper->path_variable = path;
+					} else {
+						auto named = make_uniq<SubPath>(PGQPathReferenceType::SUBPATH);
+						named->path_variable = path;
+						named->path_list = std::move(pattern->path_elements);
+						pattern->path_elements.clear();
+						pattern->path_elements.push_back(std::move(named));
+					}
+				}
+				for (auto &column : columns) {
+					column = RewriteEdgeVariableAlongPath(context, std::move(column), variable, path);
+				}
+				block.where_clause = RewriteEdgeVariableAlongPath(context, std::move(block.where_clause), variable, path);
+				break; // the pattern's element list was rewrapped
+			}
+			if (!unrollable) {
+				continue; // as before: e cannot be read here
+			}
+			// The edge is the group (()-[e]->()){n,m}.
+			auto group = make_uniq<SubPath>(PGQPathReferenceType::SUBPATH);
+			group->quantified_group = true;
+			group->lower = quantified->lower;
+			group->upper = quantified->upper;
+			group->path_mode = quantified->path_mode;
+			auto vertex = [&](const char *end) {
+				auto element = make_uniq<PathElement>(PGQPathReferenceType::PATH_ELEMENT);
+				element->match_type = PGQMatchType::MATCH_VERTEX;
+				element->variable_binding = "_anon_qe" + std::to_string(generated) + end;
+				return element;
+			};
+			group->path_list.push_back(vertex("s"));
+			if (quantified->where_clause) {
+				auto element_wrapper = make_uniq<SubPath>(PGQPathReferenceType::SUBPATH);
+				element_wrapper->where_clause = std::move(quantified->where_clause);
+				element_wrapper->path_list.push_back(std::move(quantified->path_list[0]));
+				group->path_list.push_back(std::move(element_wrapper));
+			} else {
+				group->path_list.push_back(std::move(quantified->path_list[0]));
+			}
+			group->path_list.push_back(vertex("d"));
+			generated++;
+			sequence[i] = std::move(group);
+		}
+	}
+}
+
+static void PromoteQuantifiedEdgeVariables(ClientContext &context, MatchExpression &ref) {
+	const bool shared = !ref.union_matches.empty() && ref.union_matches[0]->column_list.empty();
+	PromoteQuantifiedEdgeVariables(context, ref, ref.column_list, !shared);
+	for (auto &branch : ref.union_matches) {
+		if (branch->column_list.empty()) {
+			PromoteQuantifiedEdgeVariables(context, *branch, ref.column_list, false);
+		} else {
+			PromoteQuantifiedEdgeVariables(context, *branch, branch->column_list, true);
+		}
+	}
+}
+
 static void MarkGroupAggregates(ClientContext &context, MatchExpression &block) {
 	if (!BlockHasQuantifiedGroup(block)) {
 		return;
@@ -14358,6 +14595,7 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	auto match_copy = unique_ptr_cast<ParsedExpression, MatchExpression>(match_info->match->Copy());
 	auto *ref = match_copy.get();
 	NormalizeMatchExpression(*ref);
+	PromoteQuantifiedEdgeVariables(context, *ref);
 	{
 		QualifiedName graph_name(Identifier(ref->pg_catalog), Identifier(ref->pg_schema), Identifier(ref->pg_name));
 		auto &pg_table = *duckpgq_state->GetPropertyGraph(context, graph_name);
