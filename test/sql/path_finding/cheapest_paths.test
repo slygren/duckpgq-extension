@@ -809,6 +809,34 @@ SELECT count(*) FROM (
 ----
 0
 
+# A constant COST with an element WHERE: the shortest paths over the edges that pass it, searched by cost
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link WHERE e.w > 1 COST 2]->+(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost)))
+    EXCEPT ALL (SELECT src, dst, vs, es, 2 * depth FROM every_path
+                WHERE depth > 0 AND list_has_all((SELECT list(rowid) FROM link WHERE w > 1), es)
+                QUALIFY depth = min(depth) OVER (PARTITION BY src, dst)));
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT src, dst, vs, es, 2 * depth FROM every_path
+     WHERE depth > 0 AND list_has_all((SELECT list(rowid) FROM link WHERE w > 1), es)
+     QUALIFY depth = min(depth) OVER (PARTITION BY src, dst))
+    EXCEPT ALL (FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link WHERE e.w > 1 COST 2]->+(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost))));
+----
+0
+
+query I
+SELECT count(*) = count(DISTINCT (src, dst)) AND count(*) = (SELECT count(DISTINCT (src, dst)) FROM every_path
+    WHERE depth BETWEEN 1 AND 2 AND list_has_all((SELECT list(rowid) FROM link WHERE w > 1), es))
+FROM GRAPH_TABLE (g MATCH ANY CHEAPEST (a:Person)-[e:Link WHERE e.w > 1 COST 0.5]->{1,2}(b:Person) COLUMNS (a.id AS src, b.id AS dst));
+----
+true
+
 # The edges a WHERE excludes are not searched, nor costed (a NULL cost there is no error)
 query II rowsort
 FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link WHERE e.src < 6 COST CASE WHEN e.src < 6 THEN e.w END]->+(b:Person)

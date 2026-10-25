@@ -11328,9 +11328,12 @@ static void PrepareCheapest(MatchExpression &match, bool shared_union_columns) {
 			continue;
 		}
 		bool found = false;
-		const bool constant = AllCostsConstant(pattern->path_elements, found) && found;
 		auto *edge = SingleQuantifiedEdge(elements);
 		auto *edge_element = edge ? dynamic_cast<PathElement *>(edge->path_list[0].get()) : nullptr;
+		// A constant COST is SHORTEST, except over an edge with an element WHERE, which only the search by cost
+		// filters step by step: there it is searched like any other COST.
+		const bool constant =
+		    AllCostsConstant(pattern->path_elements, found) && found && !(edge && edge->where_clause);
 		if (constant) {
 			if (!costed) {
 				continue;
@@ -11342,11 +11345,6 @@ static void PrepareCheapest(MatchExpression &match, bool shared_union_columns) {
 				throw NotImplementedException("COST(%s) of a constant COST supports one quantified edge between two "
 				                              "vertices, e.g. %s",
 				                              path_variable, kExample);
-			}
-			if (edge->where_clause) {
-				throw NotImplementedException("COST(%s) of a constant COST is not supported with an element WHERE on "
-				                              "the costed edge",
-				                              path_variable);
 			}
 			if (ConstantCostSearch(*edge, match.one_row_per)) {
 				constant_cost_search = true;
