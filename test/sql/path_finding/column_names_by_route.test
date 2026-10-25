@@ -1,0 +1,344 @@
+# name: test/sql/path_finding/column_names_by_route.test
+# description: A COLUMNS expression has the same name whichever route answers the pattern. COLUMNS (p.id) was named
+#              `id` traversed and `v0` when an edge artifact answered. Every shape is run traversed and with ABI
+#              artifacts, and the names are compared with each other and with the name SQL gives the expression.
+# group: [path_finding]
+
+require duckpgq
+
+load __TEST_DIR__/column_names_by_route.db
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE Person(id BIGINT PRIMARY KEY, name VARCHAR);
+
+statement ok
+CREATE TABLE Tag(id BIGINT PRIMARY KEY, name VARCHAR, category VARCHAR);
+
+statement ok
+CREATE TABLE City(id BIGINT PRIMARY KEY, name VARCHAR);
+
+statement ok
+CREATE TABLE knows(src BIGINT, dst BIGINT);
+
+statement ok
+CREATE TABLE hasInterest(personId BIGINT, tagId BIGINT);
+
+statement ok
+CREATE TABLE livesIn(personId BIGINT, cityId BIGINT);
+
+statement ok
+CREATE TABLE parentOf(child BIGINT, parent BIGINT);
+
+statement ok
+INSERT INTO Person VALUES (1, 'A'), (2, 'B'), (3, 'C'), (4, 'D');
+
+statement ok
+INSERT INTO Tag VALUES (10, 't1', 'sport'), (11, 't2', 'art');
+
+statement ok
+INSERT INTO City VALUES (100, 'Oslo'), (101, 'Bergen');
+
+statement ok
+INSERT INTO knows VALUES (1, 2), (2, 3), (3, 4);
+
+statement ok
+INSERT INTO hasInterest VALUES (1, 10), (2, 10), (3, 11);
+
+statement ok
+INSERT INTO livesIn VALUES (1, 100), (2, 100), (3, 101), (4, 101);
+
+statement ok
+INSERT INTO parentOf VALUES (1, 2), (2, 3), (3, 4);
+
+statement ok
+CREATE PROPERTY GRAPH g
+VERTEX TABLES (Person LABEL Person, Tag LABEL Tag, City LABEL City)
+EDGE TABLES (
+    knows SOURCE KEY (src) REFERENCES Person (id) DESTINATION KEY (dst) REFERENCES Person (id) LABEL knows,
+    hasInterest SOURCE KEY (personId) REFERENCES Person (id) DESTINATION KEY (tagId) REFERENCES Tag (id) LABEL hasInterest,
+    livesIn SOURCE KEY (personId) REFERENCES Person (id) DESTINATION KEY (cityId) REFERENCES City (id) LABEL livesIn,
+    parentOf SOURCE KEY (child) REFERENCES Person (id) DESTINATION KEY (parent) REFERENCES Person (id) LABEL parentOf
+);
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('g', exclude_self_referential := false, closures := ['parentOf'],
+    cover := MAP {'hasInterest': ['name', 'category']});
+
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE TABLE edge_key_trav AS FROM GRAPH_TABLE (g MATCH (p:Person)-[:hasInterest]->(t:Tag) COLUMNS (p.id, t.id));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE TABLE edge_key_abi AS FROM GRAPH_TABLE (g MATCH (p:Person)-[:hasInterest]->(t:Tag) COLUMNS (p.id, t.id));
+
+# The artifact route answered it
+query I
+SELECT count(*) > 0 FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+true
+
+query I
+SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns() WHERE table_name = 'edge_key_abi';
+----
+id,id_1
+
+query I
+SELECT (SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns() WHERE table_name = 'edge_key_abi')
+     = (SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns() WHERE table_name = 'edge_key_trav');
+----
+true
+
+query I
+SELECT count(*) FROM ((FROM edge_key_abi EXCEPT ALL FROM edge_key_trav) UNION ALL (FROM edge_key_trav EXCEPT ALL FROM edge_key_abi));
+----
+0
+
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE TABLE edge_one_trav AS FROM GRAPH_TABLE (g MATCH (p:Person)-[:hasInterest]->(t:Tag) COLUMNS (p.id));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE TABLE edge_one_abi AS FROM GRAPH_TABLE (g MATCH (p:Person)-[:hasInterest]->(t:Tag) COLUMNS (p.id));
+
+# The artifact route answered it
+query I
+SELECT count(*) > 0 FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+true
+
+query I
+SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns() WHERE table_name = 'edge_one_abi';
+----
+id
+
+query I
+SELECT (SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns() WHERE table_name = 'edge_one_abi')
+     = (SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns() WHERE table_name = 'edge_one_trav');
+----
+true
+
+query I
+SELECT count(*) FROM ((FROM edge_one_abi EXCEPT ALL FROM edge_one_trav) UNION ALL (FROM edge_one_trav EXCEPT ALL FROM edge_one_abi));
+----
+0
+
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE TABLE edge_covered_trav AS FROM GRAPH_TABLE (g MATCH (p:Person)-[:hasInterest]->(t:Tag) COLUMNS (p.id, t.name, t.category));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE TABLE edge_covered_abi AS FROM GRAPH_TABLE (g MATCH (p:Person)-[:hasInterest]->(t:Tag) COLUMNS (p.id, t.name, t.category));
+
+# The artifact route answered it
+query I
+SELECT count(*) > 0 FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+true
+
+query I
+SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns() WHERE table_name = 'edge_covered_abi';
+----
+id,name,category
+
+query I
+SELECT (SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns() WHERE table_name = 'edge_covered_abi')
+     = (SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns() WHERE table_name = 'edge_covered_trav');
+----
+true
+
+query I
+SELECT count(*) FROM ((FROM edge_covered_abi EXCEPT ALL FROM edge_covered_trav) UNION ALL (FROM edge_covered_trav EXCEPT ALL FROM edge_covered_abi));
+----
+0
+
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE TABLE edge_expr_trav AS FROM GRAPH_TABLE (g MATCH (p:Person)-[:hasInterest]->(t:Tag) COLUMNS (p.id + 1, upper(t.name), t.id AS tag));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE TABLE edge_expr_abi AS FROM GRAPH_TABLE (g MATCH (p:Person)-[:hasInterest]->(t:Tag) COLUMNS (p.id + 1, upper(t.name), t.id AS tag));
+
+# The artifact route answered it
+query I
+SELECT count(*) > 0 FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+true
+
+query I
+SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns() WHERE table_name = 'edge_expr_abi';
+----
+(p.id + 1),upper(t."name"),tag
+
+query I
+SELECT (SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns() WHERE table_name = 'edge_expr_abi')
+     = (SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns() WHERE table_name = 'edge_expr_trav');
+----
+true
+
+query I
+SELECT count(*) FROM ((FROM edge_expr_abi EXCEPT ALL FROM edge_expr_trav) UNION ALL (FROM edge_expr_trav EXCEPT ALL FROM edge_expr_abi));
+----
+0
+
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE TABLE fixed2_trav AS FROM GRAPH_TABLE (g MATCH (a:Person)-[:knows]->(b:Person)-[:livesIn]->(c:City) COLUMNS (a.id, c.id, c.name));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE TABLE fixed2_abi AS FROM GRAPH_TABLE (g MATCH (a:Person)-[:knows]->(b:Person)-[:livesIn]->(c:City) COLUMNS (a.id, c.id, c.name));
+
+# The artifact route answered it
+query I
+SELECT count(*) > 0 FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+true
+
+query I
+SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns() WHERE table_name = 'fixed2_abi';
+----
+id,id_1,name
+
+query I
+SELECT (SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns() WHERE table_name = 'fixed2_abi')
+     = (SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns() WHERE table_name = 'fixed2_trav');
+----
+true
+
+query I
+SELECT count(*) FROM ((FROM fixed2_abi EXCEPT ALL FROM fixed2_trav) UNION ALL (FROM fixed2_trav EXCEPT ALL FROM fixed2_abi));
+----
+0
+
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE TABLE closure_trav AS FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:Person)-[:parentOf]->{1,3}(b:Person) COLUMNS (a.id, b.id));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE TABLE closure_abi AS FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:Person)-[:parentOf]->{1,3}(b:Person) COLUMNS (a.id, b.id));
+
+# The artifact route answered it
+query I
+SELECT count(*) > 0 FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+true
+
+query I
+SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns() WHERE table_name = 'closure_abi';
+----
+id,id_1
+
+query I
+SELECT (SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns() WHERE table_name = 'closure_abi')
+     = (SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns() WHERE table_name = 'closure_trav');
+----
+true
+
+query I
+SELECT count(*) FROM ((FROM closure_abi EXCEPT ALL FROM closure_trav) UNION ALL (FROM closure_trav EXCEPT ALL FROM closure_abi));
+----
+0
+
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE TABLE closure_path_trav AS FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Person)-[:parentOf]->{1,3}(b:Person) COLUMNS (a.id, b.name, path_length(p), vertices(p)));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE TABLE closure_path_abi AS FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Person)-[:parentOf]->{1,3}(b:Person) COLUMNS (a.id, b.name, path_length(p), vertices(p)));
+
+# The artifact route answered it
+query I
+SELECT count(*) > 0 FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+true
+
+query I
+SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns() WHERE table_name = 'closure_path_abi';
+----
+id,name,path_length(p),vertices(p)
+
+query I
+SELECT (SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns() WHERE table_name = 'closure_path_abi')
+     = (SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns() WHERE table_name = 'closure_path_trav');
+----
+true
+
+# vertices(p) holds row ids traversed and keys from an artifact (README); the rest of the row is the same
+query I
+SELECT count(*) FROM ((SELECT id, name, "path_length(p)" FROM closure_path_abi
+                       EXCEPT ALL SELECT id, name, "path_length(p)" FROM closure_path_trav)
+                      UNION ALL (SELECT id, name, "path_length(p)" FROM closure_path_trav
+                                 EXCEPT ALL SELECT id, name, "path_length(p)" FROM closure_path_abi));
+----
+0
+
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE TABLE element_id_trav AS FROM GRAPH_TABLE (g MATCH (a:Person)-[e:knows]->(b:Person) COLUMNS (element_id(e), a.id));
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE TABLE element_id_abi AS FROM GRAPH_TABLE (g MATCH (a:Person)-[e:knows]->(b:Person) COLUMNS (element_id(e), a.id));
+
+# The artifact route answered it
+query I
+SELECT count(*) > 0 FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+true
+
+query I
+SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns() WHERE table_name = 'element_id_abi';
+----
+element_id(e),id
+
+query I
+SELECT (SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns() WHERE table_name = 'element_id_abi')
+     = (SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns() WHERE table_name = 'element_id_trav');
+----
+true
+
+query I
+SELECT count(*) FROM ((FROM element_id_abi EXCEPT ALL FROM element_id_trav) UNION ALL (FROM element_id_trav EXCEPT ALL FROM element_id_abi));
+----
+0

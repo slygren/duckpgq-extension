@@ -12734,6 +12734,22 @@ unique_ptr<TableRef> PGQMatchFunction::AggregateOverUnion(ClientContext &context
 	return make_uniq<SubqueryRef>(std::move(statement), PGQId(ref.alias));
 }
 
+// A COLUMNS expression is named before any route rewrites it, with the name SQL gives the expression as written (a
+// property reference is named by its property, anything else by its text). The routes replace the expression -- an
+// artifact column, a path CTE column, a folded constant -- so a name taken from the rewritten form depended on the
+// route: COLUMNS (p.id) was `id` traversed and `v0` when the edge artifact answered.
+static void NameColumns(MatchExpression &match) {
+	for (auto &column : match.column_list) {
+		if (column->HasAlias() || column->GetExpressionClass() == ExpressionClass::STAR) {
+			continue;
+		}
+		column->SetAlias(column->GetName());
+	}
+	for (auto &branch : match.union_matches) {
+		NameColumns(*branch);
+	}
+}
+
 unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, TableFunctionBindInput &bind_input) {
 	auto duckpgq_state = GetDuckPGQState(context);
 	duckpgq_state->graph_table_query = context.transaction.GetActiveQuery();
@@ -12746,6 +12762,7 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	auto match_copy = unique_ptr_cast<ParsedExpression, MatchExpression>(match_info->match->Copy());
 	auto *ref = match_copy.get();
 	NormalizeMatchExpression(*ref);
+	NameColumns(*ref);
 	{
 		QualifiedName graph_name(Identifier(ref->pg_catalog), Identifier(ref->pg_schema), Identifier(ref->pg_name));
 		auto &pg_table = *duckpgq_state->GetPropertyGraph(context, graph_name);

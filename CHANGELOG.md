@@ -47,6 +47,8 @@ In every such case the old rows were wrong.
     now traverse unless the table is proven exact.
   - **Edge path tables built with duplicate edges collapsed** no longer answer counting patterns. They used to
     undercount.
+  - **Column names do not depend on the route.** `COLUMNS (p.id)` was named `id` traversed and `v0` when an ABI
+    artifact answered; it is `id` on every route (an expression without `AS` is named by its text).
   - **Several `GRAPH_TABLE`s in one statement** (a join, `EXCEPT`, two scalar subqueries over the same graph) give
     the rows each gives alone. DuckDB 2.0.0's `common_subplan` optimizer merged their subplans and could read one
     vertex scan's column in place of another's; it is kept off the scans of statements with a `GRAPH_TABLE`.

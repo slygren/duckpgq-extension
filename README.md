@@ -175,6 +175,9 @@ runs on. No artifact holds k paths per pair: `SHORTEST k` always traverses.
 
 ### In WHERE and COLUMNS
 
+A `COLUMNS` expression without `AS` is named as SQL names it -- a property by the property (`p.id` is `id`), anything
+else by its text (`path_length(p)`, `(p.id + 1)`) -- on every route, ABI artifacts included.
+
 | Expression | Gives |
 | --- | --- |
 | `v.prop`, `v.{a, b}` | a property; a struct of several (`struct_pack(a := v.a, b := v.b)`) |
