@@ -89,30 +89,42 @@ FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)-[e:E]<- *(n2:N));
 ----
 Parser Error: syntax error at or near "<"
 
-statement error
+# No edges: every vertex reaches only itself, by the empty path
+query II rowsort
 FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)<-> *(n2:N));
 ----
-Not implemented Error: Cannot do shortest path for edge type MATCH_EDGE_LEFT_RIGHT
+1	1
+2	2
+3	3
 
-statement error
+# No edges: every vertex reaches only itself, by the empty path
+query II rowsort
 FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)< - > *(n2:N));
 ----
-Not implemented Error: Cannot do shortest path for edge type MATCH_EDGE_LEFT_RIGHT
+1	1
+2	2
+3	3
 
-statement error
+query II rowsort
 FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)<- *(n2:N));
 ----
-Not implemented Error: Cannot do shortest path for edge type MATCH_EDGE_LEFT
+1	1
+2	2
+3	3
 
-statement error
+query II rowsort
 FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)< - *(n2:N));
 ----
-Not implemented Error: Cannot do shortest path for edge type MATCH_EDGE_LEFT
+1	1
+2	2
+3	3
 
-statement error
+query II rowsort
 FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)< -*(n2:N));
 ----
-Not implemented Error: Cannot do shortest path for edge type MATCH_EDGE_LEFT
+1	1
+2	2
+3	3
 
 statement ok
 FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)< -?(n2:N));

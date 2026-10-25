@@ -1,0 +1,543 @@
+# name: test/sql/path_finding/optional_cheapest.test
+# description: CHEAPEST as the pattern of an OPTIONAL MATCH: the LEFT JOIN of the CHEAPEST MATCH onto the bindings so far
+# group: [path_finding]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE P(id BIGINT PRIMARY KEY);
+
+statement ok
+CREATE TABLE K(src BIGINT, dst BIGINT, w DOUBLE);
+
+statement ok
+INSERT INTO P VALUES (1), (2), (3), (4), (5), (6);
+
+# 1 -> 3 directly costs 3, through 2 it costs 1 + 1: the cheapest path is the longer one
+statement ok
+INSERT INTO K VALUES (1, 2, 5), (1, 2, 1), (2, 3, 1), (1, 3, 3), (3, 4, 1), (2, 4, 4), (4, 1, 2), (2, 1, 1), (3, 5, 2);
+
+statement ok
+CREATE PROPERTY GRAPH g VERTEX TABLES (P LABEL P)
+EDGE TABLES (K SOURCE KEY (src) REFERENCES P (id) DESTINATION KEY (dst) REFERENCES P (id) LABEL K);
+
+query II
+FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ANY CHEAPEST (t)-[e:K COST e.w]->{1,1}(x:P) WHERE t.id IN (1, 6)
+    COLUMNS (t.id AS t, x.id AS x)) ORDER BY ALL;
+----
+1	2
+1	3
+6	NULL
+
+# ANY CHEAPEST (t)-[e:K COST e.w]->+(x:P) WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ANY CHEAPEST (t:P)-[e:K COST e.w]->+(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ANY CHEAPEST (t)-[e:K COST e.w]->+(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query II
+SELECT (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+0	0
+
+# ANY CHEAPEST (t)-[e:K COST e.w]->+(x:P) WHERE t.id = 5
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 5 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ANY CHEAPEST (t:P)-[e:K COST e.w]->+(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ANY CHEAPEST (t)-[e:K COST e.w]->+(x:P) WHERE t.id = 5 COLUMNS (t.id AS t, x.id AS x));
+
+query II
+SELECT (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+0	0
+
+# ANY CHEAPEST (t)-[e:K COST e.w]->{1,3}(x:P) WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ANY CHEAPEST (t:P)-[e:K COST e.w]->{1,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ANY CHEAPEST (t)-[e:K COST e.w]->{1,3}(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query II
+SELECT (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+0	0
+
+# ANY CHEAPEST (t)-[e:K COST e.w]->{1,3}(x:P) WHERE t.id = 5
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 5 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ANY CHEAPEST (t:P)-[e:K COST e.w]->{1,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ANY CHEAPEST (t)-[e:K COST e.w]->{1,3}(x:P) WHERE t.id = 5 COLUMNS (t.id AS t, x.id AS x));
+
+query II
+SELECT (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+0	0
+
+# ANY CHEAPEST (t)-[e:K COST e.w]->{2,3}(x:P) WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ANY CHEAPEST (t:P)-[e:K COST e.w]->{2,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ANY CHEAPEST (t)-[e:K COST e.w]->{2,3}(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query II
+SELECT (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+0	0
+
+# ANY CHEAPEST (t)-[e:K COST e.w]->{2,3}(x:P) WHERE t.id = 5
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 5 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ANY CHEAPEST (t:P)-[e:K COST e.w]->{2,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ANY CHEAPEST (t)-[e:K COST e.w]->{2,3}(x:P) WHERE t.id = 5 COLUMNS (t.id AS t, x.id AS x));
+
+query II
+SELECT (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+0	0
+
+# ANY CHEAPEST (t)<-[e:K COST e.w]-{1,3}(x:P) WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ANY CHEAPEST (t:P)<-[e:K COST e.w]-{1,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ANY CHEAPEST (t)<-[e:K COST e.w]-{1,3}(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query II
+SELECT (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+0	0
+
+# ANY CHEAPEST (t)<-[e:K COST e.w]-{1,3}(x:P) WHERE t.id = 5
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 5 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ANY CHEAPEST (t:P)<-[e:K COST e.w]-{1,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ANY CHEAPEST (t)<-[e:K COST e.w]-{1,3}(x:P) WHERE t.id = 5 COLUMNS (t.id AS t, x.id AS x));
+
+query II
+SELECT (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+0	0
+
+# ANY CHEAPEST (t)<-[e:K COST e.w]-{2,3}(x:P) WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ANY CHEAPEST (t:P)<-[e:K COST e.w]-{2,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ANY CHEAPEST (t)<-[e:K COST e.w]-{2,3}(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query II
+SELECT (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+0	0
+
+# ANY CHEAPEST (t)<-[e:K COST e.w]-{2,3}(x:P) WHERE t.id = 5
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 5 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ANY CHEAPEST (t:P)<-[e:K COST e.w]-{2,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ANY CHEAPEST (t)<-[e:K COST e.w]-{2,3}(x:P) WHERE t.id = 5 COLUMNS (t.id AS t, x.id AS x));
+
+query II
+SELECT (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+0	0
+
+# ANY CHEAPEST (t)-[e:K COST e.w]-{1,3}(x:P) WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ANY CHEAPEST (t:P)-[e:K COST e.w]-{1,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ANY CHEAPEST (t)-[e:K COST e.w]-{1,3}(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query II
+SELECT (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+0	0
+
+# ANY CHEAPEST (t)-[e:K COST e.w]-{1,3}(x:P) WHERE t.id = 5
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 5 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ANY CHEAPEST (t:P)-[e:K COST e.w]-{1,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ANY CHEAPEST (t)-[e:K COST e.w]-{1,3}(x:P) WHERE t.id = 5 COLUMNS (t.id AS t, x.id AS x));
+
+query II
+SELECT (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+0	0
+
+# ANY CHEAPEST (t)-[e:K COST e.w]-{2,3}(x:P) WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ANY CHEAPEST (t:P)-[e:K COST e.w]-{2,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ANY CHEAPEST (t)-[e:K COST e.w]-{2,3}(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query II
+SELECT (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+0	0
+
+# ANY CHEAPEST (t)-[e:K COST e.w]-{2,3}(x:P) WHERE t.id = 5
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 5 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ANY CHEAPEST (t:P)-[e:K COST e.w]-{2,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ANY CHEAPEST (t)-[e:K COST e.w]-{2,3}(x:P) WHERE t.id = 5 COLUMNS (t.id AS t, x.id AS x));
+
+query II
+SELECT (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+0	0
+
+# ALL CHEAPEST (t)-[e:K COST e.w]->+(x:P) WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ALL CHEAPEST (t:P)-[e:K COST e.w]->+(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ALL CHEAPEST (t)-[e:K COST e.w]->+(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query II
+SELECT (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+0	0
+
+# ALL CHEAPEST (t)-[e:K COST e.w]->+(x:P) WHERE t.id = 5
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 5 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ALL CHEAPEST (t:P)-[e:K COST e.w]->+(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ALL CHEAPEST (t)-[e:K COST e.w]->+(x:P) WHERE t.id = 5 COLUMNS (t.id AS t, x.id AS x));
+
+query II
+SELECT (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+0	0
+
+# ALL CHEAPEST (t)-[e:K COST e.w]->{1,3}(x:P) WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ALL CHEAPEST (t:P)-[e:K COST e.w]->{1,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ALL CHEAPEST (t)-[e:K COST e.w]->{1,3}(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query II
+SELECT (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+0	0
+
+# ALL CHEAPEST (t)-[e:K COST e.w]->{1,3}(x:P) WHERE t.id = 5
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 5 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ALL CHEAPEST (t:P)-[e:K COST e.w]->{1,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ALL CHEAPEST (t)-[e:K COST e.w]->{1,3}(x:P) WHERE t.id = 5 COLUMNS (t.id AS t, x.id AS x));
+
+query II
+SELECT (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+0	0
+
+# ALL CHEAPEST (t)-[e:K COST e.w]->{2,3}(x:P) WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ALL CHEAPEST (t:P)-[e:K COST e.w]->{2,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ALL CHEAPEST (t)-[e:K COST e.w]->{2,3}(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query II
+SELECT (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+0	0
+
+# ALL CHEAPEST (t)-[e:K COST e.w]->{2,3}(x:P) WHERE t.id = 5
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 5 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ALL CHEAPEST (t:P)-[e:K COST e.w]->{2,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ALL CHEAPEST (t)-[e:K COST e.w]->{2,3}(x:P) WHERE t.id = 5 COLUMNS (t.id AS t, x.id AS x));
+
+query II
+SELECT (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+0	0
+
+# ALL CHEAPEST (t)<-[e:K COST e.w]-{1,3}(x:P) WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ALL CHEAPEST (t:P)<-[e:K COST e.w]-{1,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ALL CHEAPEST (t)<-[e:K COST e.w]-{1,3}(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query II
+SELECT (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+0	0
+
+# ALL CHEAPEST (t)<-[e:K COST e.w]-{1,3}(x:P) WHERE t.id = 5
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 5 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ALL CHEAPEST (t:P)<-[e:K COST e.w]-{1,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ALL CHEAPEST (t)<-[e:K COST e.w]-{1,3}(x:P) WHERE t.id = 5 COLUMNS (t.id AS t, x.id AS x));
+
+query II
+SELECT (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+0	0
+
+# ALL CHEAPEST (t)<-[e:K COST e.w]-{2,3}(x:P) WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ALL CHEAPEST (t:P)<-[e:K COST e.w]-{2,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ALL CHEAPEST (t)<-[e:K COST e.w]-{2,3}(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query II
+SELECT (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+0	0
+
+# ALL CHEAPEST (t)<-[e:K COST e.w]-{2,3}(x:P) WHERE t.id = 5
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 5 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ALL CHEAPEST (t:P)<-[e:K COST e.w]-{2,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ALL CHEAPEST (t)<-[e:K COST e.w]-{2,3}(x:P) WHERE t.id = 5 COLUMNS (t.id AS t, x.id AS x));
+
+query II
+SELECT (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+0	0
+
+# ALL CHEAPEST (t)-[e:K COST e.w]-{1,3}(x:P) WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ALL CHEAPEST (t:P)-[e:K COST e.w]-{1,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ALL CHEAPEST (t)-[e:K COST e.w]-{1,3}(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query II
+SELECT (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+0	0
+
+# ALL CHEAPEST (t)-[e:K COST e.w]-{1,3}(x:P) WHERE t.id = 5
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 5 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ALL CHEAPEST (t:P)-[e:K COST e.w]-{1,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ALL CHEAPEST (t)-[e:K COST e.w]-{1,3}(x:P) WHERE t.id = 5 COLUMNS (t.id AS t, x.id AS x));
+
+query II
+SELECT (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+0	0
+
+# ALL CHEAPEST (t)-[e:K COST e.w]-{2,3}(x:P) WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ALL CHEAPEST (t:P)-[e:K COST e.w]-{2,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ALL CHEAPEST (t)-[e:K COST e.w]-{2,3}(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query II
+SELECT (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+0	0
+
+# ALL CHEAPEST (t)-[e:K COST e.w]-{2,3}(x:P) WHERE t.id = 5
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 5 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ALL CHEAPEST (t:P)-[e:K COST e.w]-{2,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ALL CHEAPEST (t)-[e:K COST e.w]-{2,3}(x:P) WHERE t.id = 5 COLUMNS (t.id AS t, x.id AS x));
+
+query II
+SELECT (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+0	0
+
+# A MATCH whose own pattern is a CHEAPEST search with a varying COST still cannot have an OPTIONAL MATCH
+statement error
+FROM GRAPH_TABLE (g MATCH ANY CHEAPEST (a:P)-[e:K COST e.w]->+(b:P) OPTIONAL MATCH (b)-[f:K]->(c:P) COLUMNS (a.id AS a));
+----
+not supported with OPTIONAL

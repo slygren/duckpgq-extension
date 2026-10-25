@@ -2547,6 +2547,137 @@ static void ClaimCSRSlot(PGQCSRSlot &csr_slot, const string &edge_key, int32_t &
 	}
 }
 
+//! The steps a quantified edge takes over one vertex table, as rows (src_rowid, dst_rowid, edge_rowid) of vertex and
+//! edge row ids, for each way a pattern can read the edge:
+//!   ->  the stored direction;  <-  reversed;  -  either way (a self-loop once);
+//!   <-> a reciprocal pair, as the fixed-length (a)<-[e]->(b) reads it: e runs from the next vertex back to this
+//!       one, with an edge the other way beside it. Each such pair of edges is one step; e is the edge it reports.
+//! Both ends of a step must be vertices of the table (an edge to a missing vertex is no step). The label
+//! expression applies to every edge a step uses.
+static string StepRelationSQL(const shared_ptr<PropertyGraphTable> &edge_table, PGQMatchType edge_type,
+                              const string &edge_label) {
+	const string edges = QualifiedTableName(PGQStr(edge_table->catalog_name), PGQStr(edge_table->schema_name),
+	                                        PGQStr(edge_table->table_name));
+	auto &vertex_table = *edge_table->source_pg_table;
+	const string vertices = QualifiedTableName(PGQStr(vertex_table.catalog_name), PGQStr(vertex_table.schema_name),
+	                                           PGQStr(vertex_table.table_name));
+	const string src_fk = KeywordHelper::WriteOptionallyQuoted(PGQStr(edge_table->source_fk[0]));
+	const string dst_fk = KeywordHelper::WriteOptionallyQuoted(PGQStr(edge_table->destination_fk[0]));
+	const string src_pk = KeywordHelper::WriteOptionallyQuoted(PGQStr(edge_table->source_pk[0]));
+	const string dst_pk = KeywordHelper::WriteOptionallyQuoted(PGQStr(edge_table->destination_pk[0]));
+	auto label_condition = [&](const string &alias) -> string {
+		if (edge_label.empty()) {
+			return "true";
+		}
+		auto cond = BuildLabelExprCond(edge_label, edge_table, alias, PGQStr(edge_table->table_name));
+		return cond ? cond->ToString() : "true";
+	};
+	// e from a (its source) to b (its destination)
+	const string stored = StringUtil::Format("FROM %s __e JOIN %s __a ON __a.%s = __e.%s JOIN %s __b ON __b.%s = __e.%s "
+	                                         "WHERE %s",
+	                                         edges, vertices, src_pk, src_fk, vertices, dst_pk, dst_fk,
+	                                         label_condition("__e"));
+	switch (edge_type) {
+	case PGQMatchType::MATCH_EDGE_RIGHT:
+		return "SELECT __a.rowid AS src_rowid, __b.rowid AS dst_rowid, __e.rowid AS edge_rowid " + stored;
+	case PGQMatchType::MATCH_EDGE_LEFT:
+		return "SELECT __b.rowid AS src_rowid, __a.rowid AS dst_rowid, __e.rowid AS edge_rowid " + stored;
+	case PGQMatchType::MATCH_EDGE_ANY:
+		return "SELECT __a.rowid AS src_rowid, __b.rowid AS dst_rowid, __e.rowid AS edge_rowid " + stored +
+		       " UNION ALL SELECT __b.rowid AS src_rowid, __a.rowid AS dst_rowid, __e.rowid AS edge_rowid " + stored +
+		       " AND __a.rowid <> __b.rowid";
+	case PGQMatchType::MATCH_EDGE_LEFT_RIGHT:
+		// A step from b (e's destination) to a (e's source), once per edge __r from b to a: as in the fixed-length
+		// pattern, each pair (e, __r) is a match of its own.
+		return StringUtil::Format("SELECT __b.rowid AS src_rowid, __a.rowid AS dst_rowid, __e.rowid AS edge_rowid "
+		                          "FROM %s __e JOIN %s __a ON __a.%s = __e.%s JOIN %s __b ON __b.%s = __e.%s "
+		                          "JOIN %s __r ON __r.%s = __e.%s AND __r.%s = __e.%s WHERE %s AND %s",
+		                          edges, vertices, src_pk, src_fk, vertices, dst_pk, dst_fk, edges, src_fk, dst_fk,
+		                          dst_fk, src_fk, label_condition("__e"), label_condition("__r"));
+	default:
+		throw InternalException("StepRelationSQL: not an edge");
+	}
+}
+
+//! "cte1": a CSR over StepRelationSQL's steps, built the way CreateDirectedCSRCTE builds one (create_csr_vertex
+//! sizes the rows, create_csr_edge fills them), so every CSR path function (shortestpath, allshortestpaths,
+//! iterativelength, pgq_shortest_k_paths) runs over it unchanged. Unlike the undirected CSR it keeps parallel
+//! steps apart, so path counts are exact.
+static unique_ptr<CommonTableExpressionInfo> CreateStepCSRCTE(const shared_ptr<PropertyGraphTable> &edge_table,
+                                                              PGQMatchType edge_type, const string &edge_label,
+                                                              int32_t csr_id) {
+	auto &vertex_table = *edge_table->source_pg_table;
+	const string vertices = QualifiedTableName(PGQStr(vertex_table.catalog_name), PGQStr(vertex_table.schema_name),
+	                                           PGQStr(vertex_table.table_name));
+	const string v_size = StringUtil::Format("(SELECT count(__v.%s) FROM %s __v)",
+	                                         KeywordHelper::WriteOptionallyQuoted(PGQStr(edge_table->source_pk[0])),
+	                                         vertices);
+	const string steps = StepRelationSQL(edge_table, edge_type, edge_label);
+	const string sql = StringUtil::Format(
+	    "SELECT create_csr_edge(%d, %s, CAST((SELECT sum(create_csr_vertex(%d, %s, __sub.dense_id, __sub.cnt)) "
+	    "FROM (SELECT __v.rowid AS dense_id, count(__s.src_rowid) AS cnt FROM %s __v LEFT JOIN (%s) __s "
+	    "ON __s.src_rowid = __v.rowid GROUP BY __v.rowid) __sub) AS BIGINT), (SELECT count(*) FROM (%s) __c), "
+	    "__s.src_rowid, __s.dst_rowid, __s.edge_rowid) AS temp FROM (%s) __s",
+	    csr_id, v_size, csr_id, v_size, vertices, steps, steps, steps);
+	auto info = make_uniq<CommonTableExpressionInfo>();
+	info->query_node = std::move(ParseSelectStatement(sql)->node);
+	return info;
+}
+
+//! The CSR for a quantified edge read `edge_type`: the long-standing directed and undirected builders where they
+//! apply, the step relation for the directions they do not cover (<- and <->).
+//! The undirected CSR merges parallel edges (a pair stored twice, or once each way), which keeps whether and how far
+//! a vertex is reachable but not how many shortest paths there are. ALL SHORTEST over an undirected edge counts
+//! them, so it reads the step relation instead.
+static bool UseStepCSR(PGQMatchType edge_type, bool all_shortest) {
+	return edge_type == PGQMatchType::MATCH_EDGE_LEFT || edge_type == PGQMatchType::MATCH_EDGE_LEFT_RIGHT ||
+	       (edge_type == PGQMatchType::MATCH_EDGE_ANY && all_shortest);
+}
+
+//! CSREdgeKey, telling the step-relation CSR apart from the merged undirected one over the same edges.
+static string CSRKeyFor(const shared_ptr<PropertyGraphTable> &edge_table, PGQMatchType edge_type,
+                        const string &edge_label, bool all_shortest) {
+	return CSREdgeKey(edge_table, edge_type, edge_label) + (UseStepCSR(edge_type, all_shortest) ? "|steps" : "");
+}
+
+static unique_ptr<CommonTableExpressionInfo> CreateCSRCTEFor(const shared_ptr<PropertyGraphTable> &edge_table,
+                                                             PGQMatchType edge_type, const string &edge_label,
+                                                             const string &prev_binding, const string &edge_binding,
+                                                             const string &next_binding,
+                                                             const unique_ptr<SelectNode> &select_node, int32_t csr_id,
+                                                             bool all_shortest) {
+	if (UseStepCSR(edge_type, all_shortest)) {
+		return CreateStepCSRCTE(edge_table, edge_type, edge_label, csr_id);
+	}
+	const auto edge_filter = EdgeLabelRowFilter(edge_label, edge_table);
+	if (edge_type == PGQMatchType::MATCH_EDGE_RIGHT) {
+		return CreateDirectedCSRCTE(edge_table, prev_binding, edge_binding, next_binding, csr_id, edge_filter);
+	}
+	return CreateUndirectedCSRCTE(edge_table, select_node, csr_id, edge_filter);
+}
+
+//! The CSR path functions find shortest paths from depth 1. An unbounded quantifier asks something else of them in
+//! two cases: no selector (a path mode makes it finite; every path is a match, and they return one per pair), and
+//! a lower bound above 1 (the shortest path within the bounds need not be the shortest path). A pattern of one
+//! quantified edge takes the native path search for those (NativePathSearchFor); this is reached only inside a
+//! longer pattern. Over -> and - the long-standing routes still answer that inexactly; <- and <-> refuse it.
+static void RejectInexactUnboundedCSR(PGQMatchType edge_type, const SubPath &quantifier, PGQPathSelector selector) {
+	if ((edge_type != PGQMatchType::MATCH_EDGE_LEFT && edge_type != PGQMatchType::MATCH_EDGE_LEFT_RIGHT) ||
+	    quantifier.upper < static_cast<int64_t>(1 << 30)) {
+		return;
+	}
+	if (selector == PGQPathSelector::WALK) {
+		throw NotImplementedException("An unbounded %s quantifier with a path mode and no search prefix is not "
+		                              "supported yet: give it an upper bound, or ANY / ALL SHORTEST.",
+		                              edge_type == PGQMatchType::MATCH_EDGE_LEFT ? "left-directed" : "bidirectional");
+	}
+	if (quantifier.lower > 1) {
+		throw NotImplementedException("An unbounded %s quantifier with ANY / ALL SHORTEST and a lower bound above 1 "
+		                              "is not supported yet: give it an upper bound.",
+		                              edge_type == PGQMatchType::MATCH_EDGE_LEFT ? "left-directed" : "bidirectional");
+	}
+}
+
 unique_ptr<SubqueryRef> PGQMatchFunction::CreateCountCTESubquery() {
 	//! BEGIN OF (SELECT count(cte1.temp) as temp * 0 from cte1) __x
 
@@ -2617,49 +2748,50 @@ static unique_ptr<ParsedExpression> ReverseSelfLoopFilter(const PropertyGraphTab
 	return make_uniq<OperatorExpression>(ExpressionType::OPERATOR_NOT, std::move(all_equal));
 }
 
+//! Columns of the undirected edge union carrying the edge row's rowid and which way it was read (0 as stored,
+//! 1 reversed). The union hides `rowid`; an OPTIONAL MATCH rejoins the edge by these.
+static const char *const kUndirectedEdgeRowid = "__pgq_erowid";
+static const char *const kUndirectedEdgeDirection = "__pgq_edir";
+
+//! (SELECT src, dst, * FROM edge UNION ALL SELECT dst, src, * FROM edge [no reversed self-loops]) AS alias: the
+//! edge read both ways, its first two columns oriented along the traversal.
+static unique_ptr<SubqueryRef> UndirectedEdgeUnion(const PropertyGraphTable &edge_table, const string &edge_binding) {
+	auto branch = [&](bool reversed) {
+		auto node = make_uniq<SelectNode>();
+		node->from_table = edge_table.CreateBaseTableRef(edge_binding);
+		node->select_list.push_back(
+		    PGQColRef(reversed ? edge_table.destination_fk[0] : edge_table.source_fk[0], edge_binding));
+		node->select_list.push_back(
+		    PGQColRef(reversed ? edge_table.source_fk[0] : edge_table.destination_fk[0], edge_binding));
+		node->select_list.push_back(make_uniq<StarExpression>());
+		auto rowid = PGQColRef("rowid", edge_binding);
+		rowid->SetAlias(Identifier(kUndirectedEdgeRowid));
+		node->select_list.push_back(std::move(rowid));
+		auto direction = ConstantExpression::FromValue(Value::INTEGER(reversed ? 1 : 0));
+		direction->SetAlias(Identifier(kUndirectedEdgeDirection));
+		node->select_list.push_back(std::move(direction));
+		if (reversed) {
+			node->where_clause = ReverseSelfLoopFilter(edge_table, edge_binding);
+		}
+		return node;
+	};
+	auto union_node = make_uniq<SetOperationNode>();
+	union_node->setop_type = SetOperationType::UNION;
+	union_node->setop_all = true;
+	union_node->children.push_back(branch(false));
+	union_node->children.push_back(branch(true));
+	auto union_select = make_uniq<SelectStatement>();
+	union_select->node = std::move(union_node);
+	auto union_subquery = make_uniq<SubqueryRef>(std::move(union_select));
+	union_subquery->alias = Identifier(edge_binding);
+	return union_subquery;
+}
+
 void PGQMatchFunction::EdgeTypeAny(const shared_ptr<PropertyGraphTable> &edge_table, const string &edge_binding,
                                    const string &prev_binding, const string &next_binding,
                                    vector<unique_ptr<ParsedExpression>> &conditions,
                                    unique_ptr<TableRef> &from_clause) {
-	// START SELECT src, dst, * from edge_table
-	auto src_dst_select_node = make_uniq<SelectNode>();
-
-	auto edge_left_ref = edge_table->CreateBaseTableRef(edge_binding);
-	src_dst_select_node->from_table = std::move(edge_left_ref);
-	auto src_dst_children = vector<unique_ptr<ParsedExpression>>();
-	src_dst_children.push_back(PGQColRef(edge_table->source_fk[0], edge_binding));
-	src_dst_children.push_back(PGQColRef(edge_table->destination_fk[0], edge_binding));
-	src_dst_children.push_back(make_uniq<StarExpression>());
-
-	src_dst_select_node->select_list = std::move(src_dst_children);
-	// END SELECT src, dst, * from edge_table
-
-	// START SELECT dst, src, * from edge_table
-	auto dst_src_select_node = make_uniq<SelectNode>();
-
-	auto edge_right_ref = edge_table->CreateBaseTableRef(edge_binding);
-	auto dst_src_children = vector<unique_ptr<ParsedExpression>>();
-	dst_src_select_node->from_table = std::move(edge_right_ref);
-
-	dst_src_children.push_back(PGQColRef(edge_table->destination_fk[0], edge_binding));
-	dst_src_children.push_back(PGQColRef(edge_table->source_fk[0], edge_binding));
-	dst_src_children.push_back(make_uniq<StarExpression>());
-
-	dst_src_select_node->select_list = std::move(dst_src_children);
-	dst_src_select_node->where_clause = ReverseSelfLoopFilter(*edge_table, edge_binding);
-	// END SELECT dst, src, * from edge_table
-
-	auto union_node = make_uniq<SetOperationNode>();
-	union_node->setop_type = SetOperationType::UNION;
-	union_node->setop_all = true;
-	union_node->children.push_back(std::move(src_dst_select_node));
-	union_node->children.push_back(std::move(dst_src_select_node));
-	auto union_select = make_uniq<SelectStatement>();
-	union_select->node = std::move(union_node);
-	// (SELECT src, dst, * from edge_table UNION ALL SELECT dst, src, * from
-	// edge_table)
-	auto union_subquery = make_uniq<SubqueryRef>(std::move(union_select));
-	union_subquery->alias = Identifier(edge_binding);
+	auto union_subquery = UndirectedEdgeUnion(*edge_table, edge_binding);
 	if (from_clause) {
 		auto from_join = make_uniq<JoinRef>(JoinRefType::CROSS);
 		from_join->left = std::move(from_clause);
@@ -3007,7 +3139,8 @@ static void AddBoundedORPRecursiveCTE(unique_ptr<SelectNode> &select_node, const
                                       const shared_ptr<PropertyGraphTable> &edge_table, idx_t lower, idx_t upper,
                                       unique_ptr<ParsedExpression> anchor_filter, bool reverse = false,
                                       PGQPathSelector selector = PGQPathSelector::WALK, bool undirected = false,
-                                      const string &edge_label = string(), const SubPath *cost_edge = nullptr);
+                                      const string &edge_label = string(), bool reciprocal = false,
+                                      const SubPath *cost_edge = nullptr);
 
 unique_ptr<ParsedExpression> PGQMatchFunction::CreatePathFindingFunction(
     vector<unique_ptr<PathReference>> &path_list, CreatePropertyGraphInfo &pg_table, const string &path_variable,
@@ -3048,6 +3181,28 @@ unique_ptr<ParsedExpression> PGQMatchFunction::CreatePathFindingFunction(
 		auto edge_element = GetPathElement(path_list[idx_i]);
 		if (!edge_element) {
 			auto edge_subpath = reinterpret_cast<SubPath *>(path_list[idx_i].get());
+			if (csr_slot.path_search_premade) {
+				// The native path search already put this quantifier's paths in "shortest_path_cte".
+				if (previous_vertex_subpath && previous_vertex_subpath->where_clause) {
+					conditions.push_back(std::move(previous_vertex_subpath->where_clause));
+				}
+				if (next_vertex_subpath && next_vertex_subpath->where_clause) {
+					conditions.push_back(std::move(next_vertex_subpath->where_clause));
+				}
+				auto searched_path = PGQColRef("path", "shortest_path_cte");
+				if (!final_list) {
+					final_list = std::move(searched_path);
+				} else {
+					vector<unique_ptr<ParsedExpression>> pop_children;
+					pop_children.push_back(std::move(searched_path));
+					vector<unique_ptr<ParsedExpression>> concat_children;
+					concat_children.push_back(std::move(final_list));
+					concat_children.push_back(make_uniq<FunctionExpression>("array_pop_front", std::move(pop_children)));
+					final_list = make_uniq<FunctionExpression>("list_concat", std::move(concat_children));
+				}
+				previous_vertex_element = next_vertex_element;
+				continue;
+			}
 			// A single hop chosen by cost is a path search too: it picks the cheapest of the parallel edges.
 			if (edge_subpath->upper > 1 || edge_subpath->cheapest) {
 				// (un)bounded shortest path
@@ -3084,19 +3239,22 @@ unique_ptr<ParsedExpression> PGQMatchFunction::CreatePathFindingFunction(
 				// changes the number of shortest paths but not whether one exists: ALL SHORTEST needs
 				// a directed CSR, ANY SHORTEST takes either.
 				// CHEAPEST: the weighted CSR search has no hop bounds, so a bounded quantifier enumerates its paths.
+				// The <- and <-> CSRs are built from their steps (CreateStepCSRCTE) and keep parallel steps
+				// apart, like the directed one.
+				const bool step_csr = edge_element->match_type == PGQMatchType::MATCH_EDGE_LEFT ||
+				                      edge_element->match_type == PGQMatchType::MATCH_EDGE_LEFT_RIGHT;
 				const bool csr_exact =
 				    edge_subpath->cheapest ? edge_subpath->upper >= static_cast<int64_t>(1 << 30) :
 				    edge_subpath->lower <= 1 &&
 				    ((selector == PGQPathSelector::ANY_SHORTEST &&
 				      (edge_element->match_type == PGQMatchType::MATCH_EDGE_RIGHT ||
-				       edge_element->match_type == PGQMatchType::MATCH_EDGE_ANY)) ||
+				       edge_element->match_type == PGQMatchType::MATCH_EDGE_ANY || step_csr)) ||
 				     (selector == PGQPathSelector::ALL_SHORTEST &&
-				      edge_element->match_type == PGQMatchType::MATCH_EDGE_RIGHT));
+				      (edge_element->match_type == PGQMatchType::MATCH_EDGE_RIGHT || step_csr)));
 				// A seeded bounded search enumerates too: it reads only what is reachable from the seed, where the
 				// CSR is built from the whole edge table and searched from every source the predicate admits.
 				const bool enumerate = edge_subpath->upper < static_cast<int64_t>(1 << 30) &&
-				                       (!csr_exact || source_filter) &&
-				                       edge_element->match_type != PGQMatchType::MATCH_EDGE_LEFT_RIGHT;
+				                       (!csr_exact || source_filter);
 				if (enumerate) {
 					// The element predicates hold for the endpoint bindings in the outer query; the source's also
 					// seed the enumeration so it starts from matching vertices only.
@@ -3115,7 +3273,9 @@ unique_ptr<ParsedExpression> PGQMatchFunction::CreatePathFindingFunction(
 						                          static_cast<idx_t>(edge_subpath->upper), std::move(anchor_filter),
 						                          edge_element->match_type == PGQMatchType::MATCH_EDGE_LEFT, selector,
 						                          edge_element->match_type == PGQMatchType::MATCH_EDGE_ANY,
-						                          edge_element->label, edge_subpath->cheapest ? edge_subpath : nullptr);
+						                          edge_element->label,
+						                          edge_element->match_type == PGQMatchType::MATCH_EDGE_LEFT_RIGHT,
+						                          edge_subpath->cheapest ? edge_subpath : nullptr);
 						auto path_ref = make_uniq<BaseTableRef>();
 						path_ref->SetTable(Identifier("shortest_path_cte"));
 						if (!final_select_node->from_table) {
@@ -3151,27 +3311,21 @@ unique_ptr<ParsedExpression> PGQMatchFunction::CreatePathFindingFunction(
 				// Claimed whether or not "cte1" already exists: a second pattern reusing this
 				// node's CSR must agree on which traversal built it, or it silently walks the
 				// first pattern's edges.
-				const auto sp_edge_filter = EdgeLabelRowFilter(edge_element->label, sp_edge_table);
-				ClaimCSRSlot(csr_slot, CSREdgeKey(sp_edge_table, edge_element->match_type, edge_element->label),
+				RejectInexactUnboundedCSR(edge_element->match_type, *edge_subpath, selector);
+				ClaimCSRSlot(csr_slot,
+				             CSRKeyFor(sp_edge_table, edge_element->match_type, edge_element->label, all_shortest),
 				             csr_id_counter);
 				if (final_select_node->cte_map.map.find("cte1") == final_select_node->cte_map.map.end()) {
 					if (edge_subpath->cheapest) {
 						final_select_node->cte_map.map["cte1"] = CreateWeightedDirectedCSRCTE(
 						    sp_edge_table, previous_vertex_element->variable_binding, edge_element->variable_binding,
 						    next_vertex_element->variable_binding, CostWithDefault(*edge_subpath), csr_slot.slot,
-						    sp_edge_filter);
-					} else if (edge_element->match_type == PGQMatchType::MATCH_EDGE_RIGHT) {
-						final_select_node->cte_map.map["cte1"] = CreateDirectedCSRCTE(
-						    sp_edge_table, previous_vertex_element->variable_binding, edge_element->variable_binding,
-						    next_vertex_element->variable_binding, csr_slot.slot, sp_edge_filter);
-					} else if (edge_element->match_type == PGQMatchType::MATCH_EDGE_ANY) {
-						final_select_node->cte_map.map["cte1"] =
-						    CreateUndirectedCSRCTE(sp_edge_table, final_select_node, csr_slot.slot, sp_edge_filter);
+						    EdgeLabelRowFilter(edge_element->label, sp_edge_table));
 					} else {
-						throw NotImplementedException("Cannot do shortest path for edge type %s",
-						                              edge_element->match_type == PGQMatchType::MATCH_EDGE_LEFT
-						                                  ? "MATCH_EDGE_LEFT"
-						                                  : "MATCH_EDGE_LEFT_RIGHT");
+						final_select_node->cte_map.map["cte1"] = CreateCSRCTEFor(
+						    sp_edge_table, edge_element->match_type, edge_element->label,
+						    previous_vertex_element->variable_binding, edge_element->variable_binding,
+						    next_vertex_element->variable_binding, final_select_node, csr_slot.slot, all_shortest);
 					}
 				}
 				string shortest_path_cte_name = "shortest_path_cte";
@@ -3339,10 +3493,31 @@ struct PGQStepEdges {
 };
 
 static PGQStepEdges StepEdges(const shared_ptr<PropertyGraphTable> &edge_table, const string &alias, bool reverse,
-                              bool undirected) {
+                              bool undirected, bool reciprocal = false, const string &edge_label = string()) {
 	PGQStepEdges result;
 	const string src_fk = PGQStr(edge_table->source_fk[0]);
 	const string dst_fk = PGQStr(edge_table->destination_fk[0]);
+	if (reciprocal) {
+		// (a)<-[e]->(b) as a step: e runs from b back to a, once per edge from a to b beside it (StepRelationSQL).
+		// The caller applies the label expression to e; the edge beside it gets it here.
+		const string table = QualifiedTableName(PGQStr(edge_table->catalog_name), PGQStr(edge_table->schema_name),
+		                                        PGQStr(edge_table->table_name));
+		const string q_src = KeywordHelper::WriteOptionallyQuoted(src_fk);
+		const string q_dst = KeywordHelper::WriteOptionallyQuoted(dst_fk);
+		auto beside_label = edge_label.empty()
+		                        ? nullptr
+		                        : BuildLabelExprCond(edge_label, edge_table, "__r", PGQStr(edge_table->table_name));
+		const string beside_where = beside_label ? " WHERE " + beside_label->ToString() : string();
+		const string sql = StringUtil::Format(
+		    "SELECT __l.*, __l.rowid AS __pgq_erid, __l.%s AS __pgq_out, __l.%s AS __pgq_in FROM %s __l JOIN %s __r "
+		    "ON __r.%s = __l.%s AND __r.%s = __l.%s%s",
+		    q_dst, q_src, table, table, q_src, q_dst, q_dst, q_src, beside_where);
+		result.ref = make_uniq<SubqueryRef>(ParseSelectStatement(sql), PGQId(alias));
+		result.out_col = "__pgq_out";
+		result.in_col = "__pgq_in";
+		result.rowid_col = "__pgq_erid";
+		return result;
+	}
 	if (!undirected) {
 		result.ref = edge_table->CreateBaseTableRef(alias);
 		result.out_col = reverse ? dst_fk : src_fk;
@@ -3399,7 +3574,7 @@ static void AddBoundedORPRecursiveCTE(unique_ptr<SelectNode> &select_node, const
                                       const shared_ptr<PropertyGraphTable> &edge_table, idx_t lower, idx_t upper,
                                       unique_ptr<ParsedExpression> anchor_filter, bool reverse,
                                       PGQPathSelector selector, bool undirected, const string &edge_label,
-                                      const SubPath *cost_edge) {
+                                      bool reciprocal, const SubPath *cost_edge) {
 	// ONE ROW PER cannot be made key-based the way the reachability CTE was. Its `path` is
 	// an interleaved list of rowids that BuildORPStepsCTE unnests and rejoins to the vertex
 	// and edge tables BY ROWID, and for a cross-table edge the v1 and v2 of ONE ROW PER STEP
@@ -3496,7 +3671,7 @@ static void AddBoundedORPRecursiveCTE(unique_ptr<SelectNode> &select_node, const
 	                                                      PGQColRef("rowid", mid_alias),
 	                                                      PGQColRef("cur_rowid", rec_alias));
 
-	auto step = StepEdges(edge_table, e_alias, reverse, undirected);
+	auto step = StepEdges(edge_table, e_alias, reverse, undirected, reciprocal, edge_label);
 	auto join_e = make_uniq<JoinRef>(JoinRefType::REGULAR);
 	join_e->type = JoinType::INNER;
 	join_e->left = std::move(join_mid);
@@ -3659,7 +3834,7 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
                                             unique_ptr<ParsedExpression> anchor_filter, PGQPathSelector selector,
                                             bool reverse = false, const PGQABIArtifactScan *abi_edge = nullptr,
                                             const string &edge_label = string(), bool undirected = false,
-                                            const SubPath *cost_edge = nullptr) {
+                                            bool reciprocal = false, const SubPath *cost_edge = nullptr) {
 	const bool any_shortest = selector == PGQPathSelector::ANY_SHORTEST;
 	// reverse=true walks edges backwards (for left-directed patterns like
 	// (a)<-[e]-{1,3}(b)): the anchor sits on the edge's *destination* side and each
@@ -3789,14 +3964,16 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 	// An ABI artifact holds ONE label path, and it was chosen from the stripped leaf -- so for
 	// `!X` it is X's own artifact. When the expression actually restricts, walk the edge table
 	// and apply the predicate instead of trusting an artifact picked for the wrong label.
-	const bool use_abi_edge = abi_edge && abi_edge->valid && !edge_label_cond && !undirected && !costed;
+	const bool use_abi_edge =
+	    abi_edge && abi_edge->valid && !edge_label_cond && !undirected && !costed && !reciprocal;
 	string step_out_col = use_abi_edge ? (reverse ? "v1" : "v0") : src_fk;
 	string step_in_col = use_abi_edge ? (reverse ? "v0" : "v1") : dst_fk;
 
 	unique_ptr<TableRef> e_ref;
-	if (undirected) {
-		// An undirected step crosses an edge either way: the table once in each direction.
-		auto step = StepEdges(edge_table, e_alias, false, true);
+	if (undirected || reciprocal) {
+		// An undirected step crosses an edge either way: the table once in each direction; a reciprocal one a
+		// pair of edges.
+		auto step = StepEdges(edge_table, e_alias, false, true, reciprocal, edge_label);
 		e_ref = std::move(step.ref);
 		step_out_col = step.out_col;
 		step_in_col = step.in_col;
@@ -4098,7 +4275,7 @@ static void AddBoundedVLPathFinding(unique_ptr<SelectNode> &select_node,
                                     PGQPathSelector selector, bool reverse = false,
                                     const PGQABITraversalPlan *abi_plan = nullptr,
                                     const string &edge_label = string(), bool undirected = false,
-                                    const SubPath *cost_edge = nullptr) {
+                                    bool reciprocal = false, const SubPath *cost_edge = nullptr) {
 	// An exact-length quantifier backed by a k-hop artifact needs no recursion at all.
 	const string scan_name =
 	    (abi_plan && abi_plan->exact.valid)
@@ -4106,7 +4283,8 @@ static void AddBoundedVLPathFinding(unique_ptr<SelectNode> &select_node,
 	                                     std::move(anchor_filter), reverse)
 	        : BuildBoundedVLReachabilityCTE(select_node, prev_binding, edge_table, lower, upper,
 	                                        std::move(anchor_filter), selector, reverse,
-	                                        abi_plan ? &abi_plan->step : nullptr, edge_label, undirected, cost_edge);
+	                                        abi_plan ? &abi_plan->step : nullptr, edge_label, undirected, reciprocal,
+	                                        cost_edge);
 	const string cte_alias = scan_name + "_scan";
 
 	// ── Add CTE to FROM (cross join) ─────────────────────────────────────────────
@@ -4241,11 +4419,13 @@ void PGQMatchFunction::AddPathFinding(unique_ptr<SelectNode> &select_node,
 	// which is critical for large remote (httpfs) graphs in browser or constrained environments.
 	// Undirected over one vertex table: the same CTE, stepping across an edge either way. (Across two
 	// tables an undirected walk alternates tables, which the CSR route below refuses.)
-	const bool undirected_one_table =
-	    edge_type == PGQMatchType::MATCH_EDGE_ANY &&
+	const bool one_table =
 	    StringUtil::CIEquals(PGQStr(edge_table->source_reference), PGQStr(edge_table->destination_reference));
+	const bool undirected_one_table = edge_type == PGQMatchType::MATCH_EDGE_ANY && one_table;
+	// Bidirectional (a)<-[e]->{lo,hi}(b) steps over reciprocal pairs (StepEdges).
+	const bool reciprocal_one_table = edge_type == PGQMatchType::MATCH_EDGE_LEFT_RIGHT && one_table;
 	if ((edge_type == PGQMatchType::MATCH_EDGE_RIGHT || edge_type == PGQMatchType::MATCH_EDGE_LEFT ||
-	     undirected_one_table) &&
+	     undirected_one_table || reciprocal_one_table) &&
 	    subpath->upper < static_cast<idx_t>(1 << 30)) {
 		// Left-directed (a)<-[e]-{lo,hi}(b): same recursive CTE walked in reverse.
 		// ALL CHEAPEST counts paths by cost, which no artifact holds.
@@ -4253,8 +4433,9 @@ void PGQMatchFunction::AddPathFinding(unique_ptr<SelectNode> &select_node,
 		AddBoundedVLPathFinding(select_node, conditions, prev_binding, next_binding, edge_table, subpath->lower,
 		                        subpath->upper, std::move(anchor_filter), selector,
 		                        edge_type == PGQMatchType::MATCH_EDGE_LEFT,
-		                        undirected_one_table || all_cheapest ? nullptr : abi_plan, edge_label,
-		                        undirected_one_table, subpath->cheapest ? subpath : nullptr);
+		                        undirected_one_table || reciprocal_one_table || all_cheapest ? nullptr : abi_plan,
+		                        edge_label, undirected_one_table, reciprocal_one_table,
+		                        subpath->cheapest ? subpath : nullptr);
 		return;
 	}
 
@@ -4266,29 +4447,24 @@ void PGQMatchFunction::AddPathFinding(unique_ptr<SelectNode> &select_node,
 		                              "edge between two vertex tables)");
 	}
 	RejectCrossTableCSR(edge_table, subpath->lower, subpath->upper);
-	const auto edge_filter = EdgeLabelRowFilter(edge_label, edge_table);
+	RejectInexactUnboundedCSR(edge_type, *subpath, selector);
 	// One slot per select node, shared with the iterativelength() call below and with any
 	// other code that reuses this node's "cte1", so all of them name the same entry. Claiming
 	// it also records which traversal built it, so a second pattern over a different edge
 	// table is refused rather than silently answered from this one's CSR.
-	ClaimCSRSlot(csr_slot, CSREdgeKey(edge_table, edge_type, edge_label), csr_id_counter);
+	const bool all = selector == PGQPathSelector::ALL_SHORTEST;
+	ClaimCSRSlot(csr_slot, CSRKeyFor(edge_table, edge_type, edge_label, all), csr_id_counter);
 	if (select_node->cte_map.map.find("cte1") == select_node->cte_map.map.end()) {
 		if (subpath->cheapest) {
 			// CHEAPEST: the CSR carries the costs (and refuses invalid ones) even where reachability is all that is
 			// asked, so every CHEAPEST query sees the same costs.
 			select_node->cte_map.map["cte1"] = CreateWeightedDirectedCSRCTE(
 			    edge_table, prev_binding, edge_binding, next_binding, CostWithDefault(*subpath), csr_slot.slot,
-			    edge_filter);
-		} else if (edge_type == PGQMatchType::MATCH_EDGE_RIGHT) {
-			select_node->cte_map.map["cte1"] = CreateDirectedCSRCTE(edge_table, prev_binding, edge_binding,
-			                                                       next_binding, csr_slot.slot, edge_filter);
-		} else if (edge_type == PGQMatchType::MATCH_EDGE_ANY) {
-			select_node->cte_map.map["cte1"] =
-			    CreateUndirectedCSRCTE(edge_table, select_node, csr_slot.slot, edge_filter);
+			    EdgeLabelRowFilter(edge_label, edge_table));
 		} else {
-			throw NotImplementedException("Cannot do shortest path for edge type %s",
-			                              edge_type == PGQMatchType::MATCH_EDGE_LEFT ? "MATCH_EDGE_LEFT"
-			                                                                         : "MATCH_EDGE_LEFT_RIGHT");
+			select_node->cte_map.map["cte1"] = CreateCSRCTEFor(edge_table, edge_type, edge_label, prev_binding,
+			                                                   edge_binding, next_binding, select_node, csr_slot.slot,
+			                                                   all);
 		}
 	}
 	if (select_node->cte_map.map.find("shortest_path_cte") != select_node->cte_map.map.end()) {
@@ -5151,6 +5327,12 @@ void PGQMatchFunction::ProcessPathList(ClientContext &context, vector<unique_ptr
 			if (edge_subpath->where_clause) {
 				conditions.push_back(std::move(edge_subpath->where_clause));
 			}
+			if (csr_slot.path_search_premade) {
+				// AddNativePathSearch joined this quantifier's paths ("shortest_path_cte") to both endpoints.
+				previous_vertex_element = next_vertex_element;
+				previous_vertex_table = next_vertex_table;
+				continue;
+			}
 			if (edge_subpath->path_list.size() > 1) {
 				throw NotImplementedException("Subpath on an edge is not yet supported.");
 			}
@@ -5193,7 +5375,8 @@ void PGQMatchFunction::ProcessPathList(ClientContext &context, vector<unique_ptr
 						// is wrong for a walk pattern.
 						if ((edge_element->match_type == PGQMatchType::MATCH_EDGE_RIGHT ||
 						     edge_element->match_type == PGQMatchType::MATCH_EDGE_LEFT ||
-						     (edge_element->match_type == PGQMatchType::MATCH_EDGE_ANY &&
+						     ((edge_element->match_type == PGQMatchType::MATCH_EDGE_ANY ||
+						       edge_element->match_type == PGQMatchType::MATCH_EDGE_LEFT_RIGHT) &&
 						      StringUtil::CIEquals(PGQStr(edge_table->source_reference),
 						                           PGQStr(edge_table->destination_reference)))) &&
 						    edge_subpath->upper < static_cast<idx_t>(1 << 30)) {
@@ -5216,13 +5399,12 @@ void PGQMatchFunction::ProcessPathList(ClientContext &context, vector<unique_ptr
 							                          orp_selector,
 							                          edge_element->match_type == PGQMatchType::MATCH_EDGE_ANY,
 							                          edge_element->label,
+							                          edge_element->match_type == PGQMatchType::MATCH_EDGE_LEFT_RIGHT,
 							                          edge_subpath->cheapest ? edge_subpath : nullptr);
 						} else {
 							// CSR fallback for unbounded or undirected ONE ROW PER.
 							if (final_select_node->cte_map.map.find("cte1") ==
 							    final_select_node->cte_map.map.end()) {
-								const auto orp_edge_filter =
-								    EdgeLabelRowFilter(edge_element->label, edge_table);
 								if (edge_subpath->cheapest) {
 									if (edge_element->match_type != PGQMatchType::MATCH_EDGE_RIGHT ||
 									    edge_subpath->upper < static_cast<int64_t>(1 << 30)) {
@@ -5235,25 +5417,22 @@ void PGQMatchFunction::ProcessPathList(ClientContext &context, vector<unique_ptr
 									final_select_node->cte_map.map["cte1"] = CreateWeightedDirectedCSRCTE(
 									    edge_table, previous_vertex_element->variable_binding,
 									    edge_element->variable_binding, next_vertex_element->variable_binding,
-									    CostWithDefault(*edge_subpath), csr_slot.slot, orp_edge_filter);
-								} else if (edge_element->match_type == PGQMatchType::MATCH_EDGE_RIGHT) {
-									ClaimCSRSlot(csr_slot,
-									             CSREdgeKey(edge_table, edge_element->match_type, edge_element->label),
-									             csr_id_counter);
-									final_select_node->cte_map.map["cte1"] = CreateDirectedCSRCTE(
-									    edge_table, previous_vertex_element->variable_binding,
-									    edge_element->variable_binding,
-									    next_vertex_element->variable_binding, csr_slot.slot, orp_edge_filter);
-								} else if (edge_element->match_type == PGQMatchType::MATCH_EDGE_ANY) {
-									ClaimCSRSlot(csr_slot,
-									             CSREdgeKey(edge_table, edge_element->match_type, edge_element->label),
-									             csr_id_counter);
-									final_select_node->cte_map.map["cte1"] = CreateUndirectedCSRCTE(
-									    edge_table, final_select_node, csr_slot.slot, orp_edge_filter);
+									    CostWithDefault(*edge_subpath), csr_slot.slot,
+									    EdgeLabelRowFilter(edge_element->label, edge_table));
 								} else {
-									throw NotImplementedException(
-									    "ONE ROW PER path finding is not supported for "
-									    "unbounded left-directed or bidirectional edges");
+									RejectInexactUnboundedCSR(edge_element->match_type, *edge_subpath,
+									                          any_shortest   ? PGQPathSelector::ANY_SHORTEST
+									                          : all_shortest ? PGQPathSelector::ALL_SHORTEST
+									                                         : PGQPathSelector::WALK);
+									ClaimCSRSlot(csr_slot,
+									             CSRKeyFor(edge_table, edge_element->match_type, edge_element->label,
+									                       all_shortest),
+									             csr_id_counter);
+									final_select_node->cte_map.map["cte1"] = CreateCSRCTEFor(
+									    edge_table, edge_element->match_type, edge_element->label,
+									    previous_vertex_element->variable_binding, edge_element->variable_binding,
+									    next_vertex_element->variable_binding, final_select_node, csr_slot.slot,
+									    all_shortest);
 								}
 							}
 							vector<unique_ptr<ParsedExpression>> pfc;
@@ -5376,6 +5555,78 @@ void PGQMatchFunction::ProcessPathList(ClientContext &context, vector<unique_ptr
 	}
 }
 
+//! An OPTIONAL MATCH hop is LEFT JOINed as one block (edge JOIN far vertex); the MATCH WHERE's predicates on the
+//! near vertex alone cannot reach into it, so the block was joined in full before the outer filter applied
+//! (measured 13 ms against 4 ms for 1000 seeds over 5M edges). `probe IN (SELECT pk FROM <near table> WHERE seed)`
+//! in the block restricts it to the edges the surviving near vertices can join; the outer WHERE still filters
+//! the rows, so nothing else changes. nullptr when there is no such predicate.
+static unique_ptr<ParsedExpression> OptionalSeedSemiJoin(const ParsedExpression *where_hint, const string &near_binding,
+                                                         const shared_ptr<PropertyGraphTable> &near_table,
+                                                         const string &near_pk, unique_ptr<ParsedExpression> probe) {
+	if (!where_hint || !near_table) {
+		return nullptr;
+	}
+	auto seed = ExtractSrcFilter(*where_hint, near_binding);
+	if (!seed) {
+		return nullptr;
+	}
+	auto seed_select = make_uniq<SelectNode>();
+	seed_select->select_list.push_back(PGQColRef(near_pk, near_binding));
+	seed_select->from_table = near_table->CreateBaseTableRef(near_binding);
+	seed_select->where_clause = std::move(seed);
+	auto seed_statement = make_uniq<SelectStatement>();
+	seed_statement->node = std::move(seed_select);
+	auto in_seed = make_uniq<SubqueryExpression>();
+	in_seed->GetSubqueryTypeMutable() = SubqueryType::ANY;
+	in_seed->SubqueryMutable() = std::move(seed_statement);
+	in_seed->GetChildMutable() = std::move(probe);
+	in_seed->GetComparisonTypeMutable() = ExpressionType::COMPARE_EQUAL;
+	return std::move(in_seed);
+}
+
+static unique_ptr<ParsedExpression> AndIfAny(unique_ptr<ParsedExpression> left, unique_ptr<ParsedExpression> right) {
+	if (!right) {
+		return left;
+	}
+	return make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(left), std::move(right));
+}
+
+//! LEFT JOINs one OPTIONAL MATCH hop: `edge` ON `edge_on`, and its far vertex ON `vertex_on`. As one block (edge
+//! JOIN far vertex) unless the far end cannot fail on its own -- the graph was verified at CREATE PROPERTY GRAPH
+//! (every edge's keys reference a vertex row; the trust vertex-join elimination also places in that check) and the
+//! far vertex carries no sub-label condition -- in which case two LEFT JOINs are the same rows and cheaper
+//! (seeded: 3.7 against 4.0 ms over 5M edges).
+static void JoinOptionalHop(unique_ptr<SelectNode> &select_node, unique_ptr<TableRef> edge,
+                            unique_ptr<ParsedExpression> edge_on, unique_ptr<TableRef> far_vertex,
+                            unique_ptr<ParsedExpression> vertex_on, bool far_end_cannot_fail,
+                            unique_ptr<ParsedExpression> seed) {
+	if (far_end_cannot_fail) {
+		auto edge_join = make_uniq<JoinRef>(JoinRefType::REGULAR);
+		edge_join->type = JoinType::LEFT;
+		edge_join->left = std::move(select_node->from_table);
+		edge_join->right = std::move(edge);
+		edge_join->condition = std::move(edge_on);
+		auto vertex_join = make_uniq<JoinRef>(JoinRefType::REGULAR);
+		vertex_join->type = JoinType::LEFT;
+		vertex_join->left = std::move(edge_join);
+		vertex_join->right = std::move(far_vertex);
+		vertex_join->condition = std::move(vertex_on);
+		select_node->from_table = std::move(vertex_join);
+		return;
+	}
+	auto block = make_uniq<JoinRef>(JoinRefType::REGULAR);
+	block->type = JoinType::INNER;
+	block->left = std::move(edge);
+	block->right = std::move(far_vertex);
+	block->condition = AndIfAny(std::move(vertex_on), std::move(seed));
+	auto left_join = make_uniq<JoinRef>(JoinRefType::REGULAR);
+	left_join->type = JoinType::LEFT;
+	left_join->left = std::move(select_node->from_table);
+	left_join->right = std::move(block);
+	left_join->condition = std::move(edge_on);
+	select_node->from_table = std::move(left_join);
+}
+
 void PGQMatchFunction::ProcessOptionalPathList(
     const vector<unique_ptr<PathPattern>> &opt_patterns, unique_ptr<SelectNode> &select_node,
     case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &opt_alias_map, CreatePropertyGraphInfo &pg_table,
@@ -5488,55 +5739,30 @@ void PGQMatchFunction::ProcessOptionalPathList(
 				if (require_abi_paths) {
 					ThrowABIPathRequired();
 				}
-				// (SELECT src,dst,* FROM edge UNION ALL SELECT dst,src,* FROM edge) AS edge_binding
-				auto fwd = make_uniq<SelectNode>();
-				fwd->from_table = edge_table->CreateBaseTableRef(edge_binding);
-				fwd->select_list.push_back(PGQColRef(edge_table->source_fk[0], edge_binding));
-				fwd->select_list.push_back(PGQColRef(edge_table->destination_fk[0], edge_binding));
-				fwd->select_list.push_back(make_uniq<StarExpression>());
-				auto rev = make_uniq<SelectNode>();
-				rev->from_table = edge_table->CreateBaseTableRef(edge_binding);
-				rev->select_list.push_back(PGQColRef(edge_table->destination_fk[0], edge_binding));
-				rev->select_list.push_back(PGQColRef(edge_table->source_fk[0], edge_binding));
-				rev->select_list.push_back(make_uniq<StarExpression>());
-				auto un = make_uniq<SetOperationNode>();
-				un->setop_type = SetOperationType::UNION;
-				un->setop_all = true;
-				un->children.push_back(std::move(fwd));
-				un->children.push_back(std::move(rev));
-				auto un_stmt = make_uniq<SelectStatement>();
-				un_stmt->node = std::move(un);
-				auto un_sub = make_uniq<SubqueryRef>(std::move(un_stmt));
-				un_sub->alias = Identifier(edge_binding);
-
-				// LEFT JOIN symmetric edge ON prev.src_pk = edge.src_fk
-				auto edge_on = CreateMatchJoinExpression(PGQStrs(edge_table->source_pk), PGQStrs(edge_table->source_fk), prev_binding,
-				                                         edge_binding);
-				auto edge_join = make_uniq<JoinRef>(JoinRefType::REGULAR);
-				edge_join->type = JoinType::LEFT;
-				edge_join->left = std::move(select_node->from_table);
-				edge_join->right = std::move(un_sub);
-				edge_join->condition = std::move(edge_on);
-				select_node->from_table = std::move(edge_join);
-
-				// LEFT JOIN next vertex ON next.dst_pk = edge.dst_fk (+ optional label)
+				// LEFT JOIN ((edge read both ways) JOIN next ON next.pk = edge.dst [AND label]) ON prev.pk = edge.src:
+				// the edge and its far vertex match together or not at all. The union is the one a MATCH reads
+				// (a self-loop once, not once per direction).
+				auto un_sub = UndirectedEdgeUnion(*edge_table, edge_binding);
 				unique_ptr<ParsedExpression> vertex_on = CreateMatchJoinExpression(
 				    PGQStrs(edge_table->destination_pk), PGQStrs(edge_table->destination_fk), next_binding, edge_binding);
+				bool far_end_cannot_fail = pg_table.verified;
 				if (!next_elem->label.empty()) {
 					vector<unique_ptr<ParsedExpression>> label_conds;
 					CheckInheritance(next_vertex_table, next_elem, label_conds);
 					if (!label_conds.empty()) {
+						far_end_cannot_fail = false;
 						vertex_on = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND,
 						                                             std::move(vertex_on), CreateWhereClause(label_conds));
 					}
 				}
-				auto vertex_ref = next_vertex_table->CreateBaseTableRef(next_binding);
-				auto vertex_join = make_uniq<JoinRef>(JoinRefType::REGULAR);
-				vertex_join->type = JoinType::LEFT;
-				vertex_join->left = std::move(select_node->from_table);
-				vertex_join->right = std::move(vertex_ref);
-				vertex_join->condition = std::move(vertex_on);
-				select_node->from_table = std::move(vertex_join);
+				JoinOptionalHop(select_node, std::move(un_sub),
+				                CreateMatchJoinExpression(PGQStrs(edge_table->source_pk), PGQStrs(edge_table->source_fk),
+				                                          prev_binding, edge_binding),
+				                next_vertex_table->CreateBaseTableRef(next_binding), std::move(vertex_on),
+				                far_end_cannot_fail,
+				                OptionalSeedSemiJoin(where_hint, prev_binding, prev_vertex_table,
+				                                     PGQStr(edge_table->source_pk[0]),
+				                                     PGQColRef(edge_table->source_fk[0], edge_binding)));
 
 				opt_alias_map[edge_binding] = edge_table;
 				opt_alias_map[next_binding] = next_vertex_table;
@@ -5632,60 +5858,41 @@ void PGQMatchFunction::ProcessOptionalPathList(
 				// lose a match: only an artifact that preserves multiplicity may stand in for the bridge.
 				if (path_info && (counts_exactly ? counts_exactly(*path_info) : path_info->preserves_multiplicity)) {
 					const string pt_alias = "_pgq_pt_" + std::to_string(extra_alias_counter++);
-					// v0_binding: for right-directed = prev, for left-directed = next
-					// v1_binding: for right-directed = next, for left-directed = prev
-					const string &v0_binding = pt_left_dir ? next_binding : prev_binding;
-					const string &v1_binding = pt_left_dir ? prev_binding : next_binding;
-					const string &v0_pk = PGQStr(edge_table->source_pk[0]);
-					const string &v1_pk = PGQStr(edge_table->destination_pk[0]);
+					// The artifact row runs v0 -> v1 along the stored edge: prev is v0 when right-directed and
+					// v1 when left-directed, next the other end.
+					const string bound_col = pt_left_dir ? "v1" : "v0";
+					const string free_col = pt_left_dir ? "v0" : "v1";
+					const string &bound_pk = PGQStr(pt_left_dir ? edge_table->destination_pk[0] : edge_table->source_pk[0]);
+					const string &free_pk = PGQStr(pt_left_dir ? edge_table->source_pk[0] : edge_table->destination_pk[0]);
 
-					// LEFT JOIN path_table pt ON (v0_binding.src_pk = pt.v0)
-					{
-						auto bt          = make_uniq<BaseTableRef>();
-						bt->SetQualifiedName(Identifier(path_info->catalog_name), bt->GetQualifiedName().Schema(), bt->Table());
-						bt->SetQualifiedName(bt->GetQualifiedName().Catalog(), Identifier(path_info->schema_name), bt->Table());
-						bt->SetTable(Identifier(path_info->table_name));
-						bt->alias        = Identifier(pt_alias);
-						auto on_cond = make_uniq<ComparisonExpression>(
-						    ExpressionType::COMPARE_EQUAL,
-						    PGQColRef(v0_pk, v0_binding),
-						    PGQColRef("v0", pt_alias));
-						auto left_join       = make_uniq<JoinRef>(JoinRefType::REGULAR);
-						left_join->type      = JoinType::LEFT;
-						left_join->left      = std::move(select_node->from_table);
-						left_join->right     = std::move(bt);
-						left_join->condition = std::move(on_cond);
-						select_node->from_table = std::move(left_join);
-					}
-
-					// LEFT JOIN the v1 vertex (semantic destination) ON (v1_binding.dst_pk = pt.v1)
-					// For right-directed: v1_binding = next_binding, vertex table = next_vertex_table
-					// For left-directed:  v1_binding = prev_binding, vertex table = prev_vertex_table
-					{
-						// v1 is the semantic destination vertex
-						const shared_ptr<PropertyGraphTable> &v1_vtable = pt_left_dir ? prev_vertex_table : next_vertex_table;
-						PathElement *v1_elem = pt_left_dir ? prev_elem : next_elem;
-						unique_ptr<ParsedExpression> vertex_on_cond = make_uniq<ComparisonExpression>(
-						    ExpressionType::COMPARE_EQUAL,
-						    PGQColRef(v1_pk, v1_binding),
-						    PGQColRef("v1", pt_alias));
-						if (!v1_elem->label.empty()) {
-							vector<unique_ptr<ParsedExpression>> label_conds;
-							CheckInheritance(v1_vtable, v1_elem, label_conds);
-							if (!label_conds.empty()) {
-								vertex_on_cond = make_uniq<ConjunctionExpression>(
-								    ExpressionType::CONJUNCTION_AND,
-								    std::move(vertex_on_cond), CreateWhereClause(label_conds));
-							}
+					// LEFT JOIN (path_table pt JOIN next ON next.pk = pt.<free end> [AND label]) ON prev.pk = pt.<bound
+					// end> (JoinOptionalHop): an artifact row whose far vertex is missing or of another label leaves no
+					// half-matched row behind.
+					auto bt = make_uniq<BaseTableRef>();
+					bt->SetQualifiedName(Identifier(path_info->catalog_name), bt->GetQualifiedName().Schema(), bt->Table());
+					bt->SetQualifiedName(bt->GetQualifiedName().Catalog(), Identifier(path_info->schema_name), bt->Table());
+					bt->SetTable(Identifier(path_info->table_name));
+					bt->alias = Identifier(pt_alias);
+					unique_ptr<ParsedExpression> vertex_on_cond = make_uniq<ComparisonExpression>(
+					    ExpressionType::COMPARE_EQUAL, PGQColRef(free_pk, next_binding), PGQColRef(free_col, pt_alias));
+					bool far_end_cannot_fail = pg_table.verified;
+					if (!next_elem->label.empty()) {
+						vector<unique_ptr<ParsedExpression>> label_conds;
+						CheckInheritance(next_vertex_table, next_elem, label_conds);
+						if (!label_conds.empty()) {
+							far_end_cannot_fail = false;
+							vertex_on_cond = make_uniq<ConjunctionExpression>(
+							    ExpressionType::CONJUNCTION_AND, std::move(vertex_on_cond), CreateWhereClause(label_conds));
 						}
-						auto vertex_ref      = v1_vtable->CreateBaseTableRef(v1_binding);
-						auto left_join       = make_uniq<JoinRef>(JoinRefType::REGULAR);
-						left_join->type      = JoinType::LEFT;
-						left_join->left      = std::move(select_node->from_table);
-						left_join->right     = std::move(vertex_ref);
-						left_join->condition = std::move(vertex_on_cond);
-						select_node->from_table = std::move(left_join);
 					}
+					JoinOptionalHop(select_node, std::move(bt),
+					                make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+					                                                PGQColRef(bound_pk, prev_binding),
+					                                                PGQColRef(bound_col, pt_alias)),
+					                next_vertex_table->CreateBaseTableRef(next_binding), std::move(vertex_on_cond),
+					                far_end_cannot_fail,
+					                OptionalSeedSemiJoin(where_hint, prev_binding, prev_vertex_table, bound_pk,
+					                                     PGQColRef(bound_col, pt_alias)));
 
 					opt_alias_map[next_binding] = next_vertex_table;
 					used_path_table = true;
@@ -5718,38 +5925,27 @@ void PGQMatchFunction::ProcessOptionalPathList(
 				}
 
 				// If the next vertex has a sub-label condition, fold it into the vertex ON clause.
+				bool far_end_cannot_fail = pg_table.verified;
 				if (!next_elem->label.empty()) {
 					vector<unique_ptr<ParsedExpression>> label_conds;
 					CheckInheritance(next_vertex_table, next_elem, label_conds);
 					if (!label_conds.empty()) {
+						far_end_cannot_fail = false;
 						auto label_cond = CreateWhereClause(label_conds);
 						vertex_on_cond = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND,
 						                                                   std::move(vertex_on_cond),
 						                                                   std::move(label_cond));
 					}
 				}
-
-				// LEFT JOIN edge table ON edge_on_cond
-				{
-					auto edge_ref = edge_table->CreateBaseTableRef(edge_binding);
-					auto left_join = make_uniq<JoinRef>(JoinRefType::REGULAR);
-					left_join->type = JoinType::LEFT;
-					left_join->left = std::move(select_node->from_table);
-					left_join->right = std::move(edge_ref);
-					left_join->condition = std::move(edge_on_cond);
-					select_node->from_table = std::move(left_join);
-				}
-
-				// LEFT JOIN next vertex table ON vertex_on_cond
-				{
-					auto vertex_ref = next_vertex_table->CreateBaseTableRef(next_binding);
-					auto left_join = make_uniq<JoinRef>(JoinRefType::REGULAR);
-					left_join->type = JoinType::LEFT;
-					left_join->left = std::move(select_node->from_table);
-					left_join->right = std::move(vertex_ref);
-					left_join->condition = std::move(vertex_on_cond);
-					select_node->from_table = std::move(left_join);
-				}
+				const bool right = edge_elem->match_type == PGQMatchType::MATCH_EDGE_RIGHT;
+				JoinOptionalHop(select_node, edge_table->CreateBaseTableRef(edge_binding), std::move(edge_on_cond),
+				                next_vertex_table->CreateBaseTableRef(next_binding), std::move(vertex_on_cond),
+				                far_end_cannot_fail,
+				                OptionalSeedSemiJoin(
+				                    where_hint, prev_binding, prev_vertex_table,
+				                    PGQStr(right ? edge_table->source_pk[0] : edge_table->destination_pk[0]),
+				                    PGQColRef(right ? edge_table->source_fk[0] : edge_table->destination_fk[0],
+				                              edge_binding)));
 
 				opt_alias_map[edge_binding] = edge_table;
 				opt_alias_map[next_binding] = next_vertex_table;
@@ -5758,6 +5954,288 @@ void PGQMatchFunction::ProcessOptionalPathList(
 			prev_elem = next_elem;
 			prev_vertex_table = next_vertex_table;
 		}
+	}
+}
+
+static void PrepareCheapest(MatchExpression &match, bool shared_union_columns);
+
+// The hop-by-hop OPTIONAL MATCH translation joins each element as it goes, which is a left join of the whole
+// pattern only for one hop whose far end cannot fail separately from its edge: a fixed edge (joined with its far
+// vertex as one block), or a bounded directed quantifier over one edge label (a LEFT JOIN of the reachability
+// enumeration). Everything else (several hops, several patterns, element predicates, unbounded quantifiers,
+// selectors, path modes and path variables) is matched as a MATCH of its own and left-joined as a whole. So are
+// the undirected hop and the bounded quantifier when ABI artifacts cover their edge label: the hop-by-hop forms
+// never read them, the MATCH does. Both forms give the same rows; without artifacts the hop-by-hop one is the
+// cheaper (measured: an unseeded {1,2} over 5M edges, 3.3 s against 4.8 s).
+bool PGQMatchFunction::OptionalGroupNeedsJoin(const vector<unique_ptr<PathPattern>> &opt_patterns,
+                                              const PGQPathTableCache *path_table_cache) {
+	if (opt_patterns.size() != 1) {
+		return true;
+	}
+	auto &pattern = *opt_patterns[0];
+	if (pattern.shortest || pattern.cheapest || pattern.topk || pattern.all || pattern.where_clause) {
+		return true;
+	}
+	auto &elements = pattern.path_elements;
+	if (elements.size() != 3) {
+		return true;
+	}
+	auto *src = GetPathElement(elements[0]);
+	auto *dst = GetPathElement(elements[2]);
+	if (!src || !dst || src->match_type != PGQMatchType::MATCH_VERTEX || dst->match_type != PGQMatchType::MATCH_VERTEX) {
+		return true;
+	}
+	auto covered_by_artifacts = [&](const string &label) {
+		if (!path_table_cache || label.empty()) {
+			return false;
+		}
+		for (auto &entry : path_table_cache->catalog) {
+			for (auto &part : StringUtil::Split(entry.second.edge_label_sequence, ',')) {
+				if (StringUtil::CIEquals(StringUtil::Replace(part, " ", ""), label)) {
+					return true;
+				}
+			}
+		}
+		return false;
+	};
+	if (auto *edge = GetPathElement(elements[1])) {
+		// The undirected hop reads the edge table both ways; a MATCH of it can read an artifact instead.
+		return edge->match_type == PGQMatchType::MATCH_VERTEX ||
+		       (edge->match_type == PGQMatchType::MATCH_EDGE_ANY && covered_by_artifacts(edge->label));
+	}
+	auto *quantified = GetSubPath(elements[1]);
+	if (!quantified || quantified->path_list.size() != 1 || quantified->where_clause || quantified->cost_expr ||
+	    !quantified->path_variable.empty() || quantified->path_mode > PGQPathMode::WALK ||
+	    quantified->upper >= static_cast<int64_t>(1 << 30)) {
+		return true;
+	}
+	auto *edge = GetPathElement(quantified->path_list[0]);
+	if (!edge || edge->label.empty() || IsCompoundLabel(edge->label) ||
+	    (edge->match_type != PGQMatchType::MATCH_EDGE_RIGHT && edge->match_type != PGQMatchType::MATCH_EDGE_LEFT)) {
+		return true;
+	}
+	return covered_by_artifacts(edge->label);
+}
+
+// Visits every element of a pattern; `quantified` is true inside a quantified edge, whose variable is a group
+// variable (one value per step) rather than a single element.
+static void VisitOptionalElements(PathReference &reference, bool quantified,
+                                  const std::function<void(PathElement &, bool)> &visit) {
+	if (reference.path_reference_type == PGQPathReferenceType::PATH_ELEMENT) {
+		visit(static_cast<PathElement &>(reference), quantified);
+		return;
+	}
+	auto &subpath = static_cast<SubPath &>(reference);
+	// A single-element subpath around a vertex carries its element WHERE; around an edge it is a quantifier.
+	const bool edge_quantifier = subpath.path_list.size() == 1 && subpath.path_list[0]->path_reference_type ==
+	                                                                  PGQPathReferenceType::PATH_ELEMENT &&
+	                             static_cast<PathElement &>(*subpath.path_list[0]).match_type != PGQMatchType::MATCH_VERTEX;
+	for (auto &child : subpath.path_list) {
+		VisitOptionalElements(*child, quantified || edge_quantifier, visit);
+	}
+}
+
+// OPTIONAL MATCH as SQL/PGQ defines it: the group is a pattern of its own, and each row of the bindings built so
+// far is extended by every match of it that agrees on the variables they share, or kept once with NULLs when
+// there is none. That is exactly
+//   <bindings so far> LEFT JOIN (MATCH <group> COLUMNS (<rowid of each variable>)) ON <shared rowids are equal>
+// followed by a join of each new variable's table on its rowid. The inner MATCH is rewritten like any other, so
+// it uses every route a mandatory pattern of that shape does: ABI artifacts, the path enumeration, the CSR
+// path functions. Predicates of the MATCH WHERE on a shared variable alone are also given to the inner MATCH
+// (they still filter the outer rows), which seeds its traversal.
+void PGQMatchFunction::AddOptionalGroupJoin(ClientContext &context, const MatchExpression &outer,
+                                            const vector<unique_ptr<PathPattern>> &opt_patterns,
+                                            unique_ptr<SelectNode> &select_node,
+                                            case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &opt_alias_map,
+                                            CreatePropertyGraphInfo &pg_table, int32_t &extra_alias_counter,
+                                            const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &mandatory_alias_map,
+                                            const ParsedExpression *where_hint) {
+	auto bound_table = [&](const string &binding) -> shared_ptr<PropertyGraphTable> {
+		auto entry = mandatory_alias_map.find(binding);
+		if (entry != mandatory_alias_map.end()) {
+			return entry->second;
+		}
+		entry = opt_alias_map.find(binding);
+		return entry != opt_alias_map.end() ? entry->second : nullptr;
+	};
+
+	auto inner = make_uniq<MatchExpression>();
+	inner->pg_name = outer.pg_name;
+	inner->pg_catalog = outer.pg_catalog;
+	inner->pg_schema = outer.pg_schema;
+	for (auto &pattern : opt_patterns) {
+		inner->path_patterns.push_back(pattern->Copy());
+	}
+
+	// A path variable of the group would have to be carried out of the inner MATCH; refuse rather than drop it.
+	for (auto &pattern : inner->path_patterns) {
+		for (auto &element : pattern->path_elements) {
+			auto *subpath = GetSubPath(element);
+			if (!subpath || subpath->path_variable.empty()) {
+				continue;
+			}
+			bool referenced = where_hint && ReferencesPathVariable(*where_hint, subpath->path_variable);
+			for (auto &column : outer.column_list) {
+				referenced = referenced || ReferencesPathVariable(*column, subpath->path_variable);
+			}
+			if (referenced) {
+				throw NotImplementedException("The path variable '%s' of an OPTIONAL MATCH pattern cannot be used in "
+				                              "COLUMNS or WHERE yet; name the path in a MATCH pattern instead.",
+				                              subpath->path_variable);
+			}
+		}
+	}
+
+	// Variables already bound keep their table: an unlabeled reference such as (t) gets t's label, so the inner
+	// MATCH resolves it the same way (the rowid join below restores t's own rows and labels).
+	// What the rest of the query reads of each variable; a variable it does not read is not rejoined.
+	case_insensitive_set_t referenced;
+	bool all_vertices = false;
+	auto collect_references = [&](const ParsedExpression &expression) {
+		ParsedExpressionIterator::VisitExpression<ColumnRefExpression>(expression, [&](const ColumnRefExpression &col) {
+			if (!col.ColumnNames().empty()) {
+				referenced.insert(PGQStr(col.ColumnNames()[0]));
+			}
+		});
+		ParsedExpressionIterator::VisitExpression<StarExpression>(expression, [&](const StarExpression &star) {
+			auto relation = PGQStr(star.RelationName().GetIdentifierName());
+			if (relation.empty()) {
+				all_vertices = true;
+			} else {
+				referenced.insert(relation);
+			}
+		});
+	};
+	for (auto &column : outer.column_list) {
+		collect_references(*column);
+	}
+	if (where_hint) {
+		collect_references(*where_hint);
+	}
+
+	vector<string> bindings;
+	case_insensitive_map_t<PGQMatchType> binding_types;
+	case_insensitive_set_t seen;
+	for (auto &pattern : inner->path_patterns) {
+		for (auto &element : pattern->path_elements) {
+			VisitOptionalElements(*element, false, [&](PathElement &path_element, bool quantified) {
+				if (quantified || path_element.variable_binding.empty()) {
+					return;
+				}
+				auto table = bound_table(path_element.variable_binding);
+				if (table && path_element.label.empty() && !table->main_label.empty()) {
+					path_element.label = PGQStr(table->main_label);
+				}
+				if (seen.insert(path_element.variable_binding).second) {
+					bindings.push_back(path_element.variable_binding);
+					binding_types[path_element.variable_binding] = path_element.match_type;
+				}
+			});
+		}
+	}
+
+	case_insensitive_set_t stubs;
+	auto inner_tables = PopulateGraphTableAliasMap(pg_table, *inner, &stubs);
+	const string sub_alias = "__pgq_opt_" + std::to_string(extra_alias_counter++);
+	struct OptionalBinding {
+		string name;
+		string column;
+		shared_ptr<PropertyGraphTable> table;
+		bool shared;
+		//! An undirected edge, rejoined as the same oriented union the inner MATCH read it from.
+		bool undirected;
+	};
+	vector<OptionalBinding> projected;
+	vector<unique_ptr<ParsedExpression>> seeds;
+	for (auto &binding : bindings) {
+		auto table = bound_table(binding);
+		const bool shared = table != nullptr;
+		const auto match_type = binding_types[binding];
+		if (!shared) {
+			const bool read = referenced.find(binding) != referenced.end() ||
+			                  (all_vertices && match_type == PGQMatchType::MATCH_VERTEX);
+			if (!read) {
+				continue;
+			}
+			auto entry = inner_tables.find(binding);
+			if (entry == inner_tables.end() || stubs.find(binding) != stubs.end()) {
+				continue; // no single table: nothing to rejoin by rowid
+			}
+			table = entry->second;
+		}
+		const string column = "__pgq_opt_rowid_" + std::to_string(projected.size());
+		const bool undirected = !shared && match_type == PGQMatchType::MATCH_EDGE_ANY;
+		auto rowid = PGQColRef(undirected ? kUndirectedEdgeRowid : "rowid", binding);
+		rowid->SetAlias(Identifier(column));
+		inner->column_list.push_back(std::move(rowid));
+		if (undirected) {
+			auto direction = PGQColRef(kUndirectedEdgeDirection, binding);
+			direction->SetAlias(Identifier(column + "_dir"));
+			inner->column_list.push_back(std::move(direction));
+		}
+		if (shared && where_hint) {
+			auto seed = ExtractSrcFilter(*where_hint, binding);
+			if (seed) {
+				seeds.push_back(std::move(seed));
+			}
+		}
+		projected.push_back({binding, column, table, shared, undirected});
+	}
+	if (inner->column_list.empty()) {
+		// Nothing to carry: the group still decides whether a row is extended, so keep one column.
+		inner->column_list.push_back(ConstantExpression::FromValue(Value::BOOLEAN(true)));
+	}
+	if (!seeds.empty()) {
+		inner->where_clause = CreateWhereClause(seeds);
+	}
+	inner->alias = sub_alias;
+	// The checks and the cost marking a CHEAPEST pattern gets in a MATCH (it is the inner MATCH's own pattern now).
+	PrepareCheapest(*inner, false);
+
+	auto sub = BuildMatchRef(context, *inner);
+	sub->alias = Identifier(sub_alias);
+
+	vector<unique_ptr<ParsedExpression>> on_conditions;
+	for (auto &binding : projected) {
+		if (binding.shared) {
+			on_conditions.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+			                                                        PGQColRef("rowid", binding.name),
+			                                                        PGQColRef(binding.column, sub_alias)));
+		}
+	}
+	auto join = make_uniq<JoinRef>(JoinRefType::REGULAR);
+	join->type = JoinType::LEFT;
+	join->left = std::move(select_node->from_table);
+	join->right = std::move(sub);
+	join->condition = on_conditions.empty() ? ConstantExpression::FromValue(Value::BOOLEAN(true))
+	                                        : CreateWhereClause(on_conditions);
+	select_node->from_table = std::move(join);
+
+	for (auto &binding : projected) {
+		if (binding.shared) {
+			continue;
+		}
+		auto table_join = make_uniq<JoinRef>(JoinRefType::REGULAR);
+		table_join->type = JoinType::LEFT;
+		table_join->left = std::move(select_node->from_table);
+		if (binding.undirected) {
+			table_join->right = UndirectedEdgeUnion(*binding.table, binding.name);
+			table_join->condition = make_uniq<ConjunctionExpression>(
+			    ExpressionType::CONJUNCTION_AND,
+			    make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+			                                    PGQColRef(kUndirectedEdgeRowid, binding.name),
+			                                    PGQColRef(binding.column, sub_alias)),
+			    make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+			                                    PGQColRef(kUndirectedEdgeDirection, binding.name),
+			                                    PGQColRef(binding.column + "_dir", sub_alias)));
+		} else {
+			table_join->right = binding.table->CreateBaseTableRef(binding.name);
+			table_join->condition = make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+			                                                        PGQColRef("rowid", binding.name),
+			                                                        PGQColRef(binding.column, sub_alias));
+		}
+		select_node->from_table = std::move(table_join);
+		opt_alias_map[binding.name] = binding.table;
 	}
 }
 
@@ -5940,8 +6418,9 @@ void PGQMatchFunction::CheckColumnBinding(
 		    column_ref->ColumnNames()[0].GetIdentifierName().find("_pgq_pt_") == 0) {
 			continue;
 		}
-		// 'rowid' is a column duckdb binds automatically.
-		if (column_ref->ColumnNames().back() == "rowid") {
+		// 'rowid' is a column duckdb binds automatically; __pgq_* columns are the rewrite's own.
+		if (column_ref->ColumnNames().back() == "rowid" ||
+		    PGQStr(column_ref->ColumnNames().back()).find("__pgq_") == 0) {
 			continue;
 		}
 		if (column_ref->ColumnNames().size() == 1) {
@@ -10370,9 +10849,6 @@ static void CheckUnboundedWalk(const PathReference &reference, PGQPathMode inher
 
 static void NormalizePatterns(vector<unique_ptr<PathPattern>> &patterns) {
 	for (auto &pattern : patterns) {
-		if (pattern->topk) {
-			throw NotImplementedException("TopK has not been implemented yet.");
-		}
 		for (auto &reference : pattern->path_elements) {
 			NormalizeQuantifiers(*reference);
 			if (!pattern->shortest) {
@@ -10686,6 +11162,235 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	auto *ref = match_copy.get();
 	NormalizeMatchExpression(*ref);
 	duckpgq_state->BeginRewriteDiagnostics(context);
+	return BuildMatchRef(context, *ref);
+}
+
+//! A pattern the native path search answers (pgq_shortest_k_paths): one quantified edge between two vertices.
+struct PGQNativePathSearch {
+	bool applies = false;
+	//! paths per destination, < 0 for all; ignored with all_shortest
+	int64_t k = 1;
+	bool all_shortest = false;
+	string mode = "walk";
+	PathElement *src = nullptr;
+	SubPath *src_wrapper = nullptr;
+	SubPath *quantifier = nullptr;
+	PathElement *edge = nullptr;
+	PathElement *dst = nullptr;
+	SubPath *dst_wrapper = nullptr;
+};
+
+static PathElement *NativeSearchVertex(const unique_ptr<PathReference> &reference, SubPath *&wrapper) {
+	wrapper = nullptr;
+	if (auto *element = PGQMatchFunction::GetPathElement(reference)) {
+		return element->match_type == PGQMatchType::MATCH_VERTEX ? element : nullptr;
+	}
+	auto *subpath = PGQMatchFunction::GetSubPath(reference);
+	if (!subpath || subpath->path_list.size() != 1) {
+		return nullptr;
+	}
+	auto *element = PGQMatchFunction::GetPathElement(subpath->path_list[0]);
+	if (!element || element->match_type != PGQMatchType::MATCH_VERTEX) {
+		return nullptr;
+	}
+	wrapper = subpath;
+	return element;
+}
+
+static string PathModeName(PGQPathMode mode) {
+	switch (mode) {
+	case PGQPathMode::TRAIL:
+		return "trail";
+	case PGQPathMode::ACYCLIC:
+		return "acyclic";
+	case PGQPathMode::SIMPLE:
+		return "simple";
+	default:
+		return "walk";
+	}
+}
+
+//! Which patterns the native search answers, and how:
+//! - SHORTEST k: the k shortest paths per endpoint pair, under the pattern's path mode (WALK by default);
+//! - an unbounded quantifier the CSR path functions cannot answer: with only a path mode (every path is a match),
+//!   or ANY / ALL SHORTEST from a lower bound above 1 (the shortest path within the bounds is not the shortest
+//!   path). These follow the traversal's semantics for bounded patterns: paths that visit no vertex twice.
+static PGQNativePathSearch NativePathSearchFor(PathPattern &pattern) {
+	PGQNativePathSearch search;
+	vector<unique_ptr<PathReference>> *elements = &pattern.path_elements;
+	PGQPathMode mode = PGQPathMode::NONE;
+	if (elements->size() == 1) {
+		auto *wrapper = PGQMatchFunction::GetSubPath((*elements)[0]);
+		if (wrapper && wrapper->path_list.size() > 1) {
+			mode = wrapper->path_mode;
+			elements = &wrapper->path_list;
+		}
+	}
+	const bool topk = pattern.topk > 0;
+	auto refuse = [&](const string &why) {
+		if (topk) {
+			throw NotImplementedException("SHORTEST k is supported for one quantified edge between two vertices, "
+			                              "over one edge table whose two ends are one vertex table: %s",
+			                              why);
+		}
+		return search;
+	};
+	if (elements->size() != 3) {
+		return refuse("the pattern has more than one edge");
+	}
+	search.src = NativeSearchVertex((*elements)[0], search.src_wrapper);
+	search.dst = NativeSearchVertex((*elements)[2], search.dst_wrapper);
+	search.quantifier = PGQMatchFunction::GetSubPath((*elements)[1]);
+	if (!search.src || !search.dst || !search.quantifier || search.quantifier->path_list.size() != 1) {
+		return refuse("the edge is not quantified");
+	}
+	search.edge = PGQMatchFunction::GetPathElement(search.quantifier->path_list[0]);
+	if (!search.edge || search.edge->match_type == PGQMatchType::MATCH_VERTEX) {
+		return refuse("the edge is not quantified");
+	}
+	if (search.quantifier->where_clause || search.quantifier->cost_expr) {
+		return refuse("the quantified edge has an element predicate or a cost");
+	}
+	if (search.quantifier->path_mode != PGQPathMode::NONE) {
+		mode = search.quantifier->path_mode;
+	}
+	const bool unbounded = search.quantifier->upper >= static_cast<int64_t>(1 << 30);
+	if (topk) {
+		search.k = pattern.topk;
+		search.mode = PathModeName(mode);
+	} else if (pattern.cheapest || !unbounded) {
+		return search;
+	} else if (!pattern.shortest && mode > PGQPathMode::WALK) {
+		search.k = -1;
+		search.mode = "acyclic";
+	} else if (pattern.shortest && search.quantifier->lower > 1) {
+		search.k = 1;
+		search.all_shortest = pattern.all;
+		search.mode = "acyclic";
+	} else {
+		return search;
+	}
+	search.applies = true;
+	return search;
+}
+
+//! Sets up the native path search for `search`'s pattern: the step CSR as "cte1", the paths from every source the
+//! MATCH WHERE (or the source's element WHERE) admits to every destination it admits, as "shortest_path_cte" (path,
+//! src_rowid, dst_rowid), joined to both endpoints. ProcessPathList then binds the vertices and the path functions
+//! with csr_slot.path_search_premade set.
+static void AddNativePathSearch(ClientContext &context, const PGQNativePathSearch &search, MatchExpression &ref,
+                                CreatePropertyGraphInfo &pg_table, unique_ptr<SelectNode> &select_node,
+                                vector<unique_ptr<ParsedExpression>> &conditions, PGQCSRSlot &csr_slot) {
+	auto &edge = *search.edge;
+	shared_ptr<PropertyGraphTable> edge_table;
+	try {
+		edge_table = ResolveTable(edge.label, edge.match_type, pg_table);
+	} catch (const Exception &) {
+		throw NotImplementedException("The path search needs one edge table; the label expression '%s' spans several",
+		                              edge.label);
+	}
+	if (!StringUtil::CIEquals(PGQStr(edge_table->source_reference), PGQStr(edge_table->destination_reference))) {
+		throw NotImplementedException("The path search needs an edge whose two ends are one vertex table; '%s' "
+		                              "connects '%s' and '%s'",
+		                              PGQStr(edge_table->table_name), PGQStr(edge_table->source_reference),
+		                              PGQStr(edge_table->destination_reference));
+	}
+	if (EdgeLabelAdmitsNothing(edge.label, edge_table)) {
+		throw NotImplementedException("The edge label expression '%s' admits no edge of %s", edge.label,
+		                              PGQStr(edge_table->table_name));
+	}
+	const string &src = search.src->variable_binding;
+	const string &dst = search.dst->variable_binding;
+	auto &vertex_table = *edge_table->source_pg_table;
+	const string vertices = QualifiedTableName(PGQStr(vertex_table.catalog_name), PGQStr(vertex_table.schema_name),
+	                                           PGQStr(vertex_table.table_name));
+	const string pk = KeywordHelper::WriteOptionallyQuoted(PGQStr(edge_table->source_pk[0]));
+
+	// The endpoints' own predicates (element WHERE, and the MATCH WHERE's conjuncts on that vertex alone) seed the
+	// search: it starts from the admitted sources only, and stops once every admitted destination has its paths.
+	auto seed = [&](const string &binding, SubPath *wrapper) -> string {
+		vector<string> parts;
+		if (wrapper && wrapper->where_clause) {
+			parts.push_back("(" + wrapper->where_clause->ToString() + ")");
+		}
+		if (ref.where_clause) {
+			if (auto pushed = ExtractSrcFilter(*ref.where_clause, binding)) {
+				parts.push_back("(" + pushed->ToString() + ")");
+			}
+		}
+		return StringUtil::Join(parts, " AND ");
+	};
+	const string src_seed = seed(src, search.src_wrapper);
+	const string dst_seed = seed(dst, search.dst_wrapper);
+	const string q_src = KeywordHelper::WriteOptionallyQuoted(src);
+	const string q_dst = KeywordHelper::WriteOptionallyQuoted(dst);
+	const string destinations =
+	    dst_seed.empty() ? "NULL::BIGINT[]"
+	                     : StringUtil::Format("(SELECT list(%s.rowid) FROM %s AS %s WHERE %s)", q_dst, vertices, q_dst,
+	                                          dst_seed);
+
+	const bool all_shortest = search.all_shortest;
+	ClaimCSRSlot(csr_slot, CSRKeyFor(edge_table, edge.match_type, edge.label, true) + "|search", CSRIdCounter(context));
+	if (select_node->cte_map.map.find("cte1") == select_node->cte_map.map.end()) {
+		select_node->cte_map.map["cte1"] = CreateStepCSRCTE(edge_table, edge.match_type, edge.label, csr_slot.slot);
+	}
+	const string paths_cte = "__pgq_paths_" + std::to_string(select_node->cte_map.map.size());
+	const string search_sql = StringUtil::Format(
+	    "SELECT %s.rowid AS src_rowid, unnest(pgq_shortest_k_paths(%d, (SELECT count(__v.%s) FROM %s __v), %s.rowid, "
+	    "%s, %lld, %lld, %lld, '%s', '%s', %lld, __x.temp)) AS __found FROM %s AS %s, "
+	    "(SELECT 0 * count(cte1.temp) AS temp FROM cte1) AS __x%s",
+	    q_src, csr_slot.slot, pk, vertices, q_src, destinations, static_cast<long long>(search.k),
+	    static_cast<long long>(search.quantifier->lower), static_cast<long long>(search.quantifier->upper),
+	    search.mode, all_shortest ? "all_shortest" : "k", static_cast<long long>(MaxVLFallbackRows(context)), vertices,
+	    q_src, src_seed.empty() ? "" : " WHERE " + src_seed);
+	auto search_info = make_uniq<CommonTableExpressionInfo>();
+	search_info->query_node = std::move(ParseSelectStatement(search_sql)->node);
+	select_node->cte_map.map[Identifier(paths_cte)] = std::move(search_info);
+
+	auto path_info = make_uniq<CommonTableExpressionInfo>();
+	path_info->query_node =
+	    std::move(ParseSelectStatement(StringUtil::Format("SELECT __found.path AS path, src_rowid, __found.dst AS "
+	                                                      "dst_rowid FROM %s",
+	                                                      KeywordHelper::WriteOptionallyQuoted(paths_cte)))
+	                  ->node);
+	path_info->materialized = CTEMaterialize::CTE_MATERIALIZE_ALWAYS;
+	select_node->cte_map.map["shortest_path_cte"] = std::move(path_info);
+
+	auto path_ref = make_uniq<BaseTableRef>();
+	path_ref->SetTable(Identifier("shortest_path_cte"));
+	if (select_node->from_table) {
+		auto join = make_uniq<JoinRef>(JoinRefType::CROSS);
+		join->left = std::move(select_node->from_table);
+		join->right = std::move(path_ref);
+		select_node->from_table = std::move(join);
+	} else {
+		select_node->from_table = std::move(path_ref);
+	}
+	conditions.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+	                                                     PGQColRef("src_rowid", "shortest_path_cte"),
+	                                                     PGQColRef("rowid", src)));
+	conditions.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+	                                                     PGQColRef("dst_rowid", "shortest_path_cte"),
+	                                                     PGQColRef("rowid", dst)));
+
+	PGQRewriteDiagnostic diagnostic;
+	diagnostic.graph_name = pg_table.property_graph_name;
+	diagnostic.rewrite_type = "path_search";
+	diagnostic.status = "traversal";
+	diagnostic.reason = StringUtil::Format("native path search: %s, %s, steps %lld..%lld",
+	                                       all_shortest ? "all shortest"
+	                                       : search.k < 0
+	                                           ? "every path"
+	                                           : StringUtil::Format("first %lld per pair", static_cast<long long>(search.k)),
+	                                       search.mode, static_cast<long long>(search.quantifier->lower),
+	                                       static_cast<long long>(search.quantifier->upper));
+	diagnostic.edge_label_sequence = edge.label.empty() ? "*" : edge.label;
+	RecordRewriteDiagnostic(context, std::move(diagnostic));
+}
+
+unique_ptr<TableRef> PGQMatchFunction::BuildMatchRef(ClientContext &context, MatchExpression &match) {
+	auto duckpgq_state = GetDuckPGQState(context);
+	auto *ref = &match;
 	QualifiedName graph_name(Identifier(ref->pg_catalog), Identifier(ref->pg_schema), Identifier(ref->pg_name));
 	auto *pg_table = duckpgq_state->GetPropertyGraph(context, graph_name);
 
@@ -10733,6 +11438,29 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 			    "(e.g. -[e:Label COST e.weight]->). Without a cost the request is undefined; use SHORTEST.");
 		}
 		FoldStaticPathFunctions(*ref, path_pattern->path_elements, *pg_table);
+		// SHORTEST k, and the unbounded shapes the CSR path functions cannot answer exactly, take the native path
+		// search. No artifact holds k paths per pair; the other shapes try the artifacts first.
+		auto native_search = NativePathSearchFor(*path_pattern);
+		if (native_search.applies &&
+		    (path_pattern->topk > 0 ||
+		     !TryPathTableRewrite(context, *pg_table, path_pattern->path_elements, *ref, conditions, final_select_node,
+		                          alias_map, extra_alias_counter, path_table_cache, referenced_bindings,
+		                          covered_columns, ref->one_row_per, ref->where_clause.get(),
+		                          PatternSelector(*path_pattern)))) {
+			if (require_abi_paths) {
+				ThrowABIPathRequired();
+			}
+			AddNativePathSearch(context, native_search, *ref, *pg_table, final_select_node, conditions, cte1_slot);
+			cte1_slot.path_search_premade = true;
+			ProcessPathList(context, path_pattern->path_elements, conditions, final_select_node, alias_map, *pg_table,
+			                extra_alias_counter, *ref, CSRIdCounter(context), cte1_slot, true, false,
+			                DisableABIRewrite(context) ? nullptr : &path_table_cache, MaxVLFallbackRows(context));
+			cte1_slot.path_search_premade = false;
+			continue;
+		}
+		if (native_search.applies) {
+			continue; // answered from artifacts above
+		}
 		// Tier 1: if a pre-computed path table covers this entire pattern, use it.
 		// Falls through to Tier 2/3 (ProcessPathList) when not applicable.
 		// Pass the MATCH WHERE clause for predicate pushdown (v0/v1 = constant).
@@ -10781,6 +11509,11 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	// Process OPTIONAL MATCH groups — each group becomes a chain of LEFT JOINs.
 	case_insensitive_map_t<shared_ptr<PropertyGraphTable>> optional_alias_map;
 	for (auto &opt_group : ref->optional_match_patterns) {
+		if (OptionalGroupNeedsJoin(opt_group, DisableABIRewrite(context) ? nullptr : &path_table_cache)) {
+			AddOptionalGroupJoin(context, *ref, opt_group, final_select_node, optional_alias_map, *pg_table,
+			                     extra_alias_counter, alias_map, ref->where_clause.get());
+			continue;
+		}
 		ProcessOptionalPathList(opt_group, final_select_node, optional_alias_map, *pg_table, extra_alias_counter, alias_map,
 		                        path_table_cache, require_abi_paths, ref->where_clause.get(), optional_counts_exactly);
 	}
@@ -10816,6 +11549,7 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 				auto *from_bt = dynamic_cast<BaseTableRef *>(inner_sel->from_table.get());
 				wraps_orp_path_source = from_bt &&
 				                        (PGQStr(from_bt->Table()).find("__rvl_orp_") == 0 ||
+				                         PGQStr(from_bt->Table()).find("__pgq_paths_") == 0 ||
 				                         PGQStr(from_bt->Table()).find("__tcw_orp_") == 0 ||
 				                         PGQStr(from_bt->Table()).find("__tcc_orp_") == 0);
 			}
@@ -10917,6 +11651,29 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 				    "(e.g. -[e:Label COST e.weight]->). Without a cost the request is undefined; use SHORTEST.");
 			}
 			FoldStaticPathFunctions(branch, path_pattern->path_elements, *pg_table);
+			auto native_search = NativePathSearchFor(*path_pattern);
+			if (native_search.applies &&
+			    (path_pattern->topk > 0 ||
+			     !TryPathTableRewrite(context, *pg_table, path_pattern->path_elements, branch, branch_conditions,
+			                          branch_select, branch_alias_map, branch_counter, path_table_cache,
+			                          branch_referenced_bindings, branch_covered_columns, branch.one_row_per,
+			                          branch.where_clause.get(), PatternSelector(*path_pattern)))) {
+				if (require_abi_paths) {
+					ThrowABIPathRequired();
+				}
+				PGQCSRSlot branch_cte1_slot;
+				AddNativePathSearch(context, native_search, branch, *pg_table, branch_select, branch_conditions,
+				                    branch_cte1_slot);
+				branch_cte1_slot.path_search_premade = true;
+				ProcessPathList(context, path_pattern->path_elements, branch_conditions, branch_select,
+				                branch_alias_map, *pg_table, branch_counter, branch, CSRIdCounter(context),
+				                branch_cte1_slot, true, false, DisableABIRewrite(context) ? nullptr : &path_table_cache,
+				                MaxVLFallbackRows(context));
+				continue;
+			}
+			if (native_search.applies) {
+				continue;
+			}
 			if (!TryPathTableRewrite(context, *pg_table, path_pattern->path_elements, branch, branch_conditions,
 			                         branch_select, branch_alias_map, branch_counter,
 			                         path_table_cache, branch_referenced_bindings,
@@ -10960,6 +11717,11 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 
 		case_insensitive_map_t<shared_ptr<PropertyGraphTable>> branch_opt_alias_map;
 		for (auto &opt_group : branch.optional_match_patterns) {
+			if (OptionalGroupNeedsJoin(opt_group, DisableABIRewrite(context) ? nullptr : &path_table_cache)) {
+				AddOptionalGroupJoin(context, *ref, opt_group, branch_select, branch_opt_alias_map, *pg_table,
+				                     branch_counter, branch_alias_map, branch.where_clause.get());
+				continue;
+			}
 			ProcessOptionalPathList(opt_group, branch_select, branch_opt_alias_map, *pg_table, branch_counter,
 			                        branch_alias_map, path_table_cache, require_abi_paths, branch.where_clause.get(),
 			                        optional_counts_exactly);

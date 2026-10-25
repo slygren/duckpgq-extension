@@ -1,5 +1,5 @@
 # name: test/sql/path_finding/top_k.test
-# description: Testing top-k functionality, not implemented yet.
+# description: SHORTEST k (top-k shortest paths); its semantics are checked in shortest_k.test
 # group: [path_finding]
 
 require duckpgq
@@ -36,21 +36,28 @@ FROM GRAPH_TABLE (pg
 Parser Error: syntax error at or near "5"
 
 
-statement error
-FROM GRAPH_TABLE (pg
+# The five shortest walks from Daniel to each student, the empty walk to Daniel included (David is not reachable)
+query II
+SELECT b, count(*) FROM GRAPH_TABLE (pg
         MATCH
         p =  SHORTEST 5 (a:Person)-[k:knows]-> *(b:Person)
-        WHERE a.name = 'Daniel');
+        WHERE a.name = 'Daniel'
+        COLUMNS (b.name AS b)) GROUP BY ALL ORDER BY ALL;
 ----
-Not implemented Error: TopK has not been implemented yet.
+Daniel	5
+Gabor	5
+Peter	5
+Tavneet	5
 
-statement error
+query III
 FROM GRAPH_TABLE (pg
         MATCH
-        p =  SHORTEST 5 WALK (a:Person)-[k:knows]-> *(b:Person)
-        WHERE a.name = 'Daniel');
+        p =  SHORTEST 2 WALK (a:Person)-[k:knows]-> *(b:Person)
+        WHERE a.name = 'Daniel' AND b.name = 'Peter'
+        COLUMNS (b.name AS b, path_length(p) AS l, vertices(p) AS vs)) ORDER BY ALL;
 ----
-Not implemented Error: TopK has not been implemented yet.
+Peter	1	[0, 3]
+Peter	2	[0, 1, 3]
 
 statement error
 FROM GRAPH_TABLE (pg

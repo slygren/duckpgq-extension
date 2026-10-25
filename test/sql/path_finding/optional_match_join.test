@@ -1,0 +1,1398 @@
+# name: test/sql/path_finding/optional_match_join.test
+# description: OPTIONAL MATCH is the left join of the whole optional pattern onto the bindings so far, for every shape
+# group: [path_finding]
+
+# Each case materialises the reference -- the mandatory GRAPH_TABLE LEFT JOIN the optional pattern's own
+# GRAPH_TABLE on the shared variable -- and compares it both ways (EXCEPT ALL) with the OPTIONAL MATCH. The two
+# sides are computed in separate statements on purpose: several GRAPH_TABLEs in one statement can trip DuckDB's
+# common_subplan optimizer (a separate, pre-existing problem).
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+# 1 -> 2 (twice), 2 -> 3, 1 -> 3, 3 -> 4, 2 -> 4, 4 -> 1, 2 -> 1, 3 -> 5; 6 is isolated
+statement ok
+CREATE TABLE P(id BIGINT PRIMARY KEY, name VARCHAR);
+
+statement ok
+CREATE TABLE K(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO P VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e'),(6,'f');
+
+statement ok
+INSERT INTO K VALUES (1,2),(1,2),(2,3),(1,3),(3,4),(2,4),(4,1),(2,1),(3,5);
+
+statement ok
+CREATE PROPERTY GRAPH g VERTEX TABLES (P LABEL P)
+EDGE TABLES (K SOURCE KEY (src) REFERENCES P (id) DESTINATION KEY (dst) REFERENCES P (id) LABEL K);
+
+# The same graph with edges to a vertex that does not exist (6 -> 9, 9 -> 6, 1 -> 9)
+statement ok
+CREATE TABLE KD AS SELECT * FROM K UNION ALL VALUES (6, 9), (9, 6), (1, 9);
+
+statement ok
+CREATE PROPERTY GRAPH gd VERTEX TABLES (P LABEL P)
+EDGE TABLES (KD SOURCE KEY (src) REFERENCES P (id) DESTINATION KEY (dst) REFERENCES P (id) LABEL K);
+
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+# (t)-[e:K]->(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)-[e:K]->(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)-[e:K]->(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)-[e:K]->(x:P)  WHERE t.id = 1
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 1 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)-[e:K]->(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)-[e:K]->(x:P) WHERE t.id = 1 COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)-[e:K]->{1,3}(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)-[e:K]->{1,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)-[e:K]->{1,3}(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)-[e:K]->{1,3}(x:P)  WHERE t.id = 1
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 1 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)-[e:K]->{1,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)-[e:K]->{1,3}(x:P) WHERE t.id = 1 COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)-[e:K]->{2,3}(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)-[e:K]->{2,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)-[e:K]->{2,3}(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)-[e:K]->{2,3}(x:P)  WHERE t.id = 1
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 1 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)-[e:K]->{2,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)-[e:K]->{2,3}(x:P) WHERE t.id = 1 COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)-[e:K]->{0,2}(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)-[e:K]->{0,2}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)-[e:K]->{0,2}(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)-[e:K]->{0,2}(x:P)  WHERE t.id = 1
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 1 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)-[e:K]->{0,2}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)-[e:K]->{0,2}(x:P) WHERE t.id = 1 COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# ANY SHORTEST (t)-[e:K]->+(x:P)  WHERE t.id = 1
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 1 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (t:P)-[e:K]->+(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ANY SHORTEST (t)-[e:K]->+(x:P) WHERE t.id = 1 COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# ALL SHORTEST (t)-[e:K]->+(x:P)  WHERE t.id = 1
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 1 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (t:P)-[e:K]->+(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ALL SHORTEST (t)-[e:K]->+(x:P) WHERE t.id = 1 COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# ACYCLIC (t)-[e:K]->{1,3}(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (t:P)-[e:K]->{1,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ACYCLIC (t)-[e:K]->{1,3}(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)<-[e:K]-(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)<-[e:K]-(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)<-[e:K]-(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)<-[e:K]-(x:P)  WHERE t.id = 1
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 1 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)<-[e:K]-(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)<-[e:K]-(x:P) WHERE t.id = 1 COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)<-[e:K]-{1,3}(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)<-[e:K]-{1,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)<-[e:K]-{1,3}(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)<-[e:K]-{1,3}(x:P)  WHERE t.id = 1
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 1 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)<-[e:K]-{1,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)<-[e:K]-{1,3}(x:P) WHERE t.id = 1 COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)<-[e:K]-{2,3}(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)<-[e:K]-{2,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)<-[e:K]-{2,3}(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)<-[e:K]-{2,3}(x:P)  WHERE t.id = 1
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 1 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)<-[e:K]-{2,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)<-[e:K]-{2,3}(x:P) WHERE t.id = 1 COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)<-[e:K]-{0,2}(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)<-[e:K]-{0,2}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)<-[e:K]-{0,2}(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)<-[e:K]-{0,2}(x:P)  WHERE t.id = 1
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 1 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)<-[e:K]-{0,2}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)<-[e:K]-{0,2}(x:P) WHERE t.id = 1 COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# ANY SHORTEST (t)<-[e:K]-+(x:P)  WHERE t.id = 1
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 1 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (t:P)<-[e:K]-+(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ANY SHORTEST (t)<-[e:K]-+(x:P) WHERE t.id = 1 COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# ALL SHORTEST (t)<-[e:K]-+(x:P)  WHERE t.id = 1
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 1 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (t:P)<-[e:K]-+(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ALL SHORTEST (t)<-[e:K]-+(x:P) WHERE t.id = 1 COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# ACYCLIC (t)<-[e:K]-{1,3}(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (t:P)<-[e:K]-{1,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ACYCLIC (t)<-[e:K]-{1,3}(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)-[e:K]-(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)-[e:K]-(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)-[e:K]-(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)-[e:K]-(x:P)  WHERE t.id = 1
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 1 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)-[e:K]-(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)-[e:K]-(x:P) WHERE t.id = 1 COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)-[e:K]-{1,3}(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)-[e:K]-{1,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)-[e:K]-{1,3}(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)-[e:K]-{1,3}(x:P)  WHERE t.id = 1
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 1 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)-[e:K]-{1,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)-[e:K]-{1,3}(x:P) WHERE t.id = 1 COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)-[e:K]-{2,3}(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)-[e:K]-{2,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)-[e:K]-{2,3}(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)-[e:K]-{2,3}(x:P)  WHERE t.id = 1
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 1 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)-[e:K]-{2,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)-[e:K]-{2,3}(x:P) WHERE t.id = 1 COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)-[e:K]-{0,2}(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)-[e:K]-{0,2}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)-[e:K]-{0,2}(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)-[e:K]-{0,2}(x:P)  WHERE t.id = 1
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 1 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)-[e:K]-{0,2}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)-[e:K]-{0,2}(x:P) WHERE t.id = 1 COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# ANY SHORTEST (t)-[e:K]-+(x:P)  WHERE t.id = 1
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 1 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (t:P)-[e:K]-+(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ANY SHORTEST (t)-[e:K]-+(x:P) WHERE t.id = 1 COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# ALL SHORTEST (t)-[e:K]-+(x:P)  WHERE t.id = 1
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 1 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (t:P)-[e:K]-+(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ALL SHORTEST (t)-[e:K]-+(x:P) WHERE t.id = 1 COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# ACYCLIC (t)-[e:K]-{1,3}(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (t:P)-[e:K]-{1,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ACYCLIC (t)-[e:K]-{1,3}(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)<-[e:K]->(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)<-[e:K]->(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)<-[e:K]->(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)<-[e:K]->(x:P)  WHERE t.id = 1
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 1 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)<-[e:K]->(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)<-[e:K]->(x:P) WHERE t.id = 1 COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)<-[e:K]->{1,3}(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)<-[e:K]->{1,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)<-[e:K]->{1,3}(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)<-[e:K]->{1,3}(x:P)  WHERE t.id = 1
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 1 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)<-[e:K]->{1,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)<-[e:K]->{1,3}(x:P) WHERE t.id = 1 COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)<-[e:K]->{2,3}(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)<-[e:K]->{2,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)<-[e:K]->{2,3}(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)<-[e:K]->{2,3}(x:P)  WHERE t.id = 1
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 1 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)<-[e:K]->{2,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)<-[e:K]->{2,3}(x:P) WHERE t.id = 1 COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)<-[e:K]->{0,2}(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)<-[e:K]->{0,2}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)<-[e:K]->{0,2}(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)<-[e:K]->{0,2}(x:P)  WHERE t.id = 1
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 1 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)<-[e:K]->{0,2}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)<-[e:K]->{0,2}(x:P) WHERE t.id = 1 COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# ANY SHORTEST (t)<-[e:K]->+(x:P)  WHERE t.id = 1
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 1 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (t:P)<-[e:K]->+(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ANY SHORTEST (t)<-[e:K]->+(x:P) WHERE t.id = 1 COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# ALL SHORTEST (t)<-[e:K]->+(x:P)  WHERE t.id = 1
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 1 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (t:P)<-[e:K]->+(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ALL SHORTEST (t)<-[e:K]->+(x:P) WHERE t.id = 1 COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# ACYCLIC (t)<-[e:K]->{1,3}(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (t:P)<-[e:K]->{1,3}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ACYCLIC (t)<-[e:K]->{1,3}(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+statement ok
+SET pgq_verify_edges_on_create = true;
+
+statement ok
+CREATE PROPERTY GRAPH gv VERTEX TABLES (P LABEL P)
+EDGE TABLES (K SOURCE KEY (src) REFERENCES P (id) DESTINATION KEY (dst) REFERENCES P (id) LABEL K);
+
+statement ok
+SET pgq_verify_edges_on_create = false;
+
+# (t)-[e:K]->(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (gv MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (gv MATCH (t:P)-[e:K]->(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (gv MATCH (t:P) OPTIONAL MATCH (t)-[e:K]->(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)-[e:K]->(x:P)  WHERE t.id < 4
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (gv MATCH (t:P) WHERE t.id < 4 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (gv MATCH (t:P)-[e:K]->(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (gv MATCH (t:P) OPTIONAL MATCH (t)-[e:K]->(x:P) WHERE t.id < 4 COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)<-[e:K]-(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (gv MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (gv MATCH (t:P)<-[e:K]-(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (gv MATCH (t:P) OPTIONAL MATCH (t)<-[e:K]-(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)<-[e:K]-(x:P)  WHERE t.id < 4
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (gv MATCH (t:P) WHERE t.id < 4 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (gv MATCH (t:P)<-[e:K]-(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (gv MATCH (t:P) OPTIONAL MATCH (t)<-[e:K]-(x:P) WHERE t.id < 4 COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)-[e:K]-(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (gv MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (gv MATCH (t:P)-[e:K]-(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (gv MATCH (t:P) OPTIONAL MATCH (t)-[e:K]-(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)-[e:K]-(x:P)  WHERE t.id < 4
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (gv MATCH (t:P) WHERE t.id < 4 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (gv MATCH (t:P)-[e:K]-(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (gv MATCH (t:P) OPTIONAL MATCH (t)-[e:K]-(x:P) WHERE t.id < 4 COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)<-[e:K]->(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (gv MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (gv MATCH (t:P)<-[e:K]->(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (gv MATCH (t:P) OPTIONAL MATCH (t)<-[e:K]->(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)<-[e:K]->(x:P)  WHERE t.id < 4
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (gv MATCH (t:P) WHERE t.id < 4 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (gv MATCH (t:P)<-[e:K]->(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (gv MATCH (t:P) OPTIONAL MATCH (t)<-[e:K]->(x:P) WHERE t.id < 4 COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)-[e:K]->(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (gd MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (gd MATCH (t:P)-[e:K]->(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (gd MATCH (t:P) OPTIONAL MATCH (t)-[e:K]->(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)-[e:K]->{1,2}(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (gd MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (gd MATCH (t:P)-[e:K]->{1,2}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (gd MATCH (t:P) OPTIONAL MATCH (t)-[e:K]->{1,2}(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)<-[e:K]-(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (gd MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (gd MATCH (t:P)<-[e:K]-(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (gd MATCH (t:P) OPTIONAL MATCH (t)<-[e:K]-(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)<-[e:K]-{1,2}(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (gd MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (gd MATCH (t:P)<-[e:K]-{1,2}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (gd MATCH (t:P) OPTIONAL MATCH (t)<-[e:K]-{1,2}(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)-[e:K]-(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (gd MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (gd MATCH (t:P)-[e:K]-(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (gd MATCH (t:P) OPTIONAL MATCH (t)-[e:K]-(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)-[e:K]-{1,2}(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (gd MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (gd MATCH (t:P)-[e:K]-{1,2}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (gd MATCH (t:P) OPTIONAL MATCH (t)-[e:K]-{1,2}(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)<-[e:K]->(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (gd MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (gd MATCH (t:P)<-[e:K]->(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (gd MATCH (t:P) OPTIONAL MATCH (t)<-[e:K]->(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)<-[e:K]->{1,2}(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (gd MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (gd MATCH (t:P)<-[e:K]->{1,2}(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (gd MATCH (t:P) OPTIONAL MATCH (t)<-[e:K]->{1,2}(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)-[e:K]->(x:P)-[f:K]->(y:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)-[e:K]->(x:P)-[f:K]->(y:P) COLUMNS (t.id AS t, x.id AS x, y.id AS y));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x, o.y FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)-[e:K]->(x:P)-[f:K]->(y:P) WHERE true COLUMNS (t.id AS t, x.id AS x, y.id AS y));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)-[e:K]->(x:P)-[f:K]->(y:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (gd MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (gd MATCH (t:P)-[e:K]->(x:P)-[f:K]->(y:P) COLUMNS (t.id AS t, x.id AS x, y.id AS y));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x, o.y FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (gd MATCH (t:P) OPTIONAL MATCH (t)-[e:K]->(x:P)-[f:K]->(y:P) WHERE true COLUMNS (t.id AS t, x.id AS x, y.id AS y));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)-[e:K]->{1,2}(x:P)-[f:K]->(y:P)  WHERE t.id = 1
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE t.id = 1 COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)-[e:K]->{1,2}(x:P)-[f:K]->(y:P) COLUMNS (t.id AS t, x.id AS x, y.id AS y));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x, o.y FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)-[e:K]->{1,2}(x:P)-[f:K]->(y:P) WHERE t.id = 1 COLUMNS (t.id AS t, x.id AS x, y.id AS y));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)<-[e:K]-(x:P)-[f:K]-(y:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)<-[e:K]-(x:P)-[f:K]-(y:P) COLUMNS (t.id AS t, x.id AS x, y.id AS y));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x, o.y FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)<-[e:K]-(x:P)-[f:K]-(y:P) WHERE true COLUMNS (t.id AS t, x.id AS x, y.id AS y));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)-[e:K]->(x:P), (t)<-[f:K]-(y:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)-[e:K]->(x:P), (t)<-[f:K]-(y:P) COLUMNS (t.id AS t, x.id AS x, y.id AS y));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x, o.y FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)-[e:K]->(x:P), (t)<-[f:K]-(y:P) WHERE true COLUMNS (t.id AS t, x.id AS x, y.id AS y));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t WHERE t.id < 4)-[e:K]->(x:P)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P WHERE t.id < 4)-[e:K]->(x:P) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t WHERE t.id < 4)-[e:K]->(x:P) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# (t)-[e:K]->(x:P WHERE x.id > 2)  WHERE true
+statement ok
+CREATE OR REPLACE TABLE m AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) WHERE true COLUMNS (t.id AS t));
+
+statement ok
+CREATE OR REPLACE TABLE o AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P)-[e:K]->(x:P WHERE x.id > 2) COLUMNS (t.id AS t, x.id AS x));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT m.t, o.x FROM m LEFT JOIN o ON m.t = o.t;
+
+statement ok
+CREATE OR REPLACE TABLE act AS SELECT * FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)-[e:K]->(x:P WHERE x.id > 2) WHERE true COLUMNS (t.id AS t, x.id AS x));
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+true	0	0
+
+# Hand-checked: the whole pattern matches or the row keeps NULLs. 3 -> 4 -> 1 matches, so 3 has no
+# (3, 5, NULL) row although 3 -> 5 leads nowhere; 5 and 6 have no match at all.
+query III
+FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)-[:K]->(x:P)-[:K]->(y:P) WHERE t.id >= 3
+    COLUMNS (t.id AS t, x.id AS x, y.id AS y)) ORDER BY ALL;
+----
+3	4	1
+4	1	2
+4	1	2
+4	1	3
+5	NULL	NULL
+6	NULL	NULL
+
+# An edge to a missing vertex is no match: 1 keeps its three real edges and gets no NULL row for 1 -> 9,
+# and 6 (only dangling edges) is kept once.
+query II
+FROM GRAPH_TABLE (gd MATCH (t:P) OPTIONAL MATCH (t)-[:K]->(x:P) WHERE t.id IN (1, 6)
+    COLUMNS (t.id AS t, x.id AS x)) ORDER BY ALL;
+----
+1	2
+1	2
+1	3
+6	NULL
+
+# Undirected: the edge's own columns read as in a MATCH (oriented along the traversal)
+query III
+FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH (t)-[e:K]-(x:P) WHERE t.id IN (5, 6)
+    COLUMNS (t.id AS t, e.src AS s, e.dst AS d)) ORDER BY ALL;
+----
+5	5	3
+6	NULL	NULL
+
+query IIII
+FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH ANY SHORTEST (t)<-[:K]-+(x:P) WHERE t.id = 5
+    COLUMNS (t.id AS t, x.id AS x, x.name AS n, t.name AS tn)) ORDER BY ALL;
+----
+5	1	a	e
+5	2	b	e
+5	3	c	e
+5	4	d	e
+
+# A self-loop is one undirected edge, read once as in a MATCH
+statement ok
+CREATE TABLE KL AS SELECT * FROM K UNION ALL VALUES (6, 6);
+
+statement ok
+CREATE PROPERTY GRAPH gl VERTEX TABLES (P LABEL P)
+EDGE TABLES (KL SOURCE KEY (src) REFERENCES P (id) DESTINATION KEY (dst) REFERENCES P (id) LABEL K);
+
+query II
+FROM GRAPH_TABLE (gl MATCH (t:P) OPTIONAL MATCH (t)-[:K]-(x:P) WHERE t.id = 6 COLUMNS (t.id AS t, x.id AS x));
+----
+6	6
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (gl MATCH (t:P)-[:K]-(x:P) WHERE t.id = 6 COLUMNS (t.id AS t));
+----
+1
+
+# A path variable of the optional pattern is not carried out of it yet
+statement error
+FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH p = (t)-[:K]->{1,2}(x:P) COLUMNS (t.id AS t, path_length(p) AS l));
+----
+path variable 'p' of an OPTIONAL MATCH pattern
+
+# An unused path variable is fine: 23 paths of 1 or 2 hops, and NULL rows for 5 and 6
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH p = (t)-[:K]->{1,2}(x:P) COLUMNS (t.id AS t, x.id AS x));
+----
+25
+
+# ── With ABI artifacts: the optional pattern takes the artifact routes a MATCH of it would ──────────────
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+CREATE TABLE T(id BIGINT PRIMARY KEY, name VARCHAR);
+
+statement ok
+CREATE TABLE H(child BIGINT, parent BIGINT);
+
+statement ok
+INSERT INTO T VALUES (1,'root'),(2,'a'),(3,'b'),(4,'a1'),(5,'a2'),(6,'b1'),(7,'lonely');
+
+statement ok
+INSERT INTO H VALUES (2,1),(3,1),(4,2),(5,2),(6,3);
+
+statement ok
+CREATE PROPERTY GRAPH h VERTEX TABLES (T LABEL T)
+EDGE TABLES (H SOURCE KEY (child) REFERENCES T (id) DESTINATION KEY (parent) REFERENCES T (id) LABEL H);
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('h', exclude_self_referential := false, closures := ['H']);
+
+query T
+SELECT status = 'match' FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (h MATCH (t:T) OPTIONAL MATCH ANY SHORTEST (t)-[:H]->+(x:T) COLUMNS (t.id AS t, x.id AS x))');
+----
+true
+
+query T
+SELECT status = 'match' FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (h MATCH (t:T) OPTIONAL MATCH ALL SHORTEST (t)-[:H]->+(x:T) COLUMNS (t.id AS t, x.id AS x))');
+----
+true
+
+query T
+SELECT status = 'match' FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (h MATCH (t:T) OPTIONAL MATCH (t)-[:H]->(x:T)-[:H]->(y:T) COLUMNS (t.id AS t, x.id AS x, y.id AS y))');
+----
+true
+
+query T
+SELECT status = 'match' FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (h MATCH (t:T) OPTIONAL MATCH (t)-[:H]->{1,3}(x:T) COLUMNS (t.id AS t, x.id AS x))');
+----
+true
+
+query T
+SELECT status IN ('match', 'unverified') FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (h MATCH (t:T) OPTIONAL MATCH ANY SHORTEST (t)<-[:H]-+(x:T) COLUMNS (t.id AS t, x.id AS x))');
+----
+true
+
+query T
+SELECT status = 'match' FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (h MATCH (t:T) OPTIONAL MATCH (t)-[:H]-(x:T) COLUMNS (t.id AS t, x.id AS x))');
+----
+true
+
+query T
+SELECT status = 'match' FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (h MATCH (t:T) OPTIONAL MATCH (t)-[e:H]->(x:T), (t)<-[f:H]-(y:T) COLUMNS (t.id AS t, x.id AS x, y.id AS y))');
+----
+true
+
+query II
+SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (h MATCH (t:T) OPTIONAL MATCH ANY SHORTEST (t)-[:H]->+(x:T) WHERE t.id = 4 COLUMNS (t.id AS t, x.id AS x))');
+----
+match	true
+
+query II
+FROM GRAPH_TABLE (h MATCH (t:T) OPTIONAL MATCH ANY SHORTEST (t)-[:H]->+(x:T) WHERE t.id IN (4, 7) COLUMNS (t.id AS t, x.id AS x)) ORDER BY ALL;
+----
+4	1
+4	2
+7	NULL

@@ -122,14 +122,16 @@ put over DuckLake catalogs. A graph is stored in the database it is created in a
 | `(v:A\|B)`, `(v:A&B)`, `(v:!A)` | label disjunction, conjunction, negation (`!` binds tightest, then `&`, then `\|`) |
 | `(v:Person WHERE v.age > 30)` | element-level predicate |
 | `-[e:Knows]->`, `<-[e:Knows]-`, `-[e:Knows]-` | directed, reversed, either direction |
+| `<-[e:Knows]->` | both ways: `e` runs from the next vertex back, with an edge the other way beside it (each such pair is a match); quantified, each step is such a pair |
 | `->`, `<-`, `-`, `<->` | anonymous edge of any label |
 | `-[:R]->{1,5}`, `{,3}`, `{2,}`, `{2}`, `*`, `+`, `?` | quantified (variable-length) edge, quantifier after the arrow |
 | `-[:R*1..5]->`, `-[:R*]->`, `-[:R*2]->`, `-[:R*..3]->`, `-[:R*0..]->` | Cypher's quantifier inside the edge, with Cypher's meaning (see below) |
 | `MATCH (t)-[:A]->(a), (t)-[:B]->(b)` | several patterns sharing a variable |
 | `MATCH p = …` | path variable |
 | `ANY SHORTEST`, `ALL SHORTEST`, `ANY CHEAPEST`, `ALL CHEAPEST` | path search; `COST expr [DEFAULT n]` on an edge gives its weight, a number (`DEFAULT` where `expr` is NULL). A NULL cost without `DEFAULT`, and a negative or non-finite one, is an error. CHEAPEST returns the path(s) of the least total cost within the quantifier's bounds (`ALL`: every tied path), and the path functions, `ONE ROW PER` and `cost(p)` all describe them |
+| `SHORTEST k` | the k shortest paths per endpoint pair (one quantified edge between two vertices); walks unless a path mode is given |
 | `WALK`, `TRAIL`, `SIMPLE`, `ACYCLIC` | path mode |
-| `OPTIONAL MATCH …` | left-joined pattern (fixed-length, directed) |
+| `OPTIONAL MATCH …` | the whole pattern left-joined onto the bindings so far (a row without a match keeps NULLs); any pattern a `MATCH` answers |
 | `WHERE EXISTS { (t)-[:HAS_WORKORDER]->() }`, `NOT EXISTS { … }` | correlated pattern existence |
 | `MATCH … UNION [ALL] MATCH … COLUMNS (…)` | several MATCH blocks sharing the final `COLUMNS` |
 | `MATCH … COLUMNS (…) UNION [ALL] MATCH … COLUMNS (…)` | each MATCH block with its own `COLUMNS`, combined by position as in a SQL `UNION` |
@@ -152,6 +154,15 @@ A quantified pattern without a search prefix returns **every walk** (SQL/PGQ sem
 use `ANY SHORTEST` for one per endpoint, `ALL SHORTEST` for every shortest path. A walk visits no vertex twice, so
 walks that return to their start vertex are left out, and an edge stored twice is two walks. The path variable
 (`vertices(p)`, `path_length(p)`, `ONE ROW PER`) describes the row's own walk.
+
+`SHORTEST k` follows SQL/PGQ: the k shortest paths per endpoint pair, as walks (a vertex or edge may repeat, and a
+path may return to its start) unless a path mode restricts them: `TRAIL` (no edge twice), `ACYCLIC` (no vertex twice),
+`SIMPLE` (no vertex twice except a return to the start). SQL/PGQ leaves the choice among paths tied at the k-th
+length to the implementation; here the paths of one length are taken in the order of their edge row ids along the
+path, compared position by position, so the answer is deterministic. The search runs from each source the `MATCH
+WHERE` admits (a filter on the source alone seeds it, one on the destination alone ends it early) and counts every
+partial path it builds against `pgq_max_vl_fallback_rows`, so an unseeded search on a large graph fails rather than
+runs on. No artifact holds k paths per pair: `SHORTEST k` always traverses.
 
 ### In WHERE and COLUMNS
 
@@ -292,7 +303,7 @@ artifact applies.
 | `pgq_abi_auto_max_rows` | 10,000,000 | In `auto` mode, leave out fixed-path artifacts over this many rows. |
 | `pgq_require_abi_paths` | `false` | Fail a MATCH that no artifact can answer. |
 | `pgq_disable_abi_rewrite` | `false` | Skip the ABI rewrite; traverse only. |
-| `pgq_max_vl_fallback_rows` | 20,000,000 | Row budget for a variable-length traversal that no artifact answers. |
+| `pgq_max_vl_fallback_rows` | 20,000,000 | Row budget for a variable-length traversal that no artifact answers, and for the partial paths of a `SHORTEST k` search. |
 | `pgq_verify_edges_on_create` | `false` | `CREATE PROPERTY GRAPH` rejects edges whose keys reference no vertex. Scans every edge table. |
 | `duckpgq_vertex_join_elimination` | `true` | Leave out a vertex table the query only uses for its key, where every incident edge table has a FOREIGN KEY to that key. |
 | `duckpgq_factorized_joins` | `true` | Pre-aggregate join sides that are only counted or summed, so path counts become degree products. |
@@ -400,9 +411,10 @@ building in [abi_build.cpp](src/core/functions/table/abi_build.cpp); vertex-join
 - **Patterns not supported:** bracketed sub-path groups `[ … ]{n,m}`, path unions `|` / `|+|` inside a pattern,
   `LATERAL` inside `MATCH`, horizontal aggregation along a path,
   graph updates (`INSERT`/`DELETE` of vertices or edges; the graph is a view over tables).
-- **Parsed, not implemented:** top-k shortest (`SHORTEST k`).
-- **`OPTIONAL MATCH`** is fixed-length and directed only. `ONE ROW PER` does not cover unbounded left-directed or
-  bidirectional variable-length patterns.
+- **`OPTIONAL MATCH`** cannot use the path variable of its own pattern in `COLUMNS` or `WHERE`.
+- **`SHORTEST k`** takes one quantified edge between two vertices over one edge table (no element `WHERE` on the
+  edge); longer patterns are refused. Inside a longer pattern, an unbounded quantifier with only a path mode or with a
+  lower bound above 1 is answered from the CSR, which finds one shortest path per pair (refused for `<-` and `<->`).
 - **ABI rewrites** cover the common path shapes, not every pattern; multi-hop undirected and mixed-direction chains
   traverse. Choosing between several matching artifacts is simple.
 - **`pgq_abi_build` on a SQLite-backed DuckLake catalog** fails (the build's connection and the caller's contend
@@ -410,7 +422,8 @@ building in [abi_build.cpp](src/core/functions/table/abi_build.cpp); vertex-join
 - **CHEAPEST with a cost that varies by edge** takes one quantified edge between two vertices, whose `COST` reads
   only that edge's properties and that has no element `WHERE`. Without an upper bound the edge must be
   right-directed and quantified with `+` or `*`; with one (`{1,3}`, `{2,5}`, …) any direction works.
-  It is not supported with `OPTIONAL MATCH`. It must be the only variable-length pattern of its MATCH block, or every
+  As the pattern of an `OPTIONAL MATCH` it is supported; a MATCH block whose own pattern is such a search cannot have
+  an `OPTIONAL MATCH`. It must be the only variable-length pattern of its MATCH block, or every
   one of them must search the same edges and `COST` with nothing but `cost(p)`. `cost(p)` is not available in the
   MATCH's `WHERE` (filter on it outside the `GRAPH_TABLE`). With the same positive constant on every edge the pattern
   is `SHORTEST`, and `cost(p)` there needs an unbounded `+` or `*`.
