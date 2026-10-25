@@ -30,6 +30,10 @@ GraphAlgorithmInput::GraphAlgorithmInput(ClientContext &context, const CSR *csr)
 GraphView GraphAlgorithmInput::Directed() {
 	GraphView g;
 	g.n = n;
+	if (!v) {
+		g.offsets.assign(n + 1, 0);
+		return g;
+	}
 	g.offsets.resize(n + 1);
 	for (int64_t i = 0; i <= n; i++) {
 		g.offsets[i] = v[i];
@@ -446,6 +450,9 @@ void RegisterGraphAlgorithm(ExtensionLoader &loader, const GraphAlgorithmSpec &s
 	// Every algorithm can throw (cancellation, bad parameters, a missing source vertex); a non-fallible scalar
 	// would have those rethrown as INTERNAL errors.
 	scalar.SetFallible();
+	// A parameter left out is passed as a NULL constant, and a NULL source rowid must raise an error, not fold the
+	// call to NULL.
+	scalar.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	scalar.SetExtraFunctionInfo(make_shared_ptr<GraphAlgorithmSpecInfo>(spec));
 	loader.RegisterFunction(scalar);
 
@@ -469,6 +476,7 @@ void RegisterGraphAlgorithm(ExtensionLoader &loader, const GraphAlgorithmSpec &s
 void CoreGraphAlgorithms::Register(ExtensionLoader &loader) {
 	RegisterStronglyConnectedComponent(loader);
 	RegisterTriangleCount(loader);
+	RegisterBetweennessCentrality(loader);
 }
 
 } // namespace duckdb

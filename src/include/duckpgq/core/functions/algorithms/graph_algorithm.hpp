@@ -173,6 +173,7 @@ struct CoreGraphAlgorithms {
 private:
 	static void RegisterStronglyConnectedComponent(ExtensionLoader &loader);
 	static void RegisterTriangleCount(ExtensionLoader &loader);
+	static void RegisterBetweennessCentrality(ExtensionLoader &loader);
 };
 
 } // namespace duckdb

@@ -304,6 +304,7 @@ FROM local_clustering_coefficient('social', 'Person', 'Knows');
 FROM strongly_connected_component('social', 'Person', 'Knows');
 FROM triangle_count('social', 'Person', 'Knows');
 FROM total_triangle_count('social', 'Person', 'Knows');    -- one row
+FROM betweenness_centrality('social', 'Person', 'Knows', k := 256, seed := 7, normalized := true, directed := true);
 ```
 
 How each function reads the edges (n vertices, m edges):
@@ -313,6 +314,7 @@ How each function reads the edges (n vertices, m edges):
 | `strongly_connected_component(g, v, e)` | directed | no effect | no effect | `componentId BIGINT` | O(n + m) |
 | `triangle_count(g, v, e)` | undirected | ignored | count once | `triangle_count BIGINT` | O(m^1.5) |
 | `total_triangle_count(g, v, e)` | undirected | ignored | count once | one row, `triangle_count BIGINT` | O(m^1.5) |
+| `betweenness_centrality(g, v, e, k, normalized, directed, seed)` | directed (default) or undirected | ignored | count once | `betweenness_centrality DOUBLE` | O(n m), O(k m) sampled |
 
 - **`strongly_connected_component`**: Tarjan's algorithm, iterative, so long chains are no problem. Two vertices
   share a `componentId` when each reaches the other. The id is the smallest rowid among the component's vertices,
@@ -321,6 +323,12 @@ How each function reads the edges (n vertices, m edges):
   ignored, `a -> b` and `b -> a` are one edge, and parallel edges count once. Edges are oriented from lower to higher
   (degree, rowid) and out-lists are intersected. `total_triangle_count` is the sum divided by 3. Matches
   `networkx.triangles`.
+- **`betweenness_centrality`**: Brandes' algorithm over unweighted shortest paths, endpoints excluded. Named
+  parameters: `k` samples that many source vertices (default: every vertex, the exact value); `seed` (default 0)
+  fixes the sample, so the same seed gives the same result; `normalized` (default `true`) divides by
+  (n - 1)(n - 2); `directed` (default `true`) can be set to `false` to ignore edge direction. Values and scaling
+  are `networkx.betweenness_centrality`'s (3.5), including its estimator for sampled sources, so `k = n` gives the
+  exact values. With `k = 1`, the sampled vertex's own value is NULL (NetworkX returns NaN).
 
 `scripts/compare_graph_algorithms.py` compares every function with NetworkX (or a brute force) on generated graphs:
 directed and undirected readings, disconnected parts, self-loops, parallel and reciprocal edges, empty edge and vertex

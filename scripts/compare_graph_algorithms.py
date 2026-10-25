@@ -176,6 +176,9 @@ QUERIES = {
     "betweenness_centrality_k_all": "FROM betweenness_centrality('g', 'v', 'e', k := {n}, seed := 3)",
     "betweenness_centrality_k_half_a": "FROM betweenness_centrality('g', 'v', 'e', k := {half}, seed := 11)",
     "betweenness_centrality_k_half_b": "FROM betweenness_centrality('g', 'v', 'e', k := {half}, seed := 11)",
+    "betweenness_centrality_k_most": "FROM betweenness_centrality('g', 'v', 'e', k := {most}, seed := 5)",
+    "betweenness_centrality_k_most_undirected_raw":
+        "FROM betweenness_centrality('g', 'v', 'e', k := {most}, seed := 5, directed := false, normalized := false)",
     "k_core": "FROM k_core('g', 'v', 'e')",
     "degree": "FROM degree('g', 'v', 'e')",
     "shortest_path_lengths": "FROM shortest_path_lengths('g', 'v', 'e', {source})",
@@ -229,7 +232,7 @@ def run_case(duckdb, case, only, workdir):
             continue
         if "{source}" in q and case.source is None:
             continue
-        q = q.format(n=max(n, 1), half=max(n // 2, 1), source=sql_literal(case.source))
+        q = q.format(n=max(n, 1), half=max(n // 2, 1), most=max(n - 1, 1), source=sql_literal(case.source))
         out = os.path.join(workdir, name + ".csv")
         if os.path.exists(out):
             os.remove(out)
@@ -332,6 +335,32 @@ def compare_partition(chk, case, name, got, expected_sets, ids_are_min_rowid=Tru
     chk.ok(name)
 
 
+def sampled_betweenness(g, sources, normalized, directed):
+    """networkx.betweenness_centrality's computation for a given set of sampled sources."""
+    from networkx.algorithms.centrality.betweenness import (_accumulate_basic, _rescale,
+                                                            _single_source_shortest_path_basic)
+    bc = dict.fromkeys(g, 0.0)
+    for s in sources:
+        S, P, sigma, _ = _single_source_shortest_path_basic(g, s)
+        bc, _ = _accumulate_basic(bc, S, P, sigma, s)
+    return _rescale(bc, len(g), normalized=normalized, directed=directed, k=len(sources), endpoints=False,
+                    sampled_nodes=sources)
+
+
+def check_sampled_betweenness(chk, case, name, got, g, normalized, directed):
+    """k = n - 1: the result must equal networkx's estimator for the sources without some one vertex."""
+    if got is None:
+        chk.fail(case, name, "no result (query failed)")
+        return
+    rows = {k: num(v) for k, v in got[1].items()}
+    for left_out in case.keys:
+        want = sampled_betweenness(g, [x for x in case.keys if x != left_out], normalized, directed)
+        if all(abs(rows[k] - want[k]) <= 1e-9 for k in case.keys):
+            chk.ok(name)
+            return
+    chk.fail(case, name, "no choice of the left-out source reproduces networkx's sampled estimator")
+
+
 def modularity_of(g, groups):
     return nx.community.modularity(g, groups) if g.number_of_edges() else 0.0
 
@@ -412,6 +441,11 @@ def check_case(chk, case, workdir, only, log):
                 chk.fail(case, "betweenness_centrality_k", "same seed gave different results")
             else:
                 chk.ok("betweenness_centrality_k_deterministic")
+            if 3 < n <= 80:
+                check_sampled_betweenness(chk, case, "betweenness_centrality_k_most", res["betweenness_centrality_k_most"],
+                                          dg, True, True)
+                check_sampled_betweenness(chk, case, "betweenness_centrality_k_most_undirected_raw",
+                                          res["betweenness_centrality_k_most_undirected_raw"], ug, False, False)
     if "k_core" in only:
         compare_values(chk, case, "k_core", res["k_core"], nx.core_number(case.graph()))
     if "degree" in only:
