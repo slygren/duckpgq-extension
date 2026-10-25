@@ -45,6 +45,7 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckpgq/core/utils/materialized_result.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 
 #include <chrono>
 #include "duckdb/parser/keyword_helper.hpp"
@@ -5969,6 +5970,35 @@ public:
 		                                           Table(*witness), Table(*tc)));
 	}
 
+	// The type of a table's column, or INVALID when it cannot be looked up. (Here because this is the one object
+	// the expansion builder gets that carries the ClientContext.)
+	LogicalType ColumnType(const string &catalog, const string &schema, const string &table, const string &column) {
+		try {
+			const string catalog_name = catalog.empty() ? PGQStr(DatabaseManager::GetDefaultDatabase(context)) : catalog;
+			const string schema_name = schema.empty() ? string(DEFAULT_SCHEMA) : schema;
+			auto entry = Catalog::GetEntry<TableCatalogEntry>(
+			    context, QualifiedName(Identifier(catalog_name), Identifier(schema_name), Identifier(table)),
+			    OnEntryNotFound::RETURN_NULL);
+			if (!entry || !entry->ColumnExists(Identifier(column))) {
+				return LogicalType::INVALID;
+			}
+			return entry->GetColumn(Identifier(column)).Type();
+		} catch (...) {
+			return LogicalType::INVALID;
+		}
+	}
+
+	// The type a UNION ALL gives a column whose branches have these two types.
+	LogicalType UnionType(const LogicalType &left, const LogicalType &right) {
+		return LogicalType::ForceMaxLogicalType(context, left, right);
+	}
+
+	// Whether `left IN (SELECT <right>)` binds.
+	bool InComparable(const LogicalType &left, const LogicalType &right) {
+		LogicalType compare_type;
+		return LogicalType::TryGetMaxLogicalType(context, left, right, compare_type);
+	}
+
 	// No pair of the closure is reachable at two depths, so its rows are already one per pair -- what ANY / ALL
 	// SHORTEST need, without grouping. |tc| = |tc_witness| (one row per pair), two metadata counts.
 	bool OneDepthPerPair(const PGQPathTableInfo &tc) {
@@ -7845,6 +7875,122 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 	// lookups, rather than lookups added alongside unchanged traversal.
 	if (recursion_limit == 0 && !direct_selects.empty()) {
 		return select_paths(JoinSQLUnionAll(direct_selects));
+	}
+
+	// ── The expansion, unrolled by depth and frontier label ───────────────────────────────────────────────────
+	// One CTE per (depth, label) holding the paths of that length that end at a vertex of that label, each step a
+	// UNION ALL of one join per edge family leaving the label. Against the recursive form below this does two
+	// things for a seeded expansion over many families (the served lake: ~80 families, ~38M edge rows):
+	//   - a family is read only at the depths where its source label is on the frontier, not at every iteration;
+	//   - its artifact is joined on its own v0. The recursive form joins one UNION ALL of every family, whose v0
+	//     is cast to the families' common type -- which kept the frontier's keys from pruning those scans, so
+	//     several families were read whole at every step.
+	// The answer is the recursive form's, value for value: each step computes what the recursive step computes
+	// for that family -- v0 / v1 as the UNION ALL of all families types them, dst_id cast to the source key's type
+	// (a recursive CTE takes its types from its anchor) -- and the cast on v0 is left out only where it is the
+	// identity. It is used when every type it needs can be looked up; otherwise the recursive form answers.
+	string unrolled_query;
+	{
+		const LogicalType src_type = exactness.ColumnType(PGQStr(src_table->catalog_name), PGQStr(src_table->schema_name),
+		                                                  PGQStr(src_table->table_name), src_pk_out);
+		bool types_known = src_type.id() != LogicalTypeId::INVALID;
+		// Every family's v0 / v1 type, and the types the recursive form's UNION ALL of all of them gives those columns.
+		vector<std::pair<LogicalType, LogicalType>> family_types;
+		LogicalType union_v0 = LogicalType::INVALID;
+		LogicalType union_v1 = LogicalType::INVALID;
+		for (idx_t i = 0; i < edge_tables.size() && types_known; i++) {
+			const auto &edge_table = edge_tables[i];
+			const LogicalType v0_type =
+			    exactness.ColumnType(edge_table.catalog_name, edge_table.schema_name, edge_table.table_name, "v0");
+			const LogicalType v1_type =
+			    exactness.ColumnType(edge_table.catalog_name, edge_table.schema_name, edge_table.table_name, "v1");
+			if (v0_type.id() == LogicalTypeId::INVALID || v1_type.id() == LogicalTypeId::INVALID) {
+				types_known = false;
+				break;
+			}
+			family_types.emplace_back(v0_type, v1_type);
+			union_v0 = i == 0 ? v0_type : exactness.UnionType(union_v0, v0_type);
+			union_v1 = i == 0 ? v1_type : exactness.UnionType(union_v1, v1_type);
+		}
+		// The recursive form semi-joins v0 IN (SELECT dst_id); where that does not bind, it fails, and so must this.
+		if (types_known && !edge_tables.empty() && !exactness.InComparable(union_v0, src_type)) {
+			types_known = false;
+		}
+		case_insensitive_map_t<string> frontier;
+		frontier[canonical_src_label] = "__pgq_x0_0";
+		vector<string> ctes;
+		ctes.push_back(StringUtil::Format(
+		    "__pgq_x0_0 AS MATERIALIZED (SELECT %s::VARCHAR AS dst_label, s.%s AS src_id, s.%s AS dst_id, 0 AS depth, "
+		    "list_value(CAST(s.%s AS VARCHAR)) AS path_vertices, list_value(%s::VARCHAR) AS path_vertex_labels, "
+		    "[]::VARCHAR[] AS path_edge_labels, list_value(%s::VARCHAR || ':' || CAST(s.%s AS VARCHAR)) AS "
+		    "path_participants FROM %s s%s)",
+		    src_label_sql, src_pk, src_pk, src_pk, src_label_sql, src_label_sql, src_pk, src_table_name, seed_where));
+		vector<string> all_ctes {"__pgq_x0_0"};
+		for (idx_t depth = 1; depth <= recursion_limit && types_known && !frontier.empty(); depth++) {
+			case_insensitive_map_t<vector<string>> branches;
+			case_insensitive_map_t<string> next;
+			idx_t label_index = 0;
+			for (idx_t i = 0; i < edge_tables.size(); i++) {
+				const auto &edge_table = edge_tables[i];
+				auto source = frontier.find(edge_table.src_label);
+				if (source == frontier.end()) {
+					continue;
+				}
+				const string v0 = family_types[i].first == union_v0
+				                      ? string("a.v0")
+				                      : "CAST(a.v0 AS " + union_v0.ToString() + ")";
+				const string v1 = family_types[i].second == union_v1
+				                      ? string("a.v1")
+				                      : "CAST(a.v1 AS " + union_v1.ToString() + ")";
+				const string dst_sql = KeywordHelper::WriteQuoted(edge_table.dst_label, '\'');
+				const string artifact = QualifiedTableName(edge_table.catalog_name, edge_table.schema_name,
+				                                           edge_table.table_name);
+				branches[edge_table.dst_label].push_back(StringUtil::Format(
+				    "SELECT %s::VARCHAR AS dst_label, c.src_id, CAST(%s AS %s) AS dst_id, c.depth + 1 AS depth, "
+				    "list_append(c.path_vertices, CAST(%s AS VARCHAR)) AS path_vertices, "
+				    "list_append(c.path_vertex_labels, %s::VARCHAR) AS path_vertex_labels, "
+				    "list_append(c.path_edge_labels, %s::VARCHAR) AS path_edge_labels, "
+				    "list_append(c.path_participants, %s::VARCHAR || ':' || CAST(%s AS VARCHAR)) AS path_participants "
+				    "FROM %s c JOIN %s a ON %s = c.dst_id "
+				    "WHERE NOT list_contains(c.path_participants, %s::VARCHAR || ':' || CAST(%s AS VARCHAR))",
+				    dst_sql, v1, src_type.ToString(), v1, dst_sql,
+				    KeywordHelper::WriteQuoted(edge_table.edge_label, '\''), dst_sql, v1, source->second, artifact, v0,
+				    dst_sql, v1));
+				if (!next.count(edge_table.dst_label)) {
+					next[edge_table.dst_label] = "__pgq_x" + std::to_string(depth) + "_" + std::to_string(label_index++);
+				}
+			}
+			for (auto &entry : next) {
+				ctes.push_back(entry.second + " AS MATERIALIZED (" + StringUtil::Join(branches[entry.first], " UNION ALL ") +
+				               ")");
+				all_ctes.push_back(entry.second);
+			}
+			frontier = std::move(next);
+		}
+		if (types_known) {
+			vector<string> parts;
+			for (const auto &cte : all_ctes) {
+				parts.push_back("SELECT dst_label, src_id, dst_id, depth, path_vertices, path_vertex_labels, "
+				                "path_edge_labels, path_participants FROM " +
+				                cte);
+			}
+			unrolled_query = StringUtil::Format(
+			    "WITH %s, __pgq_ctx AS (%s) %s "
+			    "SELECT c.src_id AS v0, c.dst_id AS v1, "
+			    "       c.dst_label AS __pgq_dst_label, "
+			    "       c.depth AS __pgq_path_length, "
+			    "       c.path_vertices AS __pgq_path_vertices, "
+			    "       c.path_vertex_labels AS __pgq_vertex_labels, "
+			    "       c.path_edge_labels AS __pgq_edge_labels%s "
+			    "FROM __pgq_ctx c "
+			    "WHERE %s%s",
+			    StringUtil::Join(ctes, ", "), StringUtil::Join(parts, " UNION ALL "), vertex_properties_cte,
+			    vertex_properties_select, final_filter,
+			    direct_selects.empty() ? string() : " UNION ALL " + JoinSQLUnionAll(direct_selects));
+		}
+	}
+	if (!unrolled_query.empty()) {
+		return select_paths(unrolled_query);
 	}
 
 	// path_vertices is VARCHAR[] by construction, matching the direct scans above: a path
