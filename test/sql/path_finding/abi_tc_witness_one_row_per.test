@@ -17,8 +17,11 @@ INSERT INTO tag VALUES (10, 'A'), (20, 'B'), (30, 'C');
 statement ok
 CREATE TABLE parent(src INTEGER, dst INTEGER, since INTEGER);
 
+# A hierarchy: C <- B <- A. (This fixture used to add a direct A -> C edge that its hand-made artifacts did
+# not reflect, which only "worked" while the chain rewrite reported one chain per source instead of every
+# path.)
 statement ok
-INSERT INTO parent VALUES (10, 30, 2019), (10, 20, 2020), (20, 30, 2021);
+INSERT INTO parent VALUES (10, 20, 2020), (20, 30, 2021);
 
 statement ok
 CREATE SCHEMA graph;
@@ -34,7 +37,8 @@ CREATE TABLE graph.__pg_test_graph__custom_tc_witness(
 statement ok
 INSERT INTO graph.__pg_test_graph__custom_tc_witness VALUES
     (10, 20, 1, [10, 20]),
-    (10, 30, 2, [10, 20, 30]);
+    (10, 30, 2, [10, 20, 30]),
+    (20, 30, 1, [20, 30]);
 
 statement ok
 CREATE TABLE graph.__pg_test_graph__custom_tc_chain(
@@ -46,7 +50,8 @@ CREATE TABLE graph.__pg_test_graph__custom_tc_chain(
 
 statement ok
 INSERT INTO graph.__pg_test_graph__custom_tc_chain VALUES
-    (10, 30, 2, [10, 20, 30]);
+    (10, 30, 2, [10, 20, 30]),
+    (20, 30, 1, [20, 30]);
 
 statement ok
 CREATE TABLE graph.__pgq_path_catalog AS
@@ -66,7 +71,10 @@ SELECT
     true AS is_sorted_by_v0,
     (SELECT min(depth) FROM graph.__pg_test_graph__custom_tc_witness) AS min_depth,
     (SELECT max(depth) FROM graph.__pg_test_graph__custom_tc_witness) AS max_depth,
-    'parent' AS bridge_table_names
+    'parent' AS bridge_table_names,
+    -- Declared exact: one path per pair, and every path from a source is a prefix of its chain. Without it
+    -- the binder may not substitute these artifacts for the traversal of walk patterns.
+    true AS preserves_multiplicity
 UNION ALL
 SELECT
     'test_graph' AS graph_name,
@@ -84,7 +92,8 @@ SELECT
     true AS is_sorted_by_v0,
     (SELECT min(depth) FROM graph.__pg_test_graph__custom_tc_chain) AS min_depth,
     (SELECT max(depth) FROM graph.__pg_test_graph__custom_tc_chain) AS max_depth,
-    'parent' AS bridge_table_names;
+    'parent' AS bridge_table_names,
+    true AS preserves_multiplicity;
 
 statement ok
 CREATE TABLE selected_tag(id INTEGER);
@@ -116,9 +125,9 @@ FROM GRAPH_TABLE (
 A	2020	B
 B	2021	C
 
-# Named recursive chain paths should use the ABI chain table directly for
-# path functions instead of falling back to recursive SQL.
-query II
+# Named recursive chain paths are answered from the chain table: every prefix of the chain is a path, as
+# in the traversal (it used to return only the longest one).
+query II rowsort
 FROM GRAPH_TABLE (
     test_graph
     MATCH p = (a:Tag)-[e:HasParent]->{1,3}(b:Tag)
@@ -126,7 +135,13 @@ FROM GRAPH_TABLE (
     COLUMNS (path_length(p) AS depth, vertices(p) AS vertex_ids)
 );
 ----
+1	[10, 20]
 2	[10, 20, 30]
+
+query T
+SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+tc_chain_named_path
 
 # If the destination endpoint is constrained, use tc_witness so the path is
 # reconstructed to that specific endpoint rather than the deepest chain target.
@@ -140,8 +155,8 @@ FROM GRAPH_TABLE (
 ----
 1	[10, 20]
 
-# With no destination endpoint filter, tc_chain emits the selected hierarchy chain once,
-# rather than ONE ROW PER STEP over every prefix endpoint path.
+# With no destination endpoint filter, ONE ROW PER STEP covers every path from the source: A->B, and
+# A->B->C. (tc_chain used to emit the longest chain once, which dropped the shorter path's step.)
 query II rowsort
 FROM GRAPH_TABLE (
     test_graph
@@ -151,6 +166,7 @@ FROM GRAPH_TABLE (
     COLUMNS (v1.name AS src, v2.name AS dst)
 );
 ----
+A	B
 A	B
 B	C
 
@@ -166,6 +182,7 @@ FROM GRAPH_TABLE (
 );
 ----
 10	20
+10	20
 20	30
 
 # Scalar subqueries on key columns should still qualify for the key-only chain
@@ -179,6 +196,7 @@ FROM GRAPH_TABLE (
     COLUMNS (v1.id AS src, v2.id AS dst)
 );
 ----
+10	20
 10	20
 20	30
 
@@ -195,3 +213,23 @@ FROM GRAPH_TABLE (
 ----
 A	2020	B
 B	2021	C
+
+# Each shape gives the traversal's rows
+query TT
+SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (test_graph MATCH (a:Tag)-[e:HasParent]->{1,3}(b:Tag)
+    ONE ROW PER STEP (v1, step_e, v2) WHERE a.id = 10 COLUMNS (v1.name AS src, v2.name AS dst))');
+----
+match	true
+
+query TT
+SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (test_graph MATCH (a:Tag)-[e:HasParent]->{1,3}(b:Tag)
+    ONE ROW PER STEP (v1, step_e, v2) WHERE a.name = ''A'' AND b.name = ''C''
+    COLUMNS (v1.name AS src, step_e.since AS since, v2.name AS dst))');
+----
+match	true
+
+query TT
+SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (test_graph MATCH p = (a:Tag)-[e:HasParent]->{1,3}(b:Tag)
+    WHERE a.id = 10 COLUMNS (b.id AS b, path_length(p) AS depth))');
+----
+match	true

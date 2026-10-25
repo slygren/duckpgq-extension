@@ -5443,6 +5443,63 @@ static unique_ptr<CommonTableExpressionInfo> BuildORPStepsCTE(OneRowPerMode mode
 	return cte_info;
 }
 
+//! Which paths a quantified pattern asks for. The closure and expansion routes answer some of these
+//! exactly and others not at all, so each route is chosen per selector, never assumed.
+enum class PGQPathSelector : uint8_t { WALK, ANY_SHORTEST, ALL_SHORTEST, CHEAPEST };
+
+static PGQPathSelector PatternSelector(const PathPattern &pattern) {
+	if (pattern.cheapest) {
+		return PGQPathSelector::CHEAPEST;
+	}
+	if (pattern.shortest) {
+		return pattern.all ? PGQPathSelector::ALL_SHORTEST : PGQPathSelector::ANY_SHORTEST;
+	}
+	return PGQPathSelector::WALK;
+}
+
+// Can a closure artifact (tc, tc_witness) answer a {lower,upper} pattern over its edge?
+//
+// The traversal returns simple paths: no vertex twice, never back to the start. A closure holds
+// less than that. tc keeps one row per (v0, v1, depth) and tc_witness one shortest path per
+// (v0, v1), both over walks that may revisit vertices. preserves_multiplicity is the build-time
+// proof that for this graph they lose nothing: the edge is acyclic, the depth cap was never
+// reached, and every row is exactly one path (see AddClosure in abi_build.cpp). Without it the
+// only answerable shape is ANY SHORTEST from depth 1: a shortest walk never repeats a vertex, so
+// the closure's least depth per pair is the traversal's answer, as long as the artifact reaches
+// the upper bound.
+static bool ClosureAnswers(const PGQPathTableInfo &info, PGQPathSelector selector, int64_t lower, int64_t upper) {
+	if (selector == PGQPathSelector::CHEAPEST || lower < 1) {
+		return false;
+	}
+	if (info.preserves_multiplicity) {
+		return true;
+	}
+	return selector == PGQPathSelector::ANY_SHORTEST && lower <= 1 && info.max_depth > 0 && upper <= info.max_depth;
+}
+
+// tc_chain keeps only the longest chain from each source. It can answer a pattern only when every
+// path from a source is a prefix of that chain, which the build proves (out-degree <= 1, acyclic,
+// complete) in preserves_multiplicity. Every selector then coincides: each pair has one path.
+static bool ChainAnswers(const PGQPathTableInfo &info, PGQPathSelector selector, int64_t lower) {
+	return info.preserves_multiplicity && selector != PGQPathSelector::CHEAPEST && lower >= 1;
+}
+
+// A path mode (TRAIL, ACYCLIC, ...) or a COST on any element changes which paths match; the
+// artifact routes implement neither, so such patterns are left to the traversal.
+static bool PatternHasPathModeOrCost(const vector<unique_ptr<PathReference>> &path_list) {
+	for (const auto &reference : path_list) {
+		if (reference->path_reference_type != PGQPathReferenceType::SUBPATH) {
+			continue;
+		}
+		auto &subpath = reinterpret_cast<const SubPath &>(*reference);
+		if ((subpath.path_mode != PGQPathMode::NONE && subpath.path_mode != PGQPathMode::WALK) || subpath.cost_expr ||
+		    PatternHasPathModeOrCost(subpath.path_list)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static void AddTCWitnessORPCTE(unique_ptr<SelectNode> &select_node, const PGQPathTableInfo &witness_info,
                                const shared_ptr<PropertyGraphTable> &vertex_table,
                                const shared_ptr<PropertyGraphTable> &edge_table,
@@ -5462,7 +5519,8 @@ static void AddTCWitnessORPCTE(unique_ptr<SelectNode> &select_node, const PGQPat
 	const string edge_src_fk = KeywordHelper::WriteOptionallyQuoted(PGQStr(edge_table->source_fk[0]));
 	const string edge_dst_fk = KeywordHelper::WriteOptionallyQuoted(PGQStr(edge_table->destination_fk[0]));
 
-	string depth_filter = "w.depth >= " + std::to_string(static_cast<int64_t>(lower));
+	// Never a pair that only closes a cycle: the traversal does not return to its start.
+	string depth_filter = "w.v0 <> w.v1 AND w.depth >= " + std::to_string(static_cast<int64_t>(lower));
 	if (upper < static_cast<idx_t>(1 << 30)) {
 		depth_filter += " AND w.depth <= " + std::to_string(static_cast<int64_t>(upper));
 	}
@@ -5470,10 +5528,13 @@ static void AddTCWitnessORPCTE(unique_ptr<SelectNode> &select_node, const PGQPat
 		depth_filter += " AND " + filter;
 	}
 
+	// min() keeps one edge row id per position: an edge is found by its endpoints, and a bridge
+	// holding the pair twice would otherwise put both into the path.
 	const string query = StringUtil::Format(
 	    "SELECT v0, v1, list(path_rowid ORDER BY pos) AS path, "
 	    "       any_value(src_rowid) AS src_rowid, any_value(dst_rowid) AS dst_rowid "
-	    "FROM ("
+	    "FROM (SELECT v0, v1, pos, min(path_rowid) AS path_rowid, any_value(src_rowid) AS src_rowid, "
+	    "             any_value(dst_rowid) AS dst_rowid FROM ("
 	    "  SELECT w.v0, w.v1, 2 * u.ord - 1 AS pos, v.rowid AS path_rowid, "
 	    "         sv.rowid AS src_rowid, dv.rowid AS dst_rowid "
 	    "  FROM %s w "
@@ -5492,7 +5553,7 @@ static void AddTCWitnessORPCTE(unique_ptr<SelectNode> &select_node, const PGQPat
 	    "  JOIN %s e ON e.%s = u.vertex_key "
 	    "            AND e.%s = list_extract(w.path_vertices, u.ord + 1) "
 	    "  WHERE %s AND u.ord < list_count(w.path_vertices)"
-	    ") path_rows "
+	    ") path_rows GROUP BY v0, v1, pos) positions "
 	    "GROUP BY v0, v1",
 	    witness_table, vertex_table_name, vertex_pk, vertex_table_name, vertex_pk,
 	    vertex_table_name, vertex_pk, depth_filter,
@@ -5580,26 +5641,26 @@ static void AddTCChainORPCTE(unique_ptr<SelectNode> &select_node, const PGQPathT
 		chain_from = filtered_chain_cte_name + " c";
 	}
 
-	string edge_upper_expr = "c.depth";
-	string vertex_upper_expr = "c.depth + 1";
-	if (upper < static_cast<idx_t>(1 << 30)) {
-		edge_upper_expr = "LEAST(c.depth, " + std::to_string(static_cast<int64_t>(upper)) + ")";
-		vertex_upper_expr = "LEAST(c.depth + 1, " + std::to_string(static_cast<int64_t>(upper + 1)) + ")";
-	}
-	const string dst_key_expr = "list_extract(c.path_vertices, " + vertex_upper_expr + ")";
+	// Only reached when the build proved every path from a source to be a prefix of its chain
+	// (ChainAnswers). So the paths are the chain's prefixes of length lower..upper, one per end
+	// vertex -- not, as before, the single longest prefix, which dropped every shorter path.
+	const string longest_prefix =
+	    upper < static_cast<idx_t>(1 << 30) ? "LEAST(c.depth, " + std::to_string(static_cast<int64_t>(upper)) + ")"
+	                                        : string("c.depth");
 	const string step_lower_str = std::to_string(static_cast<int64_t>(step_lower));
+	const string prefixes = StringUtil::Format(
+	    "SELECT c.v0, c.path_vertices, unnest(range(%s, %s + 1)) AS k FROM %s WHERE %s", step_lower_str,
+	    longest_prefix, chain_from, base_filter);
 
 	const string key_steps_query = local_with_prefix + StringUtil::Format(
-	    "SELECT row_number() OVER () AS __orp_step_id, * "
+	    "SELECT row_number() OVER () AS __orp_step_id, __orp_src_key, __orp_dst_key, "
+	    "       list_extract(pv, ord) AS __orp_v1_key, list_extract(pv, ord + 1) AS __orp_v2_key "
 	    "FROM ("
-	    "  SELECT c.v0 AS __orp_src_key, %s AS __orp_dst_key, "
-	    "         u.vertex_key AS __orp_v1_key, "
-	    "         list_extract(c.path_vertices, u.ord + 1) AS __orp_v2_key "
-	    "  FROM %s "
-	    "  CROSS JOIN unnest(c.path_vertices) WITH ORDINALITY AS u(vertex_key, ord) "
-	    "  WHERE %s AND u.ord >= %s AND u.ord <= %s"
+	    "  SELECT p.v0 AS __orp_src_key, list_extract(p.path_vertices, p.k + 1) AS __orp_dst_key, "
+	    "         p.path_vertices AS pv, unnest(range(1, p.k + 1)) AS ord "
+	    "  FROM (%s) p"
 	    ") key_steps",
-	    dst_key_expr, chain_from, base_filter, step_lower_str, edge_upper_expr);
+	    prefixes);
 	auto key_steps_info = make_uniq<CommonTableExpressionInfo>();
 	key_steps_info->query_node = std::move(ParseSelectStatement(key_steps_query)->node);
 	key_steps_info->materialized = CTEMaterialize::CTE_MATERIALIZE_ALWAYS;
@@ -5609,36 +5670,38 @@ static void AddTCChainORPCTE(unique_ptr<SelectNode> &select_node, const PGQPathT
 		return;
 	}
 
+	// The interleaved [vertex, edge, vertex, ...] row ids of each prefix. An edge is found by its
+	// endpoints; min() keeps one row id per position should the bridge hold the pair twice.
 	const string query = local_with_prefix + StringUtil::Format(
 	    "SELECT v0, v1, list(path_rowid ORDER BY pos) AS path, "
 	    "       any_value(src_rowid) AS src_rowid, any_value(dst_rowid) AS dst_rowid "
 	    "FROM ("
-	    "  SELECT c.v0, %s AS v1, 2 * (u.ord - %s) + 1 AS pos, v.rowid AS path_rowid, "
-	    "         sv.rowid AS src_rowid, dv.rowid AS dst_rowid "
-	    "  FROM %s "
-	    "  JOIN %s sv ON sv.%s = c.v0 "
-	    "  JOIN %s dv ON dv.%s = %s "
-	    "  CROSS JOIN unnest(c.path_vertices) WITH ORDINALITY AS u(vertex_key, ord) "
-	    "  JOIN %s v ON v.%s = u.vertex_key "
-	    "  WHERE %s AND u.ord >= %s AND u.ord <= %s "
-	    "  UNION ALL "
-	    "  SELECT c.v0, %s AS v1, 2 * (u.ord - %s + 1) AS pos, e.rowid AS path_rowid, "
-	    "         sv.rowid AS src_rowid, dv.rowid AS dst_rowid "
-	    "  FROM %s "
-	    "  JOIN %s sv ON sv.%s = c.v0 "
-	    "  JOIN %s dv ON dv.%s = %s "
-	    "  CROSS JOIN unnest(c.path_vertices) WITH ORDINALITY AS u(vertex_key, ord) "
-	    "  JOIN %s e ON e.%s = u.vertex_key "
-	    "            AND e.%s = list_extract(c.path_vertices, u.ord + 1) "
-	    "  WHERE %s AND u.ord >= %s AND u.ord <= %s"
-	    ") path_rows "
+	    "  SELECT v0, v1, pos, min(path_rowid) AS path_rowid, any_value(src_rowid) AS src_rowid, "
+	    "         any_value(dst_rowid) AS dst_rowid "
+	    "  FROM ("
+	    "    SELECT s.v0, s.v1, 2 * s.ord - 1 AS pos, v.rowid AS path_rowid, sv.rowid AS src_rowid, "
+	    "           dv.rowid AS dst_rowid "
+	    "    FROM (SELECT p.v0, list_extract(p.path_vertices, p.k + 1) AS v1, p.path_vertices, p.k, "
+	    "                 unnest(range(1, p.k + 2)) AS ord FROM (%s) p) s "
+	    "    JOIN %s sv ON sv.%s = s.v0 "
+	    "    JOIN %s dv ON dv.%s = s.v1 "
+	    "    JOIN %s v ON v.%s = list_extract(s.path_vertices, s.ord) "
+	    "    UNION ALL "
+	    "    SELECT s.v0, s.v1, 2 * s.ord AS pos, e.rowid AS path_rowid, sv.rowid AS src_rowid, "
+	    "           dv.rowid AS dst_rowid "
+	    "    FROM (SELECT p.v0, list_extract(p.path_vertices, p.k + 1) AS v1, p.path_vertices, p.k, "
+	    "                 unnest(range(1, p.k + 1)) AS ord FROM (%s) p) s "
+	    "    JOIN %s sv ON sv.%s = s.v0 "
+	    "    JOIN %s dv ON dv.%s = s.v1 "
+	    "    JOIN %s e ON e.%s = list_extract(s.path_vertices, s.ord) "
+	    "              AND e.%s = list_extract(s.path_vertices, s.ord + 1)"
+	    "  ) path_rows "
+	    "  GROUP BY v0, v1, pos"
+	    ") positions "
 	    "GROUP BY v0, v1",
-	    dst_key_expr, step_lower_str,
-	    chain_from, vertex_table_name, vertex_pk, vertex_table_name, vertex_pk, dst_key_expr,
-	    vertex_table_name, vertex_pk, base_filter, step_lower_str, vertex_upper_expr,
-	    dst_key_expr, step_lower_str,
-	    chain_from, vertex_table_name, vertex_pk, vertex_table_name, vertex_pk, dst_key_expr,
-	    edge_table_name, edge_src_fk, edge_dst_fk, base_filter, step_lower_str, edge_upper_expr);
+	    prefixes, vertex_table_name, vertex_pk, vertex_table_name, vertex_pk, vertex_table_name, vertex_pk,
+	    prefixes, vertex_table_name, vertex_pk, vertex_table_name, vertex_pk, edge_table_name, edge_src_fk,
+	    edge_dst_fk);
 
 	auto chain_cte_info = make_uniq<CommonTableExpressionInfo>();
 	chain_cte_info->query_node = std::move(ParseSelectStatement(query)->node);
@@ -5691,20 +5754,16 @@ static unique_ptr<TableRef> BuildTCChainNamedPathRef(const PGQPathTableInfo &cha
 	const idx_t step_lower = std::max<idx_t>(1, lower);
 	const string base_filter = BuildSQLFilter("c.depth >= " + std::to_string(static_cast<int64_t>(step_lower)),
 	                                          endpoint_filters);
-
-	string selected_depth_expr = "c.depth";
-	if (upper < static_cast<idx_t>(1 << 30)) {
-		selected_depth_expr = "LEAST(c.depth, " + std::to_string(static_cast<int64_t>(upper)) + ")";
-	}
-	const string vertex_upper_expr = "(" + selected_depth_expr + " + 1)";
+	// Every prefix of the chain within the bounds is a path (see AddTCChainORPCTE).
+	const string longest_prefix =
+	    upper < static_cast<idx_t>(1 << 30) ? "LEAST(c.depth, " + std::to_string(static_cast<int64_t>(upper)) + ")"
+	                                        : string("c.depth");
 	const string query = StringUtil::Format(
-	    "SELECT c.v0, list_extract(c.path_vertices, %s) AS v1, "
-	    "       %s AS __pgq_path_length, "
-	    "       list_slice(c.path_vertices, 1, %s) AS __pgq_path_vertices, %s "
-	    "FROM %s c "
-	    "WHERE %s",
-	    vertex_upper_expr, selected_depth_expr, vertex_upper_expr,
-	    TCNamedPathLabelColumns(selected_depth_expr, vertex_label, edge_label), chain_table, base_filter);
+	    "SELECT p.v0, list_extract(p.path_vertices, p.k + 1) AS v1, p.k AS __pgq_path_length, "
+	    "       list_slice(p.path_vertices, 1, p.k + 1) AS __pgq_path_vertices, %s "
+	    "FROM (SELECT c.v0, c.path_vertices, unnest(range(%s, %s + 1)) AS k FROM %s c WHERE %s) p",
+	    TCNamedPathLabelColumns("p.k", vertex_label, edge_label), std::to_string(static_cast<int64_t>(step_lower)),
+	    longest_prefix, chain_table, base_filter);
 
 	return make_uniq<SubqueryRef>(ParseSelectStatement(query), PGQId(path_alias));
 }
@@ -5715,7 +5774,8 @@ static unique_ptr<TableRef> BuildTCWitnessNamedPathRef(const PGQPathTableInfo &w
                                                        const string &vertex_label, const string &edge_label) {
 	const string witness_table = QualifiedTableName(witness_info.catalog_name, witness_info.schema_name,
 	                                                witness_info.table_name);
-	string base_filter = "w.depth >= " + std::to_string(static_cast<int64_t>(std::max<idx_t>(1, lower)));
+	// Never a pair that only closes a cycle: the traversal does not return to its start.
+	string base_filter = "w.v0 <> w.v1 AND w.depth >= " + std::to_string(static_cast<int64_t>(std::max<idx_t>(1, lower)));
 	if (upper < static_cast<idx_t>(1 << 30)) {
 		base_filter += " AND w.depth <= " + std::to_string(static_cast<int64_t>(upper));
 	}
@@ -6540,10 +6600,24 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
                                                         string &src_pk_out, string &dst_pk_out,
                                                         bool include_vertex_properties,
                                                         bool require_multiplicity_preserving,
-                                                        int64_t vl_fallback_budget) {
+                                                        int64_t vl_fallback_budget, PGQPathSelector selector) {
 	if (upper >= static_cast<idx_t>(1 << 30)) {
 		return nullptr;
 	}
+	// The expansion enumerates every simple path, exactly what the traversal walks. A selector then
+	// keeps a subset per endpoint pair: ANY SHORTEST one of the shortest, ALL SHORTEST all of them.
+	// Without this the shortest forms returned every walk.
+	auto select_paths = [&](const string &sql) -> unique_ptr<TableRef> {
+		string query = sql;
+		if (selector == PGQPathSelector::ANY_SHORTEST) {
+			query = "SELECT * FROM (" + sql + ") __pgq_ctx_paths QUALIFY row_number() OVER (PARTITION BY v0, "
+			        "__pgq_dst_label, v1 ORDER BY __pgq_path_length) = 1";
+		} else if (selector == PGQPathSelector::ALL_SHORTEST) {
+			query = "SELECT * FROM (" + sql + ") __pgq_ctx_paths QUALIFY __pgq_path_length = min(__pgq_path_length) "
+			        "OVER (PARTITION BY v0, __pgq_dst_label, v1)";
+		}
+		return make_uniq<SubqueryRef>(ParseSelectStatement(query), PGQId(path_alias));
+	};
 
 	struct ContextEdgeTable {
 		string src_label;
@@ -6874,17 +6948,26 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 			for (idx_t idx = 0; idx < artifact.hops; idx++) {
 				edge_label_list += (idx ? ", " : "") + KeywordHelper::WriteQuoted(artifact.edge_labels[idx], '\'');
 			}
+			// A k-hop artifact holds walks, which may pass a vertex twice; the recursion below (and
+			// the traversal) only ever extends to an unvisited vertex. Keep the simple paths only.
+			string participant_list;
+			for (idx_t idx = 0; idx <= artifact.hops; idx++) {
+				participant_list += (idx ? ", " : "") + KeywordHelper::WriteQuoted(artifact.vertex_labels[idx], '\'') +
+				                    " || ':' || CAST(a.v" + to_string(idx) + " AS VARCHAR)";
+			}
 			vector<string> artifact_filters;
 			PushConstraintToSQLFilter(where_constraints, src_binding, src_pk_out, "a.v0", artifact_filters);
 			if (artifact_filters.empty() && !src_key_semi_join.empty()) {
 				artifact_filters.push_back(src_key_semi_join);
 			}
+			if (artifact_filters.empty() && artifact.estimated_rows > 0) {
+				unanchored_direct_rows += artifact.estimated_rows;
+			}
+			artifact_filters.push_back("len(list_distinct([" + participant_list + "])) = " +
+			                           to_string(static_cast<int64_t>(artifact.hops + 1)));
 			string artifact_where;
 			for (idx_t idx = 0; idx < artifact_filters.size(); idx++) {
 				artifact_where += (idx ? " AND " : " WHERE ") + artifact_filters[idx];
-			}
-			if (artifact_filters.empty() && artifact.estimated_rows > 0) {
-				unanchored_direct_rows += artifact.estimated_rows;
 			}
 			direct_selects.push_back(StringUtil::Format(
 			    "SELECT a.v0 AS v0, a.%s AS v1, %s AS __pgq_dst_label, %s AS __pgq_path_length, "
@@ -7017,7 +7100,7 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 	// recursive CTE. This is the case the whole design exists for -- traversal replaced by
 	// lookups, rather than lookups added alongside unchanged traversal.
 	if (recursion_limit == 0 && !direct_selects.empty()) {
-		return make_uniq<SubqueryRef>(ParseSelectStatement(JoinSQLUnionAll(direct_selects)), PGQId(path_alias));
+		return select_paths(JoinSQLUnionAll(direct_selects));
 	}
 
 	// path_vertices is VARCHAR[] by construction, matching the direct scans above: a path
@@ -7072,7 +7155,7 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 	    std::to_string(static_cast<int64_t>(recursion_limit)), vertex_properties_cte, vertex_properties_select,
 	    final_filter, direct_selects.empty() ? string() : " UNION ALL " + JoinSQLUnionAll(direct_selects));
 
-	return make_uniq<SubqueryRef>(ParseSelectStatement(query), PGQId(path_alias));
+	return select_paths(query);
 }
 
 static bool ExpressionReferencesNonKeyColumn(const ParsedExpression *expr, const string &binding, const string &key) {
@@ -7219,7 +7302,8 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
                                  const ReferencedBindings &referenced_bindings,
                                  CoveredBindingMap &covered_columns,
                                  OneRowPerMode one_row_per_mode,
-                                 const ParsedExpression *where_hint = nullptr, bool any_shortest = false);
+                                 const ParsedExpression *where_hint = nullptr,
+                                 PGQPathSelector selector = PGQPathSelector::WALK);
 
 static unique_ptr<ParsedExpression> TryBuildBranchSummaryExistsSubquery(
     MatchExpression &inner_match, CreatePropertyGraphInfo &pg_table,
@@ -7348,7 +7432,7 @@ static unique_ptr<ParsedExpression> BuildExistsSubquery(
 		                         path_table_cache, referenced_bindings,
 		                         covered_columns,
 		                         inner_match.one_row_per,
-		                         inner_match.where_clause.get(), any_shortest)) {
+		                         inner_match.where_clause.get(), PatternSelector(*path_pattern))) {
 			if (require_abi_paths && PathPatternRequiresABIPath(path_pattern->path_elements)) {
 				ThrowABIPathRequired();
 			}
@@ -7902,7 +7986,8 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
                                  const ReferencedBindings &referenced_bindings,
                                  CoveredBindingMap &covered_columns,
                                  OneRowPerMode one_row_per_mode,
-                                 const ParsedExpression *where_hint, bool any_shortest) {
+                                 const ParsedExpression *where_hint, PGQPathSelector selector) {
+	const bool any_shortest = selector == PGQPathSelector::ANY_SHORTEST;
 	// Verification/diagnostic escape hatch: force the fallback traversal so
 	// pgq_verify_abi_rewrite() can compare the two paths.
 	if (DisableABIRewrite(context)) {
@@ -7965,277 +8050,304 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 				if (binding_is_referenced(tc_edge->variable_binding)) {
 					return false;
 				}
-				if (one_row_per_mode != OneRowPerMode::NONE) {
-					const string tc_witness_tname = "__pg_" + graph_name + "__tc_witness__" +
-					                                tc_src->label + "__" + tc_edge->label;
-					const PGQPathTableInfo *tc_witness_info =
-					    find_path_table(tc_witness_tname, "tc_witness", {tc_src->label, tc_dst->label},
-					                    {tc_edge->label});
-					if (!tc_witness_info) {
-						return false;
+				// The closures answer neither CHEAPEST nor a zero lower bound (they hold no empty
+				// path), and implement no path mode or COST: those go to the expansion or traversal.
+				const bool closure_shape = selector != PGQPathSelector::CHEAPEST && tc_sp->lower >= 1 &&
+				                           !PatternHasPathModeOrCost(path_elements);
+				if (closure_shape) {
+					if (one_row_per_mode != OneRowPerMode::NONE) {
+						const string tc_witness_tname = "__pg_" + graph_name + "__tc_witness__" +
+						                                tc_src->label + "__" + tc_edge->label;
+						const PGQPathTableInfo *tc_witness_info =
+						    find_path_table(tc_witness_tname, "tc_witness", {tc_src->label, tc_dst->label},
+						                    {tc_edge->label});
+						shared_ptr<PropertyGraphTable> vtable, etbl;
+						try {
+							vtable = ResolveTable(tc_src->label, PGQMatchType::MATCH_VERTEX, pg_table);
+							etbl = ResolveTable(tc_edge->label, PGQMatchType::MATCH_EDGE_RIGHT, pg_table);
+						} catch (...) {
+							return false;
+						}
+						if (etbl->source_pk.empty() || etbl->destination_pk.empty() ||
+						    etbl->source_fk.empty() || etbl->destination_fk.empty() ||
+						    etbl->source_pk[0] != etbl->destination_pk[0]) {
+							return false;
+						}
+						if (one_row_per_mode == OneRowPerMode::STEP &&
+						    !HasEqualityConstraint(where_constraints, tc_dst->variable_binding, PGQStr(etbl->destination_pk[0]))) {
+							const string tc_chain_tname = "__pg_" + graph_name + "__tc_chain__" +
+							                              tc_src->label + "__" + tc_edge->label;
+							const PGQPathTableInfo *tc_chain_info =
+							    find_path_table(tc_chain_tname, "tc_chain", {tc_src->label, tc_dst->label},
+							                    {tc_edge->label});
+							if (tc_chain_info && ChainAnswers(*tc_chain_info, selector, tc_sp->lower)) {
+								vector<string> endpoint_filters;
+								vector<MaterializedSQLFilter> materialized_endpoint_filters;
+								PushConstraintToTCChainFilter(where_constraints, tc_src->variable_binding,
+								                              PGQStr(etbl->source_pk[0]), "v0", endpoint_filters,
+								                              materialized_endpoint_filters);
+								if ((!endpoint_filters.empty() || !materialized_endpoint_filters.empty()) &&
+								    match_ref.where_clause) {
+									match_ref.where_clause = RemoveEndpointEqualityConjuncts(
+									    std::move(match_ref.where_clause),
+									    {{tc_src->variable_binding, PGQStr(etbl->source_pk[0])}});
+								}
+								case_insensitive_map_t<string> allowed_key_columns;
+								allowed_key_columns[tc_src->variable_binding] = PGQStr(etbl->source_pk[0]);
+								allowed_key_columns[tc_dst->variable_binding] = PGQStr(etbl->destination_pk[0]);
+								if (match_ref.one_row_per_vars.size() >= 3) {
+									allowed_key_columns[match_ref.one_row_per_vars[0]] = PGQStr(etbl->source_pk[0]);
+									allowed_key_columns[match_ref.one_row_per_vars[2]] = PGQStr(etbl->destination_pk[0]);
+								}
+								const bool key_only_chain =
+								    MatchOnlyUsesKeyColumns(match_ref, allowed_key_columns);
+								const bool batchable_chain =
+								    key_only_chain || !MatchContainsUnsupportedChainBatchExpression(match_ref);
+								AddTCChainORPCTE(select_node, *tc_chain_info, vtable, etbl, tc_sp->lower, tc_sp->upper,
+								                 endpoint_filters, materialized_endpoint_filters, !batchable_chain);
+								alias_map[tc_src->variable_binding] = vtable;
+								alias_map[tc_dst->variable_binding] = vtable;
+								auto diagnostic = MakeArtifactDiagnostic(
+								    graph_name, "tc_chain_one_row_per", "selected tc_chain artifact for ONE ROW PER STEP",
+								    *tc_chain_info, {tc_src->label, tc_dst->label}, {tc_edge->label}, "__tcc_orp",
+								    one_row_per_mode);
+								diagnostic.endpoint_filter_count =
+								    endpoint_filters.size() + materialized_endpoint_filters.size();
+								RecordRewriteDiagnostic(context, std::move(diagnostic));
+								return true;
+							}
+						}
+						if (!tc_witness_info ||
+						    !ClosureAnswers(*tc_witness_info, selector, tc_sp->lower, tc_sp->upper)) {
+							return false;
+						}
+						vector<string> endpoint_filters;
+						PushConstraintToSQLFilter(where_constraints, tc_src->variable_binding, PGQStr(etbl->source_pk[0]),
+						                          "w.v0", endpoint_filters);
+						PushConstraintToSQLFilter(where_constraints, tc_dst->variable_binding, PGQStr(etbl->destination_pk[0]),
+						                          "w.v1", endpoint_filters);
+						AddTCWitnessORPCTE(select_node, *tc_witness_info, vtable, etbl, tc_sp->lower, tc_sp->upper,
+						                   endpoint_filters);
+						alias_map[tc_src->variable_binding] = vtable;
+						alias_map[tc_dst->variable_binding] = vtable;
+						auto diagnostic = MakeArtifactDiagnostic(
+						    graph_name, "tc_witness_one_row_per", "selected tc_witness artifact for ONE ROW PER",
+						    *tc_witness_info, {tc_src->label, tc_dst->label}, {tc_edge->label}, "__tcw_orp",
+						    one_row_per_mode);
+						diagnostic.endpoint_filter_count = endpoint_filters.size();
+						RecordRewriteDiagnostic(context, std::move(diagnostic));
+						return true;
 					}
-					shared_ptr<PropertyGraphTable> vtable, etbl;
-					try {
-						vtable = ResolveTable(tc_src->label, PGQMatchType::MATCH_VERTEX, pg_table);
-						etbl = ResolveTable(tc_edge->label, PGQMatchType::MATCH_EDGE_RIGHT, pg_table);
-					} catch (...) {
-						return false;
-					}
-					if (etbl->source_pk.empty() || etbl->destination_pk.empty() ||
-					    etbl->source_fk.empty() || etbl->destination_fk.empty() ||
-					    etbl->source_pk[0] != etbl->destination_pk[0]) {
-						return false;
-					}
-					if (one_row_per_mode == OneRowPerMode::STEP &&
-					    !HasEqualityConstraint(where_constraints, tc_dst->variable_binding, PGQStr(etbl->destination_pk[0]))) {
+
+					if (one_row_per_mode == OneRowPerMode::NONE &&
+					    HasTopLevelNamedPathFunction(match_ref, named_path_variable)) {
+						const string tc_witness_tname = "__pg_" + graph_name + "__tc_witness__" +
+						                                tc_src->label + "__" + tc_edge->label;
+						const PGQPathTableInfo *tc_witness_info =
+						    find_path_table(tc_witness_tname, "tc_witness", {tc_src->label, tc_dst->label},
+						                    {tc_edge->label});
 						const string tc_chain_tname = "__pg_" + graph_name + "__tc_chain__" +
 						                              tc_src->label + "__" + tc_edge->label;
 						const PGQPathTableInfo *tc_chain_info =
 						    find_path_table(tc_chain_tname, "tc_chain", {tc_src->label, tc_dst->label},
 						                    {tc_edge->label});
-						if (tc_chain_info) {
+						shared_ptr<PropertyGraphTable> vtable, etbl;
+						try {
+							vtable = ResolveTable(tc_src->label, PGQMatchType::MATCH_VERTEX, pg_table);
+							etbl = ResolveTable(tc_edge->label, PGQMatchType::MATCH_EDGE_RIGHT, pg_table);
+						} catch (...) {
+							return false;
+						}
+						if (etbl->source_pk.empty() || etbl->destination_pk.empty() ||
+						    etbl->source_fk.empty() || etbl->destination_fk.empty() ||
+						    etbl->source_pk[0] != etbl->destination_pk[0]) {
+							return false;
+						}
+
+						const bool dst_key_constrained =
+						    HasEqualityConstraint(where_constraints, tc_dst->variable_binding, PGQStr(etbl->destination_pk[0]));
+						ReferencedBindings where_referenced_bindings;
+						CollectReferencedBindings(where_hint, where_referenced_bindings);
+						const bool dst_where_referenced =
+						    !tc_dst->variable_binding.empty() &&
+						    where_referenced_bindings.find(tc_dst->variable_binding) != where_referenced_bindings.end();
+						const bool chain_answers =
+						    tc_chain_info && ChainAnswers(*tc_chain_info, selector, tc_sp->lower);
+						const bool witness_answers =
+						    tc_witness_info && ClosureAnswers(*tc_witness_info, selector, tc_sp->lower, tc_sp->upper);
+						const bool use_witness =
+						    witness_answers && (dst_key_constrained || dst_where_referenced || !chain_answers);
+
+						// Neither closure is exact for this selector and bound: leave the pattern to the
+						// expansion over 1-hop artifacts below, or to the traversal.
+						if (use_witness || chain_answers) {
+							const string path_alias = "__pgq_named_path_" + to_string(extra_alias_counter++);
 							vector<string> endpoint_filters;
-							vector<MaterializedSQLFilter> materialized_endpoint_filters;
-							PushConstraintToTCChainFilter(where_constraints, tc_src->variable_binding,
-							                              PGQStr(etbl->source_pk[0]), "v0", endpoint_filters,
-							                              materialized_endpoint_filters);
-							if ((!endpoint_filters.empty() || !materialized_endpoint_filters.empty()) &&
-							    match_ref.where_clause) {
-								match_ref.where_clause = RemoveEndpointEqualityConjuncts(
-								    std::move(match_ref.where_clause),
-								    {{tc_src->variable_binding, PGQStr(etbl->source_pk[0])}});
+							const string table_prefix = use_witness ? "w." : "c.";
+							PushConstraintToSQLFilter(where_constraints, tc_src->variable_binding, PGQStr(etbl->source_pk[0]),
+							                          table_prefix + "v0", endpoint_filters);
+							if (use_witness) {
+								PushConstraintToSQLFilter(where_constraints, tc_dst->variable_binding, PGQStr(etbl->destination_pk[0]),
+								                          "w.v1", endpoint_filters);
 							}
-							case_insensitive_map_t<string> allowed_key_columns;
-							allowed_key_columns[tc_src->variable_binding] = PGQStr(etbl->source_pk[0]);
-							allowed_key_columns[tc_dst->variable_binding] = PGQStr(etbl->destination_pk[0]);
-							if (match_ref.one_row_per_vars.size() >= 3) {
-								allowed_key_columns[match_ref.one_row_per_vars[0]] = PGQStr(etbl->source_pk[0]);
-								allowed_key_columns[match_ref.one_row_per_vars[2]] = PGQStr(etbl->destination_pk[0]);
+
+							unique_ptr<TableRef> path_ref;
+							if (use_witness) {
+								path_ref = BuildTCWitnessNamedPathRef(*tc_witness_info, path_alias, tc_sp->lower, tc_sp->upper,
+								                                      endpoint_filters, PGQStr(vtable->main_label),
+								                                      PGQStr(etbl->main_label));
+							} else {
+								path_ref = BuildTCChainNamedPathRef(*tc_chain_info, path_alias, tc_sp->lower, tc_sp->upper,
+								                                    endpoint_filters, PGQStr(vtable->main_label),
+								                                    PGQStr(etbl->main_label));
 							}
-							const bool key_only_chain =
-							    MatchOnlyUsesKeyColumns(match_ref, allowed_key_columns);
-							const bool batchable_chain =
-							    key_only_chain || !MatchContainsUnsupportedChainBatchExpression(match_ref);
-							AddTCChainORPCTE(select_node, *tc_chain_info, vtable, etbl, tc_sp->lower, tc_sp->upper,
-							                 endpoint_filters, materialized_endpoint_filters, !batchable_chain);
-							alias_map[tc_src->variable_binding] = vtable;
-							alias_map[tc_dst->variable_binding] = vtable;
+
+							if (select_node->from_table) {
+								auto cross = make_uniq<JoinRef>(JoinRefType::CROSS);
+								cross->left = std::move(select_node->from_table);
+								cross->right = std::move(path_ref);
+								select_node->from_table = std::move(cross);
+							} else {
+								select_node->from_table = std::move(path_ref);
+							}
+
+							const string &src_binding = tc_src->variable_binding;
+							const string &dst_binding = tc_dst->variable_binding;
+							alias_map[src_binding] = vtable;
+							alias_map[dst_binding] = vtable;
+							conditions.push_back(make_uniq<ComparisonExpression>(
+							    ExpressionType::COMPARE_EQUAL,
+							    PGQColRef(etbl->source_pk[0], src_binding),
+							    PGQColRef("v0", path_alias)));
+							conditions.push_back(make_uniq<ComparisonExpression>(
+							    ExpressionType::COMPARE_EQUAL,
+							    PGQColRef(etbl->destination_pk[0], dst_binding),
+							    PGQColRef("v1", path_alias)));
+							RewriteTopLevelNamedPathFunctions(match_ref, named_path_variable, path_alias);
 							auto diagnostic = MakeArtifactDiagnostic(
-							    graph_name, "tc_chain_one_row_per", "selected tc_chain artifact for ONE ROW PER STEP",
-							    *tc_chain_info, {tc_src->label, tc_dst->label}, {tc_edge->label}, "__tcc_orp",
-							    one_row_per_mode);
-							diagnostic.endpoint_filter_count =
-							    endpoint_filters.size() + materialized_endpoint_filters.size();
+							    graph_name, use_witness ? "tc_witness_named_path" : "tc_chain_named_path",
+							    use_witness ? "selected tc_witness artifact for named path functions"
+							                : "selected tc_chain artifact for named path functions",
+							    use_witness ? *tc_witness_info : *tc_chain_info,
+							    {tc_src->label, tc_dst->label}, {tc_edge->label}, path_alias, one_row_per_mode);
+							diagnostic.endpoint_filter_count = endpoint_filters.size();
 							RecordRewriteDiagnostic(context, std::move(diagnostic));
 							return true;
 						}
 					}
-					vector<string> endpoint_filters;
-					PushConstraintToSQLFilter(where_constraints, tc_src->variable_binding, PGQStr(etbl->source_pk[0]),
-					                          "w.v0", endpoint_filters);
-					PushConstraintToSQLFilter(where_constraints, tc_dst->variable_binding, PGQStr(etbl->destination_pk[0]),
-					                          "w.v1", endpoint_filters);
-					AddTCWitnessORPCTE(select_node, *tc_witness_info, vtable, etbl, tc_sp->lower, tc_sp->upper,
-					                   endpoint_filters);
-					alias_map[tc_src->variable_binding] = vtable;
-					alias_map[tc_dst->variable_binding] = vtable;
-					auto diagnostic = MakeArtifactDiagnostic(
-					    graph_name, "tc_witness_one_row_per", "selected tc_witness artifact for ONE ROW PER",
-					    *tc_witness_info, {tc_src->label, tc_dst->label}, {tc_edge->label}, "__tcw_orp",
-					    one_row_per_mode);
-					diagnostic.endpoint_filter_count = endpoint_filters.size();
-					RecordRewriteDiagnostic(context, std::move(diagnostic));
-					return true;
-				}
 
-				if (one_row_per_mode == OneRowPerMode::NONE &&
-				    HasTopLevelNamedPathFunction(match_ref, named_path_variable)) {
-					const string tc_witness_tname = "__pg_" + graph_name + "__tc_witness__" +
-					                                tc_src->label + "__" + tc_edge->label;
-					const PGQPathTableInfo *tc_witness_info =
-					    find_path_table(tc_witness_tname, "tc_witness", {tc_src->label, tc_dst->label},
-					                    {tc_edge->label});
-					const string tc_chain_tname = "__pg_" + graph_name + "__tc_chain__" +
-					                              tc_src->label + "__" + tc_edge->label;
-					const PGQPathTableInfo *tc_chain_info =
-					    find_path_table(tc_chain_tname, "tc_chain", {tc_src->label, tc_dst->label},
-					                    {tc_edge->label});
-					shared_ptr<PropertyGraphTable> vtable, etbl;
-					try {
-						vtable = ResolveTable(tc_src->label, PGQMatchType::MATCH_VERTEX, pg_table);
-						etbl = ResolveTable(tc_edge->label, PGQMatchType::MATCH_EDGE_RIGHT, pg_table);
-					} catch (...) {
-						return false;
-					}
-					if (etbl->source_pk.empty() || etbl->destination_pk.empty() ||
-					    etbl->source_fk.empty() || etbl->destination_fk.empty() ||
-					    etbl->source_pk[0] != etbl->destination_pk[0]) {
-						return false;
-					}
-
-					const bool dst_key_constrained =
-					    HasEqualityConstraint(where_constraints, tc_dst->variable_binding, PGQStr(etbl->destination_pk[0]));
-					ReferencedBindings where_referenced_bindings;
-					CollectReferencedBindings(where_hint, where_referenced_bindings);
-					const bool dst_where_referenced =
-					    !tc_dst->variable_binding.empty() &&
-					    where_referenced_bindings.find(tc_dst->variable_binding) != where_referenced_bindings.end();
-					const bool use_witness = dst_key_constrained || dst_where_referenced || !tc_chain_info;
-					if (use_witness && !tc_witness_info) {
-						return false;
-					}
-					if (!use_witness && !tc_chain_info) {
-						return false;
-					}
-
-					const string path_alias = "__pgq_named_path_" + to_string(extra_alias_counter++);
-					vector<string> endpoint_filters;
-					const string table_prefix = use_witness ? "w." : "c.";
-					PushConstraintToSQLFilter(where_constraints, tc_src->variable_binding, PGQStr(etbl->source_pk[0]),
-					                          table_prefix + "v0", endpoint_filters);
-					if (use_witness) {
-						PushConstraintToSQLFilter(where_constraints, tc_dst->variable_binding, PGQStr(etbl->destination_pk[0]),
-						                          "w.v1", endpoint_filters);
-					}
-
-					unique_ptr<TableRef> path_ref;
-					if (use_witness) {
-						path_ref = BuildTCWitnessNamedPathRef(*tc_witness_info, path_alias, tc_sp->lower, tc_sp->upper,
-						                                      endpoint_filters, PGQStr(vtable->main_label),
-						                                      PGQStr(etbl->main_label));
-					} else {
-						path_ref = BuildTCChainNamedPathRef(*tc_chain_info, path_alias, tc_sp->lower, tc_sp->upper,
-						                                    endpoint_filters, PGQStr(vtable->main_label),
-						                                    PGQStr(etbl->main_label));
-					}
-
-					if (select_node->from_table) {
-						auto cross = make_uniq<JoinRef>(JoinRefType::CROSS);
-						cross->left = std::move(select_node->from_table);
-						cross->right = std::move(path_ref);
-						select_node->from_table = std::move(cross);
-					} else {
-						select_node->from_table = std::move(path_ref);
-					}
-
-					const string &src_binding = tc_src->variable_binding;
-					const string &dst_binding = tc_dst->variable_binding;
-					alias_map[src_binding] = vtable;
-					alias_map[dst_binding] = vtable;
-					conditions.push_back(make_uniq<ComparisonExpression>(
-					    ExpressionType::COMPARE_EQUAL,
-					    PGQColRef(etbl->source_pk[0], src_binding),
-					    PGQColRef("v0", path_alias)));
-					conditions.push_back(make_uniq<ComparisonExpression>(
-					    ExpressionType::COMPARE_EQUAL,
-					    PGQColRef(etbl->destination_pk[0], dst_binding),
-					    PGQColRef("v1", path_alias)));
-					RewriteTopLevelNamedPathFunctions(match_ref, named_path_variable, path_alias);
-					auto diagnostic = MakeArtifactDiagnostic(
-					    graph_name, use_witness ? "tc_witness_named_path" : "tc_chain_named_path",
-					    use_witness ? "selected tc_witness artifact for named path functions"
-					                : "selected tc_chain artifact for named path functions",
-					    use_witness ? *tc_witness_info : *tc_chain_info,
-					    {tc_src->label, tc_dst->label}, {tc_edge->label}, path_alias, one_row_per_mode);
-					diagnostic.endpoint_filter_count = endpoint_filters.size();
-					RecordRewriteDiagnostic(context, std::move(diagnostic));
-					return true;
-				}
-
-				const string tc_tname = "__pg_" + graph_name + "__tc__" +
-				                        tc_src->label + "__" + tc_edge->label;
-				const PGQPathTableInfo *tc_info =
-				    find_path_table(tc_tname, "transitive_closure", {tc_src->label, tc_dst->label}, {tc_edge->label});
-				if (tc_info) {
-					shared_ptr<PropertyGraphTable> vtable, etbl;
-					try {
-						vtable = ResolveTable(tc_src->label,  PGQMatchType::MATCH_VERTEX,     pg_table);
-						etbl   = ResolveTable(tc_edge->label, PGQMatchType::MATCH_EDGE_RIGHT, pg_table);
-					} catch (...) {
-						return false;
-					}
-					if (etbl->source_pk.empty() || etbl->destination_pk.empty()) {
-						return false;
-					}
-
-					const string pt_alias = "_pgq_pt_" + to_string(extra_alias_counter++);
-					{
-						auto bt          = make_uniq<BaseTableRef>();
-						bt->SetQualifiedName(Identifier(tc_info->catalog_name), bt->GetQualifiedName().Schema(), bt->Table());
-						bt->SetQualifiedName(bt->GetQualifiedName().Catalog(), Identifier(tc_info->schema_name), bt->Table());
-						bt->SetTable(Identifier(tc_info->table_name));
-						bt->alias        = Identifier(pt_alias);
-						unique_ptr<TableRef> pt_ref = std::move(bt);
-						if (select_node->from_table) {
-							auto cross   = make_uniq<JoinRef>(JoinRefType::CROSS);
-							cross->left  = std::move(select_node->from_table);
-							cross->right = std::move(pt_ref);
-							select_node->from_table = std::move(cross);
-						} else {
-							select_node->from_table = std::move(pt_ref);
+					const string tc_tname = "__pg_" + graph_name + "__tc__" +
+					                        tc_src->label + "__" + tc_edge->label;
+					const PGQPathTableInfo *tc_info =
+					    find_path_table(tc_tname, "transitive_closure", {tc_src->label, tc_dst->label}, {tc_edge->label});
+					// Named path functions need a path, which this endpoint-only artifact does not have.
+					if (tc_info && !HasTopLevelNamedPathFunction(match_ref, named_path_variable) &&
+					    ClosureAnswers(*tc_info, selector, tc_sp->lower, tc_sp->upper)) {
+						shared_ptr<PropertyGraphTable> vtable, etbl;
+						try {
+							vtable = ResolveTable(tc_src->label,  PGQMatchType::MATCH_VERTEX,     pg_table);
+							etbl   = ResolveTable(tc_edge->label, PGQMatchType::MATCH_EDGE_RIGHT, pg_table);
+						} catch (...) {
+							return false;
 						}
-					}
+						if (etbl->source_pk.empty() || etbl->destination_pk.empty()) {
+							return false;
+						}
 
-					const string &src_binding = tc_src->variable_binding;
-					const string &dst_binding = tc_dst->variable_binding;
-					alias_map[src_binding] = vtable;
-					alias_map[dst_binding] = vtable;
-					{
-						auto lhs = PGQColRef(etbl->source_pk[0], src_binding);
-						auto rhs = PGQColRef("v0", pt_alias);
-						conditions.push_back(make_uniq<ComparisonExpression>(
-						    ExpressionType::COMPARE_EQUAL, std::move(lhs), std::move(rhs)));
-					}
-					{
-						auto lhs = PGQColRef(etbl->destination_pk[0], dst_binding);
-						auto rhs = PGQColRef("v1", pt_alias);
-						conditions.push_back(make_uniq<ComparisonExpression>(
-						    ExpressionType::COMPARE_EQUAL, std::move(lhs), std::move(rhs)));
-					}
+						const string pt_alias = "_pgq_pt_" + to_string(extra_alias_counter++);
+						{
+							auto bt          = make_uniq<BaseTableRef>();
+							bt->SetQualifiedName(Identifier(tc_info->catalog_name), bt->GetQualifiedName().Schema(), bt->Table());
+							bt->SetQualifiedName(bt->GetQualifiedName().Catalog(), Identifier(tc_info->schema_name), bt->Table());
+							bt->SetTable(Identifier(tc_info->table_name));
+							bt->alias        = Identifier(pt_alias);
+							unique_ptr<TableRef> pt_ref = std::move(bt);
+							if (selector != PGQPathSelector::WALK) {
+								// A shortest path per endpoint pair, not one row per depth: the least depth
+								// within the bounds, never a pair that only closes a cycle. (ALL SHORTEST
+								// only reaches here with a verified closure, where that path is unique.)
+								string depth_filter = "depth >= " + std::to_string(tc_sp->lower);
+								if (tc_sp->upper < (1 << 30)) {
+									depth_filter += " AND depth <= " + std::to_string(tc_sp->upper);
+								}
+								pt_ref = make_uniq<SubqueryRef>(
+								    ParseSelectStatement("SELECT v0, v1, min(depth) AS depth FROM " +
+								                         QualifiedTableName(tc_info->catalog_name, tc_info->schema_name,
+								                                            tc_info->table_name) +
+								                         " WHERE " + depth_filter + " AND v0 <> v1 GROUP BY v0, v1"),
+								    PGQId(pt_alias));
+							}
+							if (select_node->from_table) {
+								auto cross   = make_uniq<JoinRef>(JoinRefType::CROSS);
+								cross->left  = std::move(select_node->from_table);
+								cross->right = std::move(pt_ref);
+								select_node->from_table = std::move(cross);
+							} else {
+								select_node->from_table = std::move(pt_ref);
+							}
+						}
 
-					// Depth filter: add bounds when the quantifier is not fully open.
-					// Unbounded upper is represented as 1 << 30 in the parser.
-					const int64_t lo = tc_sp->lower;
-					const int64_t hi = tc_sp->upper;
-					if (lo > 1) {
-						auto lhs = PGQColRef("depth", pt_alias);
-						auto rhs = ConstantExpression::FromValue(Value::BIGINT(lo));
-						conditions.push_back(make_uniq<ComparisonExpression>(
-						    ExpressionType::COMPARE_GREATERTHANOREQUALTO, std::move(lhs), std::move(rhs)));
+						const string &src_binding = tc_src->variable_binding;
+						const string &dst_binding = tc_dst->variable_binding;
+						alias_map[src_binding] = vtable;
+						alias_map[dst_binding] = vtable;
+						{
+							auto lhs = PGQColRef(etbl->source_pk[0], src_binding);
+							auto rhs = PGQColRef("v0", pt_alias);
+							conditions.push_back(make_uniq<ComparisonExpression>(
+							    ExpressionType::COMPARE_EQUAL, std::move(lhs), std::move(rhs)));
+						}
+						{
+							auto lhs = PGQColRef(etbl->destination_pk[0], dst_binding);
+							auto rhs = PGQColRef("v1", pt_alias);
+							conditions.push_back(make_uniq<ComparisonExpression>(
+							    ExpressionType::COMPARE_EQUAL, std::move(lhs), std::move(rhs)));
+						}
+
+						// Depth filter: add bounds when the quantifier is not fully open.
+						// Unbounded upper is represented as 1 << 30 in the parser.
+						const int64_t lo = tc_sp->lower;
+						const int64_t hi = tc_sp->upper;
+						if (lo > 1) {
+							auto lhs = PGQColRef("depth", pt_alias);
+							auto rhs = ConstantExpression::FromValue(Value::BIGINT(lo));
+							conditions.push_back(make_uniq<ComparisonExpression>(
+							    ExpressionType::COMPARE_GREATERTHANOREQUALTO, std::move(lhs), std::move(rhs)));
+						}
+						if (hi < (1 << 30)) {
+							auto lhs = PGQColRef("depth", pt_alias);
+							auto rhs = ConstantExpression::FromValue(Value::BIGINT(hi));
+							conditions.push_back(make_uniq<ComparisonExpression>(
+							    ExpressionType::COMPARE_LESSTHANOREQUALTO, std::move(lhs), std::move(rhs)));
+						}
+						// Predicate pushdown: WHERE src.pk = const → pt.v0 = const
+						//                     WHERE dst.pk = const → pt.v1 = const
+						// Enables S3 Parquet row-group pruning on the sorted path table.
+						PushConstraintToPathTable(where_constraints, src_binding,
+						                         PGQStr(etbl->source_pk[0]), "v0", pt_alias, conditions);
+						PushConstraintToPathTable(where_constraints, dst_binding,
+						                         PGQStr(etbl->destination_pk[0]), "v1", pt_alias, conditions);
+						const bool src_semi_join =
+						    PushBindingFilterToPathTable(where_hint, src_binding, vtable, PGQStr(etbl->source_pk[0]),
+						                                 "v0", pt_alias, conditions, where_constraints);
+						const bool dst_semi_join =
+						    PushBindingFilterToPathTable(where_hint, dst_binding, vtable, PGQStr(etbl->destination_pk[0]),
+						                                 "v1", pt_alias, conditions, where_constraints);
+						auto diagnostic = MakeArtifactDiagnostic(
+						    graph_name, "transitive_closure", "selected transitive_closure artifact",
+						    *tc_info, {tc_src->label, tc_dst->label}, {tc_edge->label}, pt_alias,
+						    one_row_per_mode);
+						// Count what was actually pushed, scalar or semi-join. Counting only the scalar
+						// form is how this read 0 for every product traversal while the query was in
+						// fact constrained -- a diagnostic that understates is worse than none, because
+						// it sends the next person looking for a gap that is not there.
+						diagnostic.endpoint_filter_count =
+						    CountEndpointFilters(where_constraints, {{src_binding, PGQStr(etbl->source_pk[0])},
+						                                             {dst_binding, PGQStr(etbl->destination_pk[0])}}) +
+						    (src_semi_join ? 1 : 0) + (dst_semi_join ? 1 : 0);
+						RecordRewriteDiagnostic(context, std::move(diagnostic));
+						return true;
 					}
-					if (hi < (1 << 30)) {
-						auto lhs = PGQColRef("depth", pt_alias);
-						auto rhs = ConstantExpression::FromValue(Value::BIGINT(hi));
-						conditions.push_back(make_uniq<ComparisonExpression>(
-						    ExpressionType::COMPARE_LESSTHANOREQUALTO, std::move(lhs), std::move(rhs)));
-					}
-					// Predicate pushdown: WHERE src.pk = const → pt.v0 = const
-					//                     WHERE dst.pk = const → pt.v1 = const
-					// Enables S3 Parquet row-group pruning on the sorted path table.
-					PushConstraintToPathTable(where_constraints, src_binding,
-					                         PGQStr(etbl->source_pk[0]), "v0", pt_alias, conditions);
-					PushConstraintToPathTable(where_constraints, dst_binding,
-					                         PGQStr(etbl->destination_pk[0]), "v1", pt_alias, conditions);
-					const bool src_semi_join =
-					    PushBindingFilterToPathTable(where_hint, src_binding, vtable, PGQStr(etbl->source_pk[0]),
-					                                 "v0", pt_alias, conditions, where_constraints);
-					const bool dst_semi_join =
-					    PushBindingFilterToPathTable(where_hint, dst_binding, vtable, PGQStr(etbl->destination_pk[0]),
-					                                 "v1", pt_alias, conditions, where_constraints);
-					auto diagnostic = MakeArtifactDiagnostic(
-					    graph_name, "transitive_closure", "selected transitive_closure artifact",
-					    *tc_info, {tc_src->label, tc_dst->label}, {tc_edge->label}, pt_alias,
-					    one_row_per_mode);
-					// Count what was actually pushed, scalar or semi-join. Counting only the scalar
-					// form is how this read 0 for every product traversal while the query was in
-					// fact constrained -- a diagnostic that understates is worse than none, because
-					// it sends the next person looking for a gap that is not there.
-					diagnostic.endpoint_filter_count =
-					    CountEndpointFilters(where_constraints, {{src_binding, PGQStr(etbl->source_pk[0])},
-					                                             {dst_binding, PGQStr(etbl->destination_pk[0])}}) +
-					    (src_semi_join ? 1 : 0) + (dst_semi_join ? 1 : 0);
-					RecordRewriteDiagnostic(context, std::move(diagnostic));
-					return true;
 				}
 			}
 		}
@@ -8253,9 +8365,12 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 		if ((*rewrite_path_elements)[1]->path_reference_type == PGQPathReferenceType::SUBPATH) {
 			ctx_sp = reinterpret_cast<SubPath *>((*rewrite_path_elements)[1].get());
 		}
+		// No CHEAPEST, no empty path (lower bound 0), no path mode or COST: the expansion
+		// implements none of them.
 		if (ctx_src && ctx_dst && ctx_sp && ctx_sp->path_list.size() == 1 &&
 		    !ctx_src->variable_binding.empty() && !ctx_src->label.empty() &&
-		    !IsCompoundLabel(ctx_src->label)) {
+		    !IsCompoundLabel(ctx_src->label) && selector != PGQPathSelector::CHEAPEST && ctx_sp->lower >= 1 &&
+		    !PatternHasPathModeOrCost(path_elements)) {
 			PathElement *ctx_edge = get_path_element(ctx_sp->path_list[0]);
 			const bool named_path_projection = HasTopLevelNamedPathFunction(match_ref, named_path_variable);
 			const bool vertex_properties_projection =
@@ -8304,8 +8419,11 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 				                                            ctx_sp->lower, ctx_sp->upper,
 				                                            where_constraints, where_hint, src_pk, dst_pk,
 				                                            vertex_properties_projection,
+				                                            // ANY SHORTEST keeps one path per pair, so a collapsed
+				                                            // duplicate edge cannot change it; every other
+				                                            // selector counts paths.
 				                                            /*require_multiplicity_preserving=*/!any_shortest,
-				                                            MaxVLFallbackRows(context));
+				                                            MaxVLFallbackRows(context), selector);
 				if (!path_ref || src_pk.empty()) {
 					return false;
 				}
@@ -9143,7 +9261,7 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 		                          path_table_cache, referenced_bindings,
 		                          covered_columns,
 		                          ref->one_row_per,
-		                          ref->where_clause.get(), any_shortest)) {
+		                          ref->where_clause.get(), PatternSelector(*path_pattern))) {
 			if (require_abi_paths && PathPatternRequiresABIPath(path_pattern->path_elements)) {
 				PGQRewriteDiagnostic diagnostic;
 				diagnostic.graph_name = pg_table->property_graph_name;
@@ -9316,7 +9434,7 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 			                         path_table_cache, branch_referenced_bindings,
 			                         branch_covered_columns,
 			                         branch.one_row_per,
-			                         branch.where_clause.get(), any_shortest)) {
+			                         branch.where_clause.get(), PatternSelector(*path_pattern))) {
 				if (require_abi_paths && PathPatternRequiresABIPath(path_pattern->path_elements)) {
 					PGQRewriteDiagnostic diagnostic;
 					diagnostic.graph_name = pg_table->property_graph_name;

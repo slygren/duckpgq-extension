@@ -208,6 +208,21 @@ query traverses, and `pgq_abi_status` shows `fresh = false`. A frozen copy of a 
 freshness is not judged (`fresh` is NULL) and the artifacts are used. Plain DuckDB tables have no change history:
 rebuild after loading data. Artifacts written by an external builder without provenance are always used.
 
+### What an artifact answers
+
+An artifact stands in for the traversal only where it gives the same rows; otherwise the pattern is traversed (or,
+under `pgq_require_abi_paths`, refused). A variable-length pattern is answered from simple paths, which the
+expansion over 1-hop and k-hop artifacts reproduces for every selector. A closure holds less: `transitive_closure`
+one row per (start, end, depth), `tc_witness` one shortest path per pair, `tc_chain` the longest chain per start.
+So a closure answers:
+
+- `ANY SHORTEST` from depth 1, when the closure reaches the upper bound: always.
+- Walks, `ALL SHORTEST`, any lower bound and `ONE ROW PER`: only when the catalog row says
+  `preserves_multiplicity = true`. `pgq_abi_build` measures it: the edge is acyclic, the depth cap was never
+  reached, and every row is exactly one path (for `tc_chain` also no vertex with two out-edges, the usual
+  hierarchy). Artifacts built elsewhere without that measurement are taken as `false`.
+- Never `CHEAPEST`, a lower bound of 0, a path mode or a `COST`.
+
 ### Seeing what the rewrite did
 
 ```sql
