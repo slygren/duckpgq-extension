@@ -55,6 +55,7 @@ static void IterativeLengthFunction(DataChunk &args, ExpressionState &state, Vec
 	UnifiedVectorFormat vdata_dst;
 	src.ToUnifiedFormat(vdata_src);
 	dst.ToUnifiedFormat(vdata_dst);
+	CheckCSRVertices(*csr_found, v_size, vdata_src, vdata_dst, args.size(), "iterativelength");
 	auto src_data = reinterpret_cast<const int64_t *>(vdata_src.data);
 	auto dst_data = reinterpret_cast<const int64_t *>(vdata_dst.data);
 
@@ -144,9 +145,9 @@ static void IterativeLengthFunction(DataChunk &args, ExpressionState &state, Vec
 // Register functions
 //------------------------------------------------------------------------------
 void CoreScalarFunctions::RegisterIterativeLengthScalarFunction(ExtensionLoader &loader) {
-	loader.RegisterFunction(ScalarFunction(
+	loader.RegisterFunction(Fallible(ScalarFunction(
 	    "iterativelength", {LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT},
-	    LogicalType::BIGINT, IterativeLengthFunction, IterativeLengthFunctionData::IterativeLengthBind));
+	    LogicalType::BIGINT, IterativeLengthFunction, IterativeLengthFunctionData::IterativeLengthBind)));
 }
 
 } // namespace duckdb

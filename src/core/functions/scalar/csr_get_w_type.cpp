@@ -25,12 +25,9 @@ static void GetCsrWTypeFunction(DataChunk &args, ExpressionState &state, Vector 
 	int32_t flag;
 	if (!csr->initialized_w) {
 		flag = static_cast<int32_t>(CSRWType::UNWEIGHTED);
-	} else if (!csr->w.empty()) {
-		flag = static_cast<int32_t>(CSRWType::INTWEIGHT);
-	} else if (!csr->w_double.empty()) {
-		flag = static_cast<int32_t>(CSRWType::DOUBLEWEIGHT);
 	} else {
-		throw InternalException("Corrupted weight vector");
+		// Not by which weight vector is filled: a CSR without edges has both empty.
+		flag = static_cast<int32_t>(csr->double_weights ? CSRWType::DOUBLEWEIGHT : CSRWType::INTWEIGHT);
 	}
 	result_data[0] = flag;
 }
@@ -39,8 +36,8 @@ static void GetCsrWTypeFunction(DataChunk &args, ExpressionState &state, Vector 
 // Register functions
 //------------------------------------------------------------------------------
 void CoreScalarFunctions::RegisterGetCSRWTypeScalarFunction(ExtensionLoader &loader) {
-	loader.RegisterFunction(ScalarFunction("csr_get_w_type", {LogicalType::INTEGER}, LogicalType::INTEGER,
-	                                       GetCsrWTypeFunction, CSRFunctionData::CSRBind));
+	loader.RegisterFunction(Fallible(ScalarFunction("csr_get_w_type", {LogicalType::INTEGER}, LogicalType::INTEGER,
+	                                       GetCsrWTypeFunction, CSRFunctionData::CSRBind)));
 }
 
 } // namespace duckdb

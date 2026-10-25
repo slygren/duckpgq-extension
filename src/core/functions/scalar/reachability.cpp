@@ -195,6 +195,7 @@ static void ReachabilityFunction(DataChunk &args, ExpressionState &state, Vector
 	auto duckpgq_state = GetDuckPGQState(info.context);
 
 	CSR *csr = duckpgq_state->GetCSR(info.csr_id);
+	CheckCSRVertices(*csr, input_size, vdata_src, vdata_target, args.size(), "reachability");
 
 	// NULL source or destination: the answer is NULL (these rows get no lane in InitialiseBfs)
 	auto &result_validity = FlatVector::ValidityMutable(result);
@@ -274,10 +275,10 @@ static void ReachabilityFunction(DataChunk &args, ExpressionState &state, Vector
 // Register functions
 //------------------------------------------------------------------------------
 void CoreScalarFunctions::RegisterReachabilityScalarFunction(ExtensionLoader &loader) {
-	loader.RegisterFunction(ScalarFunction(
+	loader.RegisterFunction(Fallible(ScalarFunction(
 	    "reachability",
 	    {LogicalType::INTEGER, LogicalType::BOOLEAN, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT},
-	    LogicalType::BOOLEAN, ReachabilityFunction, IterativeLengthFunctionData::IterativeLengthBind));
+	    LogicalType::BOOLEAN, ReachabilityFunction, IterativeLengthFunctionData::IterativeLengthBind)));
 }
 
 } // namespace duckdb

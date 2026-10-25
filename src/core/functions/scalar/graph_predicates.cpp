@@ -18,8 +18,8 @@ static void LabelPredicateFunction(DataChunk &, ExpressionState &, Vector &) {
 //------------------------------------------------------------------------------
 void CoreScalarFunctions::RegisterGraphPredicateScalarFunctions(ExtensionLoader &loader) {
 	for (auto name : {"is_labeled", "not_labeled"}) {
-		loader.RegisterFunction(ScalarFunction(name, {LogicalType::ANY, LogicalType::VARCHAR}, LogicalType::BOOLEAN,
-		                                       LabelPredicateFunction, LabelPredicateBind));
+		loader.RegisterFunction(Fallible(ScalarFunction(name, {LogicalType::ANY, LogicalType::VARCHAR}, LogicalType::BOOLEAN,
+		                                       LabelPredicateFunction, LabelPredicateBind)));
 	}
 }
 

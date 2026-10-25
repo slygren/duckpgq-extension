@@ -50,6 +50,7 @@ static void IterativeLength2Function(DataChunk &args, ExpressionState &state, Ve
 	UnifiedVectorFormat vdata_dst;
 	src.ToUnifiedFormat(vdata_src);
 	dst.ToUnifiedFormat(vdata_dst);
+	CheckCSRVertices(*csr_found, v_size, vdata_src, vdata_dst, args.size(), "iterativelength2");
 	auto src_data = reinterpret_cast<const int64_t *>(vdata_src.data);
 	auto dst_data = reinterpret_cast<const int64_t *>(vdata_dst.data);
 
@@ -138,9 +139,9 @@ static void IterativeLength2Function(DataChunk &args, ExpressionState &state, Ve
 // Register functions
 //------------------------------------------------------------------------------
 void CoreScalarFunctions::RegisterIterativeLength2ScalarFunction(ExtensionLoader &loader) {
-	loader.RegisterFunction(ScalarFunction(
+	loader.RegisterFunction(Fallible(ScalarFunction(
 	    "iterativelength2", {LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT},
-	    LogicalType::BIGINT, IterativeLength2Function, IterativeLengthFunctionData::IterativeLengthBind));
+	    LogicalType::BIGINT, IterativeLength2Function, IterativeLengthFunctionData::IterativeLengthBind)));
 }
 
 } // namespace duckdb

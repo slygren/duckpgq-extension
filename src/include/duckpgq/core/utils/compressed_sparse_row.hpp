@@ -45,9 +45,16 @@ public:
 	bool initialized_w = false;
 
 	size_t vsize {};
+	//! The costs are DOUBLE (w_double), else BIGINT (w); meaningful once initialized_w, even for a CSR without edges
+	bool double_weights = false;
 
 	string ToString() const;
 };
+
+//! The path functions index their arrays with the vertex ids they are given: each one must be a row of the CSR.
+//! (They are given row ids of the vertex table by the queries GRAPH_TABLE generates; a direct call can pass anything.)
+void CheckCSRVertices(const CSR &csr, int64_t v_size, const UnifiedVectorFormat &src, const UnifiedVectorFormat &dst,
+                      idx_t count, const char *function_name);
 
 struct CSRFunctionData : FunctionData {
 	CSRFunctionData(ClientContext &context, int32_t id, const LogicalType &weight_type);

@@ -35,8 +35,7 @@ static void CsrInitializeVertex(DuckPGQState &context, int32_t id, int64_t v_siz
 		csr->initialized_v = true;
 		context.csr_list[id] = std::move(csr);
 	} catch (std::bad_alloc const &) {
-		throw Exception(ExceptionType::INTERNAL, "Unable to initialize vector of size for csr vertex table "
-		                                         "representation");
+		throw OutOfMemoryException("Unable to allocate the CSR vertex array");
 	}
 }
 
@@ -51,8 +50,7 @@ static void CsrInitializeEdge(DuckPGQState &context, int32_t id, int64_t v_size,
 		csr_entry->second->e.resize(e_size, 0);
 		csr_entry->second->edge_ids.resize(e_size, 0);
 	} catch (std::bad_alloc const &) {
-		throw Exception(ExceptionType::INTERNAL, "Unable to initialize vector of size for csr edge table "
-		                                         "representation");
+		throw OutOfMemoryException("Unable to allocate the CSR edge array");
 	}
 	for (auto i = 1; i < v_size + 2; i++) {
 		csr_entry->second->v[i] += csr_entry->second->v[i - 1];
@@ -72,12 +70,12 @@ static void CsrInitializeWeight(DuckPGQState &context, int32_t id, int64_t e_siz
 			csr_entry->second->w.resize(e_size, 0);
 		} else if (weight_type == PhysicalType::DOUBLE) {
 			csr_entry->second->w_double.resize(e_size, 0);
+			csr_entry->second->double_weights = true;
 		} else {
 			throw NotImplementedException("Unrecognized weight type detected.");
 		}
 	} catch (std::bad_alloc const &) {
-		throw Exception(ExceptionType::INTERNAL, "Unable to initialize vector of size for csr weight table "
-		                                         "representation");
+		throw OutOfMemoryException("Unable to allocate the CSR weight array");
 	}
 
 	csr_entry->second->initialized_w = true;
@@ -104,7 +102,7 @@ static void CreateCsrVertexFunction(DataChunk &args, ExpressionState &state, Vec
 		lock_guard<mutex> csr_lookup_lock(duckpgq_state->csr_lock);
 		auto csr_entry = duckpgq_state->csr_list.find(info.id);
 		if (csr_entry == duckpgq_state->csr_list.end() || !csr_entry->second) {
-			throw InternalException("CSR %d disappeared while it was being initialized", info.id);
+			throw ConstraintException("CSR %d was deleted while it was being built", info.id);
 		}
 		csr = csr_entry->second.get();
 	}
@@ -277,8 +275,8 @@ ScalarFunctionSet GetCSREdgeFunction() {
 // Register functions
 //------------------------------------------------------------------------------
 void CoreScalarFunctions::RegisterCSRCreationScalarFunctions(ExtensionLoader &loader) {
-	loader.RegisterFunction(GetCSREdgeFunction());
-	loader.RegisterFunction(GetCSRVertexFunction());
+	loader.RegisterFunction(Fallible(GetCSREdgeFunction()));
+	loader.RegisterFunction(Fallible(GetCSRVertexFunction()));
 }
 
 } // namespace duckdb

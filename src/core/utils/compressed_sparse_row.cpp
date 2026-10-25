@@ -58,6 +58,30 @@ string CSR::ToString() const {
 	return result.str();
 }
 
+void CheckCSRVertices(const CSR &csr, int64_t v_size, const UnifiedVectorFormat &src, const UnifiedVectorFormat &dst,
+                      idx_t count, const char *function_name) {
+	if (v_size < 0 || static_cast<idx_t>(v_size) + 2 > csr.vsize) {
+		throw InvalidInputException("%s: the vertex count %lld does not match the CSR (%llu vertices)", function_name,
+		                            static_cast<long long>(v_size),
+		                            static_cast<unsigned long long>(csr.vsize < 2 ? 0 : csr.vsize - 2));
+	}
+	auto src_data = UnifiedVectorFormat::GetData<int64_t>(src);
+	auto dst_data = UnifiedVectorFormat::GetData<int64_t>(dst);
+	for (idx_t row = 0; row < count; row++) {
+		const auto src_index = src.sel->get_index(row);
+		const auto dst_index = dst.sel->get_index(row);
+		// A NULL endpoint has no path; the functions answer it without reading the CSR
+		const bool src_valid = src.validity.RowIsValid(src_index);
+		const bool dst_valid = dst.validity.RowIsValid(dst_index);
+		for (auto vertex : {src_valid ? src_data[src_index] : 0, dst_valid ? dst_data[dst_index] : 0}) {
+			if (src_valid && dst_valid && (vertex < 0 || vertex >= v_size)) {
+				throw InvalidInputException("%s: vertex %lld is not a row of the CSR (0 .. %lld)", function_name,
+				                            static_cast<long long>(vertex), static_cast<long long>(v_size - 1));
+			}
+		}
+	}
+}
+
 CSRFunctionData::CSRFunctionData(ClientContext &context, int32_t id, const LogicalType &weight_type)
     : context(context), id(id), weight_type(weight_type) {
 }

@@ -99,6 +99,7 @@ static void AllShortestPathsFunction(DataChunk &args, ExpressionState &state, Ve
 	UnifiedVectorFormat vdata_src, vdata_dst;
 	src.ToUnifiedFormat(args.size(), vdata_src);
 	target.ToUnifiedFormat(args.size(), vdata_dst);
+	CheckCSRVertices(*csr_found, v_size, vdata_src, vdata_dst, args.size(), "allshortestpaths");
 
 	auto src_data = reinterpret_cast<const int64_t *>(vdata_src.data);
 	auto dst_data = reinterpret_cast<const int64_t *>(vdata_dst.data);
@@ -148,10 +149,10 @@ static void AllShortestPathsFunction(DataChunk &args, ExpressionState &state, Ve
 
 void CoreScalarFunctions::RegisterAllShortestPathsScalarFunction(ExtensionLoader &loader) {
 	loader.RegisterFunction(
-	    ScalarFunction("allshortestpaths",
+	    Fallible(ScalarFunction("allshortestpaths",
 	                   {LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT},
 	                   LogicalType::LIST(LogicalType::LIST(LogicalType::BIGINT)), AllShortestPathsFunction,
-	                   IterativeLengthFunctionData::IterativeLengthBind));
+	                   IterativeLengthFunctionData::IterativeLengthBind)));
 }
 
 } // namespace duckdb

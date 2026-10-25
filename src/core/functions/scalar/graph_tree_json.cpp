@@ -370,14 +370,14 @@ void CoreScalarFunctions::RegisterGraphTreeJsonScalarFunction(ExtensionLoader &l
 		graph_tree.AddFunction(ScalarFunction({LogicalType::LIST(key_type), label_list, label_list, label_list},
 		                                      LogicalType::VARCHAR, GraphTreeJsonFunction));
 	}
-	loader.RegisterFunction(graph_tree);
+	loader.RegisterFunction(Fallible(graph_tree));
 
 	ScalarFunctionSet path_tree("path_tree_json");
 	for (const auto &key_type : key_types) {
 		path_tree.AddFunction(ScalarFunction({LogicalType::LIST(key_type), label_list, label_list}, LogicalType::VARCHAR,
 		                                     GraphTreeJsonFunction));
 	}
-	loader.RegisterFunction(path_tree);
+	loader.RegisterFunction(Fallible(path_tree));
 }
 
 } // namespace duckdb

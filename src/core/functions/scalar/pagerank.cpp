@@ -114,8 +114,8 @@ static void PageRankFunction(DataChunk &args, ExpressionState &state, Vector &re
 // Register functions
 //------------------------------------------------------------------------------
 void CoreScalarFunctions::RegisterPageRankScalarFunction(ExtensionLoader &loader) {
-	loader.RegisterFunction(ScalarFunction("pagerank", {LogicalType::INTEGER, LogicalType::BIGINT}, LogicalType::DOUBLE,
-	                                       PageRankFunction, PageRankFunctionData::PageRankBind));
+	loader.RegisterFunction(Fallible(ScalarFunction("pagerank", {LogicalType::INTEGER, LogicalType::BIGINT}, LogicalType::DOUBLE,
+	                                       PageRankFunction, PageRankFunctionData::PageRankBind)));
 }
 
 } // namespace duckdb

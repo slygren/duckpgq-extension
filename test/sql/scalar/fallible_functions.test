@@ -1,0 +1,200 @@
+# name: test/sql/scalar/fallible_functions.test
+# description: The extension's scalar functions are marked fallible. An error one throws while it executes is the
+#              error it raises (not an INTERNAL error, which invalidates the database), TRY() catches it, and the
+#              optimizer does not evaluate them on rows the query does not produce. Out-of-range vertex ids, which the
+#              path functions used to read memory with, are refused.
+# group: [scalar]
+
+require duckpgq
+
+statement ok
+CREATE TABLE Student(id BIGINT, name VARCHAR);
+
+statement ok
+INSERT INTO Student VALUES (0, 'Daniel'), (1, 'Tavneet'), (2, 'Gabor'), (3, 'Peter'), (4, 'David');
+
+statement ok
+CREATE TABLE Know(src BIGINT, dst BIGINT, w BIGINT);
+
+statement ok
+INSERT INTO Know VALUES (0, 1, 5), (0, 2, 2), (0, 3, 9), (3, 0, 1), (1, 2, 1), (1, 3, 1), (2, 3, 3), (4, 3, 4);
+
+statement ok
+SELECT count(CREATE_CSR_EDGE(1, (SELECT count(a.id) FROM Student a),
+    CAST ((SELECT sum(CREATE_CSR_VERTEX(1, (SELECT count(a.id) FROM Student a), sub.dense_id, sub.cnt))
+           FROM (SELECT a.rowid AS dense_id, count(k.src) AS cnt FROM Student a
+                 LEFT JOIN Know k ON k.src = a.id GROUP BY a.rowid) sub) AS BIGINT),
+    (SELECT count() FROM Know k JOIN Student a ON a.id = k.src JOIN Student c ON c.id = k.dst),
+    a.rowid, c.rowid, k.rowid))
+FROM Know k JOIN Student a ON a.id = k.src JOIN Student c ON c.id = k.dst;
+
+query I
+SELECT iterativelength(1, 5, 0, 3);
+----
+1
+
+statement ok
+SELECT count(CREATE_CSR_EDGE(2, (SELECT count(a.id) FROM Student a),
+    CAST ((SELECT sum(CREATE_CSR_VERTEX(2, (SELECT count(a.id) FROM Student a), sub.dense_id, sub.cnt))
+           FROM (SELECT a.rowid AS dense_id, count(k.src) AS cnt FROM Student a
+                 LEFT JOIN Know k ON k.src = a.id GROUP BY a.rowid) sub) AS BIGINT),
+    (SELECT count() FROM Know k JOIN Student a ON a.id = k.src JOIN Student c ON c.id = k.dst),
+    a.rowid, c.rowid, k.rowid))
+FROM Know k JOIN Student a ON a.id = k.src JOIN Student c ON c.id = k.dst;
+
+statement error
+SELECT iterativelength(2, 5, 0, 99);
+----
+Invalid Input Error: iterativelength: vertex 99 is not a row of the CSR
+
+statement ok
+SELECT count(CREATE_CSR_EDGE(3, (SELECT count(a.id) FROM Student a),
+    CAST ((SELECT sum(CREATE_CSR_VERTEX(3, (SELECT count(a.id) FROM Student a), sub.dense_id, sub.cnt))
+           FROM (SELECT a.rowid AS dense_id, count(k.src) AS cnt FROM Student a
+                 LEFT JOIN Know k ON k.src = a.id GROUP BY a.rowid) sub) AS BIGINT),
+    (SELECT count() FROM Know k JOIN Student a ON a.id = k.src JOIN Student c ON c.id = k.dst),
+    a.rowid, c.rowid, k.rowid))
+FROM Know k JOIN Student a ON a.id = k.src JOIN Student c ON c.id = k.dst;
+
+query I
+SELECT TRY(iterativelength(3, 5, 0, 99));
+----
+NULL
+
+statement ok
+SELECT count(CREATE_CSR_EDGE(4, (SELECT count(a.id) FROM Student a),
+    CAST ((SELECT sum(CREATE_CSR_VERTEX(4, (SELECT count(a.id) FROM Student a), sub.dense_id, sub.cnt))
+           FROM (SELECT a.rowid AS dense_id, count(k.src) AS cnt FROM Student a
+                 LEFT JOIN Know k ON k.src = a.id GROUP BY a.rowid) sub) AS BIGINT),
+    (SELECT count() FROM Know k JOIN Student a ON a.id = k.src JOIN Student c ON c.id = k.dst),
+    a.rowid, c.rowid, k.rowid))
+FROM Know k JOIN Student a ON a.id = k.src JOIN Student c ON c.id = k.dst;
+
+statement error
+SELECT iterativelength(4, 50, 0, 1);
+----
+Invalid Input Error: iterativelength: the vertex count 50 does not match the CSR
+
+statement ok
+SELECT count(CREATE_CSR_EDGE(5, (SELECT count(a.id) FROM Student a),
+    CAST ((SELECT sum(CREATE_CSR_VERTEX(5, (SELECT count(a.id) FROM Student a), sub.dense_id, sub.cnt))
+           FROM (SELECT a.rowid AS dense_id, count(k.src) AS cnt FROM Student a
+                 LEFT JOIN Know k ON k.src = a.id GROUP BY a.rowid) sub) AS BIGINT),
+    (SELECT count() FROM Know k JOIN Student a ON a.id = k.src JOIN Student c ON c.id = k.dst),
+    a.rowid, c.rowid, k.rowid))
+FROM Know k JOIN Student a ON a.id = k.src JOIN Student c ON c.id = k.dst;
+
+statement error
+SELECT iterativelength2(5, 5, 0, 7);
+----
+Invalid Input Error: iterativelength2: vertex 7
+
+statement ok
+SELECT count(CREATE_CSR_EDGE(6, (SELECT count(a.id) FROM Student a),
+    CAST ((SELECT sum(CREATE_CSR_VERTEX(6, (SELECT count(a.id) FROM Student a), sub.dense_id, sub.cnt))
+           FROM (SELECT a.rowid AS dense_id, count(k.src) AS cnt FROM Student a
+                 LEFT JOIN Know k ON k.src = a.id GROUP BY a.rowid) sub) AS BIGINT),
+    (SELECT count() FROM Know k JOIN Student a ON a.id = k.src JOIN Student c ON c.id = k.dst),
+    a.rowid, c.rowid, k.rowid))
+FROM Know k JOIN Student a ON a.id = k.src JOIN Student c ON c.id = k.dst;
+
+statement error
+SELECT iterativelengthbidirectional(6, 5, 9, 1);
+----
+Invalid Input Error: iterativelengthbidirectional: vertex 9
+
+statement ok
+SELECT count(CREATE_CSR_EDGE(7, (SELECT count(a.id) FROM Student a),
+    CAST ((SELECT sum(CREATE_CSR_VERTEX(7, (SELECT count(a.id) FROM Student a), sub.dense_id, sub.cnt))
+           FROM (SELECT a.rowid AS dense_id, count(k.src) AS cnt FROM Student a
+                 LEFT JOIN Know k ON k.src = a.id GROUP BY a.rowid) sub) AS BIGINT),
+    (SELECT count() FROM Know k JOIN Student a ON a.id = k.src JOIN Student c ON c.id = k.dst),
+    a.rowid, c.rowid, k.rowid))
+FROM Know k JOIN Student a ON a.id = k.src JOIN Student c ON c.id = k.dst;
+
+statement error
+SELECT shortestpath(7, 5, -1, 1);
+----
+Invalid Input Error: shortestpath: vertex -1
+
+statement ok
+SELECT count(CREATE_CSR_EDGE(8, (SELECT count(a.id) FROM Student a),
+    CAST ((SELECT sum(CREATE_CSR_VERTEX(8, (SELECT count(a.id) FROM Student a), sub.dense_id, sub.cnt))
+           FROM (SELECT a.rowid AS dense_id, count(k.src) AS cnt FROM Student a
+                 LEFT JOIN Know k ON k.src = a.id GROUP BY a.rowid) sub) AS BIGINT),
+    (SELECT count() FROM Know k JOIN Student a ON a.id = k.src JOIN Student c ON c.id = k.dst),
+    a.rowid, c.rowid, k.rowid))
+FROM Know k JOIN Student a ON a.id = k.src JOIN Student c ON c.id = k.dst;
+
+statement error
+SELECT allshortestpaths(8, 5, 0, 7);
+----
+Invalid Input Error: allshortestpaths: vertex 7
+
+statement ok
+SELECT count(CREATE_CSR_EDGE(9, (SELECT count(a.id) FROM Student a),
+    CAST ((SELECT sum(CREATE_CSR_VERTEX(9, (SELECT count(a.id) FROM Student a), sub.dense_id, sub.cnt))
+           FROM (SELECT a.rowid AS dense_id, count(k.src) AS cnt FROM Student a
+                 LEFT JOIN Know k ON k.src = a.id GROUP BY a.rowid) sub) AS BIGINT),
+    (SELECT count() FROM Know k JOIN Student a ON a.id = k.src JOIN Student c ON c.id = k.dst),
+    a.rowid, c.rowid, k.rowid))
+FROM Know k JOIN Student a ON a.id = k.src JOIN Student c ON c.id = k.dst;
+
+statement error
+SELECT reachability(9, false, 5, 0, 7);
+----
+Invalid Input Error: reachability: vertex 7
+
+statement ok
+SELECT count(CREATE_CSR_EDGE(10, (SELECT count(a.id) FROM Student a),
+    CAST ((SELECT sum(CREATE_CSR_VERTEX(10, (SELECT count(a.id) FROM Student a), sub.dense_id, sub.cnt))
+           FROM (SELECT a.rowid AS dense_id, count(k.src) AS cnt FROM Student a
+                 LEFT JOIN Know k ON k.src = a.id GROUP BY a.rowid) sub) AS BIGINT),
+    (SELECT count() FROM Know k JOIN Student a ON a.id = k.src JOIN Student c ON c.id = k.dst),
+    a.rowid, c.rowid, k.rowid, k.w))
+FROM Know k JOIN Student a ON a.id = k.src JOIN Student c ON c.id = k.dst;
+
+statement error
+SELECT cheapest_path_length(10, 5, 0, 12);
+----
+Invalid Input Error: cheapest path search: vertex 0 or 12 is not a row of the CSR
+
+# A CSR that was never built
+statement error
+SELECT shortestpath(99, 5, 0, 1);
+----
+Constraint Error: Invalid ID
+
+# graph_tree_json refuses lists that do not fit together, and TRY catches it
+statement error
+SELECT graph_tree_json([1, 2], ['a'], []);
+----
+Invalid Input Error: vertices and vertex_labels must have the same length
+
+query I
+SELECT TRY(graph_tree_json([1, 2], ['a'], []));
+----
+NULL
+
+# A thrown error is never evaluated for a row the query filtered out: the bad vertex is only in a row the WHERE drops
+
+statement ok
+SELECT count(CREATE_CSR_EDGE(12, (SELECT count(a.id) FROM Student a),
+    CAST ((SELECT sum(CREATE_CSR_VERTEX(12, (SELECT count(a.id) FROM Student a), sub.dense_id, sub.cnt))
+           FROM (SELECT a.rowid AS dense_id, count(k.src) AS cnt FROM Student a
+                 LEFT JOIN Know k ON k.src = a.id GROUP BY a.rowid) sub) AS BIGINT),
+    (SELECT count() FROM Know k JOIN Student a ON a.id = k.src JOIN Student c ON c.id = k.dst),
+    a.rowid, c.rowid, k.rowid))
+FROM Know k JOIN Student a ON a.id = k.src JOIN Student c ON c.id = k.dst;
+
+query II
+SELECT x, iterativelength(12, 5, 0, x) FROM (VALUES (1::BIGINT), (2::BIGINT), (99::BIGINT)) t(x) WHERE x < 5 ORDER BY x;
+----
+1	1
+2	1
+
+# Nothing above invalidated the database
+query I
+SELECT count(*) FROM Student;
+----
+5
