@@ -145,7 +145,7 @@ use `ANY SHORTEST` for one per endpoint. Walks that return to their start vertex
 | `element_id(x)`, `label(x)` | element id; label as declared in `CREATE PROPERTY GRAPH` (a table with sub-labels reports its main label). `label(x) = 'Person'` is case-sensitive; `IS LABELED` is not |
 | `x IS [NOT] LABELED L` | label test (WHERE only) |
 | `ALL_DIFFERENT(a, b, …)` | the bound elements are pairwise distinct |
-| `path_length(p)`, `vertices(p)`, `edges(p)` | hops; the path's vertices and edges (row ids when traversed, keys when an ABI artifact answers) |
+| `path_length(p)`, `vertices(p)`, `edges(p)` | hops; the path's vertices (row ids when traversed, keys when an ABI artifact answers) and edges (row ids; no artifact has them, so a pattern asking for `edges(p)` is traversed) |
 | `vertex_labels(p)`, `edge_labels(p)` | declared labels along the path, in path order, traversed or answered by an ABI artifact. They need each vertex and edge of the path to have one table, from its label or from the edge next to it |
 | `cost(p)` | total cost of an `ANY`/`ALL CHEAPEST` path |
 | `path_tree_json(…)`, `graph_tree_json(…)` | nest paths into a JSON tree |

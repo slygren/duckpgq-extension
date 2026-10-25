@@ -1,0 +1,127 @@
+# name: test/sql/path_finding/abi_edges_function.test
+# description: edges(p) works whether or not artifacts exist: a route without an edge column leaves the pattern to the traversal
+# group: [path_finding]
+
+# edges(p) is answered by the traversal with the edges' row ids. No artifact holds those (an artifact's edge id
+# is hash(label | src | dst)), and the artifact routes used to take the pattern anyway and leave edges(p)
+# unrewritten, so a query that ran before pgq_abi_build failed after it.
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE Person(id BIGINT PRIMARY KEY);
+
+statement ok
+CREATE TABLE knows(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO Person VALUES (1), (2), (3), (4);
+
+statement ok
+INSERT INTO knows VALUES (1, 2), (2, 3), (3, 4);
+
+statement ok
+CREATE PROPERTY GRAPH g VERTEX TABLES (Person LABEL Person)
+EDGE TABLES (knows SOURCE KEY (src) REFERENCES Person (id) DESTINATION KEY (dst) REFERENCES Person (id) LABEL Knows);
+
+# ── no artifacts ────────────────────────────────────────────────────────────────────────────────────────────────────
+
+query III rowsort
+FROM GRAPH_TABLE (g MATCH p = (a:Person)-[:Knows]->{1,2}(b) COLUMNS (a.id AS a, path_length(p), edges(p)));
+----
+1	1	[0]
+1	2	[0, 1]
+2	1	[1]
+2	2	[1, 2]
+3	1	[2]
+
+query III rowsort
+FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Person)-[:Knows]->{1,3}(b:Person) WHERE a.id = 1
+    COLUMNS (b.id AS b, edges(p), edge_labels(p)));
+----
+2	[0]	[Knows]
+3	[0, 1]	[Knows, Knows]
+4	[0, 1, 2]	[Knows, Knows, Knows]
+
+# ── 1-hop and k-hop artifacts: the expansion would answer, but has no edge column ────────────────────────────────────
+
+statement ok
+FROM pgq_abi_build('g', exclude_self_referential := false);
+
+query III rowsort
+FROM GRAPH_TABLE (g MATCH p = (a:Person)-[:Knows]->{1,2}(b) COLUMNS (a.id AS a, path_length(p), edges(p)));
+----
+1	1	[0]
+1	2	[0, 1]
+2	1	[1]
+2	2	[1, 2]
+3	1	[2]
+
+query I
+SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+0
+
+# Without edges(p) the same pattern is still answered by the expansion
+statement ok
+FROM GRAPH_TABLE (g MATCH p = (a:Person)-[:Knows]->{1,2}(b) COLUMNS (a.id AS a, path_length(p)));
+
+query T
+SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+abi_context_expansion
+
+# Fixed length: left to the traversal too
+query II rowsort
+FROM GRAPH_TABLE (g MATCH p = (a:Person)-[:Knows]->(b:Person)-[:Knows]->(c:Person) COLUMNS (a.id AS a, edges(p)));
+----
+1	[0, 1]
+2	[1, 2]
+
+# ── closures ────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+statement ok
+FROM pgq_abi_build('g', exclude_self_referential := false, closures := ['Knows']);
+
+query III rowsort
+FROM GRAPH_TABLE (g MATCH p = (a:Person)-[k:Knows]->{1,2}(b:Person) COLUMNS (a.id AS a, b.id AS b, edges(p)));
+----
+1	2	[0]
+1	3	[0, 1]
+2	3	[1]
+2	4	[1, 2]
+3	4	[2]
+
+query III rowsort
+FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Person)-[:Knows]->{1,3}(b:Person) WHERE a.id = 1
+    COLUMNS (b.id AS b, edges(p), edge_labels(p)));
+----
+2	[0]	[Knows]
+3	[0, 1]	[Knows, Knows]
+4	[0, 1, 2]	[Knows, Knows, Knows]
+
+query III rowsort
+FROM GRAPH_TABLE (g MATCH p = (a:Person)-[k:Knows]->{1,3}(b:Person) WHERE b.id = 4 COLUMNS (a.id AS a, path_length(p), edges(p)));
+----
+1	3	[0, 1, 2]
+2	2	[1, 2]
+3	1	[2]
+
+# Without edges(p) the closure answers
+statement ok
+FROM GRAPH_TABLE (g MATCH p = (a:Person)-[k:Knows]->{1,3}(b:Person) WHERE b.id = 4 COLUMNS (a.id AS a, path_length(p)));
+
+query T
+SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+tc_witness_named_path
+
+# pgq_verify_abi_rewrite: no rewrite fires, and both runs agree
+query TIIT
+SELECT status, abi_rows, fallback_rows, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH p = (a:Person)-[k:Knows]->{1,2}(b:Person)
+    COLUMNS (a.id AS a, b.id AS b, edges(p)))');
+----
+unverified	5	5	false

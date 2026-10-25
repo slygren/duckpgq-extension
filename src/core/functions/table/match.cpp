@@ -5835,6 +5835,35 @@ static bool HasTopLevelNamedPathFunction(const MatchExpression &ref, const strin
 	return false;
 }
 
+// True when COLUMNS apply a function to the named path that a route has no column for. edges(p) is the
+// usual one: the traversal returns the edges' row ids, and no artifact holds those. A route that would
+// leave such a function unrewritten declines, and the pattern is traversed instead of failing to bind.
+static bool HasUnprovidedPathFunction(const MatchExpression &ref, const string &path_variable,
+                                      std::initializer_list<const char *> provided) {
+	if (path_variable.empty()) {
+		return false;
+	}
+	for (const auto &expression : ref.column_list) {
+		auto *function_ref = dynamic_cast<FunctionExpression *>(expression.get());
+		if (!function_ref || function_ref->GetArguments().size() != 1) {
+			continue;
+		}
+		auto *column_ref = dynamic_cast<const ColumnRefExpression *>(&function_ref->GetArguments()[0].GetExpression());
+		if (!column_ref || column_ref->ColumnNames().size() != 1 ||
+		    !StringUtil::CIEquals(PGQStr(column_ref->ColumnNames()[0]), path_variable)) {
+			continue;
+		}
+		bool is_provided = false;
+		for (const char *name : provided) {
+			is_provided = is_provided || StringUtil::CIEquals(function_ref->FunctionName().GetIdentifierName(), name);
+		}
+		if (!is_provided) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static void RewriteTopLevelNamedPathFunctions(MatchExpression &ref, const string &path_variable,
                                               const string &path_alias) {
 	for (auto &expression : ref.column_list) {
@@ -8051,9 +8080,13 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 					return false;
 				}
 				// The closures answer neither CHEAPEST nor a zero lower bound (they hold no empty
-				// path), and implement no path mode or COST: those go to the expansion or traversal.
-				const bool closure_shape = selector != PGQPathSelector::CHEAPEST && tc_sp->lower >= 1 &&
-				                           !PatternHasPathModeOrCost(path_elements);
+				// path), implement no path mode or COST, and have no column for edges(p): those go
+				// to the expansion or the traversal.
+				const bool closure_shape =
+				    selector != PGQPathSelector::CHEAPEST && tc_sp->lower >= 1 &&
+				    !PatternHasPathModeOrCost(path_elements) &&
+				    !HasUnprovidedPathFunction(match_ref, named_path_variable,
+				                               {"path_length", "vertices", "vertex_labels", "edge_labels"});
 				if (closure_shape) {
 					if (one_row_per_mode != OneRowPerMode::NONE) {
 						const string tc_witness_tname = "__pg_" + graph_name + "__tc_witness__" +
@@ -8370,7 +8403,10 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 		if (ctx_src && ctx_dst && ctx_sp && ctx_sp->path_list.size() == 1 &&
 		    !ctx_src->variable_binding.empty() && !ctx_src->label.empty() &&
 		    !IsCompoundLabel(ctx_src->label) && selector != PGQPathSelector::CHEAPEST && ctx_sp->lower >= 1 &&
-		    !PatternHasPathModeOrCost(path_elements)) {
+		    !PatternHasPathModeOrCost(path_elements) &&
+		    !HasUnprovidedPathFunction(match_ref, named_path_variable,
+		                               {"path_length", "vertices", "vertex_labels", "edge_labels",
+		                                "vertex_properties"})) {
 			PathElement *ctx_edge = get_path_element(ctx_sp->path_list[0]);
 			const bool named_path_projection = HasTopLevelNamedPathFunction(match_ref, named_path_variable);
 			const bool vertex_properties_projection =
