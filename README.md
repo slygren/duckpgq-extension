@@ -307,6 +307,7 @@ FROM total_triangle_count('social', 'Person', 'Knows');    -- one row
 FROM betweenness_centrality('social', 'Person', 'Knows', k := 256, seed := 7, normalized := true, directed := true);
 FROM label_propagation('social', 'Person', 'Knows', seed := 7, max_iterations := 100);
 FROM louvain('social', 'Person', 'Knows', resolution := 1.0, seed := 7);
+FROM k_core('social', 'Person', 'Knows');
 ```
 
 How each function reads the edges (n vertices, m edges):
@@ -319,6 +320,7 @@ How each function reads the edges (n vertices, m edges):
 | `betweenness_centrality(g, v, e, k, normalized, directed, seed)` | directed (default) or undirected | ignored | count once | `betweenness_centrality DOUBLE` | O(n m), O(k m) sampled |
 | `label_propagation(g, v, e, seed, max_iterations)` | undirected | ignored | count once | `community BIGINT` | O(m) per round |
 | `louvain(g, v, e, resolution, seed)` | undirected, unweighted | ignored | count once | `community BIGINT` | O(m) per pass, typically O(m log n) |
+| `k_core(g, v, e)` | undirected | ignored | count once | `core_number BIGINT` | O(n + m) |
 
 - **`strongly_connected_component`**: Tarjan's algorithm, iterative, so long chains are no problem. Two vertices
   share a `componentId` when each reaches the other. The id is the smallest rowid among the component's vertices,
@@ -348,6 +350,10 @@ How each function reads the edges (n vertices, m edges):
   NetworkX's partition (different random generator). On the generated test graphs its modularity is within 0.02 of
   the best of five NetworkX seeds, and planted partitions are recovered exactly. As with any Louvain, a community can
   be internally disconnected; Leiden's refinement step, which prevents that, is not implemented.
+- **`k_core`**: each vertex's core number, the largest k such that the vertex lies in a subgraph where every vertex
+  has at least k neighbours, computed by Batagelj-Zaversnik bucket peeling. The k-core is
+  `WHERE core_number >= k`. `networkx.core_number` refuses graphs with self-loops; here they are dropped, which gives
+  NetworkX's answer for the graph without them.
 
 `scripts/compare_graph_algorithms.py` compares every function with NetworkX (or a brute force) on generated graphs:
 directed and undirected readings, disconnected parts, self-loops, parallel and reciprocal edges, empty edge and vertex

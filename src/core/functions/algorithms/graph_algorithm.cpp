@@ -479,6 +479,7 @@ void CoreGraphAlgorithms::Register(ExtensionLoader &loader) {
 	RegisterBetweennessCentrality(loader);
 	RegisterLabelPropagation(loader);
 	RegisterLouvain(loader);
+	RegisterKCore(loader);
 }
 
 } // namespace duckdb

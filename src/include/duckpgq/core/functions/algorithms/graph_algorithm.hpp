@@ -176,6 +176,7 @@ private:
 	static void RegisterBetweennessCentrality(ExtensionLoader &loader);
 	static void RegisterLabelPropagation(ExtensionLoader &loader);
 	static void RegisterLouvain(ExtensionLoader &loader);
+	static void RegisterKCore(ExtensionLoader &loader);
 };
 
 } // namespace duckdb

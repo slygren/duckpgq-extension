@@ -1,0 +1,72 @@
+# name: test/sql/algorithms/k_core.test
+# description: k_core: core numbers of the undirected simple graph (direction ignored, parallel edges once,
+#              self-loops dropped) = networkx.core_number after removing self-loops.
+# group: [algorithms]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE v (id VARCHAR);
+
+statement ok
+INSERT INTO v VALUES ('i'), ('h'), ('g'), ('f'), ('e'), ('d'), ('c'), ('b'), ('a');
+
+# K4 on a..d (with a parallel and a reciprocal edge), a triangle e - f - g hanging off d, a self-loop on h, and an
+# isolated i.
+statement ok
+CREATE TABLE e (src VARCHAR, dst VARCHAR);
+
+statement ok
+INSERT INTO e VALUES ('a', 'b'), ('a', 'c'), ('d', 'a'), ('b', 'c'), ('b', 'd'), ('c', 'd'), ('a', 'b'), ('b', 'a'),
+    ('d', 'e'), ('e', 'f'), ('f', 'g'), ('g', 'e'), ('h', 'h');
+
+statement ok
+CREATE PROPERTY GRAPH g VERTEX TABLES (v) EDGE TABLES (e SOURCE KEY (src) REFERENCES v (id) DESTINATION KEY (dst) REFERENCES v (id));
+
+query II
+SELECT id, core_number FROM k_core('g', 'v', 'e') ORDER BY id;
+----
+a	3
+b	3
+c	3
+d	3
+e	2
+f	2
+g	2
+h	0
+i	0
+
+# The k-core itself is a filter on the result.
+query I
+SELECT list(id ORDER BY id) FROM k_core('g', 'v', 'e') WHERE core_number >= 3;
+----
+[a, b, c, d]
+
+# A complete graph on 50 vertices: every core number is 49.
+statement ok
+CREATE TABLE kv AS SELECT range AS id FROM range(50);
+
+statement ok
+CREATE TABLE ke AS SELECT a.id AS src, b.id AS dst FROM kv a, kv b WHERE a.id < b.id;
+
+statement ok
+CREATE PROPERTY GRAPH kg VERTEX TABLES (kv) EDGE TABLES (ke SOURCE KEY (src) REFERENCES kv (id) DESTINATION KEY (dst) REFERENCES kv (id));
+
+query II
+SELECT min(core_number), max(core_number) FROM k_core('kg', 'kv', 'ke');
+----
+49	49
+
+statement ok
+CREATE TABLE ne (src VARCHAR, dst VARCHAR);
+
+statement ok
+CREATE PROPERTY GRAPH ng VERTEX TABLES (v) EDGE TABLES (ne SOURCE KEY (src) REFERENCES v (id) DESTINATION KEY (dst) REFERENCES v (id));
+
+query II
+SELECT count(*), max(core_number) FROM k_core('ng', 'v', 'ne');
+----
+9	0
