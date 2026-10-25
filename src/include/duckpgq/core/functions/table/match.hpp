@@ -265,7 +265,7 @@ public:
 	//! The query for one MATCH block and its UNION [ALL] MATCH branches. allow_abi = false keeps every pattern on the
 	//! traversal routes, which bind each element to a table row.
 	static unique_ptr<QueryNode> BuildMatchQueryNode(ClientContext &context, MatchExpression *ref, bool allow_abi);
-	//! A MATCH with path pattern unions, built from MATCH blocks without them.
+	//! A MATCH with path pattern unions or path property functions, built from MATCH blocks without either.
 	static unique_ptr<QueryNode> BuildLoweredMatchQueryNode(ClientContext &context, MatchExpression &ref);
 
 	static unique_ptr<SubqueryRef> GenerateSubpathPatternSubquery(unique_ptr<PathPattern> &path_pattern,

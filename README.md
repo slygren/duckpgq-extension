@@ -10,7 +10,7 @@ documentation for the upstream project is at [duckpgq.org](https://duckpgq.org/)
 
 | Added here | In short | More |
 | --- | --- | --- |
-| PGQL-style patterns | label expressions, `OPTIONAL MATCH`, `EXISTS { }`, `UNION` of MATCH blocks, path pattern unions (`\|`, `\|+\|`), `ONE ROW PER …`, path functions, property projection | [Query language](#query-language) |
+| PGQL-style patterns | label expressions, `OPTIONAL MATCH`, `EXISTS { }`, `UNION` of MATCH blocks, path pattern unions (`\|`, `\|+\|`), `ONE ROW PER …`, path functions and aggregation along a path, property projection | [Query language](#query-language) |
 | ABI path tables | precomputed path tables that `GRAPH_TABLE` reads instead of traversing; the extension builds them, checks they are fresh and reports which one a query used | [ABI path tables](#abi-path-tables) |
 | Server and browser use | a setting that turns the grammar on for every connection, so a [Quack](#serving-graphs-over-quack) server can serve graphs; a wasm build | [Deployment](#deployment) |
 | Planner work | factorized joins for counts over n:m paths, vertex-join elimination, a frontier semi-join for bounded context expansion | [docs/FACTORIZED_JOINS.md](docs/FACTORIZED_JOINS.md), [docs/duckdb_v2.md](docs/duckdb_v2.md) |
@@ -157,6 +157,7 @@ walks that return to their start vertex are left out, and an edge stored twice i
 | `ALL_DIFFERENT(a, b, …)` | the bound elements are pairwise distinct |
 | `path_length(p)`, `vertices(p)`, `edges(p)` | hops; the path's vertices (row ids when traversed, keys when an ABI artifact answers) and edges (row ids; no artifact has them, so a pattern asking for `edges(p)` is traversed) |
 | `vertex_labels(p)`, `edge_labels(p)` | declared labels along the path, in path order, traversed or answered by an ABI artifact. They need each vertex and edge of the path to have one table, from its label or from the edge next to it |
+| `vertex_property(p, 'x')`, `edge_property(p, 'x')` | property `x` of every vertex / edge of path `p`, in path order (NULL where an element's table has no `x`), for aggregating along the path: `list_sum(edge_property(p, 'weight'))`, `list_avg`, `list_min`, `list_max`, `len`. In COLUMNS and WHERE, on every route that answers `vertices(p)` / `edges(p)`, ABI artifacts included; `edge_property` is traversed, like `edges(p)` |
 | `cost(p)` | total cost of an `ANY`/`ALL CHEAPEST` path |
 | `path_tree_json(…)`, `graph_tree_json(…)` | nest paths into a JSON tree |
 
@@ -392,11 +393,12 @@ building in [abi_build.cpp](src/core/functions/table/abi_build.cpp); vertex-join
 - **One DuckDB version per binary**, and unsigned (see [Deployment](#deployment)).
 - **Patterns not supported:** bracketed sub-path groups `[ … ]{n,m}` and parenthesized path patterns (a quantified
   or nested union such as `((a)-[:R]->(b) | (a)-[:S]->(b)){1,3}`), Cypher's `[:R*1..5]` (write `-[:R]->{1,5}`),
-  `LATERAL` inside `MATCH`, horizontal aggregation along a path, graph updates (`INSERT`/`DELETE` of vertices or
-  edges; the graph is a view over tables).
+  `LATERAL` inside `MATCH`, graph updates (`INSERT`/`DELETE` of vertices or edges; the graph is a view over tables).
 - **Path pattern unions** (`|`, `|+|`) stand at the top level of a MATCH pattern, and take no search prefix
   (`ANY SHORTEST … | …`), OPTIONAL MATCH or ONE ROW PER. `|` removes duplicates only between fixed-length, directed
   operands; operands that may match the same variable-length walk need `|+|` or disjoint labels.
+- **`vertex_property(p, 'x')` / `edge_property(p, 'x')`** take a literal property name. The lists are looked up
+  after the match (one join per element table), so they cost about what the equivalent hand-written join does.
 - **Parsed, not implemented:** top-k shortest (`SHORTEST k`).
 - **`OPTIONAL MATCH`** is fixed-length and directed only. `ONE ROW PER` does not cover unbounded left-directed or
   bidirectional variable-length patterns.

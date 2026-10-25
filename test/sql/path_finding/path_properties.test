@@ -1,0 +1,495 @@
+# name: test/sql/path_finding/path_properties.test
+# description: vertex_property(p, 'x') / edge_property(p, 'x'): a property of every vertex / edge of a matched path,
+#              in path order, for aggregation along the path (list_sum, list_avg, list_min, list_max, len). Checked
+#              against brute-force walks, and traversed against answered from ABI artifacts.
+# group: [path_finding]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE tag(id INTEGER PRIMARY KEY, name VARCHAR, prio INTEGER);
+
+# A diamond (1 -> 2 -> 3 and 1 -> 5 -> 3) and a second root (4)
+statement ok
+INSERT INTO tag VALUES (1, 'Pump A', 3), (2, 'Area', 2), (3, 'Plant', 1), (4, 'Valve', 5), (5, 'Line', NULL);
+
+statement ok
+CREATE TABLE workorder(id INTEGER PRIMARY KEY, title VARCHAR, cost DOUBLE);
+
+statement ok
+INSERT INTO workorder VALUES (10, 'WO-10', 100.5), (11, 'WO-11', 7);
+
+statement ok
+CREATE TABLE notification(id INTEGER PRIMARY KEY, title VARCHAR, cost DOUBLE);
+
+statement ok
+INSERT INTO notification VALUES (20, 'N-20', 2.5);
+
+statement ok
+CREATE TABLE operation(id INTEGER PRIMARY KEY, title VARCHAR, cost DOUBLE);
+
+statement ok
+INSERT INTO operation VALUES (100, 'Inspect', 1), (101, 'Repair', 40);
+
+statement ok
+CREATE TABLE has_parent(src INTEGER, dst INTEGER, w INTEGER);
+
+statement ok
+INSERT INTO has_parent VALUES (1, 2, 1), (2, 3, 2), (4, 2, 3), (1, 5, 4), (5, 3, 5);
+
+statement ok
+CREATE TABLE has_workorder(src INTEGER, dst INTEGER, w INTEGER);
+
+statement ok
+INSERT INTO has_workorder VALUES (1, 10, 4), (4, 11, 5), (2, 11, 6);
+
+statement ok
+CREATE TABLE has_notification(src INTEGER, dst INTEGER, w INTEGER);
+
+statement ok
+INSERT INTO has_notification VALUES (1, 20, 7);
+
+statement ok
+CREATE TABLE has_operation(src INTEGER, dst INTEGER, w INTEGER);
+
+statement ok
+INSERT INTO has_operation VALUES (10, 100, 8), (10, 101, 9), (11, 101, 10);
+
+statement ok
+CREATE TABLE notified_operation(src INTEGER, dst INTEGER, w INTEGER);
+
+statement ok
+INSERT INTO notified_operation VALUES (20, 100, 11);
+
+statement ok
+CREATE PROPERTY GRAPH mg
+VERTEX TABLES (tag LABEL Tag, workorder LABEL Workorder, notification LABEL Notification, operation LABEL Operation)
+EDGE TABLES (
+    has_parent SOURCE KEY (src) REFERENCES tag (id) DESTINATION KEY (dst) REFERENCES tag (id) LABEL HasParent,
+    has_workorder SOURCE KEY (src) REFERENCES tag (id) DESTINATION KEY (dst) REFERENCES workorder (id) LABEL HasWorkorder,
+    has_notification SOURCE KEY (src) REFERENCES tag (id) DESTINATION KEY (dst) REFERENCES notification (id)
+        LABEL HasNotification,
+    has_operation SOURCE KEY (src) REFERENCES workorder (id) DESTINATION KEY (dst) REFERENCES operation (id)
+        LABEL HasOperation,
+    notified_operation SOURCE KEY (src) REFERENCES notification (id) DESTINATION KEY (dst) REFERENCES operation (id)
+        LABEL NotifiedOperation
+);
+
+# Brute force: every HasParent walk of 1 to 3 hops, with the properties along it (the hierarchy is acyclic)
+statement ok
+CREATE TABLE walks AS
+WITH RECURSIVE w(src, cur, names, prios, ws, depth) AS (
+    SELECT id, id, [name], [prio], []::INTEGER[], 0 FROM tag
+    UNION ALL
+    SELECT w.src, e.dst, list_append(w.names, t.name), list_append(w.prios, t.prio), list_append(w.ws, e.w), w.depth + 1
+    FROM w JOIN has_parent e ON e.src = w.cur JOIN tag t ON t.id = e.dst
+    WHERE w.depth < 3)
+SELECT src, cur, names, prios, ws, depth FROM w WHERE depth >= 1;
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Traversed
+# ---------------------------------------------------------------------------------------------------------------------
+
+statement ok
+SET pgq_abi_mode = 'off';
+
+query IITTT rowsort
+FROM GRAPH_TABLE (mg MATCH p = (a:Tag)-[:HasParent]->{1,3}(b:Tag) WHERE a.id = 1
+                  COLUMNS (a.id AS a, b.id AS b, vertex_property(p, 'name') AS names,
+                           vertex_property(p, 'prio') AS prios, edge_property(p, 'w') AS ws));
+----
+1	2	[Pump A, Area]	[3, 2]	[1]
+1	3	[Pump A, Area, Plant]	[3, 2, 1]	[1, 2]
+1	3	[Pump A, Line, Plant]	[3, NULL, 1]	[4, 5]
+1	5	[Pump A, Line]	[3, NULL]	[4]
+
+# Every walk against the brute force, with the aggregates computed from the lists
+statement ok
+CREATE OR REPLACE TABLE actual AS
+FROM GRAPH_TABLE (mg MATCH p = (a:Tag)-[:HasParent]->{1,3}(b:Tag)
+                  COLUMNS (a.id AS a, b.id AS b, vertex_property(p, 'name') AS names,
+                           list_sum(vertex_property(p, 'prio')) AS prio_sum,
+                           list_avg(vertex_property(p, 'prio')) AS prio_avg,
+                           list_min(vertex_property(p, 'prio')) AS prio_min,
+                           list_max(edge_property(p, 'w')) AS w_max,
+                           len(edge_property(p, 'w')) AS hops,
+                           path_length(p) AS path_length));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS
+SELECT src AS a, cur AS b, names, list_sum(prios) AS prio_sum, list_avg(prios) AS prio_avg, list_min(prios) AS prio_min,
+       list_max(ws) AS w_max, len(ws) AS hops, depth AS path_length
+FROM walks;
+
+query II
+SELECT (SELECT count(*) FROM actual), count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+8	0
+
+query I
+SELECT count(*) FROM actual WHERE hops <> path_length;
+----
+0
+
+# In WHERE, alone or next to ordinary conditions
+statement ok
+CREATE OR REPLACE TABLE actual AS
+FROM GRAPH_TABLE (mg MATCH p = (a:Tag)-[:HasParent]->{1,3}(b:Tag)
+                  WHERE list_sum(edge_property(p, 'w')) >= 3 AND b.id = 3 AND len(vertex_property(p, 'name')) > 2
+                  COLUMNS (a.id AS a, b.id AS b, edge_property(p, 'w') AS ws));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS
+SELECT src AS a, cur AS b, ws FROM walks WHERE list_sum(ws) >= 3 AND cur = 3 AND len(names) > 2;
+
+query II
+SELECT (SELECT count(*) FROM actual), count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+3	0
+
+query II rowsort
+FROM GRAPH_TABLE (mg MATCH p = (a:Tag)-[:HasParent]->{1,3}(b:Tag)
+                  WHERE list_max(vertex_property(p, 'prio')) = 5 OR a.id = 2
+                  COLUMNS (a.id AS a, b.id AS b));
+----
+2	3
+4	2
+4	3
+
+# A zero-hop path has one vertex and no edges
+query IITTI rowsort
+FROM GRAPH_TABLE (mg MATCH p = (a:Tag)-[:HasParent]->{0,2}(b:Tag) WHERE a.id = 4
+                  COLUMNS (a.id AS a, b.id AS b, vertex_property(p, 'name') AS names, edge_property(p, 'w') AS ws,
+                           coalesce(list_sum(edge_property(p, 'w')), 0) AS total));
+----
+4	2	[Valve, Area]	[3]	3
+4	3	[Valve, Area, Plant]	[3, 2]	5
+4	4	[Valve]	[]	0
+
+# Fixed-length paths over several tables: a table without the property gives NULL at its positions
+query IITT rowsort
+FROM GRAPH_TABLE (mg MATCH p = (a:Tag)-[:HasWorkorder]->(w:Workorder)-[:HasOperation]->(o:Operation)
+                  COLUMNS (a.id AS a, o.id AS o, vertex_property(p, 'title') AS titles, edge_property(p, 'w') AS ws));
+----
+1	100	[NULL, WO-10, Inspect]	[4, 8]
+1	101	[NULL, WO-10, Repair]	[4, 9]
+2	101	[NULL, WO-11, Repair]	[6, 10]
+4	101	[NULL, WO-11, Repair]	[5, 10]
+
+statement ok
+CREATE OR REPLACE TABLE actual AS
+FROM GRAPH_TABLE (mg MATCH p = (a:Tag)-[e:HasWorkorder]->(w:Workorder)-[f:HasOperation]->(o:Operation)
+                  COLUMNS (vertex_property(p, 'title') AS titles, list_sum(vertex_property(p, 'cost')) AS cost,
+                           edge_property(p, 'w') AS ws));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS
+FROM GRAPH_TABLE (mg MATCH (a:Tag)-[e:HasWorkorder]->(w:Workorder)-[f:HasOperation]->(o:Operation)
+                  COLUMNS ([NULL, w.title, o.title] AS titles, w.cost + o.cost AS cost, [e.w, f.w] AS ws));
+
+query II
+SELECT (SELECT count(*) FROM actual), count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+4	0
+
+# A property list is typed by the tables the path can reach: INTEGER here, not widened by the DOUBLE costs elsewhere
+query T
+SELECT DISTINCT typeof(ws) FROM GRAPH_TABLE (mg MATCH p = (a:Tag)-[:HasParent]->{1,2}(b:Tag) COLUMNS (edge_property(p, 'w') AS ws));
+----
+INTEGER[]
+
+# Several paths and calls in one MATCH; names and aliases as usual
+query IITT
+FROM GRAPH_TABLE (mg MATCH p = (a:Tag)-[:HasWorkorder]->(w:Workorder), q = (w)-[:HasOperation]->(o:Operation)
+                  WHERE a.id = 1 AND o.id = 100
+                  COLUMNS (a.id, o.id, vertex_property(p, 'name'), vertex_property(q, 'title')));
+----
+1	100	[Pump A, NULL]	[WO-10, Inspect]
+
+query T
+SELECT column_name FROM (DESCRIBE FROM GRAPH_TABLE (mg MATCH p = (a:Tag)-[:HasParent]->(b:Tag)
+                                             COLUMNS (a.id, vertex_property(p, 'name'), len(edge_property(p, 'w')) AS n)));
+----
+id
+vertex_property(p, 'name')
+n
+
+# Without a COLUMNS property: the default columns, filtered by a path property
+query III rowsort
+FROM GRAPH_TABLE (mg MATCH p = (a:Tag)-[:HasParent]->(b:Tag) WHERE list_sum(edge_property(p, 'w')) > 4) SELECT id, name, id_1;
+----
+5	Line	3
+
+# With a path pattern union and with UNION of MATCH blocks
+query IIT rowsort
+FROM GRAPH_TABLE (mg MATCH p = (a:Tag)-[:HasWorkorder]->(x:Workorder) | (a:Tag)-[:HasNotification]->(x:Notification)
+                  WHERE a.id = 1
+                  COLUMNS (a.id AS a, x.id AS x, vertex_property(p, 'title') AS titles));
+----
+1	10	[NULL, WO-10]
+1	20	[NULL, N-20]
+
+query IT rowsort
+FROM GRAPH_TABLE (mg
+    MATCH p = (a:Tag)-[:HasParent]->(b:Tag) WHERE a.id = 1
+    UNION ALL
+    MATCH p = (a:Tag)-[:HasWorkorder]->(b:Workorder) WHERE a.id = 4
+    COLUMNS (a.id AS a, edge_property(p, 'w') AS ws));
+----
+1	[1]
+1	[4]
+4	[5]
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Answered from ABI artifacts: the same answers. Only vertex_property can be: edges(p) has no artifact column, so a
+# pattern reading edge_property is traversed.
+# ---------------------------------------------------------------------------------------------------------------------
+
+statement ok
+CREATE OR REPLACE TABLE trav_chain AS
+FROM GRAPH_TABLE (mg MATCH p = (a:Tag)-[:HasParent]->{1,3}(b:Tag)
+                  COLUMNS (a.id AS a, b.id AS b, vertex_property(p, 'name') AS names,
+                           list_sum(vertex_property(p, 'prio')) AS s));
+
+statement ok
+CREATE OR REPLACE TABLE trav_where AS
+FROM GRAPH_TABLE (mg MATCH p = (a:Tag)-[:HasParent]->{1,3}(b:Tag) WHERE list_sum(vertex_property(p, 'prio')) > 4
+                  COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+SET pgq_abi_mode = 'consume';
+
+statement ok
+CREATE SCHEMA graph;
+
+statement ok
+FROM pgq_abi_build('mg', exclude_self_referential := false, closures := ['HasParent']);
+
+statement ok
+CREATE OR REPLACE TABLE actual AS
+FROM GRAPH_TABLE (mg MATCH p = (a:Tag)-[:HasParent]->{1,3}(b:Tag)
+                  COLUMNS (a.id AS a, b.id AS b, vertex_property(p, 'name') AS names,
+                           list_sum(vertex_property(p, 'prio')) AS s));
+
+query T
+SELECT list(DISTINCT path_kind) FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+[context_expansion]
+
+query II
+SELECT (SELECT count(*) FROM actual), count(*) FROM ((FROM actual EXCEPT ALL FROM trav_chain) UNION ALL (FROM trav_chain EXCEPT ALL FROM actual));
+----
+8	0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS
+FROM GRAPH_TABLE (mg MATCH p = (a:Tag)-[:HasParent]->{1,3}(b:Tag) WHERE list_sum(vertex_property(p, 'prio')) > 4
+                  COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM actual), count(*) FROM ((FROM actual EXCEPT ALL FROM trav_where) UNION ALL (FROM trav_where EXCEPT ALL FROM actual));
+----
+4	0
+
+# Context expansion over every edge family (no traversal route exists for an unlabeled destination over several
+# tables): against the explicit fixed-length paths
+statement ok
+CREATE OR REPLACE TABLE actual AS
+FROM GRAPH_TABLE (mg MATCH p = (t:Tag)-[:!HasParent]->{1,2}(x)
+                  COLUMNS (t.id AS t, vertices(p) AS ids, vertex_property(p, 'title') AS titles,
+                           list_sum(vertex_property(p, 'cost')) AS cost));
+
+query T
+SELECT list(DISTINCT path_kind) FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+[context_expansion]
+
+statement ok
+CREATE OR REPLACE TABLE expected AS
+SELECT * FROM (
+    FROM GRAPH_TABLE (mg MATCH (t:Tag)-[:HasWorkorder]->(w:Workorder)
+                      COLUMNS (t.id AS t, [t.id::VARCHAR, w.id::VARCHAR] AS ids, [NULL, w.title] AS titles, w.cost AS cost))
+    UNION ALL
+    FROM GRAPH_TABLE (mg MATCH (t:Tag)-[:HasNotification]->(n:Notification)
+                      COLUMNS (t.id AS t, [t.id::VARCHAR, n.id::VARCHAR] AS ids, [NULL, n.title] AS titles, n.cost AS cost))
+    UNION ALL
+    FROM GRAPH_TABLE (mg MATCH (t:Tag)-[:HasWorkorder]->(w:Workorder)-[:HasOperation]->(o:Operation)
+                      COLUMNS (t.id AS t, [t.id::VARCHAR, w.id::VARCHAR, o.id::VARCHAR] AS ids,
+                               [NULL, w.title, o.title] AS titles, w.cost + o.cost AS cost))
+    UNION ALL
+    FROM GRAPH_TABLE (mg MATCH (t:Tag)-[:HasNotification]->(n:Notification)-[:NotifiedOperation]->(o:Operation)
+                      COLUMNS (t.id AS t, [t.id::VARCHAR, n.id::VARCHAR, o.id::VARCHAR] AS ids,
+                               [NULL, n.title, o.title] AS titles, n.cost + o.cost AS cost)));
+
+query II
+SELECT (SELECT count(*) FROM actual), count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+9	0
+
+query ITR rowsort
+FROM GRAPH_TABLE (mg MATCH p = (t:Tag)-[:!HasParent]->{1,2}(x) WHERE t.id = 1
+                  COLUMNS (t.id AS t, vertex_property(p, 'title') AS titles, list_sum(vertex_property(p, 'cost')) AS cost));
+----
+1	[NULL, N-20, Inspect]	3.5
+1	[NULL, N-20]	2.5
+1	[NULL, WO-10, Inspect]	101.5
+1	[NULL, WO-10, Repair]	140.5
+1	[NULL, WO-10]	100.5
+
+# edge_property needs edges(p), which no artifact holds: the pattern is traversed, with the same answer
+query IITT rowsort
+FROM GRAPH_TABLE (mg MATCH p = (a:Tag)-[:HasParent]->{1,3}(b:Tag) WHERE a.id = 1
+                  COLUMNS (a.id AS a, b.id AS b, vertex_property(p, 'name') AS names, edge_property(p, 'w') AS ws));
+----
+1	2	[Pump A, Area]	[1]
+1	3	[Pump A, Area, Plant]	[1, 2]
+1	3	[Pump A, Line, Plant]	[4, 5]
+1	5	[Pump A, Line]	[4]
+
+query I
+SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+0
+
+# A hierarchy, whose closures are exact: the chain and witness artifacts answer
+statement ok
+CREATE TABLE node(id INTEGER PRIMARY KEY, name VARCHAR, prio INTEGER);
+
+statement ok
+INSERT INTO node SELECT i, 'n' || i, i % 7 FROM range(1, 41) t(i);
+
+statement ok
+CREATE TABLE parent(src INTEGER, dst INTEGER, w INTEGER);
+
+statement ok
+INSERT INTO parent SELECT i, i // 2, i % 5 FROM range(2, 41) t(i);
+
+statement ok
+CREATE PROPERTY GRAPH tree VERTEX TABLES (node LABEL Node)
+EDGE TABLES (parent SOURCE KEY (src) REFERENCES node (id) DESTINATION KEY (dst) REFERENCES node (id) LABEL Parent);
+
+statement ok
+SET pgq_abi_mode = 'off';
+
+statement ok
+CREATE OR REPLACE TABLE trav_tree AS
+FROM GRAPH_TABLE (tree MATCH p = (a:Node)-[:Parent]->{1,5}(b:Node)
+                  COLUMNS (a.id AS a, b.id AS b, vertex_property(p, 'name') AS names,
+                           list_sum(vertex_property(p, 'prio')) AS s, list_max(vertex_property(p, 'prio')) AS m));
+
+statement ok
+CREATE OR REPLACE TABLE trav_tree_shortest AS
+FROM GRAPH_TABLE (tree MATCH p = ANY SHORTEST (a:Node)-[:Parent]->+(b:Node) WHERE b.id = 1
+                  COLUMNS (a.id AS a, vertex_property(p, 'prio') AS prios));
+
+statement ok
+SET pgq_abi_mode = 'consume';
+
+statement ok
+FROM pgq_abi_build('tree', exclude_self_referential := false, closures := ['Parent']);
+
+statement ok
+CREATE OR REPLACE TABLE actual AS
+FROM GRAPH_TABLE (tree MATCH p = (a:Node)-[:Parent]->{1,5}(b:Node)
+                  COLUMNS (a.id AS a, b.id AS b, vertex_property(p, 'name') AS names,
+                           list_sum(vertex_property(p, 'prio')) AS s, list_max(vertex_property(p, 'prio')) AS m));
+
+query T
+SELECT list(DISTINCT path_kind) FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+[tc_chain]
+
+query II
+SELECT (SELECT count(*) FROM actual), count(*) FROM ((FROM actual EXCEPT ALL FROM trav_tree) UNION ALL (FROM trav_tree EXCEPT ALL FROM actual));
+----
+143	0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS
+FROM GRAPH_TABLE (tree MATCH p = ANY SHORTEST (a:Node)-[:Parent]->+(b:Node) WHERE b.id = 1
+                  COLUMNS (a.id AS a, vertex_property(p, 'prio') AS prios));
+
+query I
+SELECT count(*) > 0 FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+true
+
+query II
+SELECT (SELECT count(*) FROM actual), count(*) FROM ((FROM actual EXCEPT ALL FROM trav_tree_shortest) UNION ALL (FROM trav_tree_shortest EXCEPT ALL FROM actual));
+----
+39	0
+
+# Each list is the property of the path's vertices, in order: against vertices(p), the keys the artifact holds
+query I
+SELECT count(*) FROM GRAPH_TABLE (tree MATCH p = (a:Node)-[:Parent]->{1,5}(b:Node)
+                                  COLUMNS (vertices(p) AS ids, vertex_property(p, 'name') AS names))
+WHERE names <> list_transform(ids, lambda x: 'n' || x);
+----
+0
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------------------------------------------------
+
+statement error
+FROM GRAPH_TABLE (mg MATCH (a:Tag)-[:HasParent]->(b:Tag) COLUMNS (vertex_property(a, 'name')));
+----
+needs 'a' to be a path variable of this MATCH
+
+statement error
+FROM GRAPH_TABLE (mg MATCH p = (a:Tag)-[:HasParent]->(b:Tag) COLUMNS (vertex_property(p, a.name)));
+----
+the property name must be a string literal
+
+statement error
+FROM GRAPH_TABLE (mg MATCH p = (a:Tag)-[:HasParent]->(b:Tag) COLUMNS (edge_property(p, 'title')));
+----
+no edge table of property graph 'mg' has a property 'title'
+
+statement error
+FROM GRAPH_TABLE (mg MATCH p = (a:Tag)-[:HasParent]->(b:Tag) COLUMNS (a.*, vertex_property(p, 'name')));
+----
+COLUMNS with x.* cannot be combined with vertex_property / edge_property
+
+statement error
+FROM GRAPH_TABLE (mg MATCH p = (a:Tag)-[:HasParent]->(b:Tag) COLUMNS (vertex_property(p)));
+----
+takes a path variable and a property name
+
+# An artifact holds keys; a key that names two vertices cannot be looked up, and says so instead of answering
+statement ok
+CREATE TABLE dnode(id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO dnode VALUES (1, 'a'), (2, 'b'), (3, 'c');
+
+statement ok
+CREATE TABLE dparent(src INTEGER, dst INTEGER);
+
+statement ok
+INSERT INTO dparent VALUES (2, 1), (3, 2);
+
+statement ok
+CREATE PROPERTY GRAPH dg VERTEX TABLES (dnode LABEL DNode)
+EDGE TABLES (dparent SOURCE KEY (src) REFERENCES dnode (id) DESTINATION KEY (dst) REFERENCES dnode (id) LABEL DParent);
+
+statement ok
+FROM pgq_abi_build('dg', exclude_self_referential := false, closures := ['DParent']);
+
+query IT rowsort
+FROM GRAPH_TABLE (dg MATCH p = (a:DNode)-[:DParent]->{1,2}(b:DNode) COLUMNS (a.id, vertex_property(p, 'name') AS n));
+----
+2	[b, a]
+3	[c, b, a]
+3	[c, b]
+
+statement ok
+INSERT INTO dnode VALUES (2, 'b-again');
+
+statement error
+FROM GRAPH_TABLE (dg MATCH p = (a:DNode)-[:DParent]->{1,2}(b:DNode) COLUMNS (a.id, vertex_property(p, 'name') AS n));
+----
+a vertex key on the path matches several vertices

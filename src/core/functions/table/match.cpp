@@ -10133,11 +10133,46 @@ static void NormalizeMatchExpression(MatchExpression &match) {
 }
 
 //------------------------------------------------------------------------------
-// Path pattern unions
+// Path pattern unions and path property functions
 //------------------------------------------------------------------------------
-// Lowered onto MATCH blocks without them, so every route (traversal and ABI artifacts) answers them unchanged:
-// `A | B` and `A |+| B` become one MATCH per choice of operand ("leaf"), combined with UNION ALL. For `|`,
-// operands that may match the same path binding are deduplicated on the identity of every element instead.
+// Both are lowered onto MATCH blocks that have neither, so every route (traversal and ABI artifacts) answers them
+// unchanged:
+// - `A | B` and `A |+| B` become one MATCH per choice of operand ("leaf"), combined with UNION ALL. For `|`,
+//   operands that may match the same path binding are deduplicated on the identity of every element instead.
+// - vertex_property(p, 'x') / edge_property(p, 'x') are looked up after the match, from vertices(p) / edges(p)
+//   and their labels, which each route already provides.
+
+static bool IsPathPropertyCall(const ParsedExpression &expression) {
+	if (expression.GetExpressionClass() != ExpressionClass::FUNCTION) {
+		return false;
+	}
+	auto &function = expression.Cast<FunctionExpression>();
+	auto name = function.FunctionName().GetIdentifierName();
+	return StringUtil::CIEquals(name, "vertex_property") || StringUtil::CIEquals(name, "edge_property");
+}
+
+static bool ContainsPathPropertyCall(const ParsedExpression *expression) {
+	if (!expression) {
+		return false;
+	}
+	if (IsPathPropertyCall(*expression)) {
+		return true;
+	}
+	bool found = false;
+	ParsedExpressionIterator::EnumerateChildren(*expression, [&](const ParsedExpression &child) {
+		found = found || ContainsPathPropertyCall(&child);
+	});
+	return found;
+}
+
+static bool UsesPathPropertyCalls(const MatchExpression &match) {
+	for (auto &column : match.column_list) {
+		if (ContainsPathPropertyCall(column.get())) {
+			return true;
+		}
+	}
+	return ContainsPathPropertyCall(match.where_clause.get());
+}
 
 static bool HasPathPatternUnion(const vector<unique_ptr<PathPattern>> &patterns) {
 	for (auto &pattern : patterns) {
@@ -10149,11 +10184,11 @@ static bool HasPathPatternUnion(const vector<unique_ptr<PathPattern>> &patterns)
 }
 
 static bool NeedsLoweredMatch(const MatchExpression &ref) {
-	if (HasPathPatternUnion(ref.path_patterns)) {
+	if (HasPathPatternUnion(ref.path_patterns) || UsesPathPropertyCalls(ref)) {
 		return true;
 	}
 	for (auto &branch : ref.union_matches) {
-		if (HasPathPatternUnion(branch->path_patterns)) {
+		if (HasPathPatternUnion(branch->path_patterns) || ContainsPathPropertyCall(branch->where_clause.get())) {
 			return true;
 		}
 	}
@@ -10489,7 +10524,507 @@ static unique_ptr<QueryNode> CombineUnionAll(vector<unique_ptr<QueryNode>> nodes
 	return result;
 }
 
+//------------------------------------------------------------------------------
+// vertex_property(p, 'x') / edge_property(p, 'x')
+//------------------------------------------------------------------------------
+struct PGQPathPropertySlot {
+	string path_variable;
+	bool vertex = true;
+	string name; //! hidden column prefix, e.g. __pgq_pp0
+	bool with_labels = true;
+	//! The tables of this kind in the graph, in declaration order.
+	vector<shared_ptr<PropertyGraphTable>> tables;
+};
+
+struct PGQPathPropertyValue {
+	idx_t slot = 0;
+	string property;
+	string name; //! e.g. __pgq_ppv0
+};
+
+static bool IsNamedPathOf(const MatchExpression &match, const string &path_variable) {
+	for (auto &pattern : match.path_patterns) {
+		if (pattern->path_elements.size() != 1) {
+			continue;
+		}
+		auto *subpath = PGQMatchFunction::GetSubPath(pattern->path_elements[0]);
+		if (subpath && StringUtil::CIEquals(subpath->path_variable, path_variable)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//! The tables the elements of one kind on path p can come from, in declaration order. Every vertex of a path with
+//! edges is an end of one of its edges, so the vertex tables are the ends of the tables its edges can bind.
+static vector<shared_ptr<PropertyGraphTable>> PathElementTables(const MatchExpression &match,
+                                                                const string &path_variable, bool vertex,
+                                                                CreatePropertyGraphInfo &pg_table) {
+	vector<PGQUnionPosition> positions;
+	for (auto &pattern : match.path_patterns) {
+		auto *subpath = pattern->path_elements.size() == 1 ? PGQMatchFunction::GetSubPath(pattern->path_elements[0])
+		                                                   : nullptr;
+		if (subpath && StringUtil::CIEquals(subpath->path_variable, path_variable) &&
+		    !FlattenUnionOperand(pattern->path_elements, positions)) {
+			positions.clear();
+		}
+	}
+	if (positions.empty()) {
+		return vertex ? pg_table.vertex_tables : pg_table.edge_tables;
+	}
+	case_insensitive_set_t edge_tables;
+	case_insensitive_set_t vertex_tables;
+	bool has_edges = false;
+	for (auto &position : positions) {
+		auto candidates = UnionCandidateTables(*position.element, pg_table);
+		if (position.element->match_type != PGQMatchType::MATCH_VERTEX) {
+			has_edges = true;
+			edge_tables.insert(candidates.begin(), candidates.end());
+		} else if (positions.size() == 1) {
+			vertex_tables = candidates;
+		}
+	}
+	auto table_name = [](const PropertyGraphTable &table) {
+		return QualifiedTableName(PGQStr(table.catalog_name), PGQStr(table.schema_name), PGQStr(table.table_name));
+	};
+	if (has_edges) {
+		for (auto &table : pg_table.edge_tables) {
+			if (edge_tables.find(table_name(*table)) != edge_tables.end()) {
+				for (auto &end : {table->source_pg_table, table->destination_pg_table}) {
+					if (end) {
+						vertex_tables.insert(table_name(*end));
+					}
+				}
+			}
+		}
+	}
+	vector<shared_ptr<PropertyGraphTable>> result;
+	for (auto &table : vertex ? pg_table.vertex_tables : pg_table.edge_tables) {
+		if ((vertex ? vertex_tables : edge_tables).count(table_name(*table))) {
+			result.push_back(table);
+		}
+	}
+	return result;
+}
+
+//! The type of a table's column, or INVALID when it cannot be looked up.
+static LogicalType PathPropertyColumnType(ClientContext &context, const PropertyGraphTable &table,
+                                          const string &column) {
+	try {
+		const string catalog_name = table.catalog_name.empty() ? PGQStr(DatabaseManager::GetDefaultDatabase(context))
+		                                                       : PGQStr(table.catalog_name);
+		const string schema_name = table.schema_name.empty() ? string(DEFAULT_SCHEMA) : PGQStr(table.schema_name);
+		auto entry = Catalog::GetEntry<TableCatalogEntry>(
+		    context, QualifiedName(Identifier(catalog_name), Identifier(schema_name), table.table_name),
+		    OnEntryNotFound::RETURN_NULL);
+		if (!entry || !entry->ColumnExists(Identifier(column))) {
+			return LogicalType::INVALID;
+		}
+		return entry->GetColumn(Identifier(column)).Type();
+	} catch (...) {
+		return LogicalType::INVALID;
+	}
+}
+
+static bool TableHasProperty(const PropertyGraphTable &table, const string &property) {
+	for (auto &column : table.column_names) {
+		if (StringUtil::CIEquals(PGQStr(column), property)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//! An expression another part of the query can evaluate as one column: a property reference, a graph function of
+//! a variable or path, or a subquery.
+static bool IsGraphAtom(const ParsedExpression &expression) {
+	switch (expression.GetExpressionClass()) {
+	case ExpressionClass::COLUMN_REF:
+	case ExpressionClass::SUBQUERY:
+		return true;
+	case ExpressionClass::FUNCTION: {
+		auto name = StringUtil::Lower(expression.Cast<FunctionExpression>().FunctionName().GetIdentifierName());
+		static const case_insensitive_set_t graph_functions {
+		    "element_id", "label",         "labels",      "vertices",          "edges",        "path_length",
+		    "vertex_labels", "edge_labels", "vertex_properties", "cost", "is_labeled", "not_labeled",
+		    "all_different"};
+		return graph_functions.find(name) != graph_functions.end();
+	}
+	default:
+		return false;
+	}
+}
+
+static unique_ptr<QueryNode> BuildPathPropertyNode(ClientContext &context, MatchExpression &leaf, bool allow_abi) {
+	auto duckpgq_state = GetDuckPGQState(context);
+	QualifiedName graph_name(Identifier(leaf.pg_catalog), Identifier(leaf.pg_schema), Identifier(leaf.pg_name));
+	auto &pg_table = *duckpgq_state->GetPropertyGraph(context, graph_name);
+
+	vector<PGQPathPropertySlot> slots;
+	vector<PGQPathPropertyValue> values;
+	// The inner MATCH: the hidden path columns first, then everything evaluated per match.
+	auto inner = unique_ptr_cast<ParsedExpression, MatchExpression>(leaf.Copy());
+	inner->column_list.clear();
+	inner->where_clause.reset();
+	idx_t atom_count = 0;
+	vector<string> hidden_columns {"__pgq_pp_rid"};
+
+	auto value_reference = [&](FunctionExpression &call) -> unique_ptr<ParsedExpression> {
+		const string function_name = StringUtil::Lower(call.FunctionName().GetIdentifierName());
+		const bool vertex = function_name == "vertex_property";
+		auto &arguments = call.GetArguments();
+		const ColumnRefExpression *path_ref =
+		    arguments.size() == 2 && arguments[0].GetExpression().GetExpressionClass() == ExpressionClass::COLUMN_REF
+		        ? &arguments[0].GetExpression().Cast<ColumnRefExpression>()
+		        : nullptr;
+		if (!path_ref || path_ref->ColumnNames().size() != 1) {
+			throw BinderException("%s(p, 'property') takes a path variable and a property name", function_name);
+		}
+		const string path_variable = PGQStr(path_ref->ColumnNames()[0]);
+		if (!IsNamedPathOf(leaf, path_variable)) {
+			throw BinderException("%s(%s, ...) needs '%s' to be a path variable of this MATCH (MATCH %s = ...)",
+			                      function_name, path_variable, path_variable, path_variable);
+		}
+		auto &property_expression = arguments[1].GetExpression();
+		if (property_expression.GetExpressionClass() != ExpressionClass::CONSTANT ||
+		    property_expression.Cast<ConstantExpression>().GetLiteral().ToValue().type().id() !=
+		        LogicalTypeId::VARCHAR) {
+			throw BinderException("%s(%s, ...): the property name must be a string literal", function_name,
+			                      path_variable);
+		}
+		const string property =
+		    property_expression.Cast<ConstantExpression>().GetLiteral().ToValue().GetValue<string>();
+		auto tables = PathElementTables(leaf, path_variable, vertex, pg_table);
+		bool any_table = false;
+		for (auto &table : tables) {
+			any_table = any_table || TableHasProperty(*table, property);
+		}
+		if (!any_table) {
+			throw BinderException("%s(%s, '%s'): no %s table of property graph '%s' has a property '%s'",
+			                      function_name, path_variable, property, vertex ? "vertex" : "edge",
+			                      pg_table.property_graph_name, property);
+		}
+		idx_t slot_index = slots.size();
+		for (idx_t i = 0; i < slots.size(); i++) {
+			if (slots[i].vertex == vertex && StringUtil::CIEquals(slots[i].path_variable, path_variable)) {
+				slot_index = i;
+			}
+		}
+		if (slot_index == slots.size()) {
+			PGQPathPropertySlot slot;
+			slot.path_variable = path_variable;
+			slot.vertex = vertex;
+			slot.name = "__pgq_pp" + to_string(slot_index);
+			slot.tables = tables;
+			slot.with_labels = tables.size() > 1;
+			vector<unique_ptr<ParsedExpression>> ids_arguments;
+			ids_arguments.push_back(PGQColRef(path_variable));
+			auto ids = make_uniq<FunctionExpression>(vertex ? "vertices" : "edges", std::move(ids_arguments));
+			ids->SetAlias(Identifier(slot.name + "_ids"));
+			inner->column_list.push_back(std::move(ids));
+			hidden_columns.push_back(slot.name + "_ids");
+			if (slot.with_labels) {
+				vector<unique_ptr<ParsedExpression>> label_arguments;
+				label_arguments.push_back(PGQColRef(path_variable));
+				auto labels = make_uniq<FunctionExpression>(vertex ? "vertex_labels" : "edge_labels",
+				                                            std::move(label_arguments));
+				labels->SetAlias(Identifier(slot.name + "_lbl"));
+				inner->column_list.push_back(std::move(labels));
+				hidden_columns.push_back(slot.name + "_lbl");
+			}
+			slots.push_back(std::move(slot));
+		}
+		idx_t value_index = values.size();
+		for (idx_t i = 0; i < values.size(); i++) {
+			if (values[i].slot == slot_index && values[i].property == property) {
+				value_index = i;
+			}
+		}
+		if (value_index == values.size()) {
+			PGQPathPropertyValue value;
+			value.slot = slot_index;
+			value.property = property;
+			value.name = "__pgq_ppv" + to_string(value_index);
+			values.push_back(std::move(value));
+		}
+		// A path without elements of this kind (the edges of a zero-hop path) has no values: the empty list. The
+		// values are only read once the lookup is known to be one row per element (checked after the match is
+		// built, as it depends on the route).
+		return PGQColRef("__pgq_ppslot" + to_string(value_index), "__pgq_pp_placeholder");
+	};
+
+	// Property calls become lookups; the graph atoms around them are evaluated by the inner MATCH.
+	std::function<unique_ptr<ParsedExpression>(unique_ptr<ParsedExpression>)> split;
+	split = [&](unique_ptr<ParsedExpression> expression) -> unique_ptr<ParsedExpression> {
+		if (IsPathPropertyCall(*expression)) {
+			auto alias = expression->GetAlias();
+			auto replacement = value_reference(expression->Cast<FunctionExpression>());
+			replacement->SetAlias(alias);
+			return std::move(replacement);
+		}
+		if (IsGraphAtom(*expression)) {
+			auto alias = expression->GetAlias();
+			const string atom_name = "__pgq_ppa" + to_string(atom_count++);
+			expression->SetAlias(Identifier(atom_name));
+			inner->column_list.push_back(std::move(expression));
+			hidden_columns.push_back(atom_name);
+			auto replacement = PGQColRef(atom_name, "__pgq_pp_r");
+			replacement->SetAlias(alias);
+			return std::move(replacement);
+		}
+		ParsedExpressionIterator::EnumerateChildren(
+		    *expression, [&](unique_ptr<ParsedExpression> &child) { child = split(std::move(child)); });
+		return expression;
+	};
+
+	// COLUMNS: when no column reads a path property, the inner MATCH produces them as they are and the outer query
+	// passes them through; otherwise each column is rebuilt over the inner columns.
+	bool columns_read_properties = false;
+	for (auto &column : leaf.column_list) {
+		columns_read_properties = columns_read_properties || ContainsPathPropertyCall(column.get());
+	}
+	vector<unique_ptr<ParsedExpression>> outer_columns;
+	for (auto &column : leaf.column_list) {
+		if (!columns_read_properties) {
+			inner->column_list.push_back(column->Copy());
+			continue;
+		}
+		if (column->GetExpressionClass() == ExpressionClass::STAR) {
+			throw BinderException("COLUMNS with x.* cannot be combined with vertex_property / edge_property in "
+			                      "COLUMNS; list the properties instead");
+		}
+		auto name = column->GetAlias().empty() ? column->GetName() : column->GetAlias();
+		unique_ptr<ParsedExpression> outer_column;
+		if (!ContainsPathPropertyCall(column.get())) {
+			const string atom_name = "__pgq_ppa" + to_string(atom_count++);
+			auto inner_column = column->Copy();
+			inner_column->SetAlias(Identifier(atom_name));
+			inner->column_list.push_back(std::move(inner_column));
+			outer_column = PGQColRef(atom_name, "__pgq_pp_r");
+		} else {
+			outer_column = split(column->Copy());
+		}
+		outer_column->SetAlias(name);
+		outer_columns.push_back(std::move(outer_column));
+	}
+
+	// WHERE: conjuncts without a path property stay in the MATCH; the rest filter the looked-up rows.
+	vector<unique_ptr<ParsedExpression>> conjuncts;
+	std::function<void(unique_ptr<ParsedExpression>)> collect_conjuncts = [&](unique_ptr<ParsedExpression> e) {
+		if (e->GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+			for (auto &child : e->Cast<ConjunctionExpression>().GetChildrenMutable()) {
+				collect_conjuncts(std::move(child));
+			}
+			return;
+		}
+		conjuncts.push_back(std::move(e));
+	};
+	if (leaf.where_clause) {
+		collect_conjuncts(leaf.where_clause->Copy());
+	}
+	vector<unique_ptr<ParsedExpression>> inner_conditions;
+	vector<unique_ptr<ParsedExpression>> outer_conditions;
+	for (auto &conjunct : conjuncts) {
+		if (ContainsPathPropertyCall(conjunct.get())) {
+			outer_conditions.push_back(split(std::move(conjunct)));
+		} else {
+			inner_conditions.push_back(std::move(conjunct));
+		}
+	}
+	if (!inner_conditions.empty()) {
+		inner->where_clause = PGQMatchFunction::CreateWhereClause(inner_conditions);
+	}
+
+	auto inner_node = PGQMatchFunction::BuildMatchQueryNode(context, inner.get(), allow_abi);
+
+	// How the route answered vertices(p) / edges(p): row ids (traversal) or keys (ABI artifacts).
+	vector<bool> keyed(slots.size(), false);
+	for (idx_t i = 0; i < slots.size(); i++) {
+		auto &slot = slots[i];
+		const string ids_name = slot.name + "_ids";
+		const ParsedExpression *answer = nullptr;
+		if (inner_node->type == QueryNodeType::SELECT_NODE) {
+			for (auto &expression : inner_node->Cast<SelectNode>().select_list) {
+				if (StringUtil::CIEquals(expression->GetAlias().GetIdentifierName(), ids_name)) {
+					answer = expression.get();
+				}
+			}
+		}
+		const string call = string(slot.vertex ? "vertex_property(" : "edge_property(") + slot.path_variable + ", ...)";
+		if (answer && answer->GetExpressionClass() == ExpressionClass::FUNCTION &&
+		    StringUtil::CIEquals(answer->Cast<FunctionExpression>().FunctionName().GetIdentifierName(),
+		                         "list_slice")) {
+			keyed[i] = false;
+		} else if (slot.vertex && answer && answer->GetExpressionClass() == ExpressionClass::COLUMN_REF &&
+		           StringUtil::CIEquals(PGQStr(answer->Cast<ColumnRefExpression>().ColumnNames().back()),
+		                                "__pgq_path_vertices")) {
+			keyed[i] = true;
+		} else {
+			throw BinderException("%s cannot be answered: the route chosen for '%s' does not identify the path's "
+			                      "%s",
+			                      call, slot.path_variable, slot.vertex ? "vertices" : "edges");
+		}
+	}
+
+	// The outer query, over the materialized matches.
+	vector<string> ctes;
+	ctes.push_back("__pgq_pp_rows AS MATERIALIZED (SELECT *, row_number() OVER () AS __pgq_pp_rid FROM "
+	               "__pgq_pp_inner)");
+	for (idx_t i = 0; i < slots.size(); i++) {
+		auto &slot = slots[i];
+		string table_index = "0";
+		if (slot.with_labels) {
+			table_index = "CASE";
+			for (idx_t t = 0; t < slot.tables.size(); t++) {
+				vector<string> labels {
+				    KeywordHelper::WriteQuoted(StringUtil::Lower(PGQStr(slot.tables[t]->main_label)), '\'')};
+				for (auto &sub_label : slot.tables[t]->sub_labels) {
+					labels.push_back(KeywordHelper::WriteQuoted(StringUtil::Lower(PGQStr(sub_label)), '\''));
+				}
+				table_index += " WHEN lower(__pgq_l) IN (" + StringUtil::Join(labels, ", ") + ") THEN " + to_string(t);
+			}
+			table_index += " END";
+		}
+		const string id_expr = keyed[i] ? "CAST(__pgq_id AS VARCHAR)" : "__pgq_id";
+		ctes.push_back(StringUtil::Format(
+		    "%s_el AS (SELECT __pgq_pp_rid, __pgq_ord, %s AS __pgq_id, %s AS __pgq_t FROM (SELECT __pgq_pp_rid, "
+		    "unnest(%s_ids) AS __pgq_id, %s AS __pgq_l, generate_subscripts(%s_ids, 1) AS __pgq_ord FROM "
+		    "__pgq_pp_rows))",
+		    slot.name, id_expr, table_index, slot.name, slot.with_labels ? "unnest(" + slot.name + "_lbl)" : "NULL",
+		    slot.name));
+	}
+	// Per path: one left join per table holding any of the properties asked for, on the table's own key type, and
+	// one grouping that builds every property's list. The join reads only the rows of the elements on the paths:
+	// the element side is the smaller one and its keys filter the table scan.
+	for (idx_t i = 0; i < slots.size(); i++) {
+		auto &slot = slots[i];
+		vector<idx_t> slot_values;
+		for (idx_t v = 0; v < values.size(); v++) {
+			if (values[v].slot == i) {
+				slot_values.push_back(v);
+			}
+		}
+		string joins;
+		// Per value: the joined table's column, chosen by the element's table when there are several.
+		vector<string> value_cases(slot_values.size());
+		for (idx_t t = 0; t < slot.tables.size(); t++) {
+			auto &table = slot.tables[t];
+			vector<string> table_values;
+			for (idx_t j = 0; j < slot_values.size(); j++) {
+				auto &value = values[slot_values[j]];
+				if (TableHasProperty(*table, value.property)) {
+					table_values.push_back(KeywordHelper::WriteOptionallyQuoted(value.property) + " AS v" +
+					                       to_string(j));
+					value_cases[j] += slot.with_labels ? StringUtil::Format(" WHEN %d THEN __pgq_x%d.v%d", t, t, j)
+					                                   : StringUtil::Format("__pgq_x%d.v%d", t, j);
+				}
+			}
+			if (table_values.empty()) {
+				continue;
+			}
+			string table_key;
+			string element_key;
+			if (keyed[i]) {
+				auto key = InferVertexKeyColumn(pg_table, table);
+				if (key.empty()) {
+					throw BinderException("vertex_property(%s, ...) cannot be answered: vertex table '%s' has no key "
+					                      "to look its vertices up by",
+					                      slot.path_variable, PGQStr(table->table_name));
+				}
+				// The artifacts hold keys as text: compare in the key column's type when it is known.
+				auto key_type = PathPropertyColumnType(context, *table, key);
+				table_key = KeywordHelper::WriteOptionallyQuoted(key);
+				if (key_type.id() == LogicalTypeId::INVALID) {
+					table_key = "CAST(" + table_key + " AS VARCHAR)";
+					element_key = "e.__pgq_id";
+				} else {
+					element_key = "TRY_CAST(e.__pgq_id AS " + key_type.ToString() + ")";
+				}
+			} else {
+				table_key = "rowid";
+				element_key = "e.__pgq_id";
+			}
+			const string table_condition = slot.with_labels ? StringUtil::Format("e.__pgq_t = %d AND ", t) : "";
+			joins += StringUtil::Format(
+			    " LEFT JOIN (SELECT %s AS k, %s FROM %s) __pgq_x%d ON %s__pgq_x%d.k = %s", table_key,
+			    StringUtil::Join(table_values, ", "),
+			    QualifiedTableName(PGQStr(table->catalog_name), PGQStr(table->schema_name), PGQStr(table->table_name)),
+			    t, table_condition, t, element_key);
+		}
+		vector<string> lists;
+		for (idx_t j = 0; j < slot_values.size(); j++) {
+			auto value_expr = slot.with_labels ? "CASE e.__pgq_t" + value_cases[j] + " END" : value_cases[j];
+			lists.push_back("list(" + value_expr + " ORDER BY e.__pgq_ord) AS " + values[slot_values[j]].name);
+		}
+		// A key that names several vertices would give the path more values than vertices.
+		const string check = keyed[i] ? ", count(*) = max(e.__pgq_ord) AS __pgq_unique" : "";
+		ctes.push_back(StringUtil::Format("%s_vals AS (SELECT e.__pgq_pp_rid, %s%s FROM %s_el e%s GROUP BY "
+		                                  "e.__pgq_pp_rid)",
+		                                  slot.name, StringUtil::Join(lists, ", "), check, slot.name, joins));
+	}
+	// The property calls, now that the routes are known.
+	std::function<unique_ptr<ParsedExpression>(unique_ptr<ParsedExpression>)> resolve;
+	resolve = [&](unique_ptr<ParsedExpression> expression) -> unique_ptr<ParsedExpression> {
+		if (expression->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			auto &names = expression->Cast<ColumnRefExpression>().ColumnNames();
+			if (names.size() == 2 && PGQStr(names[0]) == "__pgq_pp_placeholder") {
+				auto value_index = std::stoull(PGQStr(names[1]).substr(strlen("__pgq_ppslot")));
+				auto &value = values[value_index];
+				auto &slot = slots[value.slot];
+				const string message = "vertex_property(" + slot.path_variable +
+				                       ", ...): a vertex key on the path matches several vertices";
+				const string unique_check =
+				    keyed[value.slot] ? StringUtil::Format(" WHEN %s_vals.__pgq_unique IS FALSE THEN error(%s)",
+				                                           slot.name, KeywordHelper::WriteQuoted(message, '\''))
+				                      : "";
+				Parser parser(ParserOptions::Builtin());
+				auto expressions = parser.ParseExpressionList(StringUtil::Format(
+				    "CASE WHEN __pgq_pp_r.%s_ids IS NULL THEN NULL%s ELSE coalesce(%s_vals.%s, []) END", slot.name,
+				    unique_check, slot.name, value.name));
+				expressions[0]->SetAlias(expression->GetAlias());
+				return std::move(expressions[0]);
+			}
+			return expression;
+		}
+		ParsedExpressionIterator::EnumerateChildren(
+		    *expression, [&](unique_ptr<ParsedExpression> &child) { child = resolve(std::move(child)); });
+		return expression;
+	};
+	for (auto &column : outer_columns) {
+		column = resolve(std::move(column));
+	}
+	for (auto &condition : outer_conditions) {
+		condition = resolve(std::move(condition));
+	}
+	string from = "__pgq_pp_rows __pgq_pp_r";
+	for (auto &slot : slots) {
+		from += StringUtil::Format(" LEFT JOIN %s_vals ON %s_vals.__pgq_pp_rid = __pgq_pp_r.__pgq_pp_rid", slot.name,
+		                           slot.name);
+	}
+	string select_list = "1";
+	if (!columns_read_properties) {
+		vector<string> excluded;
+		for (auto &name : hidden_columns) {
+			excluded.push_back(KeywordHelper::WriteOptionallyQuoted(name));
+		}
+		select_list = "__pgq_pp_r.* EXCLUDE (" + StringUtil::Join(excluded, ", ") + ")";
+	}
+	auto outer = ParseGeneratedSelect("WITH " + StringUtil::Join(ctes, ", ") + " SELECT " + select_list + " FROM " +
+	                                  from);
+	if (columns_read_properties) {
+		outer->select_list = std::move(outer_columns);
+	}
+	if (!outer_conditions.empty()) {
+		outer->where_clause = PGQMatchFunction::CreateWhereClause(outer_conditions);
+	}
+	PrependCTE(*outer, "__pgq_pp_inner", std::move(inner_node));
+	return std::move(outer);
+}
+
 static unique_ptr<QueryNode> BuildMatchLeafNode(ClientContext &context, MatchExpression &leaf, bool allow_abi) {
+	if (UsesPathPropertyCalls(leaf)) {
+		return BuildPathPropertyNode(context, leaf, allow_abi);
+	}
 	return PGQMatchFunction::BuildMatchQueryNode(context, &leaf, allow_abi);
 }
 
