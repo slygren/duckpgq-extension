@@ -1,5 +1,5 @@
 # name: test/sql/path_finding/one_row_per_directions.test
-# description: Named paths, ONE ROW PER and unnamed patterns for unbounded left-directed and for bidirectional quantifiers
+# description: Named paths, ONE ROW PER and unnamed patterns for unbounded left-directed and bidirectional quantifiers, and the unbounded shapes the native path search answers
 # group: [path_finding]
 
 # A bidirectional step (a)<-[e]->(b) is what the fixed-length pattern matches: e runs from b back to a, with an edge
@@ -2944,6 +2944,1694 @@ SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), 
 ----
 0	0
 
+# ACYCLIC (a:P)-[e:K]->+(b:P) WHERE a.id = 1
+statement ok
+CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 1) AS vs, es FROM GRAPH_TABLE (g
+    MATCH p = ACYCLIC (a:P)-[e:K]->+(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 5 AND src = 1;
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
+----
+true	0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)-[e:K]->+(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(vs) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)-[e:K]->+(b:P) ONE ROW PER EDGE (x) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, x.rowid AS x));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(es) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)-[e:K]->+(b:P) ONE ROW PER STEP (v1, x, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, x.rowid AS x, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, vs[i], es[i], vs[i + 1] FROM (SELECT *, unnest(range(1, len(es) + 1)) AS i FROM named);
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE unnamed AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)-[e:K]->+(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), (SELECT count(*) FROM (SELECT a, b FROM named EXCEPT ALL FROM unnamed));
+----
+0	0
+
+# TRAIL (a:P)-[e:K]->*(b:P) WHERE a.id = 1
+statement ok
+CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 1) AS vs, es FROM GRAPH_TABLE (g
+    MATCH p = TRAIL (a:P)-[e:K]->*(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '->' AND depth BETWEEN 0 AND 5 AND src = 1;
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
+----
+true	0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH TRAIL (a:P)-[e:K]->*(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(vs) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH TRAIL (a:P)-[e:K]->*(b:P) ONE ROW PER EDGE (x) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, x.rowid AS x));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(es) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH TRAIL (a:P)-[e:K]->*(b:P) ONE ROW PER STEP (v1, x, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, x.rowid AS x, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, vs[i], es[i], vs[i + 1] FROM (SELECT *, unnest(range(1, len(es) + 1)) AS i FROM named);
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE unnamed AS SELECT * FROM GRAPH_TABLE (g MATCH TRAIL (a:P)-[e:K]->*(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), (SELECT count(*) FROM (SELECT a, b FROM named EXCEPT ALL FROM unnamed));
+----
+0	0
+
+# ANY SHORTEST (a:P)-[e:K]->{2,}(b:P) WHERE a.id = 1
+statement ok
+CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 1) AS vs, es FROM GRAPH_TABLE (g
+    MATCH p = ANY SHORTEST (a:P)-[e:K]->{2,}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 5 AND src = 1;
+
+# one path per pair, a shortest one of the reference's
+query III
+SELECT (SELECT count(*) FROM named) = (SELECT count(DISTINCT (a, b)) FROM ref),
+    (SELECT count(*) FROM (SELECT a, b FROM named GROUP BY ALL HAVING count(*) > 1)),
+    (SELECT count(*) FROM named n WHERE NOT EXISTS (SELECT 1 FROM ref r WHERE r.a = n.a AND r.b = n.b AND r.vs = n.vs
+        AND r.es = n.es AND len(r.es) = (SELECT min(len(es)) FROM ref r2 WHERE r2.a = n.a AND r2.b = n.b)));
+----
+true	0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]->{2,}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v));
+
+query I
+SELECT count(*) FROM ((SELECT a, b, count(*) FROM orp GROUP BY ALL) EXCEPT ALL (SELECT a, b, len(vs) FROM named WHERE true));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]->{2,}(b:P) ONE ROW PER EDGE (x) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, x.rowid AS x));
+
+query I
+SELECT count(*) FROM ((SELECT a, b, count(*) FROM orp GROUP BY ALL) EXCEPT ALL (SELECT a, b, len(es) FROM named WHERE len(es) > 0));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]->{2,}(b:P) ONE ROW PER STEP (v1, x, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, x.rowid AS x, v2.id AS v2));
+
+query I
+SELECT count(*) FROM ((SELECT a, b, count(*) FROM orp GROUP BY ALL) EXCEPT ALL (SELECT a, b, len(es) FROM named WHERE len(es) > 0));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE unnamed AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]->{2,}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), (SELECT count(*) FROM (SELECT a, b FROM named EXCEPT ALL FROM unnamed));
+----
+0	0
+
+# ALL SHORTEST (a:P)-[e:K]->{2,}(b:P) WHERE a.id = 1
+statement ok
+CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 1) AS vs, es FROM GRAPH_TABLE (g
+    MATCH p = ALL SHORTEST (a:P)-[e:K]->{2,}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 5 AND src = 1) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
+----
+true	0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[e:K]->{2,}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(vs) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[e:K]->{2,}(b:P) ONE ROW PER EDGE (x) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, x.rowid AS x));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(es) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[e:K]->{2,}(b:P) ONE ROW PER STEP (v1, x, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, x.rowid AS x, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, vs[i], es[i], vs[i + 1] FROM (SELECT *, unnest(range(1, len(es) + 1)) AS i FROM named);
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE unnamed AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[e:K]->{2,}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), (SELECT count(*) FROM (SELECT a, b FROM named EXCEPT ALL FROM unnamed));
+----
+0	0
+
+# ACYCLIC (a:P)-[e:K]->+(b:P) 
+statement ok
+CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 1) AS vs, es FROM GRAPH_TABLE (g
+    MATCH p = ACYCLIC (a:P)-[e:K]->+(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '->' AND depth BETWEEN 1 AND 5 ;
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
+----
+true	0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)-[e:K]->+(b:P) ONE ROW PER VERTEX (v)  COLUMNS (a.id AS a, b.id AS b, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(vs) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)-[e:K]->+(b:P) ONE ROW PER EDGE (x)  COLUMNS (a.id AS a, b.id AS b, x.rowid AS x));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(es) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)-[e:K]->+(b:P) ONE ROW PER STEP (v1, x, v2)  COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, x.rowid AS x, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, vs[i], es[i], vs[i + 1] FROM (SELECT *, unnest(range(1, len(es) + 1)) AS i FROM named);
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE unnamed AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)-[e:K]->+(b:P)  COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), (SELECT count(*) FROM (SELECT a, b FROM named EXCEPT ALL FROM unnamed));
+----
+0	0
+
+# TRAIL (a:P)-[e:K]->*(b:P) 
+statement ok
+CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 1) AS vs, es FROM GRAPH_TABLE (g
+    MATCH p = TRAIL (a:P)-[e:K]->*(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '->' AND depth BETWEEN 0 AND 5 ;
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
+----
+true	0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH TRAIL (a:P)-[e:K]->*(b:P) ONE ROW PER VERTEX (v)  COLUMNS (a.id AS a, b.id AS b, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(vs) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH TRAIL (a:P)-[e:K]->*(b:P) ONE ROW PER EDGE (x)  COLUMNS (a.id AS a, b.id AS b, x.rowid AS x));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(es) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH TRAIL (a:P)-[e:K]->*(b:P) ONE ROW PER STEP (v1, x, v2)  COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, x.rowid AS x, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, vs[i], es[i], vs[i + 1] FROM (SELECT *, unnest(range(1, len(es) + 1)) AS i FROM named);
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE unnamed AS SELECT * FROM GRAPH_TABLE (g MATCH TRAIL (a:P)-[e:K]->*(b:P)  COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), (SELECT count(*) FROM (SELECT a, b FROM named EXCEPT ALL FROM unnamed));
+----
+0	0
+
+# ANY SHORTEST (a:P)-[e:K]->{2,}(b:P) 
+statement ok
+CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 1) AS vs, es FROM GRAPH_TABLE (g
+    MATCH p = ANY SHORTEST (a:P)-[e:K]->{2,}(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 5 ;
+
+# one path per pair, a shortest one of the reference's
+query III
+SELECT (SELECT count(*) FROM named) = (SELECT count(DISTINCT (a, b)) FROM ref),
+    (SELECT count(*) FROM (SELECT a, b FROM named GROUP BY ALL HAVING count(*) > 1)),
+    (SELECT count(*) FROM named n WHERE NOT EXISTS (SELECT 1 FROM ref r WHERE r.a = n.a AND r.b = n.b AND r.vs = n.vs
+        AND r.es = n.es AND len(r.es) = (SELECT min(len(es)) FROM ref r2 WHERE r2.a = n.a AND r2.b = n.b)));
+----
+true	0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]->{2,}(b:P) ONE ROW PER VERTEX (v)  COLUMNS (a.id AS a, b.id AS b, v.id AS v));
+
+query I
+SELECT count(*) FROM ((SELECT a, b, count(*) FROM orp GROUP BY ALL) EXCEPT ALL (SELECT a, b, len(vs) FROM named WHERE true));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]->{2,}(b:P) ONE ROW PER EDGE (x)  COLUMNS (a.id AS a, b.id AS b, x.rowid AS x));
+
+query I
+SELECT count(*) FROM ((SELECT a, b, count(*) FROM orp GROUP BY ALL) EXCEPT ALL (SELECT a, b, len(es) FROM named WHERE len(es) > 0));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]->{2,}(b:P) ONE ROW PER STEP (v1, x, v2)  COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, x.rowid AS x, v2.id AS v2));
+
+query I
+SELECT count(*) FROM ((SELECT a, b, count(*) FROM orp GROUP BY ALL) EXCEPT ALL (SELECT a, b, len(es) FROM named WHERE len(es) > 0));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE unnamed AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]->{2,}(b:P)  COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), (SELECT count(*) FROM (SELECT a, b FROM named EXCEPT ALL FROM unnamed));
+----
+0	0
+
+# ALL SHORTEST (a:P)-[e:K]->{2,}(b:P) 
+statement ok
+CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 1) AS vs, es FROM GRAPH_TABLE (g
+    MATCH p = ALL SHORTEST (a:P)-[e:K]->{2,}(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 5 ) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
+----
+true	0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[e:K]->{2,}(b:P) ONE ROW PER VERTEX (v)  COLUMNS (a.id AS a, b.id AS b, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(vs) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[e:K]->{2,}(b:P) ONE ROW PER EDGE (x)  COLUMNS (a.id AS a, b.id AS b, x.rowid AS x));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(es) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[e:K]->{2,}(b:P) ONE ROW PER STEP (v1, x, v2)  COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, x.rowid AS x, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, vs[i], es[i], vs[i + 1] FROM (SELECT *, unnest(range(1, len(es) + 1)) AS i FROM named);
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE unnamed AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[e:K]->{2,}(b:P)  COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), (SELECT count(*) FROM (SELECT a, b FROM named EXCEPT ALL FROM unnamed));
+----
+0	0
+
+# ACYCLIC (a:P)<-[e:K]-+(b:P) WHERE a.id = 1
+statement ok
+CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 1) AS vs, es FROM GRAPH_TABLE (g
+    MATCH p = ACYCLIC (a:P)<-[e:K]-+(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 5 AND src = 1;
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
+----
+true	0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)<-[e:K]-+(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(vs) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)<-[e:K]-+(b:P) ONE ROW PER EDGE (x) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, x.rowid AS x));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(es) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)<-[e:K]-+(b:P) ONE ROW PER STEP (v1, x, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, x.rowid AS x, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, vs[i], es[i], vs[i + 1] FROM (SELECT *, unnest(range(1, len(es) + 1)) AS i FROM named);
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE unnamed AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)<-[e:K]-+(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), (SELECT count(*) FROM (SELECT a, b FROM named EXCEPT ALL FROM unnamed));
+----
+0	0
+
+# TRAIL (a:P)<-[e:K]-*(b:P) WHERE a.id = 1
+statement ok
+CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 1) AS vs, es FROM GRAPH_TABLE (g
+    MATCH p = TRAIL (a:P)<-[e:K]-*(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 0 AND 5 AND src = 1;
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
+----
+true	0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH TRAIL (a:P)<-[e:K]-*(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(vs) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH TRAIL (a:P)<-[e:K]-*(b:P) ONE ROW PER EDGE (x) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, x.rowid AS x));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(es) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH TRAIL (a:P)<-[e:K]-*(b:P) ONE ROW PER STEP (v1, x, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, x.rowid AS x, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, vs[i], es[i], vs[i + 1] FROM (SELECT *, unnest(range(1, len(es) + 1)) AS i FROM named);
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE unnamed AS SELECT * FROM GRAPH_TABLE (g MATCH TRAIL (a:P)<-[e:K]-*(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), (SELECT count(*) FROM (SELECT a, b FROM named EXCEPT ALL FROM unnamed));
+----
+0	0
+
+# ANY SHORTEST (a:P)<-[e:K]-{2,}(b:P) WHERE a.id = 1
+statement ok
+CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 1) AS vs, es FROM GRAPH_TABLE (g
+    MATCH p = ANY SHORTEST (a:P)<-[e:K]-{2,}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 5 AND src = 1;
+
+# one path per pair, a shortest one of the reference's
+query III
+SELECT (SELECT count(*) FROM named) = (SELECT count(DISTINCT (a, b)) FROM ref),
+    (SELECT count(*) FROM (SELECT a, b FROM named GROUP BY ALL HAVING count(*) > 1)),
+    (SELECT count(*) FROM named n WHERE NOT EXISTS (SELECT 1 FROM ref r WHERE r.a = n.a AND r.b = n.b AND r.vs = n.vs
+        AND r.es = n.es AND len(r.es) = (SELECT min(len(es)) FROM ref r2 WHERE r2.a = n.a AND r2.b = n.b)));
+----
+true	0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]-{2,}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v));
+
+query I
+SELECT count(*) FROM ((SELECT a, b, count(*) FROM orp GROUP BY ALL) EXCEPT ALL (SELECT a, b, len(vs) FROM named WHERE true));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]-{2,}(b:P) ONE ROW PER EDGE (x) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, x.rowid AS x));
+
+query I
+SELECT count(*) FROM ((SELECT a, b, count(*) FROM orp GROUP BY ALL) EXCEPT ALL (SELECT a, b, len(es) FROM named WHERE len(es) > 0));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]-{2,}(b:P) ONE ROW PER STEP (v1, x, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, x.rowid AS x, v2.id AS v2));
+
+query I
+SELECT count(*) FROM ((SELECT a, b, count(*) FROM orp GROUP BY ALL) EXCEPT ALL (SELECT a, b, len(es) FROM named WHERE len(es) > 0));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE unnamed AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]-{2,}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), (SELECT count(*) FROM (SELECT a, b FROM named EXCEPT ALL FROM unnamed));
+----
+0	0
+
+# ALL SHORTEST (a:P)<-[e:K]-{2,}(b:P) WHERE a.id = 1
+statement ok
+CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 1) AS vs, es FROM GRAPH_TABLE (g
+    MATCH p = ALL SHORTEST (a:P)<-[e:K]-{2,}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 5 AND src = 1) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
+----
+true	0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[e:K]-{2,}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(vs) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[e:K]-{2,}(b:P) ONE ROW PER EDGE (x) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, x.rowid AS x));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(es) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[e:K]-{2,}(b:P) ONE ROW PER STEP (v1, x, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, x.rowid AS x, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, vs[i], es[i], vs[i + 1] FROM (SELECT *, unnest(range(1, len(es) + 1)) AS i FROM named);
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE unnamed AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[e:K]-{2,}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), (SELECT count(*) FROM (SELECT a, b FROM named EXCEPT ALL FROM unnamed));
+----
+0	0
+
+# ACYCLIC (a:P)<-[e:K]-+(b:P) 
+statement ok
+CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 1) AS vs, es FROM GRAPH_TABLE (g
+    MATCH p = ACYCLIC (a:P)<-[e:K]-+(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 5 ;
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
+----
+true	0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)<-[e:K]-+(b:P) ONE ROW PER VERTEX (v)  COLUMNS (a.id AS a, b.id AS b, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(vs) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)<-[e:K]-+(b:P) ONE ROW PER EDGE (x)  COLUMNS (a.id AS a, b.id AS b, x.rowid AS x));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(es) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)<-[e:K]-+(b:P) ONE ROW PER STEP (v1, x, v2)  COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, x.rowid AS x, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, vs[i], es[i], vs[i + 1] FROM (SELECT *, unnest(range(1, len(es) + 1)) AS i FROM named);
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE unnamed AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)<-[e:K]-+(b:P)  COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), (SELECT count(*) FROM (SELECT a, b FROM named EXCEPT ALL FROM unnamed));
+----
+0	0
+
+# TRAIL (a:P)<-[e:K]-*(b:P) 
+statement ok
+CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 1) AS vs, es FROM GRAPH_TABLE (g
+    MATCH p = TRAIL (a:P)<-[e:K]-*(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 0 AND 5 ;
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
+----
+true	0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH TRAIL (a:P)<-[e:K]-*(b:P) ONE ROW PER VERTEX (v)  COLUMNS (a.id AS a, b.id AS b, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(vs) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH TRAIL (a:P)<-[e:K]-*(b:P) ONE ROW PER EDGE (x)  COLUMNS (a.id AS a, b.id AS b, x.rowid AS x));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(es) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH TRAIL (a:P)<-[e:K]-*(b:P) ONE ROW PER STEP (v1, x, v2)  COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, x.rowid AS x, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, vs[i], es[i], vs[i + 1] FROM (SELECT *, unnest(range(1, len(es) + 1)) AS i FROM named);
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE unnamed AS SELECT * FROM GRAPH_TABLE (g MATCH TRAIL (a:P)<-[e:K]-*(b:P)  COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), (SELECT count(*) FROM (SELECT a, b FROM named EXCEPT ALL FROM unnamed));
+----
+0	0
+
+# ANY SHORTEST (a:P)<-[e:K]-{2,}(b:P) 
+statement ok
+CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 1) AS vs, es FROM GRAPH_TABLE (g
+    MATCH p = ANY SHORTEST (a:P)<-[e:K]-{2,}(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 5 ;
+
+# one path per pair, a shortest one of the reference's
+query III
+SELECT (SELECT count(*) FROM named) = (SELECT count(DISTINCT (a, b)) FROM ref),
+    (SELECT count(*) FROM (SELECT a, b FROM named GROUP BY ALL HAVING count(*) > 1)),
+    (SELECT count(*) FROM named n WHERE NOT EXISTS (SELECT 1 FROM ref r WHERE r.a = n.a AND r.b = n.b AND r.vs = n.vs
+        AND r.es = n.es AND len(r.es) = (SELECT min(len(es)) FROM ref r2 WHERE r2.a = n.a AND r2.b = n.b)));
+----
+true	0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]-{2,}(b:P) ONE ROW PER VERTEX (v)  COLUMNS (a.id AS a, b.id AS b, v.id AS v));
+
+query I
+SELECT count(*) FROM ((SELECT a, b, count(*) FROM orp GROUP BY ALL) EXCEPT ALL (SELECT a, b, len(vs) FROM named WHERE true));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]-{2,}(b:P) ONE ROW PER EDGE (x)  COLUMNS (a.id AS a, b.id AS b, x.rowid AS x));
+
+query I
+SELECT count(*) FROM ((SELECT a, b, count(*) FROM orp GROUP BY ALL) EXCEPT ALL (SELECT a, b, len(es) FROM named WHERE len(es) > 0));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]-{2,}(b:P) ONE ROW PER STEP (v1, x, v2)  COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, x.rowid AS x, v2.id AS v2));
+
+query I
+SELECT count(*) FROM ((SELECT a, b, count(*) FROM orp GROUP BY ALL) EXCEPT ALL (SELECT a, b, len(es) FROM named WHERE len(es) > 0));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE unnamed AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]-{2,}(b:P)  COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), (SELECT count(*) FROM (SELECT a, b FROM named EXCEPT ALL FROM unnamed));
+----
+0	0
+
+# ALL SHORTEST (a:P)<-[e:K]-{2,}(b:P) 
+statement ok
+CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 1) AS vs, es FROM GRAPH_TABLE (g
+    MATCH p = ALL SHORTEST (a:P)<-[e:K]-{2,}(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 5 ) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
+----
+true	0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[e:K]-{2,}(b:P) ONE ROW PER VERTEX (v)  COLUMNS (a.id AS a, b.id AS b, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(vs) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[e:K]-{2,}(b:P) ONE ROW PER EDGE (x)  COLUMNS (a.id AS a, b.id AS b, x.rowid AS x));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(es) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[e:K]-{2,}(b:P) ONE ROW PER STEP (v1, x, v2)  COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, x.rowid AS x, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, vs[i], es[i], vs[i + 1] FROM (SELECT *, unnest(range(1, len(es) + 1)) AS i FROM named);
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE unnamed AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[e:K]-{2,}(b:P)  COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), (SELECT count(*) FROM (SELECT a, b FROM named EXCEPT ALL FROM unnamed));
+----
+0	0
+
+# ACYCLIC (a:P)-[e:K]-+(b:P) WHERE a.id = 1
+statement ok
+CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 1) AS vs, es FROM GRAPH_TABLE (g
+    MATCH p = ACYCLIC (a:P)-[e:K]-+(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 5 AND src = 1;
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
+----
+true	0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)-[e:K]-+(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(vs) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)-[e:K]-+(b:P) ONE ROW PER EDGE (x) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, x.rowid AS x));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(es) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)-[e:K]-+(b:P) ONE ROW PER STEP (v1, x, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, x.rowid AS x, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, vs[i], es[i], vs[i + 1] FROM (SELECT *, unnest(range(1, len(es) + 1)) AS i FROM named);
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE unnamed AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)-[e:K]-+(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), (SELECT count(*) FROM (SELECT a, b FROM named EXCEPT ALL FROM unnamed));
+----
+0	0
+
+# TRAIL (a:P)-[e:K]-*(b:P) WHERE a.id = 1
+statement ok
+CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 1) AS vs, es FROM GRAPH_TABLE (g
+    MATCH p = TRAIL (a:P)-[e:K]-*(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '-' AND depth BETWEEN 0 AND 5 AND src = 1;
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
+----
+true	0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH TRAIL (a:P)-[e:K]-*(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(vs) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH TRAIL (a:P)-[e:K]-*(b:P) ONE ROW PER EDGE (x) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, x.rowid AS x));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(es) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH TRAIL (a:P)-[e:K]-*(b:P) ONE ROW PER STEP (v1, x, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, x.rowid AS x, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, vs[i], es[i], vs[i + 1] FROM (SELECT *, unnest(range(1, len(es) + 1)) AS i FROM named);
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE unnamed AS SELECT * FROM GRAPH_TABLE (g MATCH TRAIL (a:P)-[e:K]-*(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), (SELECT count(*) FROM (SELECT a, b FROM named EXCEPT ALL FROM unnamed));
+----
+0	0
+
+# ANY SHORTEST (a:P)-[e:K]-{2,}(b:P) WHERE a.id = 1
+statement ok
+CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 1) AS vs, es FROM GRAPH_TABLE (g
+    MATCH p = ANY SHORTEST (a:P)-[e:K]-{2,}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 5 AND src = 1;
+
+# one path per pair, a shortest one of the reference's
+query III
+SELECT (SELECT count(*) FROM named) = (SELECT count(DISTINCT (a, b)) FROM ref),
+    (SELECT count(*) FROM (SELECT a, b FROM named GROUP BY ALL HAVING count(*) > 1)),
+    (SELECT count(*) FROM named n WHERE NOT EXISTS (SELECT 1 FROM ref r WHERE r.a = n.a AND r.b = n.b AND r.vs = n.vs
+        AND r.es = n.es AND len(r.es) = (SELECT min(len(es)) FROM ref r2 WHERE r2.a = n.a AND r2.b = n.b)));
+----
+true	0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]-{2,}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v));
+
+query I
+SELECT count(*) FROM ((SELECT a, b, count(*) FROM orp GROUP BY ALL) EXCEPT ALL (SELECT a, b, len(vs) FROM named WHERE true));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]-{2,}(b:P) ONE ROW PER EDGE (x) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, x.rowid AS x));
+
+query I
+SELECT count(*) FROM ((SELECT a, b, count(*) FROM orp GROUP BY ALL) EXCEPT ALL (SELECT a, b, len(es) FROM named WHERE len(es) > 0));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]-{2,}(b:P) ONE ROW PER STEP (v1, x, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, x.rowid AS x, v2.id AS v2));
+
+query I
+SELECT count(*) FROM ((SELECT a, b, count(*) FROM orp GROUP BY ALL) EXCEPT ALL (SELECT a, b, len(es) FROM named WHERE len(es) > 0));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE unnamed AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]-{2,}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), (SELECT count(*) FROM (SELECT a, b FROM named EXCEPT ALL FROM unnamed));
+----
+0	0
+
+# ALL SHORTEST (a:P)-[e:K]-{2,}(b:P) WHERE a.id = 1
+statement ok
+CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 1) AS vs, es FROM GRAPH_TABLE (g
+    MATCH p = ALL SHORTEST (a:P)-[e:K]-{2,}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 5 AND src = 1) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
+----
+true	0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[e:K]-{2,}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(vs) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[e:K]-{2,}(b:P) ONE ROW PER EDGE (x) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, x.rowid AS x));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(es) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[e:K]-{2,}(b:P) ONE ROW PER STEP (v1, x, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, x.rowid AS x, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, vs[i], es[i], vs[i + 1] FROM (SELECT *, unnest(range(1, len(es) + 1)) AS i FROM named);
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE unnamed AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[e:K]-{2,}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), (SELECT count(*) FROM (SELECT a, b FROM named EXCEPT ALL FROM unnamed));
+----
+0	0
+
+# ACYCLIC (a:P)-[e:K]-+(b:P) 
+statement ok
+CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 1) AS vs, es FROM GRAPH_TABLE (g
+    MATCH p = ACYCLIC (a:P)-[e:K]-+(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 5 ;
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
+----
+true	0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)-[e:K]-+(b:P) ONE ROW PER VERTEX (v)  COLUMNS (a.id AS a, b.id AS b, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(vs) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)-[e:K]-+(b:P) ONE ROW PER EDGE (x)  COLUMNS (a.id AS a, b.id AS b, x.rowid AS x));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(es) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)-[e:K]-+(b:P) ONE ROW PER STEP (v1, x, v2)  COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, x.rowid AS x, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, vs[i], es[i], vs[i + 1] FROM (SELECT *, unnest(range(1, len(es) + 1)) AS i FROM named);
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE unnamed AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)-[e:K]-+(b:P)  COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), (SELECT count(*) FROM (SELECT a, b FROM named EXCEPT ALL FROM unnamed));
+----
+0	0
+
+# TRAIL (a:P)-[e:K]-*(b:P) 
+statement ok
+CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 1) AS vs, es FROM GRAPH_TABLE (g
+    MATCH p = TRAIL (a:P)-[e:K]-*(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '-' AND depth BETWEEN 0 AND 5 ;
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
+----
+true	0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH TRAIL (a:P)-[e:K]-*(b:P) ONE ROW PER VERTEX (v)  COLUMNS (a.id AS a, b.id AS b, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(vs) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH TRAIL (a:P)-[e:K]-*(b:P) ONE ROW PER EDGE (x)  COLUMNS (a.id AS a, b.id AS b, x.rowid AS x));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(es) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH TRAIL (a:P)-[e:K]-*(b:P) ONE ROW PER STEP (v1, x, v2)  COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, x.rowid AS x, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, vs[i], es[i], vs[i + 1] FROM (SELECT *, unnest(range(1, len(es) + 1)) AS i FROM named);
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE unnamed AS SELECT * FROM GRAPH_TABLE (g MATCH TRAIL (a:P)-[e:K]-*(b:P)  COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), (SELECT count(*) FROM (SELECT a, b FROM named EXCEPT ALL FROM unnamed));
+----
+0	0
+
+# ANY SHORTEST (a:P)-[e:K]-{2,}(b:P) 
+statement ok
+CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 1) AS vs, es FROM GRAPH_TABLE (g
+    MATCH p = ANY SHORTEST (a:P)-[e:K]-{2,}(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 5 ;
+
+# one path per pair, a shortest one of the reference's
+query III
+SELECT (SELECT count(*) FROM named) = (SELECT count(DISTINCT (a, b)) FROM ref),
+    (SELECT count(*) FROM (SELECT a, b FROM named GROUP BY ALL HAVING count(*) > 1)),
+    (SELECT count(*) FROM named n WHERE NOT EXISTS (SELECT 1 FROM ref r WHERE r.a = n.a AND r.b = n.b AND r.vs = n.vs
+        AND r.es = n.es AND len(r.es) = (SELECT min(len(es)) FROM ref r2 WHERE r2.a = n.a AND r2.b = n.b)));
+----
+true	0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]-{2,}(b:P) ONE ROW PER VERTEX (v)  COLUMNS (a.id AS a, b.id AS b, v.id AS v));
+
+query I
+SELECT count(*) FROM ((SELECT a, b, count(*) FROM orp GROUP BY ALL) EXCEPT ALL (SELECT a, b, len(vs) FROM named WHERE true));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]-{2,}(b:P) ONE ROW PER EDGE (x)  COLUMNS (a.id AS a, b.id AS b, x.rowid AS x));
+
+query I
+SELECT count(*) FROM ((SELECT a, b, count(*) FROM orp GROUP BY ALL) EXCEPT ALL (SELECT a, b, len(es) FROM named WHERE len(es) > 0));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]-{2,}(b:P) ONE ROW PER STEP (v1, x, v2)  COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, x.rowid AS x, v2.id AS v2));
+
+query I
+SELECT count(*) FROM ((SELECT a, b, count(*) FROM orp GROUP BY ALL) EXCEPT ALL (SELECT a, b, len(es) FROM named WHERE len(es) > 0));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE unnamed AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)-[e:K]-{2,}(b:P)  COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), (SELECT count(*) FROM (SELECT a, b FROM named EXCEPT ALL FROM unnamed));
+----
+0	0
+
+# ALL SHORTEST (a:P)-[e:K]-{2,}(b:P) 
+statement ok
+CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 1) AS vs, es FROM GRAPH_TABLE (g
+    MATCH p = ALL SHORTEST (a:P)-[e:K]-{2,}(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 5 ) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
+----
+true	0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[e:K]-{2,}(b:P) ONE ROW PER VERTEX (v)  COLUMNS (a.id AS a, b.id AS b, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(vs) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[e:K]-{2,}(b:P) ONE ROW PER EDGE (x)  COLUMNS (a.id AS a, b.id AS b, x.rowid AS x));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(es) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[e:K]-{2,}(b:P) ONE ROW PER STEP (v1, x, v2)  COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, x.rowid AS x, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, vs[i], es[i], vs[i + 1] FROM (SELECT *, unnest(range(1, len(es) + 1)) AS i FROM named);
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE unnamed AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)-[e:K]-{2,}(b:P)  COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), (SELECT count(*) FROM (SELECT a, b FROM named EXCEPT ALL FROM unnamed));
+----
+0	0
+
+# ACYCLIC (a:P)<-[e:K]->+(b:P) WHERE a.id = 1
+statement ok
+CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 1) AS vs, es FROM GRAPH_TABLE (g
+    MATCH p = ACYCLIC (a:P)<-[e:K]->+(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 1 AND 5 AND src = 1;
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
+----
+true	0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)<-[e:K]->+(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(vs) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)<-[e:K]->+(b:P) ONE ROW PER EDGE (x) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, x.rowid AS x));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(es) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)<-[e:K]->+(b:P) ONE ROW PER STEP (v1, x, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, x.rowid AS x, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, vs[i], es[i], vs[i + 1] FROM (SELECT *, unnest(range(1, len(es) + 1)) AS i FROM named);
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE unnamed AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)<-[e:K]->+(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), (SELECT count(*) FROM (SELECT a, b FROM named EXCEPT ALL FROM unnamed));
+----
+0	0
+
+# TRAIL (a:P)<-[e:K]->*(b:P) WHERE a.id = 1
+statement ok
+CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 1) AS vs, es FROM GRAPH_TABLE (g
+    MATCH p = TRAIL (a:P)<-[e:K]->*(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 0 AND 5 AND src = 1;
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
+----
+true	0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH TRAIL (a:P)<-[e:K]->*(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(vs) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH TRAIL (a:P)<-[e:K]->*(b:P) ONE ROW PER EDGE (x) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, x.rowid AS x));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(es) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH TRAIL (a:P)<-[e:K]->*(b:P) ONE ROW PER STEP (v1, x, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, x.rowid AS x, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, vs[i], es[i], vs[i + 1] FROM (SELECT *, unnest(range(1, len(es) + 1)) AS i FROM named);
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE unnamed AS SELECT * FROM GRAPH_TABLE (g MATCH TRAIL (a:P)<-[e:K]->*(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), (SELECT count(*) FROM (SELECT a, b FROM named EXCEPT ALL FROM unnamed));
+----
+0	0
+
+# ANY SHORTEST (a:P)<-[e:K]->{2,}(b:P) WHERE a.id = 1
+statement ok
+CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 1) AS vs, es FROM GRAPH_TABLE (g
+    MATCH p = ANY SHORTEST (a:P)<-[e:K]->{2,}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 2 AND 5 AND src = 1;
+
+# one path per pair, a shortest one of the reference's
+query III
+SELECT (SELECT count(*) FROM named) = (SELECT count(DISTINCT (a, b)) FROM ref),
+    (SELECT count(*) FROM (SELECT a, b FROM named GROUP BY ALL HAVING count(*) > 1)),
+    (SELECT count(*) FROM named n WHERE NOT EXISTS (SELECT 1 FROM ref r WHERE r.a = n.a AND r.b = n.b AND r.vs = n.vs
+        AND r.es = n.es AND len(r.es) = (SELECT min(len(es)) FROM ref r2 WHERE r2.a = n.a AND r2.b = n.b)));
+----
+true	0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]->{2,}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v));
+
+query I
+SELECT count(*) FROM ((SELECT a, b, count(*) FROM orp GROUP BY ALL) EXCEPT ALL (SELECT a, b, len(vs) FROM named WHERE true));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]->{2,}(b:P) ONE ROW PER EDGE (x) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, x.rowid AS x));
+
+query I
+SELECT count(*) FROM ((SELECT a, b, count(*) FROM orp GROUP BY ALL) EXCEPT ALL (SELECT a, b, len(es) FROM named WHERE len(es) > 0));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]->{2,}(b:P) ONE ROW PER STEP (v1, x, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, x.rowid AS x, v2.id AS v2));
+
+query I
+SELECT count(*) FROM ((SELECT a, b, count(*) FROM orp GROUP BY ALL) EXCEPT ALL (SELECT a, b, len(es) FROM named WHERE len(es) > 0));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE unnamed AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]->{2,}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), (SELECT count(*) FROM (SELECT a, b FROM named EXCEPT ALL FROM unnamed));
+----
+0	0
+
+# ALL SHORTEST (a:P)<-[e:K]->{2,}(b:P) WHERE a.id = 1
+statement ok
+CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 1) AS vs, es FROM GRAPH_TABLE (g
+    MATCH p = ALL SHORTEST (a:P)<-[e:K]->{2,}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 2 AND 5 AND src = 1) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
+----
+true	0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[e:K]->{2,}(b:P) ONE ROW PER VERTEX (v) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(vs) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[e:K]->{2,}(b:P) ONE ROW PER EDGE (x) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, x.rowid AS x));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(es) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[e:K]->{2,}(b:P) ONE ROW PER STEP (v1, x, v2) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, x.rowid AS x, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, vs[i], es[i], vs[i + 1] FROM (SELECT *, unnest(range(1, len(es) + 1)) AS i FROM named);
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE unnamed AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[e:K]->{2,}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), (SELECT count(*) FROM (SELECT a, b FROM named EXCEPT ALL FROM unnamed));
+----
+0	0
+
+# ACYCLIC (a:P)<-[e:K]->+(b:P) 
+statement ok
+CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 1) AS vs, es FROM GRAPH_TABLE (g
+    MATCH p = ACYCLIC (a:P)<-[e:K]->+(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 1 AND 5 ;
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
+----
+true	0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)<-[e:K]->+(b:P) ONE ROW PER VERTEX (v)  COLUMNS (a.id AS a, b.id AS b, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(vs) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)<-[e:K]->+(b:P) ONE ROW PER EDGE (x)  COLUMNS (a.id AS a, b.id AS b, x.rowid AS x));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(es) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)<-[e:K]->+(b:P) ONE ROW PER STEP (v1, x, v2)  COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, x.rowid AS x, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, vs[i], es[i], vs[i + 1] FROM (SELECT *, unnest(range(1, len(es) + 1)) AS i FROM named);
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE unnamed AS SELECT * FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)<-[e:K]->+(b:P)  COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), (SELECT count(*) FROM (SELECT a, b FROM named EXCEPT ALL FROM unnamed));
+----
+0	0
+
+# TRAIL (a:P)<-[e:K]->*(b:P) 
+statement ok
+CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 1) AS vs, es FROM GRAPH_TABLE (g
+    MATCH p = TRAIL (a:P)<-[e:K]->*(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 0 AND 5 ;
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
+----
+true	0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH TRAIL (a:P)<-[e:K]->*(b:P) ONE ROW PER VERTEX (v)  COLUMNS (a.id AS a, b.id AS b, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(vs) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH TRAIL (a:P)<-[e:K]->*(b:P) ONE ROW PER EDGE (x)  COLUMNS (a.id AS a, b.id AS b, x.rowid AS x));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(es) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH TRAIL (a:P)<-[e:K]->*(b:P) ONE ROW PER STEP (v1, x, v2)  COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, x.rowid AS x, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, vs[i], es[i], vs[i + 1] FROM (SELECT *, unnest(range(1, len(es) + 1)) AS i FROM named);
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE unnamed AS SELECT * FROM GRAPH_TABLE (g MATCH TRAIL (a:P)<-[e:K]->*(b:P)  COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), (SELECT count(*) FROM (SELECT a, b FROM named EXCEPT ALL FROM unnamed));
+----
+0	0
+
+# ANY SHORTEST (a:P)<-[e:K]->{2,}(b:P) 
+statement ok
+CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 1) AS vs, es FROM GRAPH_TABLE (g
+    MATCH p = ANY SHORTEST (a:P)<-[e:K]->{2,}(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 2 AND 5 ;
+
+# one path per pair, a shortest one of the reference's
+query III
+SELECT (SELECT count(*) FROM named) = (SELECT count(DISTINCT (a, b)) FROM ref),
+    (SELECT count(*) FROM (SELECT a, b FROM named GROUP BY ALL HAVING count(*) > 1)),
+    (SELECT count(*) FROM named n WHERE NOT EXISTS (SELECT 1 FROM ref r WHERE r.a = n.a AND r.b = n.b AND r.vs = n.vs
+        AND r.es = n.es AND len(r.es) = (SELECT min(len(es)) FROM ref r2 WHERE r2.a = n.a AND r2.b = n.b)));
+----
+true	0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]->{2,}(b:P) ONE ROW PER VERTEX (v)  COLUMNS (a.id AS a, b.id AS b, v.id AS v));
+
+query I
+SELECT count(*) FROM ((SELECT a, b, count(*) FROM orp GROUP BY ALL) EXCEPT ALL (SELECT a, b, len(vs) FROM named WHERE true));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]->{2,}(b:P) ONE ROW PER EDGE (x)  COLUMNS (a.id AS a, b.id AS b, x.rowid AS x));
+
+query I
+SELECT count(*) FROM ((SELECT a, b, count(*) FROM orp GROUP BY ALL) EXCEPT ALL (SELECT a, b, len(es) FROM named WHERE len(es) > 0));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]->{2,}(b:P) ONE ROW PER STEP (v1, x, v2)  COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, x.rowid AS x, v2.id AS v2));
+
+query I
+SELECT count(*) FROM ((SELECT a, b, count(*) FROM orp GROUP BY ALL) EXCEPT ALL (SELECT a, b, len(es) FROM named WHERE len(es) > 0));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE unnamed AS SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]->{2,}(b:P)  COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), (SELECT count(*) FROM (SELECT a, b FROM named EXCEPT ALL FROM unnamed));
+----
+0	0
+
+# ALL SHORTEST (a:P)<-[e:K]->{2,}(b:P) 
+statement ok
+CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 1) AS vs, es FROM GRAPH_TABLE (g
+    MATCH p = ALL SHORTEST (a:P)<-[e:K]->{2,}(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 2 AND 5 ) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+
+query III
+SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
+----
+true	0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[e:K]->{2,}(b:P) ONE ROW PER VERTEX (v)  COLUMNS (a.id AS a, b.id AS b, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(vs) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[e:K]->{2,}(b:P) ONE ROW PER EDGE (x)  COLUMNS (a.id AS a, b.id AS b, x.rowid AS x));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, unnest(es) FROM named;
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE orp AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[e:K]->{2,}(b:P) ONE ROW PER STEP (v1, x, v2)  COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, x.rowid AS x, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE orp_ref AS SELECT a, b, vs[i], es[i], vs[i + 1] FROM (SELECT *, unnest(range(1, len(es) + 1)) AS i FROM named);
+
+query II
+SELECT (SELECT count(*) FROM (FROM orp EXCEPT ALL FROM orp_ref)), (SELECT count(*) FROM (FROM orp_ref EXCEPT ALL FROM orp));
+----
+0	0
+
+statement ok
+CREATE OR REPLACE TABLE unnamed AS SELECT * FROM GRAPH_TABLE (g MATCH ALL SHORTEST (a:P)<-[e:K]->{2,}(b:P)  COLUMNS (a.id AS a, b.id AS b));
+
+query II
+SELECT (SELECT count(*) FROM (FROM unnamed EXCEPT ALL SELECT a, b FROM named)), (SELECT count(*) FROM (SELECT a, b FROM named EXCEPT ALL FROM unnamed));
+----
+0	0
+
 # The fixed-length bidirectional pattern and the {1,1} quantifier are the same matches
 statement ok
 CREATE OR REPLACE TABLE fixed AS SELECT * FROM GRAPH_TABLE (g MATCH (a:P)<-[e:K]->(b:P) COLUMNS (a.id AS a, b.id AS b, e.rowid AS e));
@@ -2963,17 +4651,8 @@ FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]-+(b:P) ONE ROW PER STEP (v1,
 ----
 3	4	3	3
 
-# Unbounded <- and <-> with no search prefix (a path mode only), or with a lower bound above 1, are refused rather
-# than answered from the CSR, which finds one shortest path per pair
-statement error
-FROM GRAPH_TABLE (g MATCH ACYCLIC (a:P)<-[e:K]-+(b:P) COLUMNS (a.id AS a, b.id AS b));
-----
-with a path mode and no search prefix
-
-statement error
-FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:P)<-[e:K]->{2,}(b:P) COLUMNS (a.id AS a, b.id AS b));
-----
-lower bound above 1
+# Unbounded with only a path mode, and ANY / ALL SHORTEST from a lower bound above 1, are answered by the native path
+# search (the CSR functions find one shortest path per pair from depth 1): compared with the reference above.
 
 # ── With ABI artifacts: no artifact route may answer these differently ──────────────────────────────────
 statement ok

@@ -103,6 +103,10 @@ struct PGQCSRSlot {
 	//! CTE to be evaluated first -- so one per select node is both sufficient and necessary:
 	//! a second copy is an ambiguous duplicate alias, not extra work.
 	bool anchor_added = false;
+	//! Set while the pattern being processed has its paths in "shortest_path_cte" already, built by the native path
+	//! search (SHORTEST k and the unbounded shapes the CSR path functions cannot answer): the path functions and ONE
+	//! ROW PER read that CTE, and no other traversal is set up for the quantifier.
+	bool path_search_premade = false;
 };
 
 struct PGQDirectLinkInfo {

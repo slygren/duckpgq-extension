@@ -128,6 +128,7 @@ put over DuckLake catalogs. A graph is stored in the database it is created in a
 | `MATCH (t)-[:A]->(a), (t)-[:B]->(b)` | several patterns sharing a variable |
 | `MATCH p = …` | path variable |
 | `ANY SHORTEST`, `ALL SHORTEST`, `ANY CHEAPEST`, `ALL CHEAPEST` | path search; `COST expr [DEFAULT n]` on an element gives its weight |
+| `SHORTEST k` | the k shortest paths per endpoint pair (one quantified edge between two vertices); walks unless a path mode is given |
 | `WALK`, `TRAIL`, `SIMPLE`, `ACYCLIC` | path mode |
 | `OPTIONAL MATCH …` | the whole pattern left-joined onto the bindings so far (a row without a match keeps NULLs); any pattern a `MATCH` answers |
 | `WHERE EXISTS { (t)-[:HAS_WORKORDER]->() }`, `NOT EXISTS { … }` | correlated pattern existence |
@@ -138,6 +139,15 @@ A quantified pattern without a search prefix returns **every walk** (SQL/PGQ sem
 use `ANY SHORTEST` for one per endpoint, `ALL SHORTEST` for every shortest path. A walk visits no vertex twice, so
 walks that return to their start vertex are left out, and an edge stored twice is two walks. The path variable
 (`vertices(p)`, `path_length(p)`, `ONE ROW PER`) describes the row's own walk.
+
+`SHORTEST k` follows SQL/PGQ: the k shortest paths per endpoint pair, as walks (a vertex or edge may repeat, and a
+path may return to its start) unless a path mode restricts them: `TRAIL` (no edge twice), `ACYCLIC` (no vertex twice),
+`SIMPLE` (no vertex twice except a return to the start). SQL/PGQ leaves the choice among paths tied at the k-th
+length to the implementation; here the paths of one length are taken in the order of their edge row ids along the
+path, compared position by position, so the answer is deterministic. The search runs from each source the `MATCH
+WHERE` admits (a filter on the source alone seeds it, one on the destination alone ends it early) and counts every
+partial path it builds against `pgq_max_vl_fallback_rows`, so an unseeded search on a large graph fails rather than
+runs on. No artifact holds k paths per pair: `SHORTEST k` always traverses.
 
 ### In WHERE and COLUMNS
 
@@ -278,7 +288,7 @@ artifact applies.
 | `pgq_abi_auto_max_rows` | 10,000,000 | In `auto` mode, leave out fixed-path artifacts over this many rows. |
 | `pgq_require_abi_paths` | `false` | Fail a MATCH that no artifact can answer. |
 | `pgq_disable_abi_rewrite` | `false` | Skip the ABI rewrite; traverse only. |
-| `pgq_max_vl_fallback_rows` | 20,000,000 | Row budget for a variable-length traversal that no artifact answers. |
+| `pgq_max_vl_fallback_rows` | 20,000,000 | Row budget for a variable-length traversal that no artifact answers, and for the partial paths of a `SHORTEST k` search. |
 | `pgq_verify_edges_on_create` | `false` | `CREATE PROPERTY GRAPH` rejects edges whose keys reference no vertex. Scans every edge table. |
 | `duckpgq_vertex_join_elimination` | `true` | Leave out a vertex table the query only uses for its key (verified graphs with a UNIQUE/PK key only). |
 | `duckpgq_factorized_joins` | `true` | Pre-aggregate join sides that are only counted or summed, so path counts become degree products. |
@@ -386,10 +396,10 @@ building in [abi_build.cpp](src/core/functions/table/abi_build.cpp); vertex-join
 - **Patterns not supported:** bracketed sub-path groups `[ … ]{n,m}`, path unions `|` / `|+|` inside a pattern,
   Cypher's `[:R*1..5]` (write `-[:R]->{1,5}`), `LATERAL` inside `MATCH`, horizontal aggregation along a path,
   graph updates (`INSERT`/`DELETE` of vertices or edges; the graph is a view over tables).
-- **Parsed, not implemented:** top-k shortest (`SHORTEST k`).
 - **`OPTIONAL MATCH`** cannot use the path variable of its own pattern in `COLUMNS` or `WHERE`.
-- **Unbounded `<-` and `<->` quantifiers** take `ANY SHORTEST` or `ALL SHORTEST` from depth 0 or 1; with only a path
-  mode, or a lower bound above 1, they are refused.
+- **`SHORTEST k`** takes one quantified edge between two vertices over one edge table (no element `WHERE` on the
+  edge); longer patterns are refused. Inside a longer pattern, an unbounded quantifier with only a path mode or with a
+  lower bound above 1 is answered from the CSR, which finds one shortest path per pair (refused for `<-` and `<->`).
 - **`UNION` of MATCH blocks** shares one final `COLUMNS` clause.
 - **ABI rewrites** cover the common path shapes, not every pattern; multi-hop undirected and mixed-direction chains
   traverse. Choosing between several matching artifacts is simple.

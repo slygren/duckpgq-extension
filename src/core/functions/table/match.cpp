@@ -2639,8 +2639,9 @@ static unique_ptr<CommonTableExpressionInfo> CreateCSRCTEFor(const shared_ptr<Pr
 
 //! The CSR path functions find shortest paths from depth 1. An unbounded quantifier asks something else of them in
 //! two cases: no selector (a path mode makes it finite; every path is a match, and they return one per pair), and
-//! a lower bound above 1 (the shortest path within the bounds need not be the shortest path). Over -> and - the
-//! long-standing routes answer those inexactly; the <- and <-> routes refuse them.
+//! a lower bound above 1 (the shortest path within the bounds need not be the shortest path). A pattern of one
+//! quantified edge takes the native path search for those (NativePathSearchFor); this is reached only inside a
+//! longer pattern. Over -> and - the long-standing routes still answer that inexactly; <- and <-> refuse it.
 static void RejectInexactUnboundedCSR(PGQMatchType edge_type, const SubPath &quantifier, PGQPathSelector selector) {
 	if ((edge_type != PGQMatchType::MATCH_EDGE_LEFT && edge_type != PGQMatchType::MATCH_EDGE_LEFT_RIGHT) ||
 	    quantifier.upper < static_cast<int64_t>(1 << 30)) {
@@ -3074,6 +3075,28 @@ unique_ptr<ParsedExpression> PGQMatchFunction::CreatePathFindingFunction(
 		auto edge_element = GetPathElement(path_list[idx_i]);
 		if (!edge_element) {
 			auto edge_subpath = reinterpret_cast<SubPath *>(path_list[idx_i].get());
+			if (csr_slot.path_search_premade) {
+				// The native path search already put this quantifier's paths in "shortest_path_cte".
+				if (previous_vertex_subpath && previous_vertex_subpath->where_clause) {
+					conditions.push_back(std::move(previous_vertex_subpath->where_clause));
+				}
+				if (next_vertex_subpath && next_vertex_subpath->where_clause) {
+					conditions.push_back(std::move(next_vertex_subpath->where_clause));
+				}
+				auto searched_path = PGQColRef("path", "shortest_path_cte");
+				if (!final_list) {
+					final_list = std::move(searched_path);
+				} else {
+					vector<unique_ptr<ParsedExpression>> pop_children;
+					pop_children.push_back(std::move(searched_path));
+					vector<unique_ptr<ParsedExpression>> concat_children;
+					concat_children.push_back(std::move(final_list));
+					concat_children.push_back(make_uniq<FunctionExpression>("array_pop_front", std::move(pop_children)));
+					final_list = make_uniq<FunctionExpression>("list_concat", std::move(concat_children));
+				}
+				previous_vertex_element = next_vertex_element;
+				continue;
+			}
 			if (edge_subpath->upper > 1) {
 				// (un)bounded shortest path
 				// Add the shortest path UDF as a CTE
@@ -5066,6 +5089,12 @@ void PGQMatchFunction::ProcessPathList(ClientContext &context, vector<unique_ptr
 			auto edge_subpath = reinterpret_cast<SubPath *>(path_list[idx_j].get());
 			if (edge_subpath->where_clause) {
 				conditions.push_back(std::move(edge_subpath->where_clause));
+			}
+			if (csr_slot.path_search_premade) {
+				// AddNativePathSearch joined this quantifier's paths ("shortest_path_cte") to both endpoints.
+				previous_vertex_element = next_vertex_element;
+				previous_vertex_table = next_vertex_table;
+				continue;
 			}
 			if (edge_subpath->path_list.size() > 1) {
 				throw NotImplementedException("Subpath on an edge is not yet supported.");
@@ -10541,9 +10570,6 @@ static void CheckUnboundedWalk(const PathReference &reference, PGQPathMode inher
 
 static void NormalizePatterns(vector<unique_ptr<PathPattern>> &patterns) {
 	for (auto &pattern : patterns) {
-		if (pattern->topk) {
-			throw NotImplementedException("TopK has not been implemented yet.");
-		}
 		for (auto &reference : pattern->path_elements) {
 			NormalizeQuantifiers(*reference);
 			if (!pattern->shortest) {
@@ -10576,6 +10602,229 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	NormalizeMatchExpression(*ref);
 	duckpgq_state->BeginRewriteDiagnostics(context);
 	return BuildMatchRef(context, *ref);
+}
+
+//! A pattern the native path search answers (pgq_shortest_k_paths): one quantified edge between two vertices.
+struct PGQNativePathSearch {
+	bool applies = false;
+	//! paths per destination, < 0 for all; ignored with all_shortest
+	int64_t k = 1;
+	bool all_shortest = false;
+	string mode = "walk";
+	PathElement *src = nullptr;
+	SubPath *src_wrapper = nullptr;
+	SubPath *quantifier = nullptr;
+	PathElement *edge = nullptr;
+	PathElement *dst = nullptr;
+	SubPath *dst_wrapper = nullptr;
+};
+
+static PathElement *NativeSearchVertex(const unique_ptr<PathReference> &reference, SubPath *&wrapper) {
+	wrapper = nullptr;
+	if (auto *element = PGQMatchFunction::GetPathElement(reference)) {
+		return element->match_type == PGQMatchType::MATCH_VERTEX ? element : nullptr;
+	}
+	auto *subpath = PGQMatchFunction::GetSubPath(reference);
+	if (!subpath || subpath->path_list.size() != 1) {
+		return nullptr;
+	}
+	auto *element = PGQMatchFunction::GetPathElement(subpath->path_list[0]);
+	if (!element || element->match_type != PGQMatchType::MATCH_VERTEX) {
+		return nullptr;
+	}
+	wrapper = subpath;
+	return element;
+}
+
+static string PathModeName(PGQPathMode mode) {
+	switch (mode) {
+	case PGQPathMode::TRAIL:
+		return "trail";
+	case PGQPathMode::ACYCLIC:
+		return "acyclic";
+	case PGQPathMode::SIMPLE:
+		return "simple";
+	default:
+		return "walk";
+	}
+}
+
+//! Which patterns the native search answers, and how:
+//! - SHORTEST k: the k shortest paths per endpoint pair, under the pattern's path mode (WALK by default);
+//! - an unbounded quantifier the CSR path functions cannot answer: with only a path mode (every path is a match),
+//!   or ANY / ALL SHORTEST from a lower bound above 1 (the shortest path within the bounds is not the shortest
+//!   path). These follow the traversal's semantics for bounded patterns: paths that visit no vertex twice.
+static PGQNativePathSearch NativePathSearchFor(PathPattern &pattern) {
+	PGQNativePathSearch search;
+	vector<unique_ptr<PathReference>> *elements = &pattern.path_elements;
+	PGQPathMode mode = PGQPathMode::NONE;
+	if (elements->size() == 1) {
+		auto *wrapper = PGQMatchFunction::GetSubPath((*elements)[0]);
+		if (wrapper && wrapper->path_list.size() > 1) {
+			mode = wrapper->path_mode;
+			elements = &wrapper->path_list;
+		}
+	}
+	const bool topk = pattern.topk > 0;
+	auto refuse = [&](const string &why) {
+		if (topk) {
+			throw NotImplementedException("SHORTEST k is supported for one quantified edge between two vertices, "
+			                              "over one edge table whose two ends are one vertex table: %s",
+			                              why);
+		}
+		return search;
+	};
+	if (elements->size() != 3) {
+		return refuse("the pattern has more than one edge");
+	}
+	search.src = NativeSearchVertex((*elements)[0], search.src_wrapper);
+	search.dst = NativeSearchVertex((*elements)[2], search.dst_wrapper);
+	search.quantifier = PGQMatchFunction::GetSubPath((*elements)[1]);
+	if (!search.src || !search.dst || !search.quantifier || search.quantifier->path_list.size() != 1) {
+		return refuse("the edge is not quantified");
+	}
+	search.edge = PGQMatchFunction::GetPathElement(search.quantifier->path_list[0]);
+	if (!search.edge || search.edge->match_type == PGQMatchType::MATCH_VERTEX) {
+		return refuse("the edge is not quantified");
+	}
+	if (search.quantifier->where_clause || search.quantifier->cost_expr) {
+		return refuse("the quantified edge has an element predicate or a cost");
+	}
+	if (search.quantifier->path_mode != PGQPathMode::NONE) {
+		mode = search.quantifier->path_mode;
+	}
+	const bool unbounded = search.quantifier->upper >= static_cast<int64_t>(1 << 30);
+	if (topk) {
+		search.k = pattern.topk;
+		search.mode = PathModeName(mode);
+	} else if (pattern.cheapest || !unbounded) {
+		return search;
+	} else if (!pattern.shortest && mode > PGQPathMode::WALK) {
+		search.k = -1;
+		search.mode = "acyclic";
+	} else if (pattern.shortest && search.quantifier->lower > 1) {
+		search.k = 1;
+		search.all_shortest = pattern.all;
+		search.mode = "acyclic";
+	} else {
+		return search;
+	}
+	search.applies = true;
+	return search;
+}
+
+//! Sets up the native path search for `search`'s pattern: the step CSR as "cte1", the paths from every source the
+//! MATCH WHERE (or the source's element WHERE) admits to every destination it admits, as "shortest_path_cte" (path,
+//! src_rowid, dst_rowid), joined to both endpoints. ProcessPathList then binds the vertices and the path functions
+//! with csr_slot.path_search_premade set.
+static void AddNativePathSearch(ClientContext &context, const PGQNativePathSearch &search, MatchExpression &ref,
+                                CreatePropertyGraphInfo &pg_table, unique_ptr<SelectNode> &select_node,
+                                vector<unique_ptr<ParsedExpression>> &conditions, PGQCSRSlot &csr_slot) {
+	auto &edge = *search.edge;
+	shared_ptr<PropertyGraphTable> edge_table;
+	try {
+		edge_table = ResolveTable(edge.label, edge.match_type, pg_table);
+	} catch (const Exception &) {
+		throw NotImplementedException("The path search needs one edge table; the label expression '%s' spans several",
+		                              edge.label);
+	}
+	if (!StringUtil::CIEquals(PGQStr(edge_table->source_reference), PGQStr(edge_table->destination_reference))) {
+		throw NotImplementedException("The path search needs an edge whose two ends are one vertex table; '%s' "
+		                              "connects '%s' and '%s'",
+		                              PGQStr(edge_table->table_name), PGQStr(edge_table->source_reference),
+		                              PGQStr(edge_table->destination_reference));
+	}
+	if (EdgeLabelAdmitsNothing(edge.label, edge_table)) {
+		throw NotImplementedException("The edge label expression '%s' admits no edge of %s", edge.label,
+		                              PGQStr(edge_table->table_name));
+	}
+	const string &src = search.src->variable_binding;
+	const string &dst = search.dst->variable_binding;
+	auto &vertex_table = *edge_table->source_pg_table;
+	const string vertices = QualifiedTableName(PGQStr(vertex_table.catalog_name), PGQStr(vertex_table.schema_name),
+	                                           PGQStr(vertex_table.table_name));
+	const string pk = KeywordHelper::WriteOptionallyQuoted(PGQStr(edge_table->source_pk[0]));
+
+	// The endpoints' own predicates (element WHERE, and the MATCH WHERE's conjuncts on that vertex alone) seed the
+	// search: it starts from the admitted sources only, and stops once every admitted destination has its paths.
+	auto seed = [&](const string &binding, SubPath *wrapper) -> string {
+		vector<string> parts;
+		if (wrapper && wrapper->where_clause) {
+			parts.push_back("(" + wrapper->where_clause->ToString() + ")");
+		}
+		if (ref.where_clause) {
+			if (auto pushed = ExtractSrcFilter(*ref.where_clause, binding)) {
+				parts.push_back("(" + pushed->ToString() + ")");
+			}
+		}
+		return StringUtil::Join(parts, " AND ");
+	};
+	const string src_seed = seed(src, search.src_wrapper);
+	const string dst_seed = seed(dst, search.dst_wrapper);
+	const string q_src = KeywordHelper::WriteOptionallyQuoted(src);
+	const string q_dst = KeywordHelper::WriteOptionallyQuoted(dst);
+	const string destinations =
+	    dst_seed.empty() ? "NULL::BIGINT[]"
+	                     : StringUtil::Format("(SELECT list(%s.rowid) FROM %s AS %s WHERE %s)", q_dst, vertices, q_dst,
+	                                          dst_seed);
+
+	const bool all_shortest = search.all_shortest;
+	ClaimCSRSlot(csr_slot, CSRKeyFor(edge_table, edge.match_type, edge.label, true) + "|search", CSRIdCounter(context));
+	if (select_node->cte_map.map.find("cte1") == select_node->cte_map.map.end()) {
+		select_node->cte_map.map["cte1"] = CreateStepCSRCTE(edge_table, edge.match_type, edge.label, csr_slot.slot);
+	}
+	const string paths_cte = "__pgq_paths_" + std::to_string(select_node->cte_map.map.size());
+	const string search_sql = StringUtil::Format(
+	    "SELECT %s.rowid AS src_rowid, unnest(pgq_shortest_k_paths(%d, (SELECT count(__v.%s) FROM %s __v), %s.rowid, "
+	    "%s, %lld, %lld, %lld, '%s', '%s', %lld, __x.temp)) AS __found FROM %s AS %s, "
+	    "(SELECT 0 * count(cte1.temp) AS temp FROM cte1) AS __x%s",
+	    q_src, csr_slot.slot, pk, vertices, q_src, destinations, static_cast<long long>(search.k),
+	    static_cast<long long>(search.quantifier->lower), static_cast<long long>(search.quantifier->upper),
+	    search.mode, all_shortest ? "all_shortest" : "k", static_cast<long long>(MaxVLFallbackRows(context)), vertices,
+	    q_src, src_seed.empty() ? "" : " WHERE " + src_seed);
+	auto search_info = make_uniq<CommonTableExpressionInfo>();
+	search_info->query_node = std::move(ParseSelectStatement(search_sql)->node);
+	select_node->cte_map.map[Identifier(paths_cte)] = std::move(search_info);
+
+	auto path_info = make_uniq<CommonTableExpressionInfo>();
+	path_info->query_node =
+	    std::move(ParseSelectStatement(StringUtil::Format("SELECT __found.path AS path, src_rowid, __found.dst AS "
+	                                                      "dst_rowid FROM %s",
+	                                                      KeywordHelper::WriteOptionallyQuoted(paths_cte)))
+	                  ->node);
+	path_info->materialized = CTEMaterialize::CTE_MATERIALIZE_ALWAYS;
+	select_node->cte_map.map["shortest_path_cte"] = std::move(path_info);
+
+	auto path_ref = make_uniq<BaseTableRef>();
+	path_ref->SetTable(Identifier("shortest_path_cte"));
+	if (select_node->from_table) {
+		auto join = make_uniq<JoinRef>(JoinRefType::CROSS);
+		join->left = std::move(select_node->from_table);
+		join->right = std::move(path_ref);
+		select_node->from_table = std::move(join);
+	} else {
+		select_node->from_table = std::move(path_ref);
+	}
+	conditions.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+	                                                     PGQColRef("src_rowid", "shortest_path_cte"),
+	                                                     PGQColRef("rowid", src)));
+	conditions.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+	                                                     PGQColRef("dst_rowid", "shortest_path_cte"),
+	                                                     PGQColRef("rowid", dst)));
+
+	PGQRewriteDiagnostic diagnostic;
+	diagnostic.graph_name = pg_table.property_graph_name;
+	diagnostic.rewrite_type = "path_search";
+	diagnostic.status = "traversal";
+	diagnostic.reason = StringUtil::Format("native path search: %s, %s, steps %lld..%lld",
+	                                       all_shortest ? "all shortest"
+	                                       : search.k < 0
+	                                           ? "every path"
+	                                           : StringUtil::Format("first %lld per pair", static_cast<long long>(search.k)),
+	                                       search.mode, static_cast<long long>(search.quantifier->lower),
+	                                       static_cast<long long>(search.quantifier->upper));
+	diagnostic.edge_label_sequence = edge.label.empty() ? "*" : edge.label;
+	RecordRewriteDiagnostic(context, std::move(diagnostic));
 }
 
 unique_ptr<TableRef> PGQMatchFunction::BuildMatchRef(ClientContext &context, MatchExpression &match) {
@@ -10628,6 +10877,29 @@ unique_ptr<TableRef> PGQMatchFunction::BuildMatchRef(ClientContext &context, Mat
 			    "(e.g. -[e:Label COST e.weight]->). Without a cost the request is undefined; use SHORTEST.");
 		}
 		FoldStaticPathFunctions(*ref, path_pattern->path_elements, *pg_table);
+		// SHORTEST k, and the unbounded shapes the CSR path functions cannot answer exactly, take the native path
+		// search. No artifact holds k paths per pair; the other shapes try the artifacts first.
+		auto native_search = NativePathSearchFor(*path_pattern);
+		if (native_search.applies &&
+		    (path_pattern->topk > 0 ||
+		     !TryPathTableRewrite(context, *pg_table, path_pattern->path_elements, *ref, conditions, final_select_node,
+		                          alias_map, extra_alias_counter, path_table_cache, referenced_bindings,
+		                          covered_columns, ref->one_row_per, ref->where_clause.get(),
+		                          PatternSelector(*path_pattern)))) {
+			if (require_abi_paths) {
+				ThrowABIPathRequired();
+			}
+			AddNativePathSearch(context, native_search, *ref, *pg_table, final_select_node, conditions, cte1_slot);
+			cte1_slot.path_search_premade = true;
+			ProcessPathList(context, path_pattern->path_elements, conditions, final_select_node, alias_map, *pg_table,
+			                extra_alias_counter, *ref, CSRIdCounter(context), cte1_slot, true, false,
+			                DisableABIRewrite(context) ? nullptr : &path_table_cache, MaxVLFallbackRows(context));
+			cte1_slot.path_search_premade = false;
+			continue;
+		}
+		if (native_search.applies) {
+			continue; // answered from artifacts above
+		}
 		// Tier 1: if a pre-computed path table covers this entire pattern, use it.
 		// Falls through to Tier 2/3 (ProcessPathList) when not applicable.
 		// Pass the MATCH WHERE clause for predicate pushdown (v0/v1 = constant).
@@ -10716,6 +10988,7 @@ unique_ptr<TableRef> PGQMatchFunction::BuildMatchRef(ClientContext &context, Mat
 				auto *from_bt = dynamic_cast<BaseTableRef *>(inner_sel->from_table.get());
 				wraps_orp_path_source = from_bt &&
 				                        (PGQStr(from_bt->Table()).find("__rvl_orp_") == 0 ||
+				                         PGQStr(from_bt->Table()).find("__pgq_paths_") == 0 ||
 				                         PGQStr(from_bt->Table()).find("__tcw_orp_") == 0 ||
 				                         PGQStr(from_bt->Table()).find("__tcc_orp_") == 0);
 			}
@@ -10809,6 +11082,29 @@ unique_ptr<TableRef> PGQMatchFunction::BuildMatchRef(ClientContext &context, Mat
 				    "(e.g. -[e:Label COST e.weight]->). Without a cost the request is undefined; use SHORTEST.");
 			}
 			FoldStaticPathFunctions(branch, path_pattern->path_elements, *pg_table);
+			auto native_search = NativePathSearchFor(*path_pattern);
+			if (native_search.applies &&
+			    (path_pattern->topk > 0 ||
+			     !TryPathTableRewrite(context, *pg_table, path_pattern->path_elements, branch, branch_conditions,
+			                          branch_select, branch_alias_map, branch_counter, path_table_cache,
+			                          branch_referenced_bindings, branch_covered_columns, branch.one_row_per,
+			                          branch.where_clause.get(), PatternSelector(*path_pattern)))) {
+				if (require_abi_paths) {
+					ThrowABIPathRequired();
+				}
+				PGQCSRSlot branch_cte1_slot;
+				AddNativePathSearch(context, native_search, branch, *pg_table, branch_select, branch_conditions,
+				                    branch_cte1_slot);
+				branch_cte1_slot.path_search_premade = true;
+				ProcessPathList(context, path_pattern->path_elements, branch_conditions, branch_select,
+				                branch_alias_map, *pg_table, branch_counter, branch, CSRIdCounter(context),
+				                branch_cte1_slot, true, false, DisableABIRewrite(context) ? nullptr : &path_table_cache,
+				                MaxVLFallbackRows(context));
+				continue;
+			}
+			if (native_search.applies) {
+				continue;
+			}
 			if (!TryPathTableRewrite(context, *pg_table, path_pattern->path_elements, branch, branch_conditions,
 			                         branch_select, branch_alias_map, branch_counter,
 			                         path_table_cache, branch_referenced_bindings,
