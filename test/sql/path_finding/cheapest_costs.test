@@ -335,16 +335,29 @@ FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 1]->(m:Person
 ----
 supports one quantified edge between two vertices
 
-# Without an upper bound the search goes forward from at most one hop up
-statement error
-FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->{2,}(b:Person) COLUMNS (COST(p)));
+# Without an upper bound: from a lower bound above 1, and left-directed (the search by cost)
+query TTR
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->{2,}(b:Person)
+    COLUMNS (a.name, b.name, round(COST(p), 9))) ORDER BY ALL;
 ----
-CHEAPEST without an upper bound supports a right-directed edge
+A	D	0.9
+A	E	2.85
+B	E	2.7
+C	E	2.35
 
-statement error
-FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)<-[e:Link COST e.w]-+(b:Person) COLUMNS (COST(p)));
+query TTR
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)<-[e:Link COST e.w]-+(b:Person)
+    COLUMNS (a.name, b.name, round(COST(p), 9))) ORDER BY ALL;
 ----
-CHEAPEST without an upper bound supports a right-directed edge
+B	A	0.45
+C	A	1.4
+D	A	0.6
+D	B	0.45
+D	C	0.1
+E	A	2.85
+E	B	2.7
+E	C	2.35
+E	D	2.25
 
 # COST(p) of a constant cost within other bounds: the constant once per step of the shortest path within them
 query TTIT
@@ -356,16 +369,29 @@ A	E	2	[0, 3, 4]
 B	E	2	[1, 3, 4]
 C	E	2	[2, 3, 4]
 
-# A COST reads its own edge; an element WHERE on the costed edge is not supported
+# A COST reads its own edge (refused otherwise, until the endpoints' contexts); an element WHERE on the costed edge
+# filters its steps
 statement error
 FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST a.id]->+(b:Person) COLUMNS (COST(p)));
 ----
 may only read properties of its own edge
 
-statement error
-FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link WHERE e.i > 1 COST e.w]->+(b:Person) COLUMNS (COST(p)));
+query TTR
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link WHERE e.i > 1 COST e.w]->+(b:Person)
+    COLUMNS (a.name, b.name, round(COST(p), 9))) ORDER BY ALL;
 ----
-element WHERE on the costed edge
+A	B	0.45
+A	C	1.4
+A	D	0.6
+A	E	2.85
+B	D	0.45
+B	E	2.7
+D	E	2.25
+
+statement error
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link WHERE e.i > a.id COST e.w]->+(b:Person) COLUMNS (COST(p)));
+----
+may only read properties of its own edge
 
 # COST(p) of a path that is not chosen by cost
 statement error
