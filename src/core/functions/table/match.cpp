@@ -6194,7 +6194,57 @@ static void VisitOptionalElements(PathReference &reference, bool quantified,
 // it uses every route a mandatory pattern of that shape does: ABI artifacts, the path enumeration, the CSR
 // path functions. Predicates of the MATCH WHERE on a shared variable alone are also given to the inner MATCH
 // (they still filter the outer rows), which seeds its traversal.
-void PGQMatchFunction::AddOptionalGroupJoin(ClientContext &context, const MatchExpression &outer,
+static void PrepareCheapest(MatchExpression &match, bool shared_union_columns);
+
+//! The path functions an OPTIONAL MATCH group's CHEAPEST path is read with: COST(p), vertices(p), edges(p),
+//! path_length(p), the label functions, element_id(p), vertex_property / edge_property(p, ...). Each call on `path`
+//! in `expression` becomes a column of the inner MATCH (`inner_columns`) and is read from `sub_alias` instead; NULL
+//! where the group did not match. Returns whether `expression` still reads the path otherwise.
+static bool CarryOptionalPathFunctions(unique_ptr<ParsedExpression> &expression, const string &path,
+                                       const string &sub_alias, vector<unique_ptr<ParsedExpression>> &inner_columns,
+                                       bool top_level) {
+	static const char *const kPathFunctions[] = {"cost",          "vertices",    "edges",          "path_length",
+	                                             "vertex_labels", "edge_labels", "element_id",     "vertex_property",
+	                                             "edge_property"};
+	if (!expression) {
+		return false;
+	}
+	if (auto *function = dynamic_cast<FunctionExpression *>(expression.get())) {
+		const string name = StringUtil::Lower(PGQStr(function->FunctionName().GetIdentifierName()));
+		auto &arguments = function->GetArgumentsMutable();
+		auto *argument =
+		    arguments.empty() ? nullptr
+		                      : dynamic_cast<ColumnRefExpression *>(arguments[0].GetExpressionMutable().get());
+		bool path_function = false;
+		for (auto *candidate : kPathFunctions) {
+			path_function = path_function || name == candidate;
+		}
+		if (path_function && argument && argument->ColumnNames().size() == 1 &&
+		    StringUtil::CIEquals(PGQStr(argument->ColumnNames()[0]), path)) {
+			const string column = "__pgq_opt_path_" + std::to_string(inner_columns.size());
+			Identifier alias = expression->HasAlias() ? expression->GetAlias()
+			                                          : Identifier(name + "(" + path + ")");
+			auto carried = expression->Copy();
+			carried->SetAlias(Identifier(column));
+			inner_columns.push_back(std::move(carried));
+			expression = PGQColRef(column, sub_alias);
+			if (top_level) {
+				expression->SetAlias(alias);
+			}
+			return false;
+		}
+	}
+	if (auto *column = dynamic_cast<ColumnRefExpression *>(expression.get())) {
+		return column->ColumnNames().size() == 1 && StringUtil::CIEquals(PGQStr(column->ColumnNames()[0]), path);
+	}
+	bool reads = false;
+	ParsedExpressionIterator::EnumerateChildren(*expression, [&](unique_ptr<ParsedExpression> &child) {
+		reads = CarryOptionalPathFunctions(child, path, sub_alias, inner_columns, false) || reads;
+	});
+	return reads;
+}
+
+void PGQMatchFunction::AddOptionalGroupJoin(ClientContext &context, MatchExpression &outer,
                                             const vector<unique_ptr<PathPattern>> &opt_patterns,
                                             unique_ptr<SelectNode> &select_node,
                                             case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &opt_alias_map,
@@ -6218,21 +6268,41 @@ void PGQMatchFunction::AddOptionalGroupJoin(ClientContext &context, const MatchE
 		inner->path_patterns.push_back(pattern->Copy());
 	}
 
-	// A path variable of the group would have to be carried out of the inner MATCH; refuse rather than drop it.
+	// A path variable of the group would have to be carried out of the inner MATCH; refuse rather than drop it. The
+	// path functions of a CHEAPEST path (COST(p) above all) are carried: the inner MATCH computes them as columns.
+	const string sub_alias = "__pgq_opt_" + std::to_string(extra_alias_counter++);
+	vector<unique_ptr<ParsedExpression>> carried_columns;
 	for (auto &pattern : inner->path_patterns) {
 		for (auto &element : pattern->path_elements) {
 			auto *subpath = GetSubPath(element);
 			if (!subpath || subpath->path_variable.empty()) {
 				continue;
 			}
-			bool referenced = where_hint && ReferencesPathVariable(*where_hint, subpath->path_variable);
+			const string &path = subpath->path_variable;
+			// Only where the WHERE read is the outer MATCH's own (a UNION branch passes another's).
+			const bool own_where = where_hint == outer.where_clause.get();
+			bool referenced = false;
+			if (pattern->cheapest && own_where) {
+				for (auto &column : outer.column_list) {
+					referenced = CarryOptionalPathFunctions(column, path, sub_alias, carried_columns, true) || referenced;
+				}
+				if (outer.where_clause && !IsCostCall(*outer.where_clause, path)) {
+					// In place: the WHERE is also read through where_hint.
+					ParsedExpressionIterator::EnumerateChildren(
+					    *outer.where_clause, [&](unique_ptr<ParsedExpression> &child) {
+						    referenced =
+						        CarryOptionalPathFunctions(child, path, sub_alias, carried_columns, false) || referenced;
+					    });
+				}
+			}
+			referenced = referenced || (where_hint && ReferencesPathVariable(*where_hint, path));
 			for (auto &column : outer.column_list) {
-				referenced = referenced || ReferencesPathVariable(*column, subpath->path_variable);
+				referenced = referenced || ReferencesPathVariable(*column, path);
 			}
 			if (referenced) {
 				throw NotImplementedException("The path variable '%s' of an OPTIONAL MATCH pattern cannot be used in "
 				                              "COLUMNS or WHERE yet; name the path in a MATCH pattern instead.",
-				                              subpath->path_variable);
+				                              path);
 			}
 		}
 	}
@@ -6287,7 +6357,6 @@ void PGQMatchFunction::AddOptionalGroupJoin(ClientContext &context, const MatchE
 
 	case_insensitive_set_t stubs;
 	auto inner_tables = PopulateGraphTableAliasMap(pg_table, *inner, &stubs);
-	const string sub_alias = "__pgq_opt_" + std::to_string(extra_alias_counter++);
 	struct OptionalBinding {
 		string name;
 		string column;
@@ -6332,6 +6401,9 @@ void PGQMatchFunction::AddOptionalGroupJoin(ClientContext &context, const MatchE
 		}
 		projected.push_back({binding, column, table, shared, undirected});
 	}
+	for (auto &column : carried_columns) {
+		inner->column_list.push_back(std::move(column));
+	}
 	if (inner->column_list.empty()) {
 		// Nothing to carry: the group still decides whether a row is extended, so keep one column.
 		inner->column_list.push_back(ConstantExpression::FromValue(Value::BOOLEAN(true)));
@@ -6340,6 +6412,8 @@ void PGQMatchFunction::AddOptionalGroupJoin(ClientContext &context, const MatchE
 		inner->where_clause = CreateWhereClause(seeds);
 	}
 	inner->alias = sub_alias;
+	// The checks and the cost marking a CHEAPEST pattern gets in a MATCH (it is the inner MATCH's own pattern now).
+	PrepareCheapest(*inner, false);
 	auto sub = BuildMatchRef(context, *inner);
 	sub->alias = Identifier(sub_alias);
 
@@ -11265,10 +11339,6 @@ static void PrepareCheapest(MatchExpression &match, bool shared_union_columns) {
 				                              "the costed edge",
 				                              path_variable);
 			}
-			if (!match.optional_match_patterns.empty()) {
-				throw NotImplementedException("COST(%s) of a constant COST is not supported with OPTIONAL MATCH",
-				                              path_variable);
-			}
 			constant_cost_search = constant_cost_search || ConstantCostSearch(*edge, match.one_row_per);
 		} else {
 			if (!edge) {
@@ -11291,10 +11361,6 @@ static void PrepareCheapest(MatchExpression &match, bool shared_union_columns) {
 				                              "properties of its own edge (%s.<property>) and of the pattern's endpoints "
 				                              "(%s, %s): %s",
 				                              readable[0], readable[1], readable[2], edge->where_clause->ToString());
-			}
-			if (!match.optional_match_patterns.empty()) {
-				throw NotImplementedException("CHEAPEST with a COST that varies by edge is not supported with OPTIONAL "
-				                              "MATCH");
 			}
 			edge->cheapest = true;
 			auto canonical = RebindColumnAlias(edge->cost_expr->Copy(), edge_element->variable_binding, "__pgq_edge");
@@ -11330,12 +11396,20 @@ static void PrepareCheapest(MatchExpression &match, bool shared_union_columns) {
 			}
 			needs_path_cte = needs_path_cte || uses_path;
 		}
-		if (costed && !constant && !match.optional_match_patterns.empty()) {
-			throw NotImplementedException("COST(%s) is not supported with OPTIONAL MATCH", path_variable);
+	}
+	// COST(q) of an OPTIONAL MATCH pattern's path is computed by that group's own MATCH (AddOptionalGroupJoin).
+	case_insensitive_set_t optional_paths;
+	for (auto &group : match.optional_match_patterns) {
+		for (auto &pattern : group) {
+			string path_variable;
+			PatternPath(*pattern, path_variable);
+			if (!path_variable.empty() && pattern->cheapest) {
+				optional_paths.insert(path_variable);
+			}
 		}
 	}
 	for (auto &call : cost_calls) {
-		if (!costed_paths.count(call)) {
+		if (!costed_paths.count(call) && !optional_paths.count(call)) {
 			throw BinderException("COST(%s): %s is not a named path of this MATCH (MATCH %s = ANY CHEAPEST ...)", call,
 			                      call, call);
 		}
@@ -11382,14 +11456,6 @@ static void NormalizeMatchExpression(MatchExpression &match) {
 	NormalizeEdgeDirections(match.path_patterns);
 	for (auto &group : match.optional_match_patterns) {
 		NormalizeEdgeDirections(group);
-		// Not yet verified on every route that answers an optional pattern (some forms returned every path
-		// rather than the cheapest one): refused until it is.
-		for (auto &pattern : group) {
-			if (pattern->cheapest) {
-				throw NotImplementedException("ANY CHEAPEST / ALL CHEAPEST is not supported in an OPTIONAL MATCH "
-				                              "pattern yet; match it in a GRAPH_TABLE of its own and LEFT JOIN that");
-			}
-		}
 	}
 	NormalizePatterns(match.path_patterns);
 	for (auto &group : match.optional_match_patterns) {
@@ -13780,8 +13846,10 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 		case_insensitive_map_t<shared_ptr<PropertyGraphTable>> branch_opt_alias_map;
 		for (auto &opt_group : branch.optional_match_patterns) {
 			if (OptionalGroupNeedsJoin(opt_group, DisableABIRewrite(context) ? nullptr : &path_table_cache)) {
-				AddOptionalGroupJoin(context, *ref, opt_group, branch_select, branch_opt_alias_map, *pg_table,
-				                     branch_counter, branch_alias_map, branch.where_clause.get());
+				// The branch's own COLUMNS decide what of the group is read (the head's when the COLUMNS are shared).
+				AddOptionalGroupJoin(context, branch.column_list.empty() ? *ref : branch, opt_group, branch_select,
+				                     branch_opt_alias_map, *pg_table, branch_counter, branch_alias_map,
+				                     branch.where_clause.get());
 				continue;
 			}
 			ProcessOptionalPathList(context, opt_group, branch_select, branch_opt_alias_map, *pg_table, branch_counter,

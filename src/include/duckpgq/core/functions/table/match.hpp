@@ -279,7 +279,7 @@ public:
 
 	//! LEFT JOINs an OPTIONAL MATCH group onto the bindings built so far: the group is matched as a MATCH of its
 	//! own and joined on the variables it shares with them, so a row without a match keeps NULLs.
-	static void AddOptionalGroupJoin(ClientContext &context, const MatchExpression &outer,
+	static void AddOptionalGroupJoin(ClientContext &context, MatchExpression &outer,
 	                                 const vector<unique_ptr<PathPattern>> &opt_patterns,
 	                                 unique_ptr<SelectNode> &select_node,
 	                                 case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &opt_alias_map,
