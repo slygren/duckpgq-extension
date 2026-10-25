@@ -14167,12 +14167,13 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildLoweredMatchQueryNode(ClientContext
 	head->union_matches.clear();
 	head->union_all_flags.clear();
 	auto result = BuildMatchBlockNode(context, *head);
-	// UNION [ALL] MATCH branches share the head's COLUMNS.
+	// UNION [ALL] MATCH branches share the head's COLUMNS, unless each block has its own.
 	for (idx_t i = 0; i < ref.union_matches.size(); i++) {
 		auto branch = unique_ptr_cast<ParsedExpression, MatchExpression>(ref.union_matches[i]->Copy());
-		branch->column_list.clear();
-		for (auto &column : ref.column_list) {
-			branch->column_list.push_back(column->Copy());
+		if (branch->column_list.empty()) {
+			for (auto &column : ref.column_list) {
+				branch->column_list.push_back(column->Copy());
+			}
 		}
 		auto set_op = make_uniq<SetOperationNode>();
 		set_op->setop_type = SetOperationType::UNION;
