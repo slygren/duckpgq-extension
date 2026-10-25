@@ -426,7 +426,8 @@ building in [abi_build.cpp](src/core/functions/table/abi_build.cpp); vertex-join
   operands; operands that may match the same variable-length walk need `|+|` or disjoint labels.
 - **`vertex_property(p, 'x')` / `edge_property(p, 'x')`** take a literal property name. The lists are looked up
   after the match (one join per element table), so they cost about what the equivalent hand-written join does.
-- **`OPTIONAL MATCH`** cannot use the path variable of its own pattern in `COLUMNS` or `WHERE`.
+- **`OPTIONAL MATCH`** cannot use the path variable of its own pattern in `COLUMNS` or `WHERE`, and its pattern cannot
+  be `ANY CHEAPEST` / `ALL CHEAPEST` yet (refused).
 - **`SHORTEST k`** takes one quantified edge between two vertices over one edge table (no element `WHERE` on the
   edge); longer patterns are refused. Inside a longer pattern, an unbounded quantifier with only a path mode or with a
   lower bound above 1 is answered from the CSR, which finds one shortest path per pair (refused for `<-`).
@@ -437,8 +438,7 @@ building in [abi_build.cpp](src/core/functions/table/abi_build.cpp); vertex-join
 - **CHEAPEST with a cost that varies by edge** takes one quantified edge between two vertices, whose `COST` reads
   only that edge's properties and that has no element `WHERE`. Without an upper bound the edge must be
   right-directed and quantified with `+` or `*`; with one (`{1,3}`, `{2,5}`, …) any direction works.
-  As the pattern of an `OPTIONAL MATCH` it is supported; a MATCH block whose own pattern is such a search cannot have
-  an `OPTIONAL MATCH`. It must be the only variable-length pattern of its MATCH block, or every
+  It is not supported with `OPTIONAL MATCH`. It must be the only variable-length pattern of its MATCH block, or every
   one of them must search the same edges and `COST` with nothing but `cost(p)`. `cost(p)` is not available in the
   MATCH's `WHERE` (filter on it outside the `GRAPH_TABLE`). With the same positive constant on every edge the pattern
   is `SHORTEST`, and `cost(p)` there needs an unbounded `+` or `*`.

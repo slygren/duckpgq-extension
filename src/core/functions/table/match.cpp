@@ -5949,8 +5949,6 @@ void PGQMatchFunction::ProcessOptionalPathList(
 	}
 }
 
-static void PrepareCheapest(MatchExpression &match, bool shared_union_columns);
-
 // The hop-by-hop OPTIONAL MATCH translation joins each element as it goes, which is a left join of the whole
 // pattern only for one hop whose far end cannot fail separately from its edge: a fixed edge (joined with its far
 // vertex as one block), or a bounded directed quantifier over one edge label (a LEFT JOIN of the reachability
@@ -6181,9 +6179,6 @@ void PGQMatchFunction::AddOptionalGroupJoin(ClientContext &context, const MatchE
 		inner->where_clause = CreateWhereClause(seeds);
 	}
 	inner->alias = sub_alias;
-	// The checks and the cost marking a CHEAPEST pattern gets in a MATCH (it is the inner MATCH's own pattern now).
-	PrepareCheapest(*inner, false);
-
 	auto sub = BuildMatchRef(context, *inner);
 	sub->alias = Identifier(sub_alias);
 
@@ -11146,6 +11141,14 @@ static void NormalizeMatchExpression(MatchExpression &match) {
 	NormalizeEdgeDirections(match.path_patterns);
 	for (auto &group : match.optional_match_patterns) {
 		NormalizeEdgeDirections(group);
+		// Not yet verified on every route that answers an optional pattern (some forms returned every path
+		// rather than the cheapest one): refused until it is.
+		for (auto &pattern : group) {
+			if (pattern->cheapest) {
+				throw NotImplementedException("ANY CHEAPEST / ALL CHEAPEST is not supported in an OPTIONAL MATCH "
+				                              "pattern yet; match it in a GRAPH_TABLE of its own and LEFT JOIN that");
+			}
+		}
 	}
 	NormalizePatterns(match.path_patterns);
 	for (auto &group : match.optional_match_patterns) {
