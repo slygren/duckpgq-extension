@@ -123,8 +123,14 @@ FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)<-[e1:E]-?(n2:N));
 statement ok
 FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)<-[e1:E] - ?(n2:N));
 
-statement ok
+# Parses; '?' admits zero hops, so this is a quantified <-> edge, which binding refuses like the other
+# quantifiers above (it used to be read as exactly one hop, dropping the zero-hop matches).
+statement error
 FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)<-[e1:E] -> ?(n2:N));
+----
+Not implemented Error: Cannot do shortest path for edge type MATCH_EDGE_LEFT_RIGHT
 
-statement ok
+statement error
 FROM GRAPH_TABLE (testgraph MATCH ANY SHORTEST (n1:N)<-[e1:E] - >?(n2:N));
+----
+Not implemented Error: Cannot do shortest path for edge type MATCH_EDGE_LEFT_RIGHT

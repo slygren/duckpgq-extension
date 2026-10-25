@@ -1,0 +1,1792 @@
+# name: test/sql/path_finding/zero_hop_quantifiers.test
+# description: Quantifiers that admit zero hops ({0,1}, ?, {0,0}, {0,k}) return the zero-hop matches, in every
+#              direction, with and without a path variable, traversed and with ABI artifacts. {0,1} and ? were
+#              taken as one hop (zero-hop rows lost) and {0,0} as exactly one hop. Checked against brute-force walks.
+# group: [path_finding]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE tag(id INTEGER PRIMARY KEY, name VARCHAR);
+
+statement ok
+INSERT INTO tag VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e'), (6, 'f');
+
+# A diamond with a cycle back to 1, and a vertex (6) without edges
+statement ok
+CREATE TABLE hp(src INTEGER, dst INTEGER);
+
+statement ok
+INSERT INTO hp VALUES (1, 2), (2, 3), (4, 2), (1, 5), (5, 3), (3, 1);
+
+statement ok
+CREATE PROPERTY GRAPH g VERTEX TABLES (tag LABEL Tag)
+EDGE TABLES (hp SOURCE KEY (src) REFERENCES tag (id) DESTINATION KEY (dst) REFERENCES tag (id) LABEL HP);
+
+# Brute force: every walk of 0 to 4 hops that visits no vertex twice, read forwards (r), backwards (l) or either way (a)
+statement ok
+CREATE TABLE walks AS
+WITH RECURSIVE w(dir, src, cur, vs, depth) AS (
+    SELECT d, id, id, [id], 0 FROM tag, (VALUES ('r'), ('l'), ('a')) t(d)
+    UNION ALL
+    SELECT w.dir, w.src, n.nxt, list_append(w.vs, n.nxt), w.depth + 1
+    FROM w, LATERAL (SELECT dst AS nxt FROM hp WHERE w.dir IN ('r', 'a') AND hp.src = w.cur
+                     UNION ALL
+                     SELECT src FROM hp WHERE w.dir IN ('l', 'a') AND hp.dst = w.cur) n
+    WHERE w.depth < 4 AND NOT list_contains(w.vs, n.nxt))
+SELECT * FROM w;
+
+query II rowsort
+FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]->{0,1}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+----
+1	1
+1	2
+1	5
+
+query II rowsort
+FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]->{0,0}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+----
+1	1
+
+query III rowsort
+FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]->?(b:Tag) WHERE a.id = 6 COLUMNS (a.id AS a, b.id AS b, path_length(p)));
+----
+6	6	0
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Traversed
+# ---------------------------------------------------------------------------------------------------------------------
+
+statement ok
+SET pgq_abi_mode = 'off';
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]->{0,1}(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'r' AND depth BETWEEN 0 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]->{0,1}(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'r' AND depth BETWEEN 0 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]->{0,1}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'r' AND depth BETWEEN 0 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]->{0,1}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'r' AND depth BETWEEN 0 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]->?(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'r' AND depth BETWEEN 0 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]->?(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'r' AND depth BETWEEN 0 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]->?(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'r' AND depth BETWEEN 0 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]->?(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'r' AND depth BETWEEN 0 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]->{0,0}(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'r' AND depth BETWEEN 0 AND 0;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]->{0,0}(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'r' AND depth BETWEEN 0 AND 0;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]->{0,0}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'r' AND depth BETWEEN 0 AND 0 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]->{0,0}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'r' AND depth BETWEEN 0 AND 0 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]->{0,2}(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'r' AND depth BETWEEN 0 AND 2;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]->{0,2}(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'r' AND depth BETWEEN 0 AND 2;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]->{0,2}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'r' AND depth BETWEEN 0 AND 2 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]->{0,2}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'r' AND depth BETWEEN 0 AND 2 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]->{1,1}(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'r' AND depth BETWEEN 1 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]->{1,1}(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'r' AND depth BETWEEN 1 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]->{1,1}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'r' AND depth BETWEEN 1 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]->{1,1}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'r' AND depth BETWEEN 1 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]->{1,3}(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'r' AND depth BETWEEN 1 AND 3;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]->{1,3}(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'r' AND depth BETWEEN 1 AND 3;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]->{1,3}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'r' AND depth BETWEEN 1 AND 3 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]->{1,3}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'r' AND depth BETWEEN 1 AND 3 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)<-[:HP]-{0,1}(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'l' AND depth BETWEEN 0 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)<-[:HP]-{0,1}(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'l' AND depth BETWEEN 0 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)<-[:HP]-{0,1}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'l' AND depth BETWEEN 0 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)<-[:HP]-{0,1}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'l' AND depth BETWEEN 0 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)<-[:HP]-?(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'l' AND depth BETWEEN 0 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)<-[:HP]-?(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'l' AND depth BETWEEN 0 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)<-[:HP]-?(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'l' AND depth BETWEEN 0 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)<-[:HP]-?(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'l' AND depth BETWEEN 0 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)<-[:HP]-{0,0}(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'l' AND depth BETWEEN 0 AND 0;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)<-[:HP]-{0,0}(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'l' AND depth BETWEEN 0 AND 0;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)<-[:HP]-{0,0}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'l' AND depth BETWEEN 0 AND 0 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)<-[:HP]-{0,0}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'l' AND depth BETWEEN 0 AND 0 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)<-[:HP]-{0,2}(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'l' AND depth BETWEEN 0 AND 2;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)<-[:HP]-{0,2}(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'l' AND depth BETWEEN 0 AND 2;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)<-[:HP]-{0,2}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'l' AND depth BETWEEN 0 AND 2 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)<-[:HP]-{0,2}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'l' AND depth BETWEEN 0 AND 2 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)<-[:HP]-{1,1}(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'l' AND depth BETWEEN 1 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)<-[:HP]-{1,1}(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'l' AND depth BETWEEN 1 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)<-[:HP]-{1,1}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'l' AND depth BETWEEN 1 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)<-[:HP]-{1,1}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'l' AND depth BETWEEN 1 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)<-[:HP]-{1,3}(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'l' AND depth BETWEEN 1 AND 3;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)<-[:HP]-{1,3}(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'l' AND depth BETWEEN 1 AND 3;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)<-[:HP]-{1,3}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'l' AND depth BETWEEN 1 AND 3 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)<-[:HP]-{1,3}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'l' AND depth BETWEEN 1 AND 3 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]-{0,1}(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'a' AND depth BETWEEN 0 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]-{0,1}(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'a' AND depth BETWEEN 0 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]-{0,1}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'a' AND depth BETWEEN 0 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]-{0,1}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'a' AND depth BETWEEN 0 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]-?(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'a' AND depth BETWEEN 0 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]-?(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'a' AND depth BETWEEN 0 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]-?(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'a' AND depth BETWEEN 0 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]-?(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'a' AND depth BETWEEN 0 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]-{0,0}(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'a' AND depth BETWEEN 0 AND 0;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]-{0,0}(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'a' AND depth BETWEEN 0 AND 0;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]-{0,0}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'a' AND depth BETWEEN 0 AND 0 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]-{0,0}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'a' AND depth BETWEEN 0 AND 0 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]-{0,2}(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'a' AND depth BETWEEN 0 AND 2;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]-{0,2}(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'a' AND depth BETWEEN 0 AND 2;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]-{0,2}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'a' AND depth BETWEEN 0 AND 2 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]-{0,2}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'a' AND depth BETWEEN 0 AND 2 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]-{1,1}(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'a' AND depth BETWEEN 1 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]-{1,1}(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'a' AND depth BETWEEN 1 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]-{1,1}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'a' AND depth BETWEEN 1 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]-{1,1}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'a' AND depth BETWEEN 1 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]-{1,3}(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'a' AND depth BETWEEN 1 AND 3;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]-{1,3}(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'a' AND depth BETWEEN 1 AND 3;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]-{1,3}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'a' AND depth BETWEEN 1 AND 3 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]-{1,3}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'a' AND depth BETWEEN 1 AND 3 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+# ---------------------------------------------------------------------------------------------------------------------
+# With ABI artifacts built (the edge artifact must not answer a zero-hop quantifier as one hop)
+# ---------------------------------------------------------------------------------------------------------------------
+
+statement ok
+SET pgq_abi_mode = 'consume';
+
+statement ok
+CREATE SCHEMA graph;
+
+statement ok
+FROM pgq_abi_build('g', exclude_self_referential := false, closures := ['HP']);
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]->{0,1}(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'r' AND depth BETWEEN 0 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]->{0,1}(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'r' AND depth BETWEEN 0 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]->{0,1}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'r' AND depth BETWEEN 0 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]->{0,1}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'r' AND depth BETWEEN 0 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]->?(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'r' AND depth BETWEEN 0 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]->?(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'r' AND depth BETWEEN 0 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]->?(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'r' AND depth BETWEEN 0 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]->?(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'r' AND depth BETWEEN 0 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]->{0,0}(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'r' AND depth BETWEEN 0 AND 0;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]->{0,0}(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'r' AND depth BETWEEN 0 AND 0;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]->{0,0}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'r' AND depth BETWEEN 0 AND 0 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]->{0,0}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'r' AND depth BETWEEN 0 AND 0 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]->{0,2}(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'r' AND depth BETWEEN 0 AND 2;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]->{0,2}(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'r' AND depth BETWEEN 0 AND 2;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]->{0,2}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'r' AND depth BETWEEN 0 AND 2 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]->{0,2}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'r' AND depth BETWEEN 0 AND 2 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]->{1,1}(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'r' AND depth BETWEEN 1 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]->{1,1}(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'r' AND depth BETWEEN 1 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]->{1,1}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'r' AND depth BETWEEN 1 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]->{1,1}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'r' AND depth BETWEEN 1 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]->{1,3}(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'r' AND depth BETWEEN 1 AND 3;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]->{1,3}(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'r' AND depth BETWEEN 1 AND 3;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]->{1,3}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'r' AND depth BETWEEN 1 AND 3 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]->{1,3}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'r' AND depth BETWEEN 1 AND 3 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)<-[:HP]-{0,1}(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'l' AND depth BETWEEN 0 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)<-[:HP]-{0,1}(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'l' AND depth BETWEEN 0 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)<-[:HP]-{0,1}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'l' AND depth BETWEEN 0 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)<-[:HP]-{0,1}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'l' AND depth BETWEEN 0 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)<-[:HP]-?(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'l' AND depth BETWEEN 0 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)<-[:HP]-?(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'l' AND depth BETWEEN 0 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)<-[:HP]-?(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'l' AND depth BETWEEN 0 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)<-[:HP]-?(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'l' AND depth BETWEEN 0 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)<-[:HP]-{0,0}(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'l' AND depth BETWEEN 0 AND 0;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)<-[:HP]-{0,0}(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'l' AND depth BETWEEN 0 AND 0;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)<-[:HP]-{0,0}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'l' AND depth BETWEEN 0 AND 0 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)<-[:HP]-{0,0}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'l' AND depth BETWEEN 0 AND 0 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)<-[:HP]-{0,2}(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'l' AND depth BETWEEN 0 AND 2;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)<-[:HP]-{0,2}(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'l' AND depth BETWEEN 0 AND 2;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)<-[:HP]-{0,2}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'l' AND depth BETWEEN 0 AND 2 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)<-[:HP]-{0,2}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'l' AND depth BETWEEN 0 AND 2 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)<-[:HP]-{1,1}(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'l' AND depth BETWEEN 1 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)<-[:HP]-{1,1}(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'l' AND depth BETWEEN 1 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)<-[:HP]-{1,1}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'l' AND depth BETWEEN 1 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)<-[:HP]-{1,1}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'l' AND depth BETWEEN 1 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)<-[:HP]-{1,3}(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'l' AND depth BETWEEN 1 AND 3;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)<-[:HP]-{1,3}(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'l' AND depth BETWEEN 1 AND 3;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)<-[:HP]-{1,3}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'l' AND depth BETWEEN 1 AND 3 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)<-[:HP]-{1,3}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'l' AND depth BETWEEN 1 AND 3 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]-{0,1}(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'a' AND depth BETWEEN 0 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]-{0,1}(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'a' AND depth BETWEEN 0 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]-{0,1}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'a' AND depth BETWEEN 0 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]-{0,1}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'a' AND depth BETWEEN 0 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]-?(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'a' AND depth BETWEEN 0 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]-?(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'a' AND depth BETWEEN 0 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]-?(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'a' AND depth BETWEEN 0 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]-?(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'a' AND depth BETWEEN 0 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]-{0,0}(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'a' AND depth BETWEEN 0 AND 0;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]-{0,0}(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'a' AND depth BETWEEN 0 AND 0;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]-{0,0}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'a' AND depth BETWEEN 0 AND 0 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]-{0,0}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'a' AND depth BETWEEN 0 AND 0 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]-{0,2}(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'a' AND depth BETWEEN 0 AND 2;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]-{0,2}(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'a' AND depth BETWEEN 0 AND 2;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]-{0,2}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'a' AND depth BETWEEN 0 AND 2 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]-{0,2}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'a' AND depth BETWEEN 0 AND 2 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]-{1,1}(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'a' AND depth BETWEEN 1 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]-{1,1}(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'a' AND depth BETWEEN 1 AND 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]-{1,1}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'a' AND depth BETWEEN 1 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]-{1,1}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'a' AND depth BETWEEN 1 AND 1 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]-{1,3}(b:Tag) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'a' AND depth BETWEEN 1 AND 3;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]-{1,3}(b:Tag) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'a' AND depth BETWEEN 1 AND 3;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HP]-{1,3}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b FROM walks WHERE dir = 'a' AND depth BETWEEN 1 AND 3 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE actual AS FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]-{1,3}(b:Tag) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE expected AS SELECT src AS a, cur AS b, depth AS l FROM walks WHERE dir = 'a' AND depth BETWEEN 1 AND 3 AND src = 1;
+
+query I
+SELECT count(*) FROM ((FROM actual EXCEPT ALL FROM expected) UNION ALL (FROM expected EXCEPT ALL FROM actual));
+----
+0
+
+# ONE ROW PER and a zero-hop segment inside a longer path
+query II rowsort
+FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[e:HP]->{0,1}(b:Tag) ONE ROW PER VERTEX (v) WHERE a.id = 4 COLUMNS (b.id AS b, v.id AS v));
+----
+2	2
+2	4
+4	4
+
+query IIII rowsort
+FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[:HP]->{0,1}(m:Tag)-[:HP]->(b:Tag) WHERE a.id = 4 COLUMNS (a.id, m.id, b.id, path_length(p)));
+----
+4	2	3	2
+4	4	2	1
+
+# ---------------------------------------------------------------------------------------------------------------------
+# {0,1} is the one-hop pattern or the zero-hop one: the one-hop rows are exactly those of {1,1} (self-loops included,
+# as for a plain edge), the zero-hop rows bind the end vertex to the start, and the edge variable is NULL there
+# ---------------------------------------------------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE sv(id INTEGER PRIMARY KEY, name VARCHAR);
+
+statement ok
+INSERT INTO sv VALUES (1, 'a'), (2, 'b'), (3, 'c');
+
+statement ok
+CREATE TABLE se(src INTEGER, dst INTEGER, w INTEGER);
+
+statement ok
+INSERT INTO se VALUES (1, 2, 10), (2, 2, 20), (2, 3, 30);
+
+statement ok
+CREATE TABLE ov(id INTEGER PRIMARY KEY);
+
+statement ok
+INSERT INTO ov VALUES (7);
+
+statement ok
+CREATE TABLE oe(src INTEGER, dst INTEGER);
+
+statement ok
+INSERT INTO oe VALUES (2, 7);
+
+statement ok
+CREATE PROPERTY GRAPH sg VERTEX TABLES (sv LABEL V, ov LABEL O)
+EDGE TABLES (se SOURCE KEY (src) REFERENCES sv (id) DESTINATION KEY (dst) REFERENCES sv (id) LABEL E,
+             oe SOURCE KEY (src) REFERENCES sv (id) DESTINATION KEY (dst) REFERENCES ov (id) LABEL F);
+
+query IIII rowsort
+FROM GRAPH_TABLE (sg MATCH (a:V)-[e:E]->{0,1}(b:V) COLUMNS (a.id AS a, b.id AS b, e.w AS w, element_id(e) AS e));
+----
+1	1	NULL	NULL
+1	2	10	0
+2	2	20	1
+2	2	NULL	NULL
+2	3	30	2
+3	3	NULL	NULL
+
+query I
+SELECT count(*) FROM ((FROM GRAPH_TABLE (sg MATCH (a:V)-[e:E]->?(b:V) WHERE e.w IS NOT NULL COLUMNS (a.id, b.id, e.w))
+                       EXCEPT ALL FROM GRAPH_TABLE (sg MATCH (a:V)-[e:E]->(b:V) COLUMNS (a.id, b.id, e.w))));
+----
+0
+
+# A condition on the edge filters only the one-hop matches
+query III rowsort
+FROM GRAPH_TABLE (sg MATCH (a:V)-[e:E WHERE e.w > 15]->?(b:V) WHERE a.id = 2 COLUMNS (a.id AS a, b.id AS b, e.w AS w));
+----
+2	2	20
+2	2	NULL
+2	3	30
+
+# Two optional hops: each is taken or not
+query III rowsort
+FROM GRAPH_TABLE (sg MATCH (a:V)-[:E]->?(m:V)-[:E]->?(b:V) WHERE a.id = 1 COLUMNS (a.id AS a, m.id AS m, b.id AS b));
+----
+1	1	1
+1	1	2
+1	2	2
+1	2	2
+1	2	3
+
+# Over an edge between two tables the end vertex has the edge's destination table, so no zero-hop match, as with {0,k}
+query II rowsort
+FROM GRAPH_TABLE (sg MATCH (a:V)-[:F]->?(b) COLUMNS (a.id AS a, b.id AS b));
+----
+2	7
+
+query II rowsort
+FROM GRAPH_TABLE (sg MATCH (a:V)-[:F]->{0,2}(b) COLUMNS (a.id AS a, b.id AS b));
+----
+2	7
+
+# A named path of zero hops
+query IITI rowsort
+FROM GRAPH_TABLE (sg MATCH p = (a:V)-[:E]->?(b:V) WHERE a.id = 3 OR b.id = 3 COLUMNS (a.id AS a, b.id AS b, vertices(p), path_length(p)));
+----
+2	3	[1, 2]	1
+3	3	[2]	0
+
+# Under a search prefix the zero-hop path is the shortest from a vertex to itself
+query III rowsort
+FROM GRAPH_TABLE (sg MATCH p = ANY SHORTEST (a:V)-[:E]->{0,1}(b:V) COLUMNS (a.id AS a, b.id AS b, path_length(p)));
+----
+1	1	0
+1	2	1
+2	2	0
+2	3	1
+3	3	0
+
+# The one-hop operand keeps the edge artifact; the zero-hop one reads only vertices, so artifacts are not required
+statement ok
+FROM pgq_abi_build('sg', exclude_self_referential := false);
+
+statement ok
+SET pgq_require_abi_paths = true;
+
+query II rowsort
+FROM GRAPH_TABLE (sg MATCH (a:V)-[:F]->?(b:O) COLUMNS (a.id AS a, b.id AS b));
+----
+2	7
+
+query II rowsort
+FROM GRAPH_TABLE (sg MATCH (a:V)-[:E]->{0,1}(b:V) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+----
+1	1
+1	2
+
+statement ok
+SET pgq_require_abi_paths = false;

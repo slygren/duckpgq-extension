@@ -1268,6 +1268,12 @@ shared_ptr<PropertyGraphTable> PGQMatchFunction::FindGraphTable(const string &la
 	return graph_table_entry->second;
 }
 
+//! True when a quantified edge can take a number of hops other than one: `{0,1}` and `?` too, whose zero-hop
+//! matches only the variable-length routes produce (the single-hop join would drop them).
+static bool IsVariableLengthEdge(const SubPath &edge_subpath) {
+	return edge_subpath.upper > 1 || edge_subpath.lower == 0;
+}
+
 // Forward declaration
 static shared_ptr<PropertyGraphTable> ResolveLabelExprTable(const string &raw_expr, PGQMatchType match_type,
                                                             CreatePropertyGraphInfo &pg_table);
@@ -2271,7 +2277,17 @@ static void RecordRewriteDiagnostic(ClientContext &context, PGQRewriteDiagnostic
 }
 
 static bool PathPatternRequiresABIPath(const vector<unique_ptr<PathReference>> &path_elements) {
-	return path_elements.size() >= 3;
+	if (path_elements.size() < 3) {
+		return false;
+	}
+	// Edges quantified {0,0} take no hop: such a pattern only matches vertices, and nothing needs an artifact.
+	for (idx_t i = 1; i < path_elements.size(); i += 2) {
+		auto *edge_subpath = PGQMatchFunction::GetSubPath(path_elements[i]);
+		if (!edge_subpath || edge_subpath->lower != 0 || edge_subpath->upper != 0) {
+			return true;
+		}
+	}
+	return false;
 }
 
 // True if any edge subpath in the pattern carries a COST expression. CHEAPEST is
@@ -2943,7 +2959,7 @@ unique_ptr<ParsedExpression> PGQMatchFunction::CreatePathFindingFunction(
 		auto edge_element = GetPathElement(path_list[idx_i]);
 		if (!edge_element) {
 			auto edge_subpath = reinterpret_cast<SubPath *>(path_list[idx_i].get());
-			if (edge_subpath->upper > 1) {
+			if (IsVariableLengthEdge(*edge_subpath)) {
 				// (un)bounded shortest path
 				// Add the shortest path UDF as a CTE
 				// The source's own predicates, from its element WHERE and the MATCH WHERE: they seed the path
@@ -4940,7 +4956,24 @@ void PGQMatchFunction::ProcessPathList(ClientContext &context, vector<unique_ptr
 				edge_table = ResolveTable(edge_element->label, edge_element->match_type, pg_table);
 			}
 
-			if (use_traversal_cte) {
+			if (edge_subpath->lower == 0 && edge_subpath->upper == 0 &&
+			    original_ref.one_row_per == OneRowPerMode::NONE) {
+				// Zero hops: the end vertex is the start vertex, a join on the row rather than a traversal.
+				const bool same_table = previous_vertex_table && next_vertex_table &&
+				                        StringUtil::CIEquals(PGQStr(previous_vertex_table->catalog_name),
+				                                             PGQStr(next_vertex_table->catalog_name)) &&
+				                        StringUtil::CIEquals(PGQStr(previous_vertex_table->schema_name),
+				                                             PGQStr(next_vertex_table->schema_name)) &&
+				                        StringUtil::CIEquals(PGQStr(previous_vertex_table->table_name),
+				                                             PGQStr(next_vertex_table->table_name));
+				if (same_table) {
+					conditions.push_back(make_uniq<ComparisonExpression>(
+					    ExpressionType::COMPARE_EQUAL, PGQColRef("rowid", previous_vertex_element->variable_binding),
+					    PGQColRef("rowid", next_vertex_element->variable_binding)));
+				} else {
+					conditions.push_back(ConstantExpression::FromValue(Value::BOOLEAN(false)));
+				}
+			} else if (use_traversal_cte) {
 				// Cross-table multi-label: use recursive CTE traversal.
 				auto edge_tbls =
 				    CollectEdgeTablesFromLabel(edge_element->label, edge_element->match_type, pg_table);
@@ -4950,7 +4983,7 @@ void PGQMatchFunction::ProcessPathList(ClientContext &context, vector<unique_ptr
 				                        next_vertex_element->variable_binding, previous_vertex_table,
 				                        next_vertex_table, edge_tbls, undirected, edge_subpath->lower,
 				                        edge_subpath->upper);
-			} else if (edge_subpath->upper > 1) {
+			} else if (IsVariableLengthEdge(*edge_subpath)) {
 				if (original_ref.one_row_per != OneRowPerMode::NONE) {
 					// ONE ROW PER: produce path lists for per-step unnesting.
 					// For finite bounded directed edges use a recursive CTE (avoids full CSR read).
@@ -6696,7 +6729,7 @@ static bool FindQuantifiedPathElements(const vector<unique_ptr<PathReference>> &
 			continue;
 		}
 		auto *sp = reinterpret_cast<SubPath *>((*effective_path_elements)[i].get());
-		if (sp->upper > 1) {
+		if (IsVariableLengthEdge(*sp)) {
 			out_src = AsPathElement((*effective_path_elements)[i - 1]);
 			out_dst = AsPathElement((*effective_path_elements)[i + 1]);
 			out_edge = sp->path_list.empty() ? nullptr : AsPathElement(sp->path_list[0]);
@@ -11330,6 +11363,103 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildLoweredMatchQueryNode(ClientContext
 	return result;
 }
 
+//! The positions of the edges of a pattern quantified {0,1} (also written ?), at the top level of its element list.
+static vector<idx_t> ZeroOrOneHopEdges(vector<unique_ptr<PathReference>> &elements) {
+	vector<idx_t> result;
+	for (idx_t i = 1; i < elements.size(); i += 2) {
+		auto *edge_subpath = PGQMatchFunction::GetSubPath(elements[i]);
+		if (edge_subpath && edge_subpath->lower == 0 && edge_subpath->upper == 1 && edge_subpath->path_list.size() == 1 &&
+		    PGQMatchFunction::GetPathElement(edge_subpath->path_list[0])) {
+			result.push_back(i);
+		}
+	}
+	return result;
+}
+
+// `-[e]->{0,1}` (or `?`) is the one-hop pattern or the zero-hop one, never both, so it is the multiset alternation
+// of the two: the one-hop operand keeps the fast join and its edge artifacts, the zero-hop one only reads vertices,
+// and e is NULL there. Kept on the variable-length route where that would not be the same answer: under a search
+// prefix (the zero-hop path is the shortest one for a vertex and itself), with ONE ROW PER, and in a union already.
+static void SplitZeroOrOneHopEdges(MatchExpression &block, CreatePropertyGraphInfo &pg_table) {
+	if (block.one_row_per != OneRowPerMode::NONE) {
+		return;
+	}
+	for (auto &pattern : block.path_patterns) {
+		if (!pattern->union_operands.empty() || pattern->shortest || pattern->cheapest || pattern->topk) {
+			continue;
+		}
+		// The element list, or the one inside the subpath a path variable or path mode wraps around it.
+		auto *elements = &pattern->path_elements;
+		if (elements->size() == 1) {
+			auto *wrapper = PGQMatchFunction::GetSubPath((*elements)[0]);
+			if (!wrapper || wrapper->lower != 1 || wrapper->upper != 1) {
+				continue;
+			}
+			elements = &wrapper->path_list;
+		}
+		const auto edge_count = ZeroOrOneHopEdges(*elements).size();
+		if (edge_count == 0 || edge_count > 3) {
+			continue;
+		}
+		// A vertex types an unlabeled neighbour by the edge's table at that end, so a zero-hop operand over an edge
+		// between two different tables matches nothing (as {0,k} does there): it is left out.
+		auto zero_hop_possible = [&](SubPath &edge) {
+			auto *element = PGQMatchFunction::GetPathElement(edge.path_list[0]);
+			try {
+				auto edge_table = ResolveTable(element->label, element->match_type, pg_table);
+				return !edge_table->source_pg_table || !edge_table->destination_pg_table ||
+				       edge_table->source_pg_table->SameTableIdentity(*edge_table->destination_pg_table);
+			} catch (std::exception &) {
+				return true;
+			}
+		};
+		vector<vector<unique_ptr<PathReference>>> operands;
+		for (idx_t choice = 0; choice < (idx_t(1) << edge_count); choice++) {
+			auto operand = pattern->Copy();
+			auto *operand_elements = &operand->path_elements;
+			if (operand_elements->size() == 1 && PGQMatchFunction::GetSubPath((*operand_elements)[0]) &&
+			    elements != &pattern->path_elements) {
+				operand_elements = &PGQMatchFunction::GetSubPath((*operand_elements)[0])->path_list;
+			}
+			auto edges = ZeroOrOneHopEdges(*operand_elements);
+			bool possible = true;
+			for (idx_t k = 0; k < edges.size(); k++) {
+				possible = possible && (!(choice & (idx_t(1) << k)) ||
+				                        zero_hop_possible(*PGQMatchFunction::GetSubPath((*operand_elements)[edges[k]])));
+			}
+			if (!possible) {
+				continue;
+			}
+			for (idx_t k = 0; k < edges.size(); k++) {
+				auto &edge = *PGQMatchFunction::GetSubPath((*operand_elements)[edges[k]]);
+				if (choice & (idx_t(1) << k)) {
+					edge.lower = 0;
+					edge.upper = 0;
+					// No edge is bound: its variable is NULL in this operand, and its own WHERE and COST have
+					// nothing to apply to.
+					auto *element = PGQMatchFunction::GetPathElement(edge.path_list[0]);
+					element->variable_binding = "_anon_zero_" + element->variable_binding;
+					edge.where_clause.reset();
+					edge.cost_expr.reset();
+				} else if (!edge.where_clause && !edge.cost_expr) {
+					// A plain edge, the form the unquantified pattern has, so the same routes answer it.
+					(*operand_elements)[edges[k]] = std::move(edge.path_list[0]);
+				} else {
+					// An edge with its own WHERE or COST is this one-element subpath in the unquantified form too.
+					edge.lower = 1;
+					edge.upper = 1;
+				}
+			}
+			operands.push_back(std::move(operand->path_elements));
+		}
+		pattern->path_elements = std::move(operands[0]);
+		for (idx_t i = 1; i < operands.size(); i++) {
+			pattern->union_operands.push_back(std::move(operands[i]));
+		}
+		pattern->union_multiset = !pattern->union_operands.empty();
+	}
+}
+
 unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, TableFunctionBindInput &bind_input) {
 	auto duckpgq_state = GetDuckPGQState(context);
 
@@ -11341,6 +11471,14 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	auto match_copy = unique_ptr_cast<ParsedExpression, MatchExpression>(match_info->match->Copy());
 	auto *ref = match_copy.get();
 	NormalizeMatchExpression(*ref);
+	{
+		QualifiedName graph_name(Identifier(ref->pg_catalog), Identifier(ref->pg_schema), Identifier(ref->pg_name));
+		auto &pg_table = *duckpgq_state->GetPropertyGraph(context, graph_name);
+		SplitZeroOrOneHopEdges(*ref, pg_table);
+		for (auto &branch : ref->union_matches) {
+			SplitZeroOrOneHopEdges(*branch, pg_table);
+		}
+	}
 	duckpgq_state->BeginRewriteDiagnostics(context);
 	auto node = NeedsLoweredMatch(*ref) ? BuildLoweredMatchQueryNode(context, *ref)
 	                                    : BuildMatchQueryNode(context, ref, true);

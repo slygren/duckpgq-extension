@@ -144,7 +144,9 @@ every operand, and `EXISTS { A | B }` holds when either operand matches.
 A quantified pattern without a search prefix returns **every walk** (SQL/PGQ semantics), not one row per endpoint;
 use `ANY SHORTEST` for one per endpoint, `ALL SHORTEST` for every shortest path. A walk visits no vertex twice, so
 walks that return to their start vertex are left out, and an edge stored twice is two walks. The path variable
-(`vertices(p)`, `path_length(p)`, `ONE ROW PER`) describes the row's own walk.
+(`vertices(p)`, `path_length(p)`, `ONE ROW PER`) describes the row's own walk. A quantifier from 0 also matches the
+zero-hop walk, which binds the end vertex to the start; `-[e]->?` (`{0,1}`) is the plain edge's matches, self-loops
+included, plus those, with `e` NULL in them.
 
 ### In WHERE and COLUMNS
 
