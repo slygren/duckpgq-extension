@@ -292,13 +292,31 @@ refuses a fallback traversal whose estimate is over budget.
 
 ## Graph algorithms
 
-From upstream, as table functions over a graph, a vertex label and an edge label:
+Table functions over a graph, a vertex label and an edge label. The edge label's edges must start and end in that
+vertex table. Each call returns one row per vertex, keyed by the vertex table's (first) key column, whatever its
+type. Each call builds its own CSR (compressed sparse row) copy of the edges, runs the algorithm once and drops the
+CSR at the end of the query. Every loop checks for query cancellation and `max_execution_time`.
 
 ```sql
 FROM pagerank('social', 'Person', 'Knows');
 FROM weakly_connected_component('social', 'Person', 'Knows');
 FROM local_clustering_coefficient('social', 'Person', 'Knows');
+FROM strongly_connected_component('social', 'Person', 'Knows');
 ```
+
+How each function reads the edges (n vertices, m edges):
+
+| Function | Graph | Self-loops | Parallel edges | Result | Time |
+| --- | --- | --- | --- | --- | --- |
+| `strongly_connected_component(g, v, e)` | directed | no effect | no effect | `componentId BIGINT` | O(n + m) |
+
+- **`strongly_connected_component`**: Tarjan's algorithm, iterative, so long chains are no problem. Two vertices
+  share a `componentId` when each reaches the other. The id is the smallest rowid among the component's vertices,
+  so it depends only on the partition and the table's row order. Matches `networkx.strongly_connected_components`.
+
+`scripts/compare_graph_algorithms.py` compares every function with NetworkX (or a brute force) on generated graphs:
+directed and undirected readings, disconnected parts, self-loops, parallel and reciprocal edges, empty edge and vertex
+tables, and integer, sparse-integer and string keys.
 
 Shortest-path searches inside `MATCH` (`ANY SHORTEST`, `CHEAPEST`) use upstream's CSR-based operators where no ABI
 artifact applies.

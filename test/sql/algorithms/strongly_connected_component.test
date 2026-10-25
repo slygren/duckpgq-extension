@@ -1,0 +1,142 @@
+# name: test/sql/algorithms/strongly_connected_component.test
+# description: strongly_connected_component: Tarjan over the directed edges; a component's id is its smallest rowid.
+#              Checked against networkx.strongly_connected_components by scripts/compare_graph_algorithms.py.
+# group: [algorithms]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+# Vertex rows inserted out of key order, so rowid (the component id) and key differ.
+statement ok
+CREATE TABLE v (id BIGINT);
+
+statement ok
+INSERT INTO v VALUES (7), (6), (5), (4), (3), (2), (1), (0);
+
+# Cycle 0 -> 1 -> 2 -> 0, a tail into cycle 3 -> 4 -> 5 -> 3, and 6 -> 7. A self-loop on 7 and a parallel 0 -> 1
+# change nothing.
+statement ok
+CREATE TABLE e (src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO e VALUES (0, 1), (1, 2), (2, 0), (2, 3), (3, 4), (4, 5), (5, 3), (6, 7), (7, 7), (0, 1);
+
+statement ok
+CREATE PROPERTY GRAPH g VERTEX TABLES (v) EDGE TABLES (e SOURCE KEY (src) REFERENCES v (id) DESTINATION KEY (dst) REFERENCES v (id));
+
+query II
+SELECT id, componentId FROM strongly_connected_component('g', 'v', 'e') ORDER BY id;
+----
+0	5
+1	5
+2	5
+3	2
+4	2
+5	2
+6	1
+7	0
+
+# Labels are case-insensitive, like the other algorithms.
+query I
+SELECT count(DISTINCT componentId) FROM strongly_connected_component('G', 'V', 'E');
+----
+4
+
+# Two calls in one query each build their own CSR.
+query I
+SELECT count(*) FROM strongly_connected_component('g', 'v', 'e') a JOIN strongly_connected_component('g', 'v', 'e') b USING (id) WHERE a.componentId = b.componentId;
+----
+8
+
+# String keys.
+statement ok
+CREATE TABLE sv AS SELECT 'v' || id AS name FROM v;
+
+statement ok
+CREATE TABLE se AS SELECT 'v' || src AS a, 'v' || dst AS b FROM e;
+
+statement ok
+CREATE PROPERTY GRAPH sg VERTEX TABLES (sv) EDGE TABLES (se SOURCE KEY (a) REFERENCES sv (name) DESTINATION KEY (b) REFERENCES sv (name));
+
+query II
+SELECT name, componentId FROM strongly_connected_component('sg', 'sv', 'se') ORDER BY name;
+----
+v0	5
+v1	5
+v2	5
+v3	2
+v4	2
+v5	2
+v6	1
+v7	0
+
+# No edges at all: every vertex is its own component.
+statement ok
+CREATE TABLE ne (src BIGINT, dst BIGINT);
+
+statement ok
+CREATE PROPERTY GRAPH ng VERTEX TABLES (v) EDGE TABLES (ne SOURCE KEY (src) REFERENCES v (id) DESTINATION KEY (dst) REFERENCES v (id));
+
+query II
+SELECT id, componentId FROM strongly_connected_component('ng', 'v', 'ne') ORDER BY id;
+----
+0	7
+1	6
+2	5
+3	4
+4	3
+5	2
+6	1
+7	0
+
+# No vertices.
+statement ok
+CREATE TABLE nv (id BIGINT);
+
+statement ok
+CREATE TABLE nve (src BIGINT, dst BIGINT);
+
+statement ok
+CREATE PROPERTY GRAPH nvg VERTEX TABLES (nv) EDGE TABLES (nve SOURCE KEY (src) REFERENCES nv (id) DESTINATION KEY (dst) REFERENCES nv (id));
+
+query I
+SELECT count(*) FROM strongly_connected_component('nvg', 'nv', 'nve');
+----
+0
+
+# A long chain: the search is iterative, so depth is no problem.
+statement ok
+CREATE TABLE cv AS SELECT range AS id FROM range(200000);
+
+statement ok
+CREATE TABLE ce AS SELECT range AS src, range + 1 AS dst FROM range(199999) UNION ALL SELECT 199999, 0;
+
+statement ok
+CREATE PROPERTY GRAPH cg VERTEX TABLES (cv) EDGE TABLES (ce SOURCE KEY (src) REFERENCES cv (id) DESTINATION KEY (dst) REFERENCES cv (id));
+
+query II
+SELECT count(DISTINCT componentId), min(componentId) FROM strongly_connected_component('cg', 'cv', 'ce');
+----
+1	0
+
+# Edges between two different vertex tables are refused.
+statement ok
+CREATE TABLE w (id BIGINT);
+
+statement ok
+CREATE TABLE vw (src BIGINT, dst BIGINT);
+
+statement ok
+CREATE PROPERTY GRAPH bg VERTEX TABLES (v, w) EDGE TABLES (vw SOURCE KEY (src) REFERENCES v (id) DESTINATION KEY (dst) REFERENCES w (id));
+
+statement error
+FROM strongly_connected_component('bg', 'v', 'vw');
+----
+Invalid Input Error: strongly_connected_component: edge table vw connects v to w; graph algorithms need edges that start and end in the same vertex table
+
+statement error
+FROM strongly_connected_component('nosuchgraph', 'v', 'e');
+----
+Property graph nosuchgraph not found

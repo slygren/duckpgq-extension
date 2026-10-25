@@ -1,6 +1,7 @@
 
 #include "duckpgq/core/module.hpp"
 #include "duckpgq/common.hpp"
+#include "duckpgq/core/functions/algorithms/graph_algorithm.hpp"
 #include "duckpgq/core/functions/scalar.hpp"
 #include "duckpgq/core/functions/table.hpp"
 #include "duckpgq/core/optimizer/factorized_join_optimizer.hpp"
@@ -13,6 +14,7 @@ void CoreModule::Register(ExtensionLoader &loader) {
 	CoreTableFunctions::Register(loader);
 	// Scalar registration includes path export helpers such as graph_tree_json().
 	CoreScalarFunctions::Register(loader);
+	CoreGraphAlgorithms::Register(loader);
 	CorePGQParser::Register(loader);
 	CorePGQPragma::Register(loader);
 	CoreOptimizer::Register(loader);
