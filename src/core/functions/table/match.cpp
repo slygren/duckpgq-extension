@@ -2579,7 +2579,7 @@ static void ClaimCSRSlot(PGQCSRSlot &csr_slot, const string &edge_key, int32_t &
 //! and destination __b), `extra_where` a condition on them.
 static string StepRelationSQL(const shared_ptr<PropertyGraphTable> &edge_table, PGQMatchType edge_type,
                               const string &edge_label, const string &extra_select = string(),
-                              const string &extra_where = string()) {
+                              const string &extra_where = string(), const string &extra_join = string()) {
 	const string edges = QualifiedTableName(PGQStr(edge_table->catalog_name), PGQStr(edge_table->schema_name),
 	                                        PGQStr(edge_table->table_name));
 	auto &vertex_table = *edge_table->source_pg_table;
@@ -2598,9 +2598,9 @@ static string StepRelationSQL(const shared_ptr<PropertyGraphTable> &edge_table, 
 	};
 	// e from a (its source) to b (its destination)
 	const string stored = StringUtil::Format("%s FROM %s __e JOIN %s __a ON __a.%s = __e.%s JOIN %s __b ON __b.%s = "
-	                                         "__e.%s WHERE %s%s",
+	                                         "__e.%s%s WHERE %s%s",
 	                                         extra_select, edges, vertices, src_pk, src_fk, vertices, dst_pk, dst_fk,
-	                                         label_condition("__e"),
+	                                         extra_join, label_condition("__e"),
 	                                         extra_where.empty() ? string() : " AND (" + extra_where + ")");
 	switch (edge_type) {
 	case PGQMatchType::MATCH_EDGE_RIGHT:
@@ -2641,28 +2641,19 @@ static unique_ptr<CommonTableExpressionInfo> CreateStepCSRCTE(const shared_ptr<P
 	return info;
 }
 
-//! "cte1" for a CHEAPEST search: a CSR over the steps a costed quantified edge takes (StepRelationSQL, any direction),
-//! less those its element WHERE (`step_filter`, over __e) excludes, weighted by `step_cost` (the COST with its
-//! DEFAULT, over __e). create_csr_edge refuses a NULL, negative or non-finite cost as for the directed weighted CSR.
-static unique_ptr<CommonTableExpressionInfo> CreateCostedStepCSRCTE(const shared_ptr<PropertyGraphTable> &edge_table,
-                                                                    PGQMatchType edge_type, const string &edge_label,
-                                                                    const string &step_cost, const string &step_filter,
+//! "cte1" for a CHEAPEST search: a CSR over `steps` (src_rowid, dst_rowid, edge_rowid; the steps a costed quantified
+//! edge takes, StepRelationSQL in any direction, less those its element WHERE excludes), weighted by the `cost` column
+//! of `costed_steps` (the same rows), over the vertices `dense_ids` (dense_id) lists, `v_size` of them.
+//! create_csr_edge refuses a NULL, negative or non-finite cost as for the directed weighted CSR.
+static unique_ptr<CommonTableExpressionInfo> CreateCostedStepCSRCTE(const string &steps, const string &costed_steps,
+                                                                    const string &dense_ids, const string &v_size,
                                                                     int32_t csr_id) {
-	auto &vertex_table = *edge_table->source_pg_table;
-	const string vertices = QualifiedTableName(PGQStr(vertex_table.catalog_name), PGQStr(vertex_table.schema_name),
-	                                           PGQStr(vertex_table.table_name));
-	const string v_size = StringUtil::Format("(SELECT count(__v.%s) FROM %s __v)",
-	                                         KeywordHelper::WriteOptionallyQuoted(PGQStr(edge_table->source_pk[0])),
-	                                         vertices);
-	const string steps = StepRelationSQL(edge_table, edge_type, edge_label, string(), step_filter);
-	const string costed_steps =
-	    StepRelationSQL(edge_table, edge_type, edge_label, ", (" + step_cost + ") AS cost", step_filter);
 	const string sql = StringUtil::Format(
 	    "SELECT create_csr_edge(%d, %s, CAST((SELECT sum(create_csr_vertex(%d, %s, __sub.dense_id, __sub.cnt)) "
-	    "FROM (SELECT __v.rowid AS dense_id, count(__s.src_rowid) AS cnt FROM %s __v LEFT JOIN (%s) __s "
-	    "ON __s.src_rowid = __v.rowid GROUP BY __v.rowid) __sub) AS BIGINT), (SELECT count(*) FROM (%s) __c), "
+	    "FROM (SELECT __v.dense_id, count(__s.src_rowid) AS cnt FROM (%s) __v LEFT JOIN (%s) __s "
+	    "ON __s.src_rowid = __v.dense_id GROUP BY __v.dense_id) __sub) AS BIGINT), (SELECT count(*) FROM (%s) __c), "
 	    "__s.src_rowid, __s.dst_rowid, __s.edge_rowid, __s.cost) AS temp FROM (%s) __s",
-	    csr_id, v_size, csr_id, v_size, vertices, steps, steps, costed_steps);
+	    csr_id, v_size, csr_id, v_size, dense_ids, steps, steps, costed_steps);
 	auto info = make_uniq<CommonTableExpressionInfo>();
 	info->query_node = std::move(ParseSelectStatement(sql)->node);
 	return info;
@@ -11162,8 +11153,9 @@ static SubPath *SingleQuantifiedEdge(const vector<unique_ptr<PathReference>> &el
 	return element && element->match_type != PGQMatchType::MATCH_VERTEX ? edge : nullptr;
 }
 
-//! Whether every column the COST reads is a property of its own edge (constants and functions of them aside).
-static bool CostReadsOnlyEdge(const ParsedExpression &expression, const string &edge_variable) {
+//! Whether every column the expression reads is a property of one of `variables` (constants and functions of them
+//! aside).
+static bool ReadsOnly(const ParsedExpression &expression, const vector<string> &variables) {
 	if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY ||
 	    expression.GetExpressionClass() == ExpressionClass::LAMBDA ||
 	    expression.GetExpressionClass() == ExpressionClass::STAR) {
@@ -11171,13 +11163,29 @@ static bool CostReadsOnlyEdge(const ParsedExpression &expression, const string &
 	}
 	if (expression.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 		auto &names = expression.Cast<ColumnRefExpression>().ColumnNames();
-		return names.size() == 2 && StringUtil::CIEquals(PGQStr(names[0]), edge_variable);
+		if (names.size() != 2) {
+			return false;
+		}
+		for (auto &variable : variables) {
+			if (StringUtil::CIEquals(PGQStr(names[0]), variable)) {
+				return true;
+			}
+		}
+		return false;
 	}
-	bool only_edge = true;
-	ParsedExpressionIterator::EnumerateChildren(expression, [&](const ParsedExpression &child) {
-		only_edge = only_edge && CostReadsOnlyEdge(child, edge_variable);
-	});
-	return only_edge;
+	bool only = true;
+	ParsedExpressionIterator::EnumerateChildren(
+	    expression, [&](const ParsedExpression &child) { only = only && ReadsOnly(child, variables); });
+	return only;
+}
+
+//! The binding of a path's endpoint vertex, possibly wrapped in a subpath carrying its element WHERE.
+static string EndpointBinding(const unique_ptr<PathReference> &reference) {
+	if (reference->path_reference_type == PGQPathReferenceType::PATH_ELEMENT) {
+		return reinterpret_cast<const PathElement &>(*reference).variable_binding;
+	}
+	auto &wrapper = reinterpret_cast<const SubPath &>(*reference);
+	return reinterpret_cast<const PathElement &>(*wrapper.path_list[0]).variable_binding;
 }
 
 //! Whether COST(p) of a constant COST over this quantified edge is the search over the constant costs
@@ -11268,16 +11276,21 @@ static void PrepareCheapest(MatchExpression &match, bool shared_union_columns) {
 				                              "every edge supports one quantified edge between two vertices, e.g. %s",
 				                              kExample);
 			}
-			if (!CostReadsOnlyEdge(*edge->cost_expr, edge_element->variable_binding)) {
-				throw NotImplementedException("A COST may only read properties of its own edge (%s.<property>): %s",
-				                              edge_element->variable_binding, edge->cost_expr->ToString());
+			// The COST and an element WHERE on the costed edge (which filters its steps before the search, as a WHERE
+			// inside a quantified pattern does) read the edge and, as singletons the same on every step, the
+			// pattern's two endpoints.
+			const vector<string> readable {edge_element->variable_binding, EndpointBinding(elements[0]),
+			                               EndpointBinding(elements[2])};
+			if (!ReadsOnly(*edge->cost_expr, readable)) {
+				throw NotImplementedException("A COST may only read properties of its own edge (%s.<property>) and of "
+				                              "the pattern's endpoints (%s, %s): %s",
+				                              readable[0], readable[1], readable[2], edge->cost_expr->ToString());
 			}
-			// An element WHERE on the costed edge filters its steps before the search (as a WHERE inside a quantified
-			// pattern does).
-			if (edge->where_clause && !CostReadsOnlyEdge(*edge->where_clause, edge_element->variable_binding)) {
+			if (edge->where_clause && !ReadsOnly(*edge->where_clause, readable)) {
 				throw NotImplementedException("An element WHERE on the costed edge of a CHEAPEST pattern may only read "
-				                              "properties of its own edge (%s.<property>): %s",
-				                              edge_element->variable_binding, edge->where_clause->ToString());
+				                              "properties of its own edge (%s.<property>) and of the pattern's endpoints "
+				                              "(%s, %s): %s",
+				                              readable[0], readable[1], readable[2], edge->where_clause->ToString());
 			}
 			if (!match.optional_match_patterns.empty()) {
 				throw NotImplementedException("CHEAPEST with a COST that varies by edge is not supported with OPTIONAL "
@@ -11303,8 +11316,9 @@ static void PrepareCheapest(MatchExpression &match, bool shared_union_columns) {
 			// The search by cost (any direction but -> without an upper bound, a lower bound above 1 without one, an
 			// element WHERE) always materialises its paths.
 			const bool searched_by_cost =
-			    edge->where_clause || (edge->upper >= (1 << 30) && (edge->lower > 1 || edge_element->match_type !=
-			                                                                                 PGQMatchType::MATCH_EDGE_RIGHT));
+			    edge->where_clause || !ReadsOnly(*edge->cost_expr, {edge_element->variable_binding}) ||
+			    (edge->upper >= (1 << 30) &&
+			     (edge->lower > 1 || edge_element->match_type != PGQMatchType::MATCH_EDGE_RIGHT));
 			bool uses_path = match.one_row_per != OneRowPerMode::NONE || pattern->all || edge->upper < (1 << 30) ||
 			                 searched_by_cost;
 			if (!path_variable.empty()) {
@@ -12961,11 +12975,13 @@ static PGQNativePathSearch NativePathSearchFor(PathPattern &pattern) {
 	if (search.quantifier->cheapest) {
 		// A COST that varies by edge (PrepareCheapest marked the edge). The long-standing routes answer a right-directed
 		// + or * without an element WHERE (Bellman-Ford over the weighted CSR) and any bounded edge without one (the
-		// bounded enumeration); the search by cost answers the rest: <- and - without an upper bound, a lower bound
-		// above 1 without one, and an element WHERE on the costed edge.
+		// bounded enumeration), both with a COST over the edge alone; the search by cost answers the rest: <- and -
+		// without an upper bound, a lower bound above 1 without one, an element WHERE on the costed edge, and a COST
+		// that reads the endpoints.
 		const bool unbounded_edge = search.quantifier->upper >= static_cast<int64_t>(1 << 30);
 		const bool long_standing =
 		    !search.quantifier->where_clause &&
+		    ReadsOnly(*search.quantifier->cost_expr, {search.edge->variable_binding}) &&
 		    (!unbounded_edge ||
 		     (search.quantifier->lower <= 1 && search.edge->match_type == PGQMatchType::MATCH_EDGE_RIGHT));
 		if (long_standing) {
@@ -13177,45 +13193,209 @@ static void AddCheapestPathSearch(ClientContext &context, const PGQNativePathSea
 	                     : StringUtil::Format("(SELECT list(%s.rowid) FROM %s AS %s WHERE %s)", q_dst, vertices, q_dst,
 	                                          dst_seed);
 
-	// The COST and the element WHERE, over the step's edge. The WHERE is consumed here: it filters steps, not rows.
-	const string step_cost = RebindColumnAlias(CostWithDefault(quantifier), edge.variable_binding, "__e")->ToString();
-	string step_filter;
+	// The COST and the element WHERE, over the step's edge __e and, as singletons, the pattern's endpoints. The WHERE
+	// is consumed here: it filters steps, not rows.
+	auto cost = CostWithDefault(quantifier);
+	unique_ptr<ParsedExpression> filter;
 	if (quantifier.where_clause) {
-		step_filter = RebindColumnAlias(quantifier.where_clause->Copy(), edge.variable_binding, "__e")->ToString();
-		quantifier.where_clause.reset();
+		filter = std::move(quantifier.where_clause);
 	}
-	const string cost_probe =
-	    StringUtil::Format("(SELECT %s FROM %s __p LIMIT 0)",
-	                       RebindColumnAlias(CostWithDefault(quantifier), edge.variable_binding, "__p")->ToString(),
-	                       edges);
+	// The endpoint properties they read, each a column of the endpoint context relation (__pgq_cost_ctx): a search
+	// runs per source and context, over the steps costed (and filtered) in that context.
+	vector<pair<string, string>> context_columns; // (binding, property)
+	auto collect = [&](const ParsedExpression &expression) {
+		ParsedExpressionIterator::VisitExpression<ColumnRefExpression>(expression, [&](const ColumnRefExpression &col) {
+			auto &names = col.ColumnNames();
+			if (names.size() != 2) {
+				return;
+			}
+			const string binding = PGQStr(names[0]);
+			if (!StringUtil::CIEquals(binding, src) && !StringUtil::CIEquals(binding, dst)) {
+				return;
+			}
+			const pair<string, string> key(StringUtil::CIEquals(binding, src) ? src : dst, PGQStr(names[1]));
+			for (auto &existing : context_columns) {
+				if (StringUtil::CIEquals(existing.first, key.first) && StringUtil::CIEquals(existing.second, key.second)) {
+					return;
+				}
+			}
+			context_columns.push_back(key);
+		});
+	};
+	collect(*cost);
+	if (filter) {
+		collect(*filter);
+	}
+	const bool contexts = !context_columns.empty();
+	bool src_context = false;
+	bool dst_context = false;
+	for (auto &column : context_columns) {
+		src_context = src_context || StringUtil::CIEquals(column.first, src);
+		dst_context = dst_context || StringUtil::CIEquals(column.first, dst);
+	}
+	auto context_name = [&](const string &binding, const string &property) {
+		for (idx_t i = 0; i < context_columns.size(); i++) {
+			if (StringUtil::CIEquals(context_columns[i].first, binding) &&
+			    StringUtil::CIEquals(context_columns[i].second, property)) {
+				return "__ctx_" + std::to_string(i);
+			}
+		}
+		throw InternalException("CHEAPEST: endpoint property %s.%s has no context column", binding, property);
+	};
+	// Over the step: the edge is __e, an endpoint property its context column.
+	auto over_step = [&](const ParsedExpression &expression) {
+		auto rebound = RebindColumnAlias(expression.Copy(), edge.variable_binding, "__e");
+		ParsedExpressionIterator::VisitExpressionMutable<ColumnRefExpression>(*rebound, [&](ColumnRefExpression &col) {
+			auto &names = col.ColumnNamesMutable();
+			if (names.size() == 2 &&
+			    (StringUtil::CIEquals(PGQStr(names[0]), src) || StringUtil::CIEquals(PGQStr(names[0]), dst))) {
+				const string binding = StringUtil::CIEquals(PGQStr(names[0]), src) ? src : dst;
+				names[1] = Identifier(context_name(binding, PGQStr(names[1])));
+				names[0] = Identifier("__ctx");
+			}
+		});
+		return rebound->ToString();
+	};
+	const string step_cost = over_step(*cost);
+	const string step_filter = filter ? over_step(*filter) : string();
+	// The COST's type, from no rows: the edge __p and the endpoints __pa, __pb.
+	auto probe_cost = RebindColumnAlias(cost->Copy(), edge.variable_binding, "__p");
+	probe_cost = RebindColumnAlias(std::move(probe_cost), src, "__pa");
+	probe_cost = RebindColumnAlias(std::move(probe_cost), dst, "__pb");
+	const string cost_probe = StringUtil::Format("(SELECT %s FROM %s __p, %s __pa, %s __pb LIMIT 0)",
+	                                             probe_cost->ToString(), edges, vertices, vertices);
+
+	const string v_count = StringUtil::Format("(SELECT count(__v.%s) FROM %s __v)", pk, vertices);
+	const int64_t budget = MaxVLFallbackRows(context);
+	string steps, costed_steps, dense_ids, v_size;
+	if (!contexts) {
+		steps = StepRelationSQL(edge_table, edge.match_type, edge.label, string(), step_filter);
+		costed_steps = StepRelationSQL(edge_table, edge.match_type, edge.label, ", (" + step_cost + ") AS cost",
+		                               step_filter);
+		dense_ids = StringUtil::Format("SELECT __v.rowid AS dense_id FROM %s __v", vertices);
+		v_size = v_count;
+	} else {
+		// The contexts: the distinct values of the properties read, over the endpoints the seeds admit. Vertex v in
+		// context c is c * V + v of the CSR, so the contexts' searches never meet.
+		vector<string> context_select;
+		for (idx_t i = 0; i < context_columns.size(); i++) {
+			context_select.push_back(StringUtil::Format(
+			    "%s.%s AS __ctx_%llu", KeywordHelper::WriteOptionallyQuoted(context_columns[i].first),
+			    KeywordHelper::WriteOptionallyQuoted(context_columns[i].second), static_cast<unsigned long long>(i)));
+		}
+		vector<string> from;
+		vector<string> where;
+		if (src_context) {
+			from.push_back(StringUtil::Format("%s AS %s", vertices, q_src));
+			if (!src_seed.empty()) {
+				where.push_back(src_seed);
+			}
+		}
+		if (dst_context) {
+			from.push_back(StringUtil::Format("%s AS %s", vertices, q_dst));
+			if (!dst_seed.empty()) {
+				where.push_back(dst_seed);
+			}
+		}
+		const string context_sql = StringUtil::Format(
+		    "SELECT (row_number() OVER ()) - 1 AS __ctx_id, * FROM (SELECT DISTINCT %s FROM %s%s)",
+		    StringUtil::Join(context_select, ", "), StringUtil::Join(from, ", "),
+		    where.empty() ? "" : " WHERE " + StringUtil::Join(where, " AND "));
+		auto context_info = make_uniq<CommonTableExpressionInfo>();
+		context_info->query_node = std::move(ParseSelectStatement(context_sql)->node);
+		// Numbered once: the CSR and the search read the same numbering.
+		context_info->materialized = CTEMaterialize::CTE_MATERIALIZE_ALWAYS;
+		select_node->cte_map.map[Identifier("__pgq_cost_ctx")] = std::move(context_info);
+		const string context_join = " CROSS JOIN __pgq_cost_ctx __ctx";
+		auto offset = [&](const string &inner, bool with_cost) {
+			return StringUtil::Format("SELECT __ctx_id * %s + src_rowid AS src_rowid, __ctx_id * %s + dst_rowid AS "
+			                          "dst_rowid, edge_rowid%s FROM (%s)",
+			                          v_count, v_count, with_cost ? ", cost" : "", inner);
+		};
+		steps = offset(StepRelationSQL(edge_table, edge.match_type, edge.label, ", __ctx.__ctx_id AS __ctx_id",
+		                               step_filter, context_join),
+		               false);
+		costed_steps = offset(StepRelationSQL(edge_table, edge.match_type, edge.label,
+		                                      ", __ctx.__ctx_id AS __ctx_id, (" + step_cost + ") AS cost", step_filter,
+		                                      context_join),
+		                      true);
+		dense_ids =
+		    StringUtil::Format("SELECT __c.__ctx_id * %s + __v.rowid AS dense_id FROM %s __v, __pgq_cost_ctx __c",
+		                       v_count, vertices);
+		// The CSR holds every context's copy of the graph: refused past the budget before it is built.
+		const string edge_count = StringUtil::Format("(SELECT count(*) FROM %s)", edges);
+		v_size = StringUtil::Format(
+		    "(SELECT CASE WHEN %lld > 0 AND __n * (%s + %s) > %lld THEN CAST(error('A CHEAPEST search whose COST or "
+		    "element WHERE reads the endpoints runs once per distinct value of what it reads: ' || __n || ' contexts "
+		    "of the graph exceed pgq_max_vl_fallback_rows (%lld). Constrain the endpoints, or raise or disable the "
+		    "budget with SET pgq_max_vl_fallback_rows.') AS BIGINT) ELSE __n * %s END FROM (SELECT count(*) AS __n "
+		    "FROM __pgq_cost_ctx))",
+		    static_cast<long long>(budget), v_count, edge_count, static_cast<long long>(budget),
+		    static_cast<long long>(budget), v_count);
+	}
 
 	ClaimCSRSlot(csr_slot,
 	             CSRKeyFor(edge_table, edge.match_type, edge.label, true) + "|cost:" + step_cost + "|where:" + step_filter,
 	             CSRIdCounter(context));
 	if (select_node->cte_map.map.find("cte1") == select_node->cte_map.map.end()) {
-		select_node->cte_map.map["cte1"] = CreateCostedStepCSRCTE(edge_table, edge.match_type, edge.label, step_cost,
-		                                                          step_filter, csr_slot.slot);
+		select_node->cte_map.map["cte1"] = CreateCostedStepCSRCTE(steps, costed_steps, dense_ids, v_size, csr_slot.slot);
 	}
 	const int64_t upper = std::min<int64_t>(quantifier.upper, static_cast<int64_t>(1 << 30));
 	const string paths_cte = "__pgq_paths_" + std::to_string(select_node->cte_map.map.size());
+	string source = StringUtil::Format("%s.rowid", q_src);
+	string search_from = StringUtil::Format("%s AS %s", vertices, q_src);
+	string search_destinations = destinations;
+	if (contexts) {
+		// Each source with each context its own properties admit; the destinations of its context.
+		auto matches = [&](const string &binding, const string &alias) {
+			vector<string> parts;
+			for (idx_t i = 0; i < context_columns.size(); i++) {
+				if (StringUtil::CIEquals(context_columns[i].first, binding)) {
+					parts.push_back(StringUtil::Format("%s.%s IS NOT DISTINCT FROM __c.__ctx_%llu", alias,
+					                                   KeywordHelper::WriteOptionallyQuoted(context_columns[i].second),
+					                                   static_cast<unsigned long long>(i)));
+				}
+			}
+			return parts.empty() ? string("true") : StringUtil::Join(parts, " AND ");
+		};
+		source = StringUtil::Format("__c.__ctx_id * %s + %s.rowid", v_count, q_src);
+		search_from = StringUtil::Format("%s AS %s JOIN __pgq_cost_ctx __c ON %s", vertices, q_src, matches(src, q_src));
+		if (dst_context || !dst_seed.empty()) {
+			vector<string> dst_where;
+			if (!dst_seed.empty()) {
+				dst_where.push_back(dst_seed);
+			}
+			if (dst_context) {
+				dst_where.push_back(matches(dst, q_dst));
+			}
+			search_destinations = StringUtil::Format("(SELECT list(__c.__ctx_id * %s + %s.rowid) FROM %s AS %s WHERE %s)",
+			                                         v_count, q_dst, vertices, q_dst,
+			                                         StringUtil::Join(dst_where, " AND "));
+		}
+	}
 	const string search_sql = StringUtil::Format(
-	    "SELECT %s.rowid AS src_rowid, unnest(pgq_cheapest_paths(%d, (SELECT count(__v.%s) FROM %s __v), %s.rowid, %s, "
-	    "%lld, %lld, '%s', %lld, %s, __x.temp)) AS __found FROM %s AS %s, (SELECT 0 * count(cte1.temp) AS temp FROM "
-	    "cte1) AS __x%s",
-	    q_src, csr_slot.slot, pk, vertices, q_src, destinations, static_cast<long long>(quantifier.lower),
-	    static_cast<long long>(upper), search.all_shortest ? "all" : "any",
-	    static_cast<long long>(MaxVLFallbackRows(context)), cost_probe, vertices, q_src,
+	    "SELECT %s.rowid AS src_rowid, unnest(pgq_cheapest_paths(%d, %s, %s, %s, %lld, %lld, '%s', %lld, %s, "
+	    "__x.temp)) AS __found FROM %s, (SELECT 0 * count(cte1.temp) AS temp FROM cte1) AS __x%s",
+	    q_src, csr_slot.slot, contexts ? StringUtil::Format("(SELECT count(*) FROM __pgq_cost_ctx) * %s", v_count)
+	                                   : v_count,
+	    source, search_destinations, static_cast<long long>(quantifier.lower), static_cast<long long>(upper),
+	    search.all_shortest ? "all" : "any", static_cast<long long>(budget), cost_probe, search_from,
 	    src_seed.empty() ? "" : " WHERE " + src_seed);
 	auto search_info = make_uniq<CommonTableExpressionInfo>();
 	search_info->query_node = std::move(ParseSelectStatement(search_sql)->node);
 	select_node->cte_map.map[Identifier(paths_cte)] = std::move(search_info);
 
+	// In contexts, vertex ids are c * V + v: the path's vertices (its odd positions) and the destination are v.
+	const string path_sql =
+	    contexts ? StringUtil::Format("SELECT list_transform(__found.path, lambda __x, __i: CASE WHEN __i %% 2 = 1 THEN "
+	                                  "__x %% __vc.__n ELSE __x END) AS path, src_rowid, __found.dst %% __vc.__n AS "
+	                                  "dst_rowid, __found.cost AS cost FROM %s, (SELECT %s AS __n) __vc",
+	                                  KeywordHelper::WriteOptionallyQuoted(paths_cte), v_count)
+	             : StringUtil::Format("SELECT __found.path AS path, src_rowid, __found.dst AS dst_rowid, __found.cost "
+	                                  "AS cost FROM %s",
+	                                  KeywordHelper::WriteOptionallyQuoted(paths_cte));
 	auto path_info = make_uniq<CommonTableExpressionInfo>();
-	path_info->query_node = std::move(ParseSelectStatement(StringUtil::Format(
-	                                                           "SELECT __found.path AS path, src_rowid, __found.dst AS "
-	                                                           "dst_rowid, __found.cost AS cost FROM %s",
-	                                                           KeywordHelper::WriteOptionallyQuoted(paths_cte)))
-	                                      ->node);
+	path_info->query_node = std::move(ParseSelectStatement(path_sql)->node);
 	path_info->materialized = CTEMaterialize::CTE_MATERIALIZE_ALWAYS;
 	select_node->cte_map.map["shortest_path_cte"] = std::move(path_info);
 
@@ -13240,10 +13420,11 @@ static void AddCheapestPathSearch(ClientContext &context, const PGQNativePathSea
 	diagnostic.graph_name = pg_table.property_graph_name;
 	diagnostic.rewrite_type = "path_search";
 	diagnostic.status = "traversal";
-	diagnostic.reason = StringUtil::Format("search by cost: %s cheapest, steps %lld..%lld%s",
+	diagnostic.reason = StringUtil::Format("search by cost: %s cheapest, steps %lld..%lld%s%s",
 	                                       search.all_shortest ? "all" : "any",
 	                                       static_cast<long long>(quantifier.lower), static_cast<long long>(upper),
-	                                       step_filter.empty() ? "" : ", steps filtered");
+	                                       step_filter.empty() ? "" : ", steps filtered",
+	                                       contexts ? ", per endpoint context" : "");
 	diagnostic.edge_label_sequence = edge.label.empty() ? "*" : edge.label;
 	RecordRewriteDiagnostic(context, std::move(diagnostic));
 }

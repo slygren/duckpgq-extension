@@ -844,6 +844,133 @@ SELECT count(*) FROM (
 ----
 0
 
+# ── A COST or element WHERE that reads the pattern's endpoints: singletons, the same on every step ───────────────
+# Searched once per distinct value of what they read (a context); checked against the brute force per pair.
+
+statement ok
+CREATE TABLE factor(id BIGINT, f BIGINT, h DOUBLE);
+
+statement ok
+INSERT INTO factor SELECT id, 1 + id % 3, 0.25 * (id % 4) FROM person;
+
+statement ok
+CREATE TABLE every_costed_path AS
+WITH RECURSIVE paths(src, dst, depth, vs, es, ws, ds) AS (
+    SELECT id, id, 0, [id], []::BIGINT[], []::BIGINT[], []::DOUBLE[] FROM person
+    UNION ALL
+    SELECT p.src, l.dst, p.depth + 1, list_append(p.vs, l.dst), list_append(p.es, l.rowid), list_append(p.ws, l.w),
+           list_append(p.ds, l.d)
+    FROM paths p JOIN link l ON l.src = p.dst
+    WHERE NOT list_contains(p.vs, l.dst))
+SELECT p.*, fa.f AS af, fa.h AS ah, fb.f AS bf, fb.h AS bh FROM paths p JOIN factor fa ON fa.id = p.src JOIN factor fb ON fb.id = p.dst;
+
+statement ok
+CREATE TABLE person_f AS SELECT p.*, f.f, f.h FROM person p JOIN factor f USING (id) ORDER BY id;
+
+statement ok
+CREATE PROPERTY GRAPH gf VERTEX TABLES (person_f LABEL Person)
+EDGE TABLES (link SOURCE KEY (src) REFERENCES person_f (id) DESTINATION KEY (dst) REFERENCES person_f (id) LABEL Link);
+
+# COST e.w * a.f: each step costs its weight times the source's factor
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (gf MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST e.w * a.f]->+(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost)))
+    EXCEPT ALL (SELECT src, dst, vs, es, af * list_sum(ws) AS cost FROM every_costed_path WHERE depth > 0
+                QUALIFY cost = min(cost) OVER (PARTITION BY src, dst)));
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT src, dst, vs, es, af * list_sum(ws) AS cost FROM every_costed_path WHERE depth > 0
+     QUALIFY cost = min(cost) OVER (PARTITION BY src, dst))
+    EXCEPT ALL (FROM GRAPH_TABLE (gf MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST e.w * a.f]->+(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost))));
+----
+0
+
+# COST e.w + b.f within bounds: each step costs its weight plus the destination's factor
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (gf MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST e.w + b.f]->{1,3}(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost)))
+    EXCEPT ALL (SELECT src, dst, vs, es, list_sum(ws) + depth * bf AS cost FROM every_costed_path WHERE depth BETWEEN 1 AND 3
+                QUALIFY cost = min(cost) OVER (PARTITION BY src, dst)));
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT src, dst, vs, es, list_sum(ws) + depth * bf AS cost FROM every_costed_path WHERE depth BETWEEN 1 AND 3
+     QUALIFY cost = min(cost) OVER (PARTITION BY src, dst))
+    EXCEPT ALL (FROM GRAPH_TABLE (gf MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST e.w + b.f]->{1,3}(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost))));
+----
+0
+
+# Both endpoints, DOUBLE, from a lower bound above 1: the steps' costs added left to right
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (gf MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.d * a.f + b.h]->{2,}(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost)))
+    EXCEPT (SELECT src, dst, vs, es, list_reduce(list_transform(ds, lambda x: x * af + bh), lambda l, r: l + r) AS cost
+            FROM every_costed_path WHERE depth >= 2 QUALIFY cost = min(cost) OVER (PARTITION BY src, dst)));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM GRAPH_TABLE (gf MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.d * a.f + b.h]->{2,}(b:Person)
+            COLUMNS (a.id)))
+     = (SELECT count(DISTINCT (src, dst)) FROM every_costed_path WHERE depth >= 2);
+----
+true
+
+# An element WHERE reading the source: the steps each source may take
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (gf MATCH p = ALL CHEAPEST (a:Person)-[e:Link WHERE e.w <= a.f COST e.w]->+(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost)))
+    EXCEPT ALL (SELECT src, dst, vs, es, list_sum(ws) AS cost FROM every_costed_path WHERE depth > 0 AND list_max(ws) <= af
+                QUALIFY cost = min(cost) OVER (PARTITION BY src, dst)));
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT src, dst, vs, es, list_sum(ws) AS cost FROM every_costed_path WHERE depth > 0 AND list_max(ws) <= af
+     QUALIFY cost = min(cost) OVER (PARTITION BY src, dst))
+    EXCEPT ALL (FROM GRAPH_TABLE (gf MATCH p = ALL CHEAPEST (a:Person)-[e:Link WHERE e.w <= a.f COST e.w]->+(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost))));
+----
+0
+
+# Seeded: a source's own context only, and a seeded destination
+query IIT rowsort
+FROM GRAPH_TABLE (gf MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w * a.id]->+(b:Person) WHERE a.id = 1 AND b.id IN (0, 4)
+    COLUMNS (b.id, COST(p), vertices(p)));
+----
+0	6	[1, 3, 5, 0]
+4	4	[1, 3, 4]
+
+# Every source with its own context is a copy of the graph per source: past the budget, a clear error
+statement ok
+SET pgq_max_vl_fallback_rows = 100;
+
+statement error
+FROM GRAPH_TABLE (gf MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w * a.id]->+(b:Person) COLUMNS (COST(p)));
+----
+contexts of the graph exceed pgq_max_vl_fallback_rows
+
+statement ok
+RESET pgq_max_vl_fallback_rows;
+
+# Other variables stay out of a COST
+statement error
+FROM GRAPH_TABLE (gf MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w * c.f]->+(b:Person), (c:Person) COLUMNS (COST(p)));
+----
+may only read properties of its own edge
+
 # A search too large for pgq_max_vl_fallback_rows says so; one that runs too long is interrupted
 statement ok
 CREATE TABLE kv(id BIGINT);
