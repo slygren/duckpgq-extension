@@ -133,22 +133,26 @@ static void CreateCsrEdgeFunction(DataChunk &args, ExpressionState &state, Vecto
 		                          "vertices referred by edge tables exist and are unique for path-finding queries.");
 	}
 
-	auto csr_entry = duckpgq_state->csr_list.find(info.id);
-	if (!csr_entry->second->initialized_e) {
+	// Under the lock, like every other reader: another CSR of the same statement may be inserted meanwhile.
+	auto *csr_found = duckpgq_state->FindCSR(info.id);
+	if (!csr_found) {
+		throw ConstraintException("Invalid ID");
+	}
+	if (!csr_found->initialized_e) {
 		CsrInitializeEdge(*duckpgq_state, info.id, vertex_size, edge_size);
 	}
 	if (info.weight_type == LogicalType::SQLNULL) {
 		TernaryExecutor::Execute<int64_t, int64_t, int64_t, int32_t>(
 		    args.data[4], args.data[5], args.data[6], result, [&](int64_t src, int64_t dst, int64_t edge_id) {
-			    auto pos = ++csr_entry->second->v[src + 1];
-			    csr_entry->second->e[(int64_t)pos - 1] = dst;
-			    csr_entry->second->edge_ids[(int64_t)pos - 1] = edge_id;
+			    auto pos = ++csr_found->v[src + 1];
+			    csr_found->e[(int64_t)pos - 1] = dst;
+			    csr_found->edge_ids[(int64_t)pos - 1] = edge_id;
 			    return 1;
 		    });
 		return;
 	}
 	auto weight_type = args.data[7].GetType().InternalType();
-	if (!csr_entry->second->initialized_w) {
+	if (!csr_found->initialized_w) {
 		CsrInitializeWeight(*duckpgq_state, info.id, edge_size, weight_type);
 	}
 	UnifiedVectorFormat src_data, dst_data, edge_id_data, weight_data;
@@ -175,11 +179,11 @@ static void CreateCsrEdgeFunction(DataChunk &args, ExpressionState &state, Vecto
 				continue;
 			}
 			auto src = src_values[src_idx];
-			auto pos = ++csr_entry->second->v[src + 1];
+			auto pos = ++csr_found->v[src + 1];
 			auto weight = weight_values[weight_idx];
-			csr_entry->second->e[(int64_t)pos - 1] = dst_values[dst_idx];
-			csr_entry->second->edge_ids[(int64_t)pos - 1] = edge_id_values[edge_id_idx];
-			csr_entry->second->w[(int64_t)pos - 1] = weight;
+			csr_found->e[(int64_t)pos - 1] = dst_values[dst_idx];
+			csr_found->edge_ids[(int64_t)pos - 1] = edge_id_values[edge_id_idx];
+			csr_found->w[(int64_t)pos - 1] = weight;
 			result_data[i] = static_cast<int32_t>(weight);
 		}
 		return;
@@ -197,11 +201,11 @@ static void CreateCsrEdgeFunction(DataChunk &args, ExpressionState &state, Vecto
 			continue;
 		}
 		auto src = src_values[src_idx];
-		auto pos = ++csr_entry->second->v[src + 1];
+		auto pos = ++csr_found->v[src + 1];
 		auto weight = weight_values[weight_idx];
-		csr_entry->second->e[(int64_t)pos - 1] = dst_values[dst_idx];
-		csr_entry->second->edge_ids[(int64_t)pos - 1] = edge_id_values[edge_id_idx];
-		csr_entry->second->w_double[(int64_t)pos - 1] = weight;
+		csr_found->e[(int64_t)pos - 1] = dst_values[dst_idx];
+		csr_found->edge_ids[(int64_t)pos - 1] = edge_id_values[edge_id_idx];
+		csr_found->w_double[(int64_t)pos - 1] = weight;
 		result_data[i] = static_cast<int32_t>(weight);
 	}
 }

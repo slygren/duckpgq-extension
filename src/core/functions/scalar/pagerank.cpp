@@ -14,18 +14,18 @@ static void PageRankFunction(DataChunk &args, ExpressionState &state, Vector &re
 	auto duckpgq_state = GetDuckPGQState(info.context);
 
 	// Locate the CSR representation of the graph
-	auto csr_entry = duckpgq_state->csr_list.find(info.csr_id);
-	if (csr_entry == duckpgq_state->csr_list.end()) {
+	auto *csr_found = duckpgq_state->FindCSR(info.csr_id);
+	if (!csr_found) {
 		throw ConstraintException("CSR not found. Is the graph populated?");
 	}
 
-	if (!(csr_entry->second->initialized_v && csr_entry->second->initialized_e)) {
+	if (!(csr_found->initialized_v && csr_found->initialized_e)) {
 		throw ConstraintException("Need to initialize CSR before running PageRank.");
 	}
 
-	auto *v = reinterpret_cast<int64_t *>(duckpgq_state->csr_list[info.csr_id]->v);
-	vector<int64_t> &e = duckpgq_state->csr_list[info.csr_id]->e;
-	size_t v_size = duckpgq_state->csr_list[info.csr_id]->vsize;
+	auto *v = reinterpret_cast<int64_t *>(csr_found->v);
+	vector<int64_t> &e = csr_found->e;
+	size_t v_size = csr_found->vsize;
 
 	// State initialization (only once)
 	if (!info.state_initialized) {

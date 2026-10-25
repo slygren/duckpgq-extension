@@ -97,6 +97,15 @@ public:
 	//! monotonically and never reused within a connection, so a slot always means one CSR.
 	//! Reset in QueryEnd() alongside csr_to_delete, once the entries are gone.
 	int32_t csr_id_counter = 0;
+	//! The CSR registered under id, or null, looked up under csr_lock. Every reader goes through here: other
+	//! threads of the same query may be inserting another CSR (one statement can hold several), and reading an
+	//! unordered_map while it rehashes is undefined -- the lookup missed and the query failed with "Invalid ID".
+	//! The CSR itself is not moved by a rehash, so the pointer stays valid after the lock is released.
+	CSR *FindCSR(int32_t id) {
+		const lock_guard<std::mutex> guard(csr_lock);
+		auto entry = csr_list.find(id);
+		return entry == csr_list.end() ? nullptr : entry->second.get();
+	}
 	int32_t AllocateCSRId() {
 		const lock_guard<std::mutex> guard(csr_lock);
 		return csr_id_counter++;

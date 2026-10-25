@@ -273,6 +273,7 @@ void DuckPGQState::BeginRewriteDiagnostics(ClientContext &context) {
 
 void DuckPGQState::QueryEnd() {
 	parse_data.reset();
+	const lock_guard<std::mutex> guard(csr_lock);
 	for (const auto &csr_id : csr_to_delete) {
 		csr_list.erase(csr_id);
 	}
@@ -335,11 +336,11 @@ CreatePropertyGraphInfo *DuckPGQState::GetPropertyGraph(const string &pg_name) {
 }
 
 CSR *DuckPGQState::GetCSR(int32_t id) {
-	auto csr_entry = csr_list.find(id);
-	if (csr_entry == csr_list.end()) {
+	auto *csr = FindCSR(id);
+	if (!csr) {
 		throw ConstraintException("CSR not found with ID %d", id);
 	}
-	return csr_entry->second.get();
+	return csr;
 }
 
 } // namespace duckdb
