@@ -1224,3 +1224,35 @@ query II
 SELECT (SELECT count(*) FROM (FROM split_opt EXCEPT ALL FROM split_opt_ref)), (SELECT count(*) FROM (FROM split_opt_ref EXCEPT ALL FROM split_opt));
 ----
 0	0
+
+# COST(p) in COLUMNS shared by UNION blocks: each block's own p, its own search (a varying, a constant COST)
+query II
+SELECT (SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person)
+        UNION ALL MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 2]->{2,3}(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, COST(p) AS cost)))
+    EXCEPT ALL (SELECT src, dst, cost FROM any_w UNION ALL SELECT DISTINCT src, dst, 2 * depth FROM shortest_by(2, 3)))),
+       (SELECT count(*) FROM (
+    (SELECT src, dst, cost FROM any_w UNION ALL SELECT DISTINCT src, dst, 2 * depth FROM shortest_by(2, 3))
+    EXCEPT ALL (FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person)
+        UNION ALL MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 2]->{2,3}(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, COST(p) AS cost)))));
+----
+0	0
+
+query I
+SELECT (SELECT count(*) FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person)
+            UNION ALL MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST e.w]->{3,}(b:Person)
+            COLUMNS (a.id AS src, b.id AS dst, COST(p) AS cost, vertices(p) AS vs)))
+     = (SELECT count(*) FROM any_w) + (SELECT count(*) FROM all_l3);
+----
+true
+
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person) WHERE a.id < 6
+        UNION ALL MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST e.w]->{3,}(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, COST(p) AS cost, vertices(p) AS vs, edges(p) AS es)))
+    EXCEPT ALL (SELECT src, dst, cost, vs, es FROM any_w WHERE src < 6 UNION ALL SELECT src, dst, cost, vs, es FROM all_l3));
+----
+0

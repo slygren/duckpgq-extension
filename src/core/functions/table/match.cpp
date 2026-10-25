@@ -11279,14 +11279,11 @@ static bool ConstantCostSearch(const SubPath &edge, OneRowPerMode one_row_per) {
 //! a search over the constant costs. Any other COST marks its edge `cheapest`: the paths are chosen by cost, by a
 //! weighted search over the CSR without an upper bound, and by enumerating the paths within the bounds with one.
 static void PrepareCheapest(MatchExpression &match, bool shared_union_columns) {
+	// COST(p) in COLUMNS shared with UNION branches names each branch's own p (each branch is checked with them).
+	(void)shared_union_columns;
 	vector<string> cost_calls;
 	for (auto &column : match.column_list) {
 		CollectCostCalls(*column, cost_calls);
-	}
-	if (!cost_calls.empty() && shared_union_columns) {
-		throw BinderException("COST(%s) in the COLUMNS shared by the MATCH blocks of a UNION is not supported: give "
-		                      "each block its own COLUMNS",
-		                      cost_calls[0]);
 	}
 	// COST(p) in the MATCH's own WHERE filters the chosen paths (the WHERE outside a path pattern applies after its
 	// selector), so it reads the same cost the COLUMNS do.
@@ -11499,7 +11496,17 @@ static void NormalizeMatchExpression(MatchExpression &match) {
 	bool shared_union_columns = !match.union_matches.empty() && match.union_matches[0]->column_list.empty();
 	PrepareCheapest(match, shared_union_columns);
 	for (auto &branch : match.union_matches) {
+		// A branch sharing the head's COLUMNS is checked against them (COST(p) names its own p); it keeps none.
+		const bool shared = shared_union_columns && branch->column_list.empty();
+		if (shared) {
+			for (auto &column : match.column_list) {
+				branch->column_list.push_back(column->Copy());
+			}
+		}
 		NormalizeMatchExpression(*branch);
+		if (shared) {
+			branch->column_list.clear();
+		}
 	}
 }
 
@@ -13533,6 +13540,21 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 	auto final_select_node = make_uniq<SelectNode>();
 	case_insensitive_map_t<shared_ptr<PropertyGraphTable>> alias_map;
 
+	// COLUMNS shared with UNION branches that read COST(p): each branch computes the cost of its own p, so it copies
+	// them as written, before the head rewrites them for its own search. (Other shared COLUMNS are copied after.)
+	vector<unique_ptr<ParsedExpression>> shared_cost_columns;
+	if (!ref->union_matches.empty() && ref->union_matches[0]->column_list.empty()) {
+		vector<string> cost_calls;
+		for (auto &column : ref->column_list) {
+			CollectCostCalls(*column, cost_calls);
+		}
+		if (!cost_calls.empty()) {
+			for (auto &column : ref->column_list) {
+				shared_cost_columns.push_back(column->Copy());
+			}
+		}
+	}
+
 	// Build/reuse session-local path-table metadata once per graph. Prefer DBT's
 	// __pgq_path_catalog ABI metadata, with a name-scan fallback for older layouts.
 	auto path_table_cache_ptr = GetPathTableCache(context, *duckpgq_state, pg_table->property_graph_name,
@@ -13764,7 +13786,7 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 	for (size_t ui = 0; ui < ref->union_matches.size(); ui++) {
 		vector<unique_ptr<ParsedExpression>> branch_cols;
 		if (ref->union_matches[ui]->column_list.empty()) {
-			for (auto &expr : ref->column_list) {
+			for (auto &expr : shared_cost_columns.empty() ? ref->column_list : shared_cost_columns) {
 				branch_cols.push_back(expr->Copy());
 			}
 		}
@@ -13790,7 +13812,11 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 		bool all = ref->union_all_flags[ui];
 		// The branch's own COLUMNS, or its copy of the shared ones.
 		const bool own_columns = !branch.column_list.empty();
-		auto &branch_columns = own_columns ? branch.column_list : union_col_copies[ui];
+		if (!own_columns && !shared_cost_columns.empty()) {
+			// Shared COLUMNS reading COST(p), as written: the branch rewrites them for its own patterns.
+			branch.column_list = std::move(union_col_copies[ui]);
+		}
+		auto &branch_columns = !branch.column_list.empty() ? branch.column_list : union_col_copies[ui];
 
 		auto branch_select = make_uniq<SelectNode>();
 		case_insensitive_map_t<shared_ptr<PropertyGraphTable>> branch_alias_map;
