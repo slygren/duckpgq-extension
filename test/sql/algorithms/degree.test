@@ -1,0 +1,58 @@
+# name: test/sql/algorithms/degree.test
+# description: degree: in-, out- and total degree per vertex over the edge rows whose endpoints exist. Parallel
+#              edges each count; a self-loop counts once in and once out (= networkx MultiDiGraph degrees).
+# group: [algorithms]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE v (id INTEGER);
+
+statement ok
+INSERT INTO v VALUES (4), (3), (2), (1);
+
+# 1 -> 2 twice, 2 -> 3, 3 -> 1, a self-loop on 3, 4 isolated, and an edge to a missing vertex 9 (not counted).
+statement ok
+CREATE TABLE e (src INTEGER, dst INTEGER);
+
+statement ok
+INSERT INTO e VALUES (1, 2), (1, 2), (2, 3), (3, 1), (3, 3), (2, 9);
+
+statement ok
+CREATE PROPERTY GRAPH g VERTEX TABLES (v) EDGE TABLES (e SOURCE KEY (src) REFERENCES v (id) DESTINATION KEY (dst) REFERENCES v (id));
+
+query IIII
+SELECT id, in_degree, out_degree, degree FROM degree('g', 'v', 'e') ORDER BY id;
+----
+1	1	2	3
+2	2	1	3
+3	2	2	4
+4	0	0	0
+
+statement ok
+CREATE TABLE ne (src INTEGER, dst INTEGER);
+
+statement ok
+CREATE PROPERTY GRAPH ng VERTEX TABLES (v) EDGE TABLES (ne SOURCE KEY (src) REFERENCES v (id) DESTINATION KEY (dst) REFERENCES v (id));
+
+query II
+SELECT count(*), sum(degree) FROM degree('ng', 'v', 'ne');
+----
+4	0
+
+statement ok
+CREATE TABLE w (id INTEGER);
+
+statement ok
+CREATE TABLE vw (src INTEGER, dst INTEGER);
+
+statement ok
+CREATE PROPERTY GRAPH bg VERTEX TABLES (v, w) EDGE TABLES (vw SOURCE KEY (src) REFERENCES v (id) DESTINATION KEY (dst) REFERENCES w (id));
+
+statement error
+FROM degree('bg', 'v', 'vw');
+----
+graph algorithms need edges that start and end in the same vertex table

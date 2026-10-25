@@ -309,6 +309,7 @@ FROM label_propagation('social', 'Person', 'Knows', seed := 7, max_iterations :=
 FROM louvain('social', 'Person', 'Knows', resolution := 1.0, seed := 7);
 FROM k_core('social', 'Person', 'Knows');
 FROM shortest_path_lengths('social', 'Person', 'Knows', 42, directed := true);   -- 42 = the source's key
+FROM degree('social', 'Person', 'Knows');
 ```
 
 How each function reads the edges (n vertices, m edges):
@@ -323,6 +324,7 @@ How each function reads the edges (n vertices, m edges):
 | `louvain(g, v, e, resolution, seed)` | undirected, unweighted | ignored | count once | `community BIGINT` | O(m) per pass, typically O(m log n) |
 | `k_core(g, v, e)` | undirected | ignored | count once | `core_number BIGINT` | O(n + m) |
 | `shortest_path_lengths(g, v, e, source, directed)` | directed (default) or undirected | no effect | no effect | `distance BIGINT`, reachable vertices only | O(n + m) |
+| `degree(g, v, e)` | directed | 1 in + 1 out | each counts | `in_degree, out_degree, degree BIGINT` | O(n + m), plain SQL |
 
 - **`strongly_connected_component`**: Tarjan's algorithm, iterative, so long chains are no problem. Two vertices
   share a `componentId` when each reaches the other. The id is the smallest rowid among the component's vertices,
@@ -360,6 +362,9 @@ How each function reads the edges (n vertices, m edges):
   vertices the source reaches are returned, the source itself at 0, as in
   `networkx.single_source_shortest_path_length`. `directed := false` ignores edge direction. An unknown or NULL
   source key is an error. For paths themselves, or weighted costs, use `MATCH ... ANY SHORTEST` / `CHEAPEST`.
+- **`degree`**: edge rows per vertex, counted at each endpoint, over the edges whose two endpoints are vertices (the
+  edges the other functions see). These are the degrees of a `networkx.MultiDiGraph`. It runs as plain SQL (two
+  aggregations), with no CSR.
 
 `scripts/compare_graph_algorithms.py` compares every function with NetworkX (or a brute force) on generated graphs:
 directed and undirected readings, disconnected parts, self-loops, parallel and reciprocal edges, empty edge and vertex

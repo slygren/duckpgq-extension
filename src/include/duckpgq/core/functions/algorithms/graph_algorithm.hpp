@@ -146,6 +146,11 @@ struct GraphAlgorithmSpec {
 	std::function<Value(int64_t rowid, const GraphAlgorithmParams &params)> isolated;
 };
 
+//! Checks a call's (graph, vertex label, edge label) arguments and returns the edge table, whose edges must start and
+//! end in the vertex table.
+shared_ptr<PropertyGraphTable> BindGraphAlgorithmEdges(ClientContext &context, TableFunctionBindInput &input,
+                                                       const string &function_name);
+
 //! Registers the table function and its scalar worker.
 void RegisterGraphAlgorithm(ExtensionLoader &loader, const GraphAlgorithmSpec &spec);
 
@@ -178,6 +183,7 @@ private:
 	static void RegisterLouvain(ExtensionLoader &loader);
 	static void RegisterKCore(ExtensionLoader &loader);
 	static void RegisterShortestPathLengths(ExtensionLoader &loader);
+	static void RegisterDegree(ExtensionLoader &loader);
 };
 
 } // namespace duckdb

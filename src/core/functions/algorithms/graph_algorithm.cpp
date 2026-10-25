@@ -149,6 +149,32 @@ void CanonicalizeLabels(vector<int64_t> &labels) {
 	}
 }
 
+shared_ptr<PropertyGraphTable> BindGraphAlgorithmEdges(ClientContext &context, TableFunctionBindInput &input,
+                                                       const string &function_name) {
+	for (idx_t i = 0; i < 3; i++) {
+		if (input.inputs[i].IsNull()) {
+			throw InvalidInputException("%s: the graph, vertex label and edge label must not be NULL", function_name);
+		}
+	}
+	auto pg_name = StringUtil::Lower(StringValue::Get(input.inputs[0]));
+	auto vertex_label = StringUtil::Lower(StringValue::Get(input.inputs[1]));
+	auto edge_label = StringUtil::Lower(StringValue::Get(input.inputs[2]));
+
+	auto duckpgq_state = GetDuckPGQState(context);
+	auto pg_info = GetPropertyGraphInfo(duckpgq_state, pg_name);
+	auto edge_pg_entry = ValidateSourceNodeAndEdgeTable(pg_info, vertex_label, edge_label);
+	auto &vertex_table = *edge_pg_entry->source_pg_table;
+	if (!edge_pg_entry->destination_pg_table || !vertex_table.SameTableIdentity(*edge_pg_entry->destination_pg_table)) {
+		throw InvalidInputException("%s: edge table %s connects %s to %s; graph algorithms need edges that start and "
+		                            "end in the same vertex table",
+		                            function_name, PGQStr(edge_pg_entry->table_name), PGQStr(vertex_table.table_name),
+		                            edge_pg_entry->destination_pg_table
+		                                ? PGQStr(edge_pg_entry->destination_pg_table->table_name)
+		                                : string("?"));
+	}
+	return edge_pg_entry;
+}
+
 //------------------------------------------------------------------------------
 // Scalar worker
 //------------------------------------------------------------------------------
@@ -362,27 +388,9 @@ string ParamLiteral(const Value &value, const LogicalType &type) {
 
 unique_ptr<TableRef> GraphAlgorithmBindReplace(ClientContext &context, TableFunctionBindInput &input) {
 	auto &spec = *input.info->Cast<GraphAlgorithmTableInfo>().spec;
-	for (idx_t i = 0; i < 3; i++) {
-		if (input.inputs[i].IsNull()) {
-			throw InvalidInputException("%s: the graph, vertex label and edge label must not be NULL", spec.name);
-		}
-	}
-	auto pg_name = StringUtil::Lower(StringValue::Get(input.inputs[0]));
-	auto vertex_label = StringUtil::Lower(StringValue::Get(input.inputs[1]));
-	auto edge_label = StringUtil::Lower(StringValue::Get(input.inputs[2]));
-
-	auto duckpgq_state = GetDuckPGQState(context);
-	auto pg_info = GetPropertyGraphInfo(duckpgq_state, pg_name);
-	auto edge_pg_entry = ValidateSourceNodeAndEdgeTable(pg_info, vertex_label, edge_label);
+	auto edge_pg_entry = BindGraphAlgorithmEdges(context, input, spec.name);
 	auto &vertex_table = *edge_pg_entry->source_pg_table;
-	if (!edge_pg_entry->destination_pg_table || !vertex_table.SameTableIdentity(*edge_pg_entry->destination_pg_table)) {
-		throw InvalidInputException("%s: edge table %s connects %s to %s; graph algorithms need edges that start and "
-		                            "end in the same vertex table",
-		                            spec.name, PGQStr(edge_pg_entry->table_name), PGQStr(vertex_table.table_name),
-		                            edge_pg_entry->destination_pg_table
-		                                ? PGQStr(edge_pg_entry->destination_pg_table->table_name)
-		                                : string("?"));
-	}
+	auto duckpgq_state = GetDuckPGQState(context);
 
 	const int32_t csr_id = duckpgq_state->AllocateCSRId();
 	const string key = DuckPGQSQL::Column(edge_pg_entry->source_pk[0], string("__pgq_v"));
@@ -481,6 +489,7 @@ void CoreGraphAlgorithms::Register(ExtensionLoader &loader) {
 	RegisterLouvain(loader);
 	RegisterKCore(loader);
 	RegisterShortestPathLengths(loader);
+	RegisterDegree(loader);
 }
 
 } // namespace duckdb
