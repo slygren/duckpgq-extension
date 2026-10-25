@@ -236,7 +236,7 @@ C	1	2
 D	1	2
 E	2	4
 
-# COST(p) inside an expression; in WHERE it is refused, filter outside
+# COST(p) inside an expression, and in the MATCH's WHERE, which filters the chosen paths as a filter outside does
 query TR
 SELECT * FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person) WHERE a.name = 'A'
     COLUMNS (b.name, round(COST(p) * 10, 6) AS c)) WHERE c > 10 ORDER BY ALL;
@@ -244,10 +244,25 @@ SELECT * FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]
 C	14.0
 E	28.5
 
-statement error
-FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person) WHERE COST(p) > 1 COLUMNS (b.name));
+query TT
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person) WHERE COST(p) > 1
+    COLUMNS (a.name, b.name)) ORDER BY ALL;
 ----
-is not supported in the WHERE of a MATCH
+A	C
+A	E
+B	E
+C	E
+D	E
+
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person) WHERE COST(p) > 1
+        COLUMNS (a.name, b.name, COST(p) AS c)))
+    EXCEPT ALL
+    (SELECT * FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person)
+        COLUMNS (a.name, b.name, COST(p) AS c)) WHERE c > 1));
+----
+0
 
 query TR
 FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 0.5]->+(b:Person) WHERE a.name = 'A'
