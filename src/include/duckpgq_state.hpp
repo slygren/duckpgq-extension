@@ -104,7 +104,20 @@ public:
 	//! threads of the same query may be inserting another CSR (one statement can hold several), and reading an
 	//! unordered_map while it rehashes is undefined -- the lookup missed and the query failed with "Invalid ID".
 	//! The CSR itself is not moved by a rehash, so the pointer stays valid after the lock is released.
+	//! A CSR to read: built, and compacted if its fill left gaps (CSR::Compact)
 	CSR *FindCSR(int32_t id) {
+		const lock_guard<std::mutex> guard(csr_lock);
+		auto entry = csr_list.find(id);
+		if (entry == csr_list.end()) {
+			return nullptr;
+		}
+		if (entry->second->compact_pending) {
+			entry->second->Compact();
+		}
+		return entry->second.get();
+	}
+	//! A CSR being filled (create_csr_edge): never compacted, other chunks are still filling it
+	CSR *FindCSRForBuild(int32_t id) {
 		const lock_guard<std::mutex> guard(csr_lock);
 		auto entry = csr_list.find(id);
 		return entry == csr_list.end() ? nullptr : entry->second.get();

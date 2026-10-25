@@ -47,6 +47,12 @@ public:
 	size_t vsize {};
 	//! The costs are DOUBLE (w_double), else BIGINT (w); meaningful once initialized_w, even for a CSR without edges
 	bool double_weights = false;
+	//! Fewer edges reach both endpoints than the degrees counted (an edge to a missing vertex is no edge): the fill
+	//! leaves a gap at the end of such a vertex's slice, closed by Compact() before the CSR is read. slice_start holds
+	//! each slice's start as sized (v[x + 1] for vertex x, v[x + 2] its end).
+	bool compact_pending = false;
+	vector<int64_t> slice_start;
+	void Compact();
 
 	string ToString() const;
 };

@@ -266,6 +266,41 @@ unique_ptr<JoinRef> GetJoinRef(const shared_ptr<PropertyGraphTable> &edge_table,
 	return first_join_ref;
 }
 
+// Closes the gaps an edge to a missing vertex leaves: the degrees are counted over the edges whose source is a
+// vertex, the CSR is filled from those whose two endpoints are, so such a vertex's slice ends early. Each slice moves
+// down to where the previous one now ends. O(V + E), and only when an edge was missing an endpoint.
+void CSR::Compact() {
+	const int64_t vertices = static_cast<int64_t>(vsize) - 2;
+	int64_t write = 0;
+	for (int64_t x = 0; x < vertices; x++) {
+		const int64_t start = slice_start[x + 1];
+		const int64_t end = v[x + 1];
+		for (int64_t i = start; i < end; i++, write++) {
+			e[write] = e[i];
+			edge_ids[write] = edge_ids[i];
+			if (!w.empty()) {
+				w[write] = w[i];
+			}
+			if (!w_double.empty()) {
+				w_double[write] = w_double[i];
+			}
+		}
+		v[x + 1] = write;
+	}
+	v[vertices + 1] = write;
+	e.resize(write);
+	edge_ids.resize(write);
+	if (!w.empty()) {
+		w.resize(write);
+	}
+	if (!w_double.empty()) {
+		w_double.resize(write);
+	}
+	slice_start.clear();
+	slice_start.shrink_to_fit();
+	compact_pending = false;
+}
+
 unique_ptr<SubqueryExpression> CreateDirectedCSRVertexSubquery(const shared_ptr<PropertyGraphTable> &edge_table,
                                                                const string &prev_binding, int32_t csr_id,
                                                                const PGQEdgeRowFilter &edge_filter) {

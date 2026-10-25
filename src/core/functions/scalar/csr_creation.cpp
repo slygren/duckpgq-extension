@@ -39,7 +39,7 @@ static void CsrInitializeVertex(DuckPGQState &context, int32_t id, int64_t v_siz
 	}
 }
 
-static void CsrInitializeEdge(DuckPGQState &context, int32_t id, int64_t v_size, int64_t e_size) {
+static void CsrInitializeEdge(DuckPGQState &context, int32_t id, int64_t v_size, int64_t e_size, bool gaps) {
 	const lock_guard<mutex> csr_init_lock(context.csr_lock);
 
 	auto csr_entry = context.csr_list.find(id);
@@ -54,6 +54,11 @@ static void CsrInitializeEdge(DuckPGQState &context, int32_t id, int64_t v_size,
 	}
 	for (auto i = 1; i < v_size + 2; i++) {
 		csr_entry->second->v[i] += csr_entry->second->v[i - 1];
+	}
+	if (gaps) {
+		auto &csr = *csr_entry->second;
+		csr.slice_start.assign(csr.v, csr.v + v_size + 2);
+		csr.compact_pending = true;
 	}
 	csr_entry->second->initialized_e = true;
 }
@@ -131,24 +136,40 @@ static void CreateCsrEdgeFunction(DataChunk &args, ExpressionState &state, Vecto
 	int64_t vertex_size = args.data[1].GetValue(0).GetValue<int64_t>();
 	int64_t edge_size = args.data[2].GetValue(0).GetValue<int64_t>();
 	int64_t edge_size_count = args.data[3].GetValue(0).GetValue<int64_t>();
-	if (edge_size != edge_size_count) {
+	// edge_size: the degrees, over the edges whose source is a vertex; edge_size_count: the edges reaching both
+	// endpoints, which fill it. More of those means a key held by two vertices. Fewer means edges to a missing
+	// vertex, which are no edges: their slots are left empty and compacted away before the CSR is read.
+	auto throw_non_unique = [&]() {
 		duckpgq_state->csr_to_delete.insert(info.id);
 		throw ConstraintException("Non-existent/non-unique vertices detected. Make sure all "
 		                          "vertices referred by edge tables exist and are unique for path-finding queries.");
+	};
+	if (edge_size_count > edge_size) {
+		throw_non_unique();
 	}
 
 	// Under the lock, like every other reader: another CSR of the same statement may be inserted meanwhile.
-	auto *csr_found = duckpgq_state->FindCSR(info.id);
+	auto *csr_found = duckpgq_state->FindCSRForBuild(info.id);
 	if (!csr_found) {
 		throw ConstraintException("Invalid ID");
 	}
 	if (!csr_found->initialized_e) {
-		CsrInitializeEdge(*duckpgq_state, info.id, vertex_size, edge_size);
+		CsrInitializeEdge(*duckpgq_state, info.id, vertex_size, edge_size, edge_size_count < edge_size);
 	}
+	// With gaps a vertex's edges may not fill its slice; one that would overrun it has a destination key held by
+	// two vertices.
+	const int64_t *slice_start = csr_found->compact_pending ? csr_found->slice_start.data() : nullptr;
+	auto slot = [&](int64_t src) {
+		auto pos = ++csr_found->v[src + 1];
+		if (slice_start && pos > slice_start[src + 2]) {
+			throw_non_unique();
+		}
+		return pos;
+	};
 	if (info.weight_type == LogicalType::SQLNULL) {
 		TernaryExecutor::Execute<int64_t, int64_t, int64_t, int32_t>(
 		    args.data[4], args.data[5], args.data[6], result, [&](int64_t src, int64_t dst, int64_t edge_id) {
-			    auto pos = ++csr_found->v[src + 1];
+			    auto pos = slot(src);
 			    csr_found->e[(int64_t)pos - 1] = dst;
 			    csr_found->edge_ids[(int64_t)pos - 1] = edge_id;
 			    return 1;
@@ -187,7 +208,7 @@ static void CreateCsrEdgeFunction(DataChunk &args, ExpressionState &state, Vecto
 				ThrowNullCost(*duckpgq_state, info.id);
 			}
 			auto src = src_values[src_idx];
-			auto pos = ++csr_found->v[src + 1];
+			auto pos = slot(src);
 			auto weight = weight_values[weight_idx];
 			if (weight < 0) {
 				duckpgq_state->csr_to_delete.insert(info.id);
@@ -218,7 +239,7 @@ static void CreateCsrEdgeFunction(DataChunk &args, ExpressionState &state, Vecto
 			ThrowNullCost(*duckpgq_state, info.id);
 		}
 		auto src = src_values[src_idx];
-		auto pos = ++csr_found->v[src + 1];
+		auto pos = slot(src);
 		auto weight = weight_values[weight_idx];
 		if (!(weight >= 0) || std::isinf(weight)) {
 			duckpgq_state->csr_to_delete.insert(info.id);

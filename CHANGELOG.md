@@ -130,6 +130,9 @@ with identical answers.
   with "Cannot compare VARCHAR and BIGINT".
 - **`edges(p)`** on an ABI route used to fail. It now traverses.
 - **Bounded CHEAPEST** used to fail with "CSR not found".
+- **Unbounded ANY / ALL SHORTEST and CHEAPEST over an edge table with edges to missing vertices** (lake data has
+  them) failed with "Non-existent/non-unique vertices detected". Such an edge is no edge of the graph, as everywhere
+  else, and is skipped.
 - **Errors raised by the extension's functions** (a CSR that is not built, an invalid argument to
   `graph_tree_json`, a vertex id outside the CSR) are reported as themselves. They used to surface as INTERNAL
   errors, which invalidate the database, and `TRY()` could not catch them. Out-of-range vertex ids given to the
