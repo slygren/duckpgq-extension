@@ -1,7 +1,9 @@
 #include "duckpgq/core/functions/table/vertex_elimination.hpp"
 
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/parser/constraints/foreign_key_constraint.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
@@ -60,6 +62,14 @@ void PGQVertexJoinRecorder::Record(const string &vertex_alias, const vector<Iden
 // Elimination
 //------------------------------------------------------------------------------
 namespace {
+
+vector<Identifier> PGQIds(const vector<string> &names) {
+	vector<Identifier> result;
+	for (auto &name : names) {
+		result.emplace_back(name);
+	}
+	return result;
+}
 
 idx_t KeyPosition(const vector<string> &keys, const string &key) {
 	for (idx_t i = 0; i < keys.size(); i++) {
@@ -542,6 +552,74 @@ private:
 		return false;
 	}
 
+	//! Whether DuckDB enforces edge_keys -> vertex_entry(vertex_keys) through a FOREIGN KEY on the edge table. DuckDB
+	//! checks it on every insert and update of the edge table and every delete and key update of the vertex table.
+	bool HasForeignKey(const TableCatalogEntry &edge_entry, const vector<Identifier> &edge_keys,
+	                   const TableCatalogEntry &vertex_entry, const vector<Identifier> &vertex_keys) {
+		if (edge_keys.empty() || edge_keys.size() != vertex_keys.size()) {
+			return false;
+		}
+		for (auto &constraint : edge_entry.GetConstraints()) {
+			if (constraint->type != ConstraintType::FOREIGN_KEY) {
+				continue;
+			}
+			auto &foreign_key = constraint->Cast<ForeignKeyConstraint>();
+			if (!foreign_key.info.IsAppendConstraint() || foreign_key.fk_columns.size() != edge_keys.size() ||
+			    foreign_key.pk_columns.size() != edge_keys.size()) {
+				continue;
+			}
+			// The referenced table must be this vertex table, not one of the same name elsewhere.
+			auto schema = foreign_key.info.schema.empty() ? edge_entry.ParentSchema().name : foreign_key.info.schema;
+			optional_ptr<TableCatalogEntry> referenced;
+			try {
+				referenced = Catalog::GetEntry<TableCatalogEntry>(
+				    context, QualifiedName(edge_entry.ParentCatalog().GetName(), schema,
+				                           foreign_key.info.table),
+				    OnEntryNotFound::RETURN_NULL);
+			} catch (std::exception &) {
+				referenced = nullptr;
+			}
+			if (!referenced || referenced.get() != &vertex_entry) {
+				continue;
+			}
+			bool pairs_match = true;
+			for (idx_t i = 0; i < edge_keys.size() && pairs_match; i++) {
+				pairs_match = false;
+				for (idx_t j = 0; j < foreign_key.fk_columns.size(); j++) {
+					if (StringUtil::CIEquals(PGQStr(foreign_key.fk_columns[j]), PGQStr(edge_keys[i])) &&
+					    StringUtil::CIEquals(PGQStr(foreign_key.pk_columns[j]), PGQStr(vertex_keys[i]))) {
+						pairs_match = true;
+						break;
+					}
+				}
+			}
+			if (pairs_match) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	//! Whether every row of the join's edge table references a row of the vertex table on the join's keys, now and
+	//! after any later modification: only a FOREIGN KEY guarantees that. A check made at CREATE PROPERTY GRAPH
+	//! (pgq_verify_edges_on_create) does not: rows written later are not checked, and DuckDB tables record nowhere
+	//! whether they changed since. (A DuckLake table's snapshots do, but DuckLake tables have no UNIQUE key, which
+	//! elimination needs as well.)
+	bool EdgesReferenceVertices(const PGQVertexEdgeJoin &join, const PropertyGraphTable &vertex_pg_table) {
+		auto edge_entry = LookupTable(*join.edge_table);
+		auto vertex_entry = LookupTable(vertex_pg_table);
+		if (!edge_entry || !vertex_entry) {
+			return false;
+		}
+		if (!join.undirected) {
+			return HasForeignKey(*edge_entry, PGQIds(join.edge_keys), *vertex_entry, PGQIds(join.vertex_keys));
+		}
+		// Both endpoint columns feed the undirected edge's key.
+		auto &edge = *join.edge_table;
+		return HasForeignKey(*edge_entry, edge.source_fk, *vertex_entry, edge.source_pk) &&
+		       HasForeignKey(*edge_entry, edge.destination_fk, *vertex_entry, edge.destination_pk);
+	}
+
 	bool TryPlan(VertexPlan &plan) {
 		if (plan.disqualified || plan.joins.empty() || !node.from_table) {
 			return false;
@@ -582,6 +660,11 @@ private:
 		}
 		if (!HasUniqueConstraint(*vertex_table, keys)) {
 			return false;
+		}
+		for (auto join_index : plan.joins) {
+			if (!EdgesReferenceVertices(joins[join_index], vertex_pg_table)) {
+				return false;
+			}
 		}
 
 		plan.needs_cast.assign(plan.joins.size(), vector<bool>(keys.size(), false));
@@ -741,9 +824,8 @@ private:
 } // namespace
 
 idx_t PGQEliminateVertexJoins(ClientContext &context, SelectNode &node, const vector<PGQVertexEdgeJoin> &joins,
-                              const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map,
-                              bool graph_verified) {
-	if (!graph_verified || joins.empty() || !node.from_table) {
+                              const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map) {
+	if (joins.empty() || !node.from_table) {
 		return 0;
 	}
 	Value value;

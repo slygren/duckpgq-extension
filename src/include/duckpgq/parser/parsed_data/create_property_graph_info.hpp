@@ -37,9 +37,8 @@ struct CreatePropertyGraphInfo : public CreateInfo {
 	//! Dictionary to point label to vector or edge table
 	case_insensitive_map_t<shared_ptr<PropertyGraphTable>> label_map;
 
-	//! Whether CREATE PROPERTY GRAPH verified that every edge key references a vertex row. Graphs persisted before
-	//! the check existed, or created over tables the check could not read, are not verified and keep their vertex
-	//! joins in MATCH (see VertexEliminationPlanner).
+	//! Whether CREATE PROPERTY GRAPH verified that every edge key references a vertex row, as of that moment. Graphs
+	//! persisted before the check existed, or created over tables the check could not read, are not verified.
 	bool verified = false;
 
 	//! The WITH ABI (...) clause: what pgq_abi_build builds for this graph, as a STRUCT literal in SQL text

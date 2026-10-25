@@ -364,11 +364,11 @@ static bool HasEnforcedForeignKey(const TableCatalogEntry &edge_entry, const vec
 
 //! The property graph declares that every edge key references a vertex row (SOURCE KEY ... REFERENCES ...). SQL/PGQ
 //! calls an edge whose key matches no vertex an "incomplete edge" (ISO/IEC 9075-16, 9.5). Verify the declaration once,
-//! when the graph is created, so that the MATCH translation can rely on it (see VertexEliminationPlanner). Rows
-//! modified after creation are not re-checked. An edge with a NULL key component references nothing and is never
-//! matched; it is accepted. A FOREIGN KEY constraint already guarantees the reference and skips the scan.
+//! when the graph is created. Rows modified after creation are not re-checked, so the MATCH translation does not rely
+//! on it (vertex-join elimination needs a FOREIGN KEY). An edge with a NULL key component references nothing and is
+//! never matched; it is accepted. A FOREIGN KEY constraint already guarantees the reference and skips the scan.
 //! Returns false when the data could not be inspected (tables that are not yet committed are invisible to the
-//! separate connection); the graph is then created unverified and the MATCH translation keeps the vertex joins.
+//! separate connection); the graph is then created unverified.
 static bool CheckEdgeKeysReferenceVertices(ClientContext &context, Connection &connection,
                                            const shared_ptr<PropertyGraphTable> &edge_table_p, const string &side,
                                            const vector<Identifier> &edge_keys,
@@ -454,8 +454,7 @@ void CreatePropertyGraphFunction::CreatePropertyGraphFunc(ClientContext &context
 
 	// Verify the data before anything is registered, so that a failed CREATE leaves no trace and CREATE OR REPLACE
 	// keeps the previous definition.
-	// The check scans every edge table; it is opt-in because only vertex elimination, which this build's MATCH
-	// translation does not perform, relies on it.
+	// The check scans every edge table, so it is opt-in.
 	Value verify_edges;
 	const bool verify = context.TryGetCurrentSetting("pgq_verify_edges_on_create", verify_edges) &&
 	                    !verify_edges.IsNull() && verify_edges.GetValue<bool>();

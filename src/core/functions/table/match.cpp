@@ -10345,7 +10345,7 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	final_select_node->where_clause = CreateWhereClause(conditions);
 	final_select_node->select_list =
 	    BuildFinalColumnList(std::move(ref->column_list), alias_to_vertex_and_edge_tables, stub_bindings);
-	PGQEliminateVertexJoins(context, *final_select_node, vertex_joins, alias_map, pg_table->verified);
+	PGQEliminateVertexJoins(context, *final_select_node, vertex_joins, alias_map);
 
 	if (ref->union_matches.empty()) {
 		auto subquery = make_uniq<SelectStatement>();

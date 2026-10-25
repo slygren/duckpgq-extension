@@ -1,0 +1,205 @@
+# name: test/sql/pattern_matching/vertex_elimination_safety.test
+# description: Vertex-join elimination only where every edge is known to reference a vertex, now and later
+# group: [pattern_matching]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+SET pgq_verify_edges_on_create = true;
+
+statement ok
+CREATE TABLE person(id BIGINT PRIMARY KEY, name VARCHAR);
+
+statement ok
+INSERT INTO person VALUES (1, 'a'), (2, 'b'), (3, 'c');
+
+statement ok
+CREATE TABLE tag(id BIGINT PRIMARY KEY, name VARCHAR);
+
+statement ok
+INSERT INTO tag VALUES (10, 't10'), (11, 't11');
+
+# ── Without foreign keys: the CREATE-time check proves nothing about later rows, so the vertex joins stay ──────────
+
+statement ok
+CREATE TABLE likes(pid BIGINT NOT NULL, tid BIGINT NOT NULL);
+
+statement ok
+INSERT INTO likes VALUES (1, 10), (2, 10), (3, 11);
+
+statement ok
+CREATE PROPERTY GRAPH plain
+VERTEX TABLES (person LABEL Person, tag LABEL Tag)
+EDGE TABLES (likes SOURCE KEY (pid) REFERENCES person (id) DESTINATION KEY (tid) REFERENCES tag (id) LABEL Likes);
+
+query II
+EXPLAIN SELECT * FROM GRAPH_TABLE (plain MATCH (p:Person)-[l:Likes]->(t:Tag) COLUMNS (p.id, t.id AS tid));
+----
+physical_plan	<REGEX>:.*main\.person\s.*
+
+query II
+EXPLAIN SELECT * FROM GRAPH_TABLE (plain MATCH (p:Person)-[l:Likes]->(t:Tag) COLUMNS (p.id, t.id AS tid));
+----
+physical_plan	<REGEX>:.*main\.tag\s.*
+
+# Edges that reference no vertex, added after CREATE: the joins drop them
+statement ok
+INSERT INTO likes VALUES (2, 99), (42, 11);
+
+query II
+SELECT * FROM GRAPH_TABLE (plain MATCH (p:Person)-[l:Likes]->(t:Tag) COLUMNS (p.id, t.id AS tid)) ORDER BY ALL;
+----
+1	10
+2	10
+3	11
+
+statement ok
+SET duckpgq_vertex_join_elimination = false;
+
+query II
+SELECT * FROM GRAPH_TABLE (plain MATCH (p:Person)-[l:Likes]->(t:Tag) COLUMNS (p.id, t.id AS tid)) ORDER BY ALL;
+----
+1	10
+2	10
+3	11
+
+statement ok
+SET duckpgq_vertex_join_elimination = true;
+
+# Deleting a vertex an edge references: the edge is dropped too
+statement ok
+DELETE FROM person WHERE id = 3;
+
+query II
+SELECT * FROM GRAPH_TABLE (plain MATCH (p:Person)-[l:Likes]->(t:Tag) COLUMNS (p.id, t.id AS tid)) ORDER BY ALL;
+----
+1	10
+2	10
+
+statement ok
+INSERT INTO person VALUES (3, 'c');
+
+# ── With foreign keys DuckDB enforces every edge's reference, so the vertex joins are left out ─────────────────────
+# Without the CREATE-time check, which these graphs do not need (and likes now holds incomplete edges).
+
+statement ok
+SET pgq_verify_edges_on_create = false;
+
+statement ok
+CREATE TABLE tagged(pid BIGINT NOT NULL REFERENCES person (id), tid BIGINT NOT NULL REFERENCES tag (id));
+
+statement ok
+INSERT INTO tagged VALUES (1, 10), (2, 10), (3, 11);
+
+statement ok
+CREATE PROPERTY GRAPH keyed
+VERTEX TABLES (person LABEL Person, tag LABEL Tag)
+EDGE TABLES (
+    tagged SOURCE KEY (pid) REFERENCES person (id) DESTINATION KEY (tid) REFERENCES tag (id) LABEL Tagged,
+    likes SOURCE KEY (pid) REFERENCES person (id) DESTINATION KEY (tid) REFERENCES tag (id) LABEL Likes
+);
+
+query II
+EXPLAIN SELECT * FROM GRAPH_TABLE (keyed MATCH (p:Person)-[g:Tagged]->(t:Tag) COLUMNS (p.id, t.id AS tid));
+----
+physical_plan	<!REGEX>:.*main\.(person|tag)\s.*
+
+query II
+SELECT * FROM GRAPH_TABLE (keyed MATCH (p:Person)-[g:Tagged]->(t:Tag) COLUMNS (p.id, t.id AS tid)) ORDER BY ALL;
+----
+1	10
+2	10
+3	11
+
+# A vertex shared with an edge table that has no foreign key keeps its join: t is joined to both edges
+query II
+EXPLAIN SELECT * FROM GRAPH_TABLE (keyed
+    MATCH (p:Person)-[g:Tagged]->(t:Tag)<-[l:Likes]-(q:Person) COLUMNS (p.id, q.id AS qid, t.id AS tid));
+----
+physical_plan	<REGEX>:.*main\.tag\s.*
+
+query III
+SELECT * FROM GRAPH_TABLE (keyed
+    MATCH (p:Person)-[g:Tagged]->(t:Tag)<-[l:Likes]-(q:Person) COLUMNS (p.id, q.id AS qid, t.id AS tid)) ORDER BY ALL;
+----
+1	1	10
+1	2	10
+2	1	10
+2	2	10
+3	3	11
+
+statement ok
+SET duckpgq_vertex_join_elimination = false;
+
+query III
+SELECT * FROM GRAPH_TABLE (keyed
+    MATCH (p:Person)-[g:Tagged]->(t:Tag)<-[l:Likes]-(q:Person) COLUMNS (p.id, q.id AS qid, t.id AS tid)) ORDER BY ALL;
+----
+1	1	10
+1	2	10
+2	1	10
+2	2	10
+3	3	11
+
+statement ok
+SET duckpgq_vertex_join_elimination = true;
+
+# A foreign key to a table of the same name in another schema is not a reference to the vertex table
+statement ok
+CREATE SCHEMA other;
+
+statement ok
+CREATE TABLE main.topic(id BIGINT PRIMARY KEY);
+
+statement ok
+INSERT INTO main.topic VALUES (11);
+
+statement ok
+CREATE TABLE other.topic(id BIGINT PRIMARY KEY);
+
+statement ok
+INSERT INTO other.topic VALUES (10), (11), (12);
+
+# Foreign keys stay within a schema: this one references other.topic
+statement ok
+CREATE TABLE other.marked(pid BIGINT NOT NULL, tid BIGINT NOT NULL REFERENCES topic (id));
+
+statement ok
+INSERT INTO other.marked VALUES (1, 10), (2, 12), (3, 11);
+
+statement ok
+CREATE PROPERTY GRAPH elsewhere
+VERTEX TABLES (person LABEL Person, main.topic LABEL Topic)
+EDGE TABLES (other.marked SOURCE KEY (pid) REFERENCES person (id) DESTINATION KEY (tid) REFERENCES main.topic (id)
+             LABEL Marked);
+
+query II
+EXPLAIN SELECT * FROM GRAPH_TABLE (elsewhere MATCH (p:Person)-[m:Marked]->(t:Topic) COLUMNS (p.id, t.id AS tid));
+----
+physical_plan	<REGEX>:.*main\.topic\s.*
+
+query II
+SELECT * FROM GRAPH_TABLE (elsewhere MATCH (p:Person)-[m:Marked]->(t:Topic) COLUMNS (p.id, t.id AS tid)) ORDER BY ALL;
+----
+3	11
+
+# ── The same answers from ABI artifacts ─────────────────────────────────────────────────────────────────────────────
+
+statement ok
+FROM pgq_abi_build('keyed', exclude_self_referential := false);
+
+query II
+SELECT * FROM GRAPH_TABLE (keyed MATCH (p:Person)-[g:Tagged]->(t:Tag) COLUMNS (p.id, t.id AS tid)) ORDER BY ALL;
+----
+1	10
+2	10
+3	11
+
+query TT
+SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (keyed MATCH (p:Person)-[g:Tagged]->(t:Tag)
+    COLUMNS (p.id, t.id AS tid))');
+----
+match	true

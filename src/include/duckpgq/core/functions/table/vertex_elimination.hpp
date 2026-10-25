@@ -56,9 +56,10 @@ static constexpr const char *PGQ_VERTEX_JOIN_ELIMINATION_SETTING = "duckpgq_vert
 //! joined to each other on their key columns instead, references to the vertex key are redirected to one of the edge
 //! keys, and the vertex table is left out of the FROM clause.
 //!
-//! This is only sound when CREATE PROPERTY GRAPH verified that every edge key references a vertex row
-//! (pgq_verify_edges_on_create), so graph_verified gates it. An edge made incomplete by later modifications then
-//! survives where the join would have dropped it; that is the documented limit of the optimization.
+//! This is only sound when every edge key references a vertex row, so every incident edge table must declare a
+//! FOREIGN KEY to the vertex key, which DuckDB enforces on every modification of either table. The check
+//! pgq_verify_edges_on_create makes at CREATE PROPERTY GRAPH is not enough: rows written later are not checked, and a
+//! DuckDB table records nowhere whether it changed since.
 //!
 //! The decision is taken on the complete SELECT, after every later rewrite (OPTIONAL MATCH, ONE ROW PER, graph
 //! functions, EXISTS, ...), so nothing added afterwards can still reference an eliminated vertex. A vertex is kept
@@ -68,7 +69,6 @@ static constexpr const char *PGQ_VERTEX_JOIN_ELIMINATION_SETTING = "duckpgq_vert
 //!
 //! Returns the number of eliminated vertex variables.
 idx_t PGQEliminateVertexJoins(ClientContext &context, SelectNode &node, const vector<PGQVertexEdgeJoin> &joins,
-                              const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map,
-                              bool graph_verified);
+                              const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map);
 
 } // namespace duckdb

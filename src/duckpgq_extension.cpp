@@ -80,7 +80,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 		config.AddExtensionOption(
 		    "pgq_verify_edges_on_create",
 		    "Have CREATE PROPERTY GRAPH check that every edge key references a vertex row, rejecting incomplete edges. "
-		    "Scans every edge table, so it is off by default.",
+		    "Scans every edge table, so it is off by default. Rows written later are not checked.",
 		    LogicalType::BOOLEAN, Value::BOOLEAN(false), nullptr, SetScope::SESSION);
 	}
 	if (!config.HasExtensionOption("pgq_abi_mode")) {
@@ -108,8 +108,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 		config.AddExtensionOption(
 		    "duckpgq_vertex_join_elimination",
 		    "Leave vertex tables out of the MATCH translation when the query only uses their key, joining the incident "
-		    "edge tables to each other instead. Only applies to graphs whose edges CREATE PROPERTY GRAPH verified "
-		    "(pgq_verify_edges_on_create).",
+		    "edge tables to each other instead. Only where every edge table has a FOREIGN KEY to the vertex key, so "
+		    "that every edge references a vertex.",
 		    LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::SESSION);
 	}
 	if (!config.HasExtensionOption("duckpgq_default_grammar")) {

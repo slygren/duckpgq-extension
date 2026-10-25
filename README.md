@@ -281,7 +281,7 @@ artifact applies.
 | `pgq_disable_abi_rewrite` | `false` | Skip the ABI rewrite; traverse only. |
 | `pgq_max_vl_fallback_rows` | 20,000,000 | Row budget for a variable-length traversal that no artifact answers. |
 | `pgq_verify_edges_on_create` | `false` | `CREATE PROPERTY GRAPH` rejects edges whose keys reference no vertex. Scans every edge table. |
-| `duckpgq_vertex_join_elimination` | `true` | Leave out a vertex table the query only uses for its key (verified graphs with a UNIQUE/PK key only). |
+| `duckpgq_vertex_join_elimination` | `true` | Leave out a vertex table the query only uses for its key, where every incident edge table has a FOREIGN KEY to that key. |
 | `duckpgq_factorized_joins` | `true` | Pre-aggregate join sides that are only counted or summed, so path counts become degree products. |
 | `duckpgq_factorized_join_operator` | `true` | Use the `FACTORIZED_GROUP_JOIN` operator when both sides are only counted or summed. |
 | `duckpgq_factorized_join_directory` | `true` | Let that operator count into a dense array when key bounds are known. |
@@ -394,8 +394,6 @@ building in [abi_build.cpp](src/core/functions/table/abi_build.cpp); vertex-join
   traverse. Choosing between several matching artifacts is simple.
 - **`pgq_abi_build` on a SQLite-backed DuckLake catalog** fails (the build's connection and the caller's contend
   for the file); run the statements from `pgq_abi_sql` on the caller's connection instead.
-- **Vertex-join elimination** trusts the check made at `CREATE PROPERTY GRAPH`; edges inserted later are not
-  re-checked.
 - **CHEAPEST costs** are BIGINT; fractional weights are rounded.
 
 ## Documentation map

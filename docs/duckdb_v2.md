@@ -30,7 +30,7 @@ FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->(b:Person) COLUMNS (a.name, b.nam
 | `pgq_abi_mode` | `consume` | `consume`: use ABI artifacts that exist, never build any. `auto`: also build a graph's artifacts at CREATE PROPERTY GRAPH when it has none and its database is writable. `off`: ignore artifacts. |
 | `pgq_abi_auto_max_rows` | 10000000 | In `auto` mode, leave out fixed-path artifacts whose chain holds more rows than this. |
 | `pgq_abi_on_stale` | `skip` | An artifact built from DuckLake tables that changed afterwards is stale. `skip`: leave it out and traverse. `use`: use it anyway. |
-| `duckpgq_vertex_join_elimination` | true | Leave a vertex table out of a MATCH when the query only uses its key (see below). Only applies to graphs created with `pgq_verify_edges_on_create`. |
+| `duckpgq_vertex_join_elimination` | true | Leave a vertex table out of a MATCH when the query only uses its key (see below). Only where the edge tables have FOREIGN KEYs to the vertex key. |
 
 ## ABI artifacts
 
@@ -135,11 +135,11 @@ These were verified against the fork's build:
 A vertex table that a MATCH only joins to prove that the edge endpoints exist is left out. The incident edges are joined to each other on their key columns instead, and references to the vertex key read the edge's key column. For `(p:Person)-[hi:hasInterest]->(t:Tag)-[hc:hasCategory]->(c:Category) WHERE c.name = 'Athlete' COLUMNS (p.id, t.id)`, only `hasInterest`, `hasCategory` and `Category` are scanned.
 
 - **When it applies:**
-  - The graph was created with `SET pgq_verify_edges_on_create = true`. That check is what makes the vertex join redundant, so unverified graphs keep every join.
-  - The vertex key has a PRIMARY KEY or UNIQUE constraint. DuckLake tables have none, so lake graphs keep their joins; the ABI rewrite already skips vertex joins it doesn't need there.
+  - Every incident edge table declares a FOREIGN KEY to the vertex key. DuckDB enforces it on every insert and update of the edge table and every delete or key update of the vertex table, so every edge references a vertex, then and later. That is what makes the vertex join redundant.
+  - The vertex key has a PRIMARY KEY or UNIQUE constraint (a foreign key needs one anyway). DuckLake tables have neither, so lake graphs keep their joins; the ABI rewrite already skips vertex joins it doesn't need there.
   - The query uses the vertex only through its key, in the COLUMNS list or WHERE clause.
 - **When the join stays:** the vertex is kept if it is referenced any other way: a property, `rowid`, `v.*` or `*`, a label-inheritance check, a path-finding endpoint, or anything inside a subquery, lambda, EXISTS, OPTIONAL MATCH join condition or UNION branch.
-- **The limit:** edges inserted after CREATE PROPERTY GRAPH are not checked. An edge that references no vertex then survives when its vertex is eliminated, where the join would have dropped it. This is upstream's documented behaviour.
+- **Not enough:** the check `SET pgq_verify_edges_on_create = true` makes at CREATE PROPERTY GRAPH. Rows written afterwards are not checked, and a DuckDB table records nowhere whether it changed since (its row counts miss deletes and in-place updates, and its commit counter moves with every transaction, read-only ones included). Upstream eliminated on that check alone, so an edge inserted later that referenced no vertex survived where the join would have dropped it.
 - **Turning it off:** `SET duckpgq_vertex_join_elimination = false`.
 
 ## Not ported (yet)
