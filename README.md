@@ -124,7 +124,7 @@ put over DuckLake catalogs. A graph is stored in the database it is created in a
 | `-[e:Knows]->`, `<-[e:Knows]-`, `-[e:Knows]-` | directed, reversed, either direction |
 | `->`, `<-`, `-`, `<->` | anonymous edge of any label |
 | `-[:R]->{1,5}`, `{,3}`, `{2,}`, `{2}`, `*`, `+`, `?` | quantified (variable-length) edge, quantifier after the arrow |
-| `-[:R*1..5]->`, `-[:R*]->`, `-[:R*2]->`, `-[:R*..3]->`, `-[:R*0..]->` | Cypher's quantifier inside the edge, with Cypher's meaning: `*` is `{1,}`, a missing lower bound is 1 (`*..3` is `{1,3}`) |
+| `-[:R*1..5]->`, `-[:R*]->`, `-[:R*2]->`, `-[:R*..3]->`, `-[:R*0..]->` | Cypher's quantifier inside the edge, with Cypher's meaning (see below) |
 | `MATCH (t)-[:A]->(a), (t)-[:B]->(b)` | several patterns sharing a variable |
 | `MATCH p = …` | path variable |
 | `ANY SHORTEST`, `ALL SHORTEST`, `ANY CHEAPEST`, `ALL CHEAPEST` | path search; `COST expr [DEFAULT n]` on an edge gives its weight, a number (`DEFAULT` where `expr` is NULL). A NULL cost without `DEFAULT`, and a negative or non-finite one, is an error |
@@ -134,6 +134,19 @@ put over DuckLake catalogs. A graph is stored in the database it is created in a
 | `MATCH … UNION [ALL] MATCH … COLUMNS (…)` | several MATCH blocks sharing the final `COLUMNS` |
 | `MATCH … COLUMNS (…) UNION [ALL] MATCH … COLUMNS (…)` | each MATCH block with its own `COLUMNS`, combined by position as in a SQL `UNION` |
 | `ONE ROW PER VERTEX (v)`, `ONE ROW PER EDGE (e)`, `ONE ROW PER STEP (v1, e, v2)` | one output row per element of each matched path |
+
+Cypher's quantifier inside the edge means what it means in Cypher, so a pattern copied from Neo4j returns the same
+paths. Its lower bound defaults to 1, so **a bare `*` is one or more hops here, but zero or more in the arrow form
+`->*`**:
+
+| Cypher form | Arrow form |
+| --- | --- |
+| `-[:R*]->`, `-[:R*..]->` | `-[:R]->{1,}` (`->+`) |
+| `-[:R*..3]->` | `-[:R]->{1,3}` |
+| `-[:R*1..5]->` | `-[:R]->{1,5}` |
+| `-[:R*2]->` | `-[:R]->{2}` |
+| `-[:R*0..3]->` | `-[:R]->{0,3}` (`{,3}`) |
+| `-[:R*0..]->` | `-[:R]->{0,}` (`->*`) |
 
 A quantified pattern without a search prefix returns **every walk** (SQL/PGQ semantics), not one row per endpoint;
 use `ANY SHORTEST` for one per endpoint, `ALL SHORTEST` for every shortest path. A walk visits no vertex twice, so
