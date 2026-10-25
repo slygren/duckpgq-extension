@@ -1,5 +1,6 @@
 #include "duckpgq/core/utils/compressed_sparse_row.hpp"
 #include "duckpgq/core/utils/duckpgq_identifier.hpp"
+#include "duckpgq/core/utils/duckpgq_sql.hpp"
 #include "duckdb/common/string.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/parser/expression/comparison_expression.hpp"
@@ -162,25 +163,16 @@ void SetupSelectNode(unique_ptr<SelectNode> &select_node, const shared_ptr<Prope
 	}
 }
 
-// Function to create a subquery expression for counting table entries
+//! The number of vertex slots of a CSR over this table: one past the largest rowid, NOT the row count. Every CSR
+//! array and every path search's visited set is indexed by rowid, and rowids keep their gaps after a DELETE, so
+//! sizing them by count(*) wrote past the end of the arrays (and dropped the last vertices) once rows were deleted.
+//! A slot whose row is gone is a vertex without edges that no query row ever asks about.
 unique_ptr<SubqueryExpression> GetCountTable(const shared_ptr<PropertyGraphTable> &table, const string &table_alias,
                                              const string &primary_key) {
-	auto select_count = make_uniq<SelectStatement>();
-	auto select_inner = make_uniq<SelectNode>();
-	auto ref = table->CreateBaseTableRef(table_alias);
-	select_inner->from_table = std::move(ref);
-
-	vector<unique_ptr<ParsedExpression>> children;
-	children.push_back(PGQColRef(primary_key, table_alias));
-
-	auto count_function = make_uniq<FunctionExpression>("count", std::move(children));
-	select_inner->select_list.push_back(std::move(count_function));
-	select_count->node = std::move(select_inner);
-
-	auto result = make_uniq<SubqueryExpression>();
-	result->SubqueryMutable() = std::move(select_count);
-	result->GetSubqueryTypeMutable() = SubqueryType::SCALAR;
-	return result;
+	(void)primary_key;
+	return DuckPGQSQL::ParseScalarSubquery("SELECT coalesce(max(" + DuckPGQSQL::Column(string("rowid"), table_alias) +
+	                                           ") + 1, 0) FROM " + DuckPGQSQL::TableRef(*table, table_alias),
+	                                       "CSR vertex count");
 }
 
 LogicalType PGQCostType(const LogicalType &type) {
