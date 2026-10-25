@@ -305,6 +305,7 @@ FROM strongly_connected_component('social', 'Person', 'Knows');
 FROM triangle_count('social', 'Person', 'Knows');
 FROM total_triangle_count('social', 'Person', 'Knows');    -- one row
 FROM betweenness_centrality('social', 'Person', 'Knows', k := 256, seed := 7, normalized := true, directed := true);
+FROM label_propagation('social', 'Person', 'Knows', seed := 7, max_iterations := 100);
 ```
 
 How each function reads the edges (n vertices, m edges):
@@ -315,6 +316,7 @@ How each function reads the edges (n vertices, m edges):
 | `triangle_count(g, v, e)` | undirected | ignored | count once | `triangle_count BIGINT` | O(m^1.5) |
 | `total_triangle_count(g, v, e)` | undirected | ignored | count once | one row, `triangle_count BIGINT` | O(m^1.5) |
 | `betweenness_centrality(g, v, e, k, normalized, directed, seed)` | directed (default) or undirected | ignored | count once | `betweenness_centrality DOUBLE` | O(n m), O(k m) sampled |
+| `label_propagation(g, v, e, seed, max_iterations)` | undirected | ignored | count once | `community BIGINT` | O(m) per round |
 
 - **`strongly_connected_component`**: Tarjan's algorithm, iterative, so long chains are no problem. Two vertices
   share a `componentId` when each reaches the other. The id is the smallest rowid among the component's vertices,
@@ -329,6 +331,13 @@ How each function reads the edges (n vertices, m edges):
   (n - 1)(n - 2); `directed` (default `true`) can be set to `false` to ignore edge direction. Values and scaling
   are `networkx.betweenness_centrality`'s (3.5), including its estimator for sampled sources, so `k = n` gives the
   exact values. With `k = 1`, the sampled vertex's own value is NULL (NetworkX returns NaN).
+- **`label_propagation`**: asynchronous label propagation (Raghavan et al. 2007), the rule
+  `networkx.asyn_lpa_communities` uses. Every vertex starts with its own label. Each round visits the vertices in a
+  random order drawn from `seed` (default 0). A vertex whose label is not among its neighbours' most frequent labels
+  takes one of them, chosen at random from the same seed. It stops after a round with no change, when every vertex
+  holds a most frequent neighbour label, or after `max_iterations` rounds (default 100). The same seed gives the same
+  communities on every platform. NetworkX uses Python's random generator, so labels differ from NetworkX's. A
+  `community` is the smallest rowid among its members.
 
 `scripts/compare_graph_algorithms.py` compares every function with NetworkX (or a brute force) on generated graphs:
 directed and undirected readings, disconnected parts, self-loops, parallel and reciprocal edges, empty edge and vertex

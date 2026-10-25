@@ -477,6 +477,7 @@ void CoreGraphAlgorithms::Register(ExtensionLoader &loader) {
 	RegisterStronglyConnectedComponent(loader);
 	RegisterTriangleCount(loader);
 	RegisterBetweennessCentrality(loader);
+	RegisterLabelPropagation(loader);
 }
 
 } // namespace duckdb
