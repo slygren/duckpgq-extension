@@ -2759,7 +2759,11 @@ static const char *const kUndirectedEdgeDirection = "__pgq_edir";
 
 //! (SELECT src, dst, * FROM edge UNION ALL SELECT dst, src, * FROM edge [no reversed self-loops]) AS alias: the
 //! edge read both ways, its first two columns oriented along the traversal.
-static unique_ptr<SubqueryRef> UndirectedEdgeUnion(const PropertyGraphTable &edge_table, const string &edge_binding) {
+//! `forward_filter` / `reverse_filter`, when given, restrict the edges each branch reads (over the edge table's own
+//! columns, under the alias edge_binding).
+static unique_ptr<SubqueryRef> UndirectedEdgeUnion(const PropertyGraphTable &edge_table, const string &edge_binding,
+                                                   unique_ptr<ParsedExpression> forward_filter = nullptr,
+                                                   unique_ptr<ParsedExpression> reverse_filter = nullptr) {
 	auto branch = [&](bool reversed) {
 		auto node = make_uniq<SelectNode>();
 		node->from_table = edge_table.CreateBaseTableRef(edge_binding);
@@ -2774,9 +2778,15 @@ static unique_ptr<SubqueryRef> UndirectedEdgeUnion(const PropertyGraphTable &edg
 		auto direction = ConstantExpression::FromValue(Value::INTEGER(reversed ? 1 : 0));
 		direction->SetAlias(Identifier(kUndirectedEdgeDirection));
 		node->select_list.push_back(std::move(direction));
+		unique_ptr<ParsedExpression> filter = reversed ? std::move(reverse_filter) : std::move(forward_filter);
 		if (reversed) {
-			node->where_clause = ReverseSelfLoopFilter(edge_table, edge_binding);
+			auto self_loop = ReverseSelfLoopFilter(edge_table, edge_binding);
+			filter = !filter ? std::move(self_loop)
+			                 : !self_loop ? std::move(filter)
+			                              : make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND,
+			                                                                 std::move(filter), std::move(self_loop));
 		}
+		node->where_clause = std::move(filter);
 		return node;
 	};
 	auto union_node = make_uniq<SetOperationNode>();
@@ -5552,15 +5562,94 @@ void PGQMatchFunction::ProcessPathList(ClientContext &context, vector<unique_ptr
 //! (measured 13 ms against 4 ms for 1000 seeds over 5M edges). `probe IN (SELECT pk FROM <near table> WHERE seed)`
 //! in the block restricts it to the edges the surviving near vertices can join; the outer WHERE still filters
 //! the rows, so nothing else changes. nullptr when there is no such predicate.
+//! The type of a column of a catalog table, or INVALID when it cannot be looked up.
+static LogicalType QualifiedColumnType(ClientContext &context, const string &catalog, const string &schema,
+                                       const string &table, const string &column) {
+	try {
+		const string catalog_name = catalog.empty() ? PGQStr(DatabaseManager::GetDefaultDatabase(context)) : catalog;
+		const string schema_name = schema.empty() ? string(DEFAULT_SCHEMA) : schema;
+		auto entry = Catalog::GetEntry<TableCatalogEntry>(
+		    context, QualifiedName(Identifier(catalog_name), Identifier(schema_name), Identifier(table)),
+		    OnEntryNotFound::RETURN_NULL);
+		if (!entry || !entry->ColumnExists(Identifier(column))) {
+			return LogicalType::INVALID;
+		}
+		return entry->GetColumn(Identifier(column)).Type();
+	} catch (...) {
+		return LogicalType::INVALID;
+	}
+}
+
+static LogicalType GraphTableColumnType(ClientContext &context, const PropertyGraphTable &table, const string &column) {
+	return QualifiedColumnType(context, PGQStr(table.catalog_name), PGQStr(table.schema_name), PGQStr(table.table_name),
+	                           column);
+}
+
+//! Whether the vertex key and every probe column have one (known) type, so a predicate on the key means the same on
+//! the probe.
+static bool SameKeyType(ClientContext &context, const PropertyGraphTable &vertex_table, const string &key,
+                        const vector<LogicalType> &probe_types) {
+	const auto key_type = GraphTableColumnType(context, vertex_table, key);
+	if (key_type.id() == LogicalTypeId::INVALID) {
+		return false;
+	}
+	for (auto &type : probe_types) {
+		if (type != key_type) {
+			return false;
+		}
+	}
+	return true;
+}
+
+//! Whether `expression` reads nothing of `binding` but its key column (constants and scalar subqueries are values).
+static bool ReadsOnlyKeyOf(const ParsedExpression &expression, const string &binding, const string &key) {
+	if (auto *column = dynamic_cast<const ColumnRefExpression *>(&expression)) {
+		if (column->ColumnNames().empty() || !StringUtil::CIEquals(PGQStr(column->ColumnNames()[0]), binding)) {
+			return true;
+		}
+		return column->ColumnNames().size() == 2 && StringUtil::CIEquals(PGQStr(column->ColumnNames()[1]), key);
+	}
+	bool only_key = true;
+	ParsedExpressionIterator::EnumerateChildren(expression, [&](const ParsedExpression &child) {
+		only_key = only_key && ReadsOnlyKeyOf(child, binding, key);
+	});
+	return only_key;
+}
+
+static unique_ptr<ParsedExpression> ReplaceKeyOf(unique_ptr<ParsedExpression> expression, const string &binding,
+                                                 const ParsedExpression &replacement) {
+	if (auto *column = dynamic_cast<ColumnRefExpression *>(expression.get())) {
+		if (!column->ColumnNames().empty() && StringUtil::CIEquals(PGQStr(column->ColumnNames()[0]), binding)) {
+			return replacement.Copy();
+		}
+		return expression;
+	}
+	ParsedExpressionIterator::EnumerateChildren(*expression, [&](unique_ptr<ParsedExpression> &child) {
+		child = ReplaceKeyOf(std::move(child), binding, replacement);
+	});
+	return expression;
+}
+
 static unique_ptr<ParsedExpression> OptionalSeedSemiJoin(const ParsedExpression *where_hint, const string &near_binding,
                                                          const shared_ptr<PropertyGraphTable> &near_table,
-                                                         const string &near_pk, unique_ptr<ParsedExpression> probe) {
-	if (!where_hint || !near_table) {
+                                                         const string &near_pk, unique_ptr<ParsedExpression> probe,
+                                                         bool probe_has_key_type, bool allow_substitution = true) {
+	// With keys of different (or unknown) types the block's join compares them with an implicit cast that neither an
+	// IN nor a moved predicate reproduces (and IN refuses to bind): no seed, the block is joined in full.
+	if (!where_hint || !near_table || !probe_has_key_type) {
 		return nullptr;
 	}
 	auto seed = ExtractSrcFilter(*where_hint, near_binding);
 	if (!seed) {
 		return nullptr;
+	}
+	// The usual seed reads only the near vertex's key (t.key = (SELECT ...), t.key IN (...)). Then the probe column,
+	// which the block joins to that key and which holds values of the same type, can carry the predicate itself:
+	// the same edges, without reading the vertex table again (measured on the lake: 35 against 23 ms for one seed).
+	// Not over the undirected union: there DuckDB estimates the filtered union poorly and builds on the far vertex
+	// table (14.6 against 8.6 ms with the semi-join, 5M edges); the semi-join's small seed side plans well.
+	if (allow_substitution && ReadsOnlyKeyOf(*seed, near_binding, near_pk)) {
+		return ReplaceKeyOf(std::move(seed), near_binding, *probe);
 	}
 	auto seed_select = make_uniq<SelectNode>();
 	seed_select->select_list.push_back(PGQColRef(near_pk, near_binding));
@@ -5620,13 +5709,15 @@ static void JoinOptionalHop(unique_ptr<SelectNode> &select_node, unique_ptr<Tabl
 }
 
 void PGQMatchFunction::ProcessOptionalPathList(
-    const vector<unique_ptr<PathPattern>> &opt_patterns, unique_ptr<SelectNode> &select_node,
+    ClientContext &context, const vector<unique_ptr<PathPattern>> &opt_patterns, unique_ptr<SelectNode> &select_node,
     case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &opt_alias_map, CreatePropertyGraphInfo &pg_table,
     int32_t &extra_alias_counter,
     const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &mandatory_alias_map,
     const PGQPathTableCache &path_table_cache,
     bool require_abi_paths, const ParsedExpression *where_hint,
-    const std::function<bool(const PGQPathTableInfo &)> &counts_exactly) {
+    const std::function<bool(const PGQPathTableInfo &)> &counts_exactly,
+    const std::function<bool(const PGQPathTableInfo &, const string &, const PropertyGraphTable &, const string &)>
+        &far_ends_complete) {
 	const string &graph_name = pg_table.property_graph_name;
 
 	for (auto &path_pattern : opt_patterns) {
@@ -5752,9 +5843,14 @@ void PGQMatchFunction::ProcessOptionalPathList(
 				                                          prev_binding, edge_binding),
 				                next_vertex_table->CreateBaseTableRef(next_binding), std::move(vertex_on),
 				                far_end_cannot_fail,
-				                OptionalSeedSemiJoin(where_hint, prev_binding, prev_vertex_table,
-				                                     PGQStr(edge_table->source_pk[0]),
-				                                     PGQColRef(edge_table->source_fk[0], edge_binding)));
+				                OptionalSeedSemiJoin(
+				                    where_hint, prev_binding, prev_vertex_table, PGQStr(edge_table->source_pk[0]),
+				                    PGQColRef(edge_table->source_fk[0], edge_binding),
+				                    SameKeyType(context, *prev_vertex_table, PGQStr(edge_table->source_pk[0]),
+				                                {GraphTableColumnType(context, *edge_table, PGQStr(edge_table->source_fk[0])),
+				                                 GraphTableColumnType(context, *edge_table,
+				                                                      PGQStr(edge_table->destination_fk[0]))}),
+				                    false));
 
 				opt_alias_map[edge_binding] = edge_table;
 				opt_alias_map[next_binding] = next_vertex_table;
@@ -5867,7 +5963,11 @@ void PGQMatchFunction::ProcessOptionalPathList(
 					bt->alias = Identifier(pt_alias);
 					unique_ptr<ParsedExpression> vertex_on_cond = make_uniq<ComparisonExpression>(
 					    ExpressionType::COMPARE_EQUAL, PGQColRef(free_pk, next_binding), PGQColRef(free_col, pt_alias));
-					bool far_end_cannot_fail = pg_table.verified;
+					// An artifact whose every row reaches a vertex (measured once per lake state) cannot leave a
+					// half-matched row either.
+					bool far_end_cannot_fail =
+					    pg_table.verified ||
+					    (far_ends_complete && far_ends_complete(*path_info, free_col, *next_vertex_table, free_pk));
 					if (!next_elem->label.empty()) {
 						vector<unique_ptr<ParsedExpression>> label_conds;
 						CheckInheritance(next_vertex_table, next_elem, label_conds);
@@ -5883,8 +5983,13 @@ void PGQMatchFunction::ProcessOptionalPathList(
 					                                                PGQColRef(bound_col, pt_alias)),
 					                next_vertex_table->CreateBaseTableRef(next_binding), std::move(vertex_on_cond),
 					                far_end_cannot_fail,
-					                OptionalSeedSemiJoin(where_hint, prev_binding, prev_vertex_table, bound_pk,
-					                                     PGQColRef(bound_col, pt_alias)));
+					                OptionalSeedSemiJoin(
+					                    where_hint, prev_binding, prev_vertex_table, bound_pk,
+					                    PGQColRef(bound_col, pt_alias),
+					                    SameKeyType(context, *prev_vertex_table, bound_pk,
+					                                {QualifiedColumnType(context, path_info->catalog_name,
+					                                                     path_info->schema_name, path_info->table_name,
+					                                                     bound_col)})));
 
 					opt_alias_map[next_binding] = next_vertex_table;
 					used_path_table = true;
@@ -5937,7 +6042,12 @@ void PGQMatchFunction::ProcessOptionalPathList(
 				                    where_hint, prev_binding, prev_vertex_table,
 				                    PGQStr(right ? edge_table->source_pk[0] : edge_table->destination_pk[0]),
 				                    PGQColRef(right ? edge_table->source_fk[0] : edge_table->destination_fk[0],
-				                              edge_binding)));
+				                              edge_binding),
+				                    SameKeyType(context, *prev_vertex_table,
+				                                PGQStr(right ? edge_table->source_pk[0] : edge_table->destination_pk[0]),
+				                                {GraphTableColumnType(context, *edge_table,
+				                                                      PGQStr(right ? edge_table->source_fk[0]
+				                                                                   : edge_table->destination_fk[0]))})));
 
 				opt_alias_map[edge_binding] = edge_table;
 				opt_alias_map[next_binding] = next_vertex_table;
@@ -6591,6 +6701,19 @@ public:
 		             StringUtil::Format("WITH %s SELECT (SELECT count(*) FROM %s) = (SELECT coalesce(sum(n), 0) FROM __c%llu)",
 		                                StringUtil::Join(ctes, ", "), Table(info),
 		                                static_cast<unsigned long long>(edges.size())));
+	}
+
+	// Every row of an artifact reaches a vertex at its `column` end: an OPTIONAL MATCH hop over it then needs no
+	// guard against a half-matched row. Measured once per lake state, like the multiplicity probes.
+	bool FarEndsComplete(const PGQPathTableInfo &info, const string &column, const PropertyGraphTable &vertex_table,
+	                     const string &key) {
+		const string vertices = QualifiedTableName(PGQStr(vertex_table.catalog_name), PGQStr(vertex_table.schema_name),
+		                                           PGQStr(vertex_table.table_name));
+		return Probe("far_ends|" + Table(info) + "|" + column,
+		             StringUtil::Format("SELECT NOT EXISTS (SELECT 1 FROM %s a WHERE NOT EXISTS (SELECT 1 FROM %s v "
+		                                "WHERE v.%s = a.%s))",
+		                                Table(info), vertices, KeywordHelper::WriteOptionallyQuoted(key),
+		                                KeywordHelper::WriteOptionallyQuoted(column)));
 	}
 
 	// A closure (tc, tc_witness, tc_chain) of one self-referential edge holds exactly the traversal's paths up
@@ -12749,6 +12872,11 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 	PGQExactness optional_exactness(context, path_table_cache, *pg_table);
 	const std::function<bool(const PGQPathTableInfo &)> optional_counts_exactly =
 	    [&optional_exactness](const PGQPathTableInfo &info) { return optional_exactness.CountsExactly(info); };
+	const std::function<bool(const PGQPathTableInfo &, const string &, const PropertyGraphTable &, const string &)>
+	    optional_far_ends_complete = [&optional_exactness](const PGQPathTableInfo &info, const string &column,
+	                                                        const PropertyGraphTable &vertex_table, const string &key) {
+		    return optional_exactness.FarEndsComplete(info, column, vertex_table, key);
+	    };
 	const ReferencedBindings referenced_bindings = CollectReferencedBindings(*ref);
 	const bool require_abi_paths = RequireABIPaths(context);
 	CoveredBindingMap covered_columns;
@@ -12864,8 +12992,9 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 			                     extra_alias_counter, alias_map, ref->where_clause.get());
 			continue;
 		}
-		ProcessOptionalPathList(opt_group, final_select_node, optional_alias_map, *pg_table, extra_alias_counter, alias_map,
-		                        path_table_cache, require_abi_paths, ref->where_clause.get(), optional_counts_exactly);
+		ProcessOptionalPathList(context, opt_group, final_select_node, optional_alias_map, *pg_table, extra_alias_counter, alias_map,
+		                        path_table_cache, require_abi_paths, ref->where_clause.get(), optional_counts_exactly,
+		                        optional_far_ends_complete);
 	}
 
 	// Maps from table alias to table, including vertex and edge tables.
@@ -13070,9 +13199,9 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 				                     branch_counter, branch_alias_map, branch.where_clause.get());
 				continue;
 			}
-			ProcessOptionalPathList(opt_group, branch_select, branch_opt_alias_map, *pg_table, branch_counter,
+			ProcessOptionalPathList(context, opt_group, branch_select, branch_opt_alias_map, *pg_table, branch_counter,
 			                        branch_alias_map, path_table_cache, require_abi_paths, branch.where_clause.get(),
-			                        optional_counts_exactly);
+			                        optional_counts_exactly, optional_far_ends_complete);
 		}
 
 		case_insensitive_set_t branch_stub_bindings;

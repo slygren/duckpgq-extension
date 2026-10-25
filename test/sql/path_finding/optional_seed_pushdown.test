@@ -1,0 +1,162 @@
+# name: test/sql/path_finding/optional_seed_pushdown.test
+# description: A one-hop OPTIONAL MATCH seeded by the MATCH WHERE: the seed restricts the hop's edges, never its answer
+# group: [path_finding]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE T(tagname VARCHAR PRIMARY KEY, note VARCHAR);
+
+statement ok
+CREATE TABLE W(wo VARCHAR PRIMARY KEY);
+
+statement ok
+CREATE TABLE HW(tag VARCHAR, wo VARCHAR);
+
+statement ok
+INSERT INTO T VALUES ('t1', 'x'), ('t2', 'y'), ('t3', 'x'), ('007', 'z');
+
+statement ok
+INSERT INTO W VALUES ('w1'), ('w2'), ('w3');
+
+# t1 -> w1, w2; t2 -> w3 and an edge to a work order that does not exist; t3 -> nothing; 007 -> w1
+statement ok
+INSERT INTO HW VALUES ('t1', 'w1'), ('t1', 'w2'), ('t2', 'w3'), ('t2', 'w9'), ('007', 'w1');
+
+statement ok
+CREATE PROPERTY GRAPH g VERTEX TABLES (T LABEL TAG, W LABEL WO)
+EDGE TABLES (HW SOURCE KEY (tag) REFERENCES T (tagname) DESTINATION KEY (wo) REFERENCES W (wo) LABEL HAS_WO);
+
+# The seed reads only the key, as a scalar subquery (the shape of the DB Shell recipe): it is put on the edge's key
+query II
+FROM GRAPH_TABLE (g MATCH (t:TAG) OPTIONAL MATCH (t)-[:HAS_WO]->(w:WO)
+    WHERE t.tagname = (SELECT tag FROM HW WHERE wo = 'w3' LIMIT 1) COLUMNS (t.tagname AS t, w.wo AS w)) ORDER BY ALL;
+----
+t2	w3
+
+query II
+FROM GRAPH_TABLE (g MATCH (t:TAG) OPTIONAL MATCH (t)-[:HAS_WO]->(w:WO)
+    WHERE t.tagname IN ('t1', 't3') COLUMNS (t.tagname AS t, w.wo AS w)) ORDER BY ALL;
+----
+t1	w1
+t1	w2
+t3	NULL
+
+# A seed on another property is a semi-join on the vertex table
+query II
+FROM GRAPH_TABLE (g MATCH (t:TAG) OPTIONAL MATCH (t)-[:HAS_WO]->(w:WO)
+    WHERE t.note = 'x' COLUMNS (t.tagname AS t, w.wo AS w)) ORDER BY ALL;
+----
+t1	w1
+t1	w2
+t3	NULL
+
+# Both kinds at once, and the undirected and left-directed hops
+query II
+FROM GRAPH_TABLE (g MATCH (t:TAG) OPTIONAL MATCH (t)-[:HAS_WO]-(w:WO)
+    WHERE t.tagname >= 't2' AND t.note <> 'q' COLUMNS (t.tagname AS t, w.wo AS w)) ORDER BY ALL;
+----
+t2	w3
+t3	NULL
+
+query II
+FROM GRAPH_TABLE (g MATCH (w:WO) OPTIONAL MATCH (w)<-[:HAS_WO]-(t:TAG)
+    WHERE w.wo = 'w1' COLUMNS (w.wo AS w, t.tagname AS t)) ORDER BY ALL;
+----
+w1	007
+w1	t1
+
+# Mixed key types: a BIGINT edge column against a VARCHAR vertex key. A predicate on the key must not be moved onto
+# the edge column ('007' and 7 compare differently), so the semi-join applies
+statement ok
+CREATE TABLE HN(tag BIGINT, wo VARCHAR);
+
+statement ok
+INSERT INTO HN VALUES (7, 'w2');
+
+statement ok
+CREATE PROPERTY GRAPH gn VERTEX TABLES (T LABEL TAG, W LABEL WO)
+EDGE TABLES (HN SOURCE KEY (tag) REFERENCES T (tagname) DESTINATION KEY (wo) REFERENCES W (wo) LABEL HAS_WO);
+
+statement ok
+CREATE TABLE ref AS SELECT m.t, o.w FROM (FROM GRAPH_TABLE (gn MATCH (t:TAG) WHERE t.tagname = '007' COLUMNS (t.tagname AS t))) m
+LEFT JOIN (FROM GRAPH_TABLE (gn MATCH (t:TAG)-[:HAS_WO]->(w:WO) COLUMNS (t.tagname AS t, w.wo AS w))) o ON m.t = o.t;
+
+statement ok
+CREATE TABLE act AS FROM GRAPH_TABLE (gn MATCH (t:TAG) OPTIONAL MATCH (t)-[:HAS_WO]->(w:WO)
+    WHERE t.tagname = '007' COLUMNS (t.tagname AS t, w.wo AS w));
+
+query II
+SELECT (SELECT count(*) FROM (FROM act EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM act));
+----
+0	0
+
+# ── The hop answered from an edge artifact. Its far ends are probed once: an artifact row whose work order does not
+# exist (t2 -> w9 is copied into the artifact) must not leave a (t2, NULL) row next to t2's real match ──────────────
+statement ok
+CREATE TABLE HD(tag VARCHAR, wo VARCHAR);
+
+statement ok
+INSERT INTO HD VALUES ('t1', 'w1'), ('t1', 'w2'), ('t2', 'w3'), ('t2', 'w9');
+
+statement ok
+CREATE PROPERTY GRAPH gd VERTEX TABLES (T LABEL TAG, W LABEL WO)
+EDGE TABLES (HD SOURCE KEY (tag) REFERENCES T (tagname) DESTINATION KEY (wo) REFERENCES W (wo) LABEL HAS_WO);
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('gd');
+
+query II
+FROM GRAPH_TABLE (gd MATCH (t:TAG) OPTIONAL MATCH (t)-[:HAS_WO]->(w:WO) COLUMNS (t.tagname AS t, w.wo AS w)) ORDER BY ALL;
+----
+007	NULL
+t1	w1
+t1	w2
+t2	w3
+t3	NULL
+
+query T
+SELECT status FROM pgq_last_rewrite_diagnostics() WHERE reason LIKE 'far_ends|%';
+----
+not_exact
+
+query T
+SELECT status IN ('match', 'unverified') FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (gd MATCH (t:TAG) OPTIONAL MATCH (t)-[:HAS_WO]->(w:WO) WHERE t.tagname = ''t2'' COLUMNS (t.tagname AS t, w.wo AS w))');
+----
+true
+
+# Every artifact row reaches a work order: the probe says so, and the answer is the same
+statement ok
+CREATE TABLE HC(tag VARCHAR, wo VARCHAR);
+
+statement ok
+INSERT INTO HC VALUES ('t1', 'w1'), ('t1', 'w2'), ('t2', 'w3');
+
+statement ok
+CREATE PROPERTY GRAPH gc VERTEX TABLES (T LABEL TAG, W LABEL WO)
+EDGE TABLES (HC SOURCE KEY (tag) REFERENCES T (tagname) DESTINATION KEY (wo) REFERENCES W (wo) LABEL HAS_WO);
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('gc');
+
+query II
+FROM GRAPH_TABLE (gc MATCH (t:TAG) OPTIONAL MATCH (t)-[:HAS_WO]->(w:WO) WHERE t.tagname IN ('t1', 't3')
+    COLUMNS (t.tagname AS t, w.wo AS w)) ORDER BY ALL;
+----
+t1	w1
+t1	w2
+t3	NULL
+
+query T
+SELECT status FROM pgq_last_rewrite_diagnostics() WHERE reason LIKE 'far_ends|%';
+----
+exact
+
+# (the hop-by-hop OPTIONAL route records no rewrite diagnostic, so the verifier cannot tell the two runs apart)
+query T
+SELECT status IN ('match', 'unverified') FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (gc MATCH (t:TAG) OPTIONAL MATCH (t)-[:HAS_WO]->(w:WO) COLUMNS (t.tagname AS t, w.wo AS w))');
+----
+true
