@@ -433,8 +433,8 @@ building in [abi_build.cpp](src/core/functions/table/abi_build.cpp); vertex-join
   operands; operands that may match the same variable-length walk need `|+|` or disjoint labels.
 - **`vertex_property(p, 'x')` / `edge_property(p, 'x')`** take a literal property name. The lists are looked up
   after the match (one join per element table), so they cost about what the equivalent hand-written join does.
-- **`OPTIONAL MATCH`** cannot use the path variable of its own pattern in `COLUMNS` or `WHERE`, and its pattern cannot
-  be `ANY CHEAPEST` / `ALL CHEAPEST` yet (refused).
+- **`OPTIONAL MATCH`**: its pattern cannot be `ANY CHEAPEST` / `ALL CHEAPEST` yet (refused). Its path variable can be
+  read in `COLUMNS` and `WHERE` (NULL where it did not match), but not in `COLUMNS` shared by `UNION` branches.
 - **`SHORTEST k`** takes one quantified edge between two vertices over one edge table (no element `WHERE` on the
   edge); longer patterns are refused. Inside a longer pattern, an unbounded quantifier with only a path mode or with a
   lower bound above 1 is answered from the CSR, which finds one shortest path per pair (refused for `<-`).

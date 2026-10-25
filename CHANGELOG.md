@@ -137,6 +137,8 @@ with identical answers.
 - **`ONE ROW PER` over a quantifier whose endpoint has an element WHERE** (`(a:Person WHERE a.name = 'Ann')`) used
   to fail with "could not locate quantified path element". It gives the rows of the same condition in the MATCH
   WHERE.
+- **The path variable of an OPTIONAL MATCH pattern** can be used in COLUMNS and WHERE: `path_length(p)`, `vertices(p)`,
+  `vertex_property(p, 'x')`, ... are NULL where the optional pattern did not match. It was refused.
 - **Unbounded ANY / ALL SHORTEST and CHEAPEST over an edge table with edges to missing vertices** (lake data has
   them) failed with "Non-existent/non-unique vertices detected". Such an edge is no edge of the graph, as everywhere
   else, and is skipped.

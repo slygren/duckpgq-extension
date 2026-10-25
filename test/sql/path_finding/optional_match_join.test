@@ -1315,11 +1315,12 @@ SELECT count(*) FROM GRAPH_TABLE (gl MATCH (t:P)-[:K]-(x:P) WHERE t.id = 6 COLUM
 ----
 1
 
-# A path variable of the optional pattern is not carried out of it yet
-statement error
+# The path variable of the optional pattern is carried out of it: 23 paths of 1 or 2 hops, NULL for 5 and 6
+query III
+SELECT count(*), count(l), list(t ORDER BY t) FILTER (WHERE l IS NULL)
 FROM GRAPH_TABLE (g MATCH (t:P) OPTIONAL MATCH p = (t)-[:K]->{1,2}(x:P) COLUMNS (t.id AS t, path_length(p) AS l));
 ----
-path variable 'p' of an OPTIONAL MATCH pattern
+25	23	[5, 6]
 
 # An unused path variable is fine: 23 paths of 1 or 2 hops, and NULL rows for 5 and 6
 query I

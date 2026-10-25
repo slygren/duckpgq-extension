@@ -6149,7 +6149,9 @@ void PGQMatchFunction::AddOptionalGroupJoin(ClientContext &context, const MatchE
                                             case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &opt_alias_map,
                                             CreatePropertyGraphInfo &pg_table, int32_t &extra_alias_counter,
                                             const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &mandatory_alias_map,
-                                            const ParsedExpression *where_hint) {
+                                            vector<unique_ptr<ParsedExpression>> &columns,
+                                            unique_ptr<ParsedExpression> &where) {
+	const ParsedExpression *where_hint = where.get();
 	auto bound_table = [&](const string &binding) -> shared_ptr<PropertyGraphTable> {
 		auto entry = mandatory_alias_map.find(binding);
 		if (entry != mandatory_alias_map.end()) {
@@ -6167,21 +6169,13 @@ void PGQMatchFunction::AddOptionalGroupJoin(ClientContext &context, const MatchE
 		inner->path_patterns.push_back(pattern->Copy());
 	}
 
-	// A path variable of the group would have to be carried out of the inner MATCH; refuse rather than drop it.
+	// The group's path variables: what COLUMNS and WHERE read of them is computed by the inner MATCH (below).
+	vector<string> path_variables;
 	for (auto &pattern : inner->path_patterns) {
 		for (auto &element : pattern->path_elements) {
 			auto *subpath = GetSubPath(element);
-			if (!subpath || subpath->path_variable.empty()) {
-				continue;
-			}
-			bool referenced = where_hint && ReferencesPathVariable(*where_hint, subpath->path_variable);
-			for (auto &column : outer.column_list) {
-				referenced = referenced || ReferencesPathVariable(*column, subpath->path_variable);
-			}
-			if (referenced) {
-				throw NotImplementedException("The path variable '%s' of an OPTIONAL MATCH pattern cannot be used in "
-				                              "COLUMNS or WHERE yet; name the path in a MATCH pattern instead.",
-				                              subpath->path_variable);
+			if (subpath && !subpath->path_variable.empty()) {
+				path_variables.push_back(subpath->path_variable);
 			}
 		}
 	}
@@ -6289,6 +6283,60 @@ void PGQMatchFunction::AddOptionalGroupJoin(ClientContext &context, const MatchE
 		inner->where_clause = CreateWhereClause(seeds);
 	}
 	inner->alias = sub_alias;
+	// A path function of a path variable of the group -- path_length(p), vertices(p), vertex_property(p, 'w') -- is
+	// answered by the inner MATCH, where p is a path of its own pattern, and read back as a column: NULL on a row the
+	// group did not extend, like every other variable of it. Only the call is carried, so the expression around it
+	// (path_length(p) + a.id, list_sum(...), a comparison in WHERE) still reads the outer variables.
+	idx_t carried = 0;
+	std::function<void(unique_ptr<ParsedExpression> &)> carry = [&](unique_ptr<ParsedExpression> &expression) {
+		for (auto &path_variable : path_variables) {
+			if (!ReferencesPathVariable(*expression, path_variable)) {
+				continue;
+			}
+			// A call of a path function on it: the inner MATCH answers those as columns of their own.
+			bool path_call = false;
+			if (expression->GetExpressionClass() == ExpressionClass::FUNCTION) {
+				for (auto &argument : expression->Cast<FunctionExpression>().GetArguments()) {
+					auto &value = argument.GetExpression();
+					path_call = path_call ||
+					            (value.GetExpressionClass() == ExpressionClass::COLUMN_REF &&
+					             value.Cast<ColumnRefExpression>().ColumnNames().size() == 1 &&
+					             StringUtil::CIEquals(PGQStr(value.Cast<ColumnRefExpression>().ColumnNames()[0]),
+					                                  path_variable));
+				}
+			}
+			if (path_call) {
+				const string column = "__pgq_opt_path_" + std::to_string(carried++);
+				auto computed = expression->Copy();
+				computed->SetAlias(Identifier(column));
+				inner->column_list.push_back(std::move(computed));
+				auto replacement = PGQColRef(column, sub_alias);
+				if (expression->HasAlias()) {
+					replacement->SetAlias(expression->GetAlias());
+				}
+				expression = std::move(replacement);
+				return;
+			}
+		}
+		ParsedExpressionIterator::EnumerateChildren(*expression,
+		                                            [&](unique_ptr<ParsedExpression> &child) { carry(child); });
+	};
+	if (!path_variables.empty()) {
+		for (auto &column : columns) {
+			carry(column);
+		}
+		if (where) {
+			carry(where);
+		}
+	}
+	if (carried > 0 && &columns == &outer.column_list) {
+		for (auto &branch : outer.union_matches) {
+			if (branch->column_list.empty()) {
+				throw NotImplementedException("The path variable of an OPTIONAL MATCH pattern cannot be used in COLUMNS "
+				                              "shared by UNION branches; give each branch its own COLUMNS");
+			}
+		}
+	}
 	auto sub = BuildMatchRef(context, *inner);
 	sub->alias = Identifier(sub_alias);
 
@@ -11323,27 +11371,55 @@ static bool IsPathPropertyCall(const ParsedExpression &expression) {
 	return StringUtil::CIEquals(name, "vertex_property") || StringUtil::CIEquals(name, "edge_property");
 }
 
-static bool ContainsPathPropertyCall(const ParsedExpression *expression) {
+//! A property call on the path variable of one of the block's OPTIONAL MATCH patterns: the OPTIONAL group's own
+//! MATCH answers it (AddOptionalGroupJoin carries it out), so the block's lowering leaves it alone.
+static bool IsOptionalPathPropertyCall(const ParsedExpression &expression, const MatchExpression *block) {
+	if (!block || !IsPathPropertyCall(expression)) {
+		return false;
+	}
+	auto &arguments = expression.Cast<FunctionExpression>().GetArguments();
+	if (arguments.empty() || arguments[0].GetExpression().GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+		return false;
+	}
+	auto &names = arguments[0].GetExpression().Cast<ColumnRefExpression>().ColumnNames();
+	if (names.size() != 1) {
+		return false;
+	}
+	for (auto &group : block->optional_match_patterns) {
+		for (auto &pattern : group) {
+			if (pattern->path_elements.size() != 1) {
+				continue;
+			}
+			auto *subpath = PGQMatchFunction::GetSubPath(pattern->path_elements[0]);
+			if (subpath && StringUtil::CIEquals(subpath->path_variable, PGQStr(names[0]))) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+static bool ContainsPathPropertyCall(const ParsedExpression *expression, const MatchExpression *block = nullptr) {
 	if (!expression) {
 		return false;
 	}
 	if (IsPathPropertyCall(*expression)) {
-		return true;
+		return !IsOptionalPathPropertyCall(*expression, block);
 	}
 	bool found = false;
 	ParsedExpressionIterator::EnumerateChildren(*expression, [&](const ParsedExpression &child) {
-		found = found || ContainsPathPropertyCall(&child);
+		found = found || ContainsPathPropertyCall(&child, block);
 	});
 	return found;
 }
 
 static bool UsesPathPropertyCalls(const MatchExpression &match) {
 	for (auto &column : match.column_list) {
-		if (ContainsPathPropertyCall(column.get())) {
+		if (ContainsPathPropertyCall(column.get(), &match)) {
 			return true;
 		}
 	}
-	return ContainsPathPropertyCall(match.where_clause.get());
+	return ContainsPathPropertyCall(match.where_clause.get(), &match);
 }
 
 static bool HasPathPatternUnion(const vector<unique_ptr<PathPattern>> &patterns) {
@@ -11928,13 +12004,13 @@ static unique_ptr<QueryNode> BuildPathPropertyNode(ClientContext &context, Match
 	// Property calls become lookups; the graph atoms around them are evaluated by the inner MATCH.
 	std::function<unique_ptr<ParsedExpression>(unique_ptr<ParsedExpression>)> split;
 	split = [&](unique_ptr<ParsedExpression> expression) -> unique_ptr<ParsedExpression> {
-		if (IsPathPropertyCall(*expression)) {
+		if (IsPathPropertyCall(*expression) && !IsOptionalPathPropertyCall(*expression, &leaf)) {
 			auto alias = expression->GetAlias();
 			auto replacement = value_reference(expression->Cast<FunctionExpression>());
 			replacement->SetAlias(alias);
 			return std::move(replacement);
 		}
-		if (IsGraphAtom(*expression)) {
+		if (IsGraphAtom(*expression) || IsOptionalPathPropertyCall(*expression, &leaf)) {
 			auto alias = expression->GetAlias();
 			const string atom_name = "__pgq_ppa" + to_string(atom_count++);
 			expression->SetAlias(Identifier(atom_name));
@@ -11953,7 +12029,7 @@ static unique_ptr<QueryNode> BuildPathPropertyNode(ClientContext &context, Match
 	// passes them through; otherwise each column is rebuilt over the inner columns.
 	bool columns_read_properties = false;
 	for (auto &column : leaf.column_list) {
-		columns_read_properties = columns_read_properties || ContainsPathPropertyCall(column.get());
+		columns_read_properties = columns_read_properties || ContainsPathPropertyCall(column.get(), &leaf);
 	}
 	vector<unique_ptr<ParsedExpression>> outer_columns;
 	for (auto &column : leaf.column_list) {
@@ -13434,7 +13510,7 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 	for (auto &opt_group : ref->optional_match_patterns) {
 		if (OptionalGroupNeedsJoin(opt_group, DisableABIRewrite(context) ? nullptr : &path_table_cache)) {
 			AddOptionalGroupJoin(context, *ref, opt_group, final_select_node, optional_alias_map, *pg_table,
-			                     extra_alias_counter, alias_map, ref->where_clause.get());
+			                     extra_alias_counter, alias_map, ref->column_list, ref->where_clause);
 			continue;
 		}
 		ProcessOptionalPathList(context, opt_group, final_select_node, optional_alias_map, *pg_table, extra_alias_counter, alias_map,
@@ -13654,7 +13730,7 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 		for (auto &opt_group : branch.optional_match_patterns) {
 			if (OptionalGroupNeedsJoin(opt_group, DisableABIRewrite(context) ? nullptr : &path_table_cache)) {
 				AddOptionalGroupJoin(context, *ref, opt_group, branch_select, branch_opt_alias_map, *pg_table,
-				                     branch_counter, branch_alias_map, branch.where_clause.get());
+				                     branch_counter, branch_alias_map, branch_columns, branch.where_clause);
 				continue;
 			}
 			ProcessOptionalPathList(context, opt_group, branch_select, branch_opt_alias_map, *pg_table, branch_counter,
