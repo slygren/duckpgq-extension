@@ -149,10 +149,30 @@ struct GraphAlgorithmSpec {
 	std::function<Value(int64_t rowid, const GraphAlgorithmParams &params)> isolated;
 };
 
-//! Checks a call's (graph, vertex label, edge label) arguments and returns the edge table, whose edges must start and
-//! end in the vertex table.
-shared_ptr<PropertyGraphTable> BindGraphAlgorithmEdges(ClientContext &context, TableFunctionBindInput &input,
-                                                       const string &function_name);
+//! A call's (graph, vertex label, edge label): the edge table, whose edges must start and end in the vertex table,
+//! and the labels, which may be sub-labels (`LABEL Person IN kind (Student, Teacher)`) admitting only some rows.
+//! The algorithm then runs on the subgraph of the vertices with the vertex label and the edges with the edge label
+//! between them.
+struct GraphAlgorithmBinding {
+	shared_ptr<PropertyGraphTable> edge;
+	string vertex_label;
+	string edge_label;
+
+	PropertyGraphTable &VertexTable() const {
+		return *edge->source_pg_table;
+	}
+	//! A SQL condition on the vertex table's row `alias` for the vertex label, or "" when every row has it.
+	string VertexCondition(const string &alias) const;
+	//! A SQL condition on the edge table's row `alias`: the edge label, and both endpoints with the vertex label;
+	//! "" when every edge row qualifies.
+	string EdgeCondition(const string &alias) const;
+	//! EdgeCondition as the CSR builders take it (empty when there is no condition).
+	PGQEdgeRowFilter EdgeFilter() const;
+};
+
+//! Checks a call's (graph, vertex label, edge label) arguments.
+GraphAlgorithmBinding BindGraphAlgorithmEdges(ClientContext &context, TableFunctionBindInput &input,
+                                              const string &function_name);
 
 //! Registers the table function and its scalar worker.
 void RegisterGraphAlgorithm(ExtensionLoader &loader, const GraphAlgorithmSpec &spec);

@@ -293,7 +293,8 @@ refuses a fallback traversal whose estimate is over budget.
 ## Graph algorithms
 
 Table functions over a graph, a vertex label and an edge label. The edge label's edges must start and end in that
-vertex table. Each call returns one row per vertex, keyed by the vertex table's (first) key column, whatever its
+vertex table. A sub-label (`LABEL Person IN kind (Student, Teacher)`) restricts the run to the vertices with the
+vertex label and the edges with the edge label between them. Each call returns one row per vertex, keyed by the vertex table's (first) key column, whatever its
 type. Each call builds its own CSR (compressed sparse row) copy of the edges, runs the algorithm once and drops the
 CSR at the end of the query. Every loop checks for query cancellation and `max_execution_time`.
 

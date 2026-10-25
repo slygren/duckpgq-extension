@@ -149,8 +149,52 @@ void CanonicalizeLabels(vector<int64_t> &labels) {
 	}
 }
 
-shared_ptr<PropertyGraphTable> BindGraphAlgorithmEdges(ClientContext &context, TableFunctionBindInput &input,
-                                                       const string &function_name) {
+//! The condition a single label puts on a table's rows (as MATCH's label filter builds it): none for the main label,
+//! the discriminator bit for a sub-label.
+static string LabelCondition(const PropertyGraphTable &table, const string &label, const string &alias) {
+	if (StringUtil::CIEquals(PGQStr(table.main_label), label)) {
+		return "";
+	}
+	for (idx_t i = 0; i < table.sub_labels.size(); i++) {
+		if (StringUtil::CIEquals(PGQStr(table.sub_labels[i]), label)) {
+			const auto bit = std::to_string(int64_t(1) << i);
+			return "((" + DuckPGQSQL::Column(table.discriminator, alias) + " & " + bit + ") = " + bit + ")";
+		}
+	}
+	throw InvalidInputException("'%s' is not a label of table %s", label, PGQStr(table.table_name));
+}
+
+string GraphAlgorithmBinding::VertexCondition(const string &alias) const {
+	return LabelCondition(VertexTable(), vertex_label, alias);
+}
+
+string GraphAlgorithmBinding::EdgeCondition(const string &alias) const {
+	string result = LabelCondition(*edge, edge_label, alias);
+	auto vertex_condition = VertexCondition("__pgq_f");
+	if (vertex_condition.empty()) {
+		return result;
+	}
+	auto endpoint = [&](const Identifier &fk, const Identifier &pk) {
+		return DuckPGQSQL::Column(fk, alias) + " IN (SELECT " + DuckPGQSQL::Column(pk, string("__pgq_f")) + " FROM " +
+		       DuckPGQSQL::TableRef(VertexTable(), string("__pgq_f")) + " WHERE " + vertex_condition + ")";
+	};
+	auto endpoints = endpoint(edge->source_fk[0], edge->source_pk[0]) + " AND " +
+	                 endpoint(edge->destination_fk[0], edge->destination_pk[0]);
+	return result.empty() ? endpoints : result + " AND " + endpoints;
+}
+
+PGQEdgeRowFilter GraphAlgorithmBinding::EdgeFilter() const {
+	if (EdgeCondition("__probe").empty()) {
+		return {};
+	}
+	auto binding = *this;
+	return [binding](const string &alias) -> unique_ptr<ParsedExpression> {
+		return DuckPGQSQL::ParseExpression(binding.EdgeCondition(alias), "graph algorithm edge filter");
+	};
+}
+
+GraphAlgorithmBinding BindGraphAlgorithmEdges(ClientContext &context, TableFunctionBindInput &input,
+                                              const string &function_name) {
 	for (idx_t i = 0; i < 3; i++) {
 		if (input.inputs[i].IsNull()) {
 			throw InvalidInputException("%s: the graph, vertex label and edge label must not be NULL", function_name);
@@ -172,7 +216,14 @@ shared_ptr<PropertyGraphTable> BindGraphAlgorithmEdges(ClientContext &context, T
 		                                ? PGQStr(edge_pg_entry->destination_pg_table->table_name)
 		                                : string("?"));
 	}
-	return edge_pg_entry;
+	GraphAlgorithmBinding binding;
+	binding.edge = edge_pg_entry;
+	binding.vertex_label = vertex_label;
+	binding.edge_label = edge_label;
+	// Fails early for a label that is not the table's (which GetTableByLabel would not have returned anyway).
+	binding.VertexCondition("__probe");
+	binding.EdgeCondition("__probe");
+	return binding;
 }
 
 //------------------------------------------------------------------------------
@@ -390,9 +441,14 @@ string ParamLiteral(const Value &value, const LogicalType &type) {
 
 unique_ptr<TableRef> GraphAlgorithmBindReplace(ClientContext &context, TableFunctionBindInput &input) {
 	auto &spec = *input.info->Cast<GraphAlgorithmTableInfo>().spec;
-	auto edge_pg_entry = BindGraphAlgorithmEdges(context, input, spec.name);
-	auto &vertex_table = *edge_pg_entry->source_pg_table;
+	auto binding = BindGraphAlgorithmEdges(context, input, spec.name);
+	auto &edge_pg_entry = binding.edge;
+	auto &vertex_table = binding.VertexTable();
 	auto duckpgq_state = GetDuckPGQState(context);
+	auto where = [&](const string &alias) {
+		auto condition = binding.VertexCondition(alias);
+		return condition.empty() ? string() : " WHERE " + condition;
+	};
 
 	const int32_t csr_id = duckpgq_state->AllocateCSRId();
 	const string key = DuckPGQSQL::Column(edge_pg_entry->source_pk[0], string("__pgq_v"));
@@ -407,12 +463,17 @@ unique_ptr<TableRef> GraphAlgorithmBindReplace(ClientContext &context, TableFunc
 		auto source_literal = input.inputs[3].ToSQLString();
 		call << ", (SELECT " << DuckPGQSQL::Column(string("rowid"), string("__pgq_s")) << " FROM "
 		     << DuckPGQSQL::TableRef(vertex_table, string("__pgq_s")) << " WHERE "
-		     << DuckPGQSQL::Column(edge_pg_entry->source_pk[0], string("__pgq_s")) << " = " << source_literal << ")"
+		     << DuckPGQSQL::Column(edge_pg_entry->source_pk[0], string("__pgq_s")) << " = " << source_literal;
+		auto source_condition = binding.VertexCondition("__pgq_s");
+		if (!source_condition.empty()) {
+			call << " AND " << source_condition;
+		}
+		call << ")"
 		     << ", " << DuckPGQSQL::StringLiteral(input.inputs[3].ToString());
 	}
 	if (spec.needs_vertex_set) {
 		call << ", (SELECT list(" << DuckPGQSQL::Column(string("rowid"), string("__pgq_l")) << ") FROM "
-		     << DuckPGQSQL::TableRef(vertex_table, string("__pgq_l")) << ")";
+		     << DuckPGQSQL::TableRef(vertex_table, string("__pgq_l")) << where("__pgq_l") << ")";
 	}
 	for (auto &param : spec.named_parameters) {
 		Value value(param.type);
@@ -428,7 +489,7 @@ unique_ptr<TableRef> GraphAlgorithmBindReplace(ClientContext &context, TableFunc
 	std::ostringstream query;
 	query << "SELECT " << key << ", add(" << DuckPGQSQL::Column(string("temp"), string("__x")) << ", " << call.str()
 	      << ") AS " << DuckPGQSQL::Identifier(spec.column) << " FROM " << DuckPGQSQL::TableRef(vertex_table, string("__pgq_v"))
-	      << " CROSS JOIN (SELECT multiply(0, count(csr_cte.temp)) AS temp FROM csr_cte) AS __x";
+	      << " CROSS JOIN (SELECT multiply(0, count(csr_cte.temp)) AS temp FROM csr_cte) AS __x" << where("__pgq_v");
 	string sql = query.str();
 	if (spec.takes_source) {
 		sql = "SELECT * FROM (" + sql + ") AS __pgq_r WHERE " + DuckPGQSQL::Identifier(spec.column) + " IS NOT NULL";
@@ -436,7 +497,8 @@ unique_ptr<TableRef> GraphAlgorithmBindReplace(ClientContext &context, TableFunc
 	auto select_statement = DuckPGQSQL::ParseSelect(sql, spec.name);
 	auto select_node = unique_ptr_cast<QueryNode, SelectNode>(std::move(select_statement->node));
 	return CreateTableFunctionSubquery(std::move(select_node),
-	                                   CreateDirectedCSRCTE(edge_pg_entry, "src", "edge", "dst", csr_id), "csr_cte",
+	                                   CreateDirectedCSRCTE(edge_pg_entry, "src", "edge", "dst", csr_id, binding.EdgeFilter()),
+	                                   "csr_cte",
 	                                   spec.alias.empty() ? spec.name : spec.alias);
 }
 
