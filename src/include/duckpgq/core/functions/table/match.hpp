@@ -262,6 +262,23 @@ public:
 
 	static unique_ptr<TableRef> MatchBindReplace(ClientContext &context, TableFunctionBindInput &input);
 
+	//! The rewrite of one normalized MATCH block (with its UNION branches) into a subquery.
+	static unique_ptr<TableRef> BuildMatchRef(ClientContext &context, MatchExpression &match);
+
+	//! Whether an OPTIONAL MATCH group is left-joined as a whole (AddOptionalGroupJoin) rather than hop by hop.
+	static bool OptionalGroupNeedsJoin(const vector<unique_ptr<PathPattern>> &opt_patterns,
+	                                   const PGQPathTableCache *path_table_cache);
+
+	//! LEFT JOINs an OPTIONAL MATCH group onto the bindings built so far: the group is matched as a MATCH of its
+	//! own and joined on the variables it shares with them, so a row without a match keeps NULLs.
+	static void AddOptionalGroupJoin(ClientContext &context, const MatchExpression &outer,
+	                                 const vector<unique_ptr<PathPattern>> &opt_patterns,
+	                                 unique_ptr<SelectNode> &select_node,
+	                                 case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &opt_alias_map,
+	                                 CreatePropertyGraphInfo &pg_table, int32_t &extra_alias_counter,
+	                                 const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &mandatory_alias_map,
+	                                 const ParsedExpression *where_hint);
+
 	static unique_ptr<SubqueryRef> GenerateSubpathPatternSubquery(unique_ptr<PathPattern> &path_pattern,
 	                                                              CreatePropertyGraphInfo *pg_table,
 	                                                              vector<unique_ptr<ParsedExpression>> &column_list,

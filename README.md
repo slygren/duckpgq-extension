@@ -128,7 +128,7 @@ put over DuckLake catalogs. A graph is stored in the database it is created in a
 | `MATCH p = …` | path variable |
 | `ANY SHORTEST`, `ALL SHORTEST`, `ANY CHEAPEST`, `ALL CHEAPEST` | path search; `COST expr [DEFAULT n]` on an element gives its weight |
 | `WALK`, `TRAIL`, `SIMPLE`, `ACYCLIC` | path mode |
-| `OPTIONAL MATCH …` | left-joined pattern (fixed-length, directed) |
+| `OPTIONAL MATCH …` | the whole pattern left-joined onto the bindings so far (a row without a match keeps NULLs); any pattern a `MATCH` answers |
 | `WHERE EXISTS { (t)-[:HAS_WORKORDER]->() }`, `NOT EXISTS { … }` | correlated pattern existence |
 | `MATCH … UNION [ALL] MATCH …` | several MATCH blocks, one shared `COLUMNS` |
 | `ONE ROW PER VERTEX (v)`, `ONE ROW PER EDGE (e)`, `ONE ROW PER STEP (v1, e, v2)` | one output row per element of each matched path |
@@ -386,8 +386,8 @@ building in [abi_build.cpp](src/core/functions/table/abi_build.cpp); vertex-join
   Cypher's `[:R*1..5]` (write `-[:R]->{1,5}`), `LATERAL` inside `MATCH`, horizontal aggregation along a path,
   graph updates (`INSERT`/`DELETE` of vertices or edges; the graph is a view over tables).
 - **Parsed, not implemented:** top-k shortest (`SHORTEST k`).
-- **`OPTIONAL MATCH`** is fixed-length and directed only. `ONE ROW PER` does not cover unbounded left-directed or
-  bidirectional variable-length patterns.
+- **`OPTIONAL MATCH`** cannot use the path variable of its own pattern in `COLUMNS` or `WHERE`. `ONE ROW PER` does
+  not cover unbounded left-directed or bidirectional variable-length patterns.
 - **`UNION` of MATCH blocks** shares one final `COLUMNS` clause.
 - **ABI rewrites** cover the common path shapes, not every pattern; multi-hop undirected and mixed-direction chains
   traverse. Choosing between several matching artifacts is simple.

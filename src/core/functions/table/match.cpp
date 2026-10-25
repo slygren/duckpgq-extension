@@ -2598,49 +2598,50 @@ static unique_ptr<ParsedExpression> ReverseSelfLoopFilter(const PropertyGraphTab
 	return make_uniq<OperatorExpression>(ExpressionType::OPERATOR_NOT, std::move(all_equal));
 }
 
+//! Columns of the undirected edge union carrying the edge row's rowid and which way it was read (0 as stored,
+//! 1 reversed). The union hides `rowid`; an OPTIONAL MATCH rejoins the edge by these.
+static const char *const kUndirectedEdgeRowid = "__pgq_erowid";
+static const char *const kUndirectedEdgeDirection = "__pgq_edir";
+
+//! (SELECT src, dst, * FROM edge UNION ALL SELECT dst, src, * FROM edge [no reversed self-loops]) AS alias: the
+//! edge read both ways, its first two columns oriented along the traversal.
+static unique_ptr<SubqueryRef> UndirectedEdgeUnion(const PropertyGraphTable &edge_table, const string &edge_binding) {
+	auto branch = [&](bool reversed) {
+		auto node = make_uniq<SelectNode>();
+		node->from_table = edge_table.CreateBaseTableRef(edge_binding);
+		node->select_list.push_back(
+		    PGQColRef(reversed ? edge_table.destination_fk[0] : edge_table.source_fk[0], edge_binding));
+		node->select_list.push_back(
+		    PGQColRef(reversed ? edge_table.source_fk[0] : edge_table.destination_fk[0], edge_binding));
+		node->select_list.push_back(make_uniq<StarExpression>());
+		auto rowid = PGQColRef("rowid", edge_binding);
+		rowid->SetAlias(Identifier(kUndirectedEdgeRowid));
+		node->select_list.push_back(std::move(rowid));
+		auto direction = ConstantExpression::FromValue(Value::INTEGER(reversed ? 1 : 0));
+		direction->SetAlias(Identifier(kUndirectedEdgeDirection));
+		node->select_list.push_back(std::move(direction));
+		if (reversed) {
+			node->where_clause = ReverseSelfLoopFilter(edge_table, edge_binding);
+		}
+		return node;
+	};
+	auto union_node = make_uniq<SetOperationNode>();
+	union_node->setop_type = SetOperationType::UNION;
+	union_node->setop_all = true;
+	union_node->children.push_back(branch(false));
+	union_node->children.push_back(branch(true));
+	auto union_select = make_uniq<SelectStatement>();
+	union_select->node = std::move(union_node);
+	auto union_subquery = make_uniq<SubqueryRef>(std::move(union_select));
+	union_subquery->alias = Identifier(edge_binding);
+	return union_subquery;
+}
+
 void PGQMatchFunction::EdgeTypeAny(const shared_ptr<PropertyGraphTable> &edge_table, const string &edge_binding,
                                    const string &prev_binding, const string &next_binding,
                                    vector<unique_ptr<ParsedExpression>> &conditions,
                                    unique_ptr<TableRef> &from_clause) {
-	// START SELECT src, dst, * from edge_table
-	auto src_dst_select_node = make_uniq<SelectNode>();
-
-	auto edge_left_ref = edge_table->CreateBaseTableRef(edge_binding);
-	src_dst_select_node->from_table = std::move(edge_left_ref);
-	auto src_dst_children = vector<unique_ptr<ParsedExpression>>();
-	src_dst_children.push_back(PGQColRef(edge_table->source_fk[0], edge_binding));
-	src_dst_children.push_back(PGQColRef(edge_table->destination_fk[0], edge_binding));
-	src_dst_children.push_back(make_uniq<StarExpression>());
-
-	src_dst_select_node->select_list = std::move(src_dst_children);
-	// END SELECT src, dst, * from edge_table
-
-	// START SELECT dst, src, * from edge_table
-	auto dst_src_select_node = make_uniq<SelectNode>();
-
-	auto edge_right_ref = edge_table->CreateBaseTableRef(edge_binding);
-	auto dst_src_children = vector<unique_ptr<ParsedExpression>>();
-	dst_src_select_node->from_table = std::move(edge_right_ref);
-
-	dst_src_children.push_back(PGQColRef(edge_table->destination_fk[0], edge_binding));
-	dst_src_children.push_back(PGQColRef(edge_table->source_fk[0], edge_binding));
-	dst_src_children.push_back(make_uniq<StarExpression>());
-
-	dst_src_select_node->select_list = std::move(dst_src_children);
-	dst_src_select_node->where_clause = ReverseSelfLoopFilter(*edge_table, edge_binding);
-	// END SELECT dst, src, * from edge_table
-
-	auto union_node = make_uniq<SetOperationNode>();
-	union_node->setop_type = SetOperationType::UNION;
-	union_node->setop_all = true;
-	union_node->children.push_back(std::move(src_dst_select_node));
-	union_node->children.push_back(std::move(dst_src_select_node));
-	auto union_select = make_uniq<SelectStatement>();
-	union_select->node = std::move(union_node);
-	// (SELECT src, dst, * from edge_table UNION ALL SELECT dst, src, * from
-	// edge_table)
-	auto union_subquery = make_uniq<SubqueryRef>(std::move(union_select));
-	union_subquery->alias = Identifier(edge_binding);
+	auto union_subquery = UndirectedEdgeUnion(*edge_table, edge_binding);
 	if (from_clause) {
 		auto from_join = make_uniq<JoinRef>(JoinRefType::CROSS);
 		from_join->left = std::move(from_clause);
@@ -5131,6 +5132,78 @@ void PGQMatchFunction::ProcessPathList(ClientContext &context, vector<unique_ptr
 	}
 }
 
+//! An OPTIONAL MATCH hop is LEFT JOINed as one block (edge JOIN far vertex); the MATCH WHERE's predicates on the
+//! near vertex alone cannot reach into it, so the block was joined in full before the outer filter applied
+//! (measured 13 ms against 4 ms for 1000 seeds over 5M edges). `probe IN (SELECT pk FROM <near table> WHERE seed)`
+//! in the block restricts it to the edges the surviving near vertices can join; the outer WHERE still filters
+//! the rows, so nothing else changes. nullptr when there is no such predicate.
+static unique_ptr<ParsedExpression> OptionalSeedSemiJoin(const ParsedExpression *where_hint, const string &near_binding,
+                                                         const shared_ptr<PropertyGraphTable> &near_table,
+                                                         const string &near_pk, unique_ptr<ParsedExpression> probe) {
+	if (!where_hint || !near_table) {
+		return nullptr;
+	}
+	auto seed = ExtractSrcFilter(*where_hint, near_binding);
+	if (!seed) {
+		return nullptr;
+	}
+	auto seed_select = make_uniq<SelectNode>();
+	seed_select->select_list.push_back(PGQColRef(near_pk, near_binding));
+	seed_select->from_table = near_table->CreateBaseTableRef(near_binding);
+	seed_select->where_clause = std::move(seed);
+	auto seed_statement = make_uniq<SelectStatement>();
+	seed_statement->node = std::move(seed_select);
+	auto in_seed = make_uniq<SubqueryExpression>();
+	in_seed->GetSubqueryTypeMutable() = SubqueryType::ANY;
+	in_seed->SubqueryMutable() = std::move(seed_statement);
+	in_seed->GetChildMutable() = std::move(probe);
+	in_seed->GetComparisonTypeMutable() = ExpressionType::COMPARE_EQUAL;
+	return std::move(in_seed);
+}
+
+static unique_ptr<ParsedExpression> AndIfAny(unique_ptr<ParsedExpression> left, unique_ptr<ParsedExpression> right) {
+	if (!right) {
+		return left;
+	}
+	return make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(left), std::move(right));
+}
+
+//! LEFT JOINs one OPTIONAL MATCH hop: `edge` ON `edge_on`, and its far vertex ON `vertex_on`. As one block (edge
+//! JOIN far vertex) unless the far end cannot fail on its own -- the graph was verified at CREATE PROPERTY GRAPH
+//! (every edge's keys reference a vertex row; the trust vertex-join elimination also places in that check) and the
+//! far vertex carries no sub-label condition -- in which case two LEFT JOINs are the same rows and cheaper
+//! (seeded: 3.7 against 4.0 ms over 5M edges).
+static void JoinOptionalHop(unique_ptr<SelectNode> &select_node, unique_ptr<TableRef> edge,
+                            unique_ptr<ParsedExpression> edge_on, unique_ptr<TableRef> far_vertex,
+                            unique_ptr<ParsedExpression> vertex_on, bool far_end_cannot_fail,
+                            unique_ptr<ParsedExpression> seed) {
+	if (far_end_cannot_fail) {
+		auto edge_join = make_uniq<JoinRef>(JoinRefType::REGULAR);
+		edge_join->type = JoinType::LEFT;
+		edge_join->left = std::move(select_node->from_table);
+		edge_join->right = std::move(edge);
+		edge_join->condition = std::move(edge_on);
+		auto vertex_join = make_uniq<JoinRef>(JoinRefType::REGULAR);
+		vertex_join->type = JoinType::LEFT;
+		vertex_join->left = std::move(edge_join);
+		vertex_join->right = std::move(far_vertex);
+		vertex_join->condition = std::move(vertex_on);
+		select_node->from_table = std::move(vertex_join);
+		return;
+	}
+	auto block = make_uniq<JoinRef>(JoinRefType::REGULAR);
+	block->type = JoinType::INNER;
+	block->left = std::move(edge);
+	block->right = std::move(far_vertex);
+	block->condition = AndIfAny(std::move(vertex_on), std::move(seed));
+	auto left_join = make_uniq<JoinRef>(JoinRefType::REGULAR);
+	left_join->type = JoinType::LEFT;
+	left_join->left = std::move(select_node->from_table);
+	left_join->right = std::move(block);
+	left_join->condition = std::move(edge_on);
+	select_node->from_table = std::move(left_join);
+}
+
 void PGQMatchFunction::ProcessOptionalPathList(
     const vector<unique_ptr<PathPattern>> &opt_patterns, unique_ptr<SelectNode> &select_node,
     case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &opt_alias_map, CreatePropertyGraphInfo &pg_table,
@@ -5243,55 +5316,30 @@ void PGQMatchFunction::ProcessOptionalPathList(
 				if (require_abi_paths) {
 					ThrowABIPathRequired();
 				}
-				// (SELECT src,dst,* FROM edge UNION ALL SELECT dst,src,* FROM edge) AS edge_binding
-				auto fwd = make_uniq<SelectNode>();
-				fwd->from_table = edge_table->CreateBaseTableRef(edge_binding);
-				fwd->select_list.push_back(PGQColRef(edge_table->source_fk[0], edge_binding));
-				fwd->select_list.push_back(PGQColRef(edge_table->destination_fk[0], edge_binding));
-				fwd->select_list.push_back(make_uniq<StarExpression>());
-				auto rev = make_uniq<SelectNode>();
-				rev->from_table = edge_table->CreateBaseTableRef(edge_binding);
-				rev->select_list.push_back(PGQColRef(edge_table->destination_fk[0], edge_binding));
-				rev->select_list.push_back(PGQColRef(edge_table->source_fk[0], edge_binding));
-				rev->select_list.push_back(make_uniq<StarExpression>());
-				auto un = make_uniq<SetOperationNode>();
-				un->setop_type = SetOperationType::UNION;
-				un->setop_all = true;
-				un->children.push_back(std::move(fwd));
-				un->children.push_back(std::move(rev));
-				auto un_stmt = make_uniq<SelectStatement>();
-				un_stmt->node = std::move(un);
-				auto un_sub = make_uniq<SubqueryRef>(std::move(un_stmt));
-				un_sub->alias = Identifier(edge_binding);
-
-				// LEFT JOIN symmetric edge ON prev.src_pk = edge.src_fk
-				auto edge_on = CreateMatchJoinExpression(PGQStrs(edge_table->source_pk), PGQStrs(edge_table->source_fk), prev_binding,
-				                                         edge_binding);
-				auto edge_join = make_uniq<JoinRef>(JoinRefType::REGULAR);
-				edge_join->type = JoinType::LEFT;
-				edge_join->left = std::move(select_node->from_table);
-				edge_join->right = std::move(un_sub);
-				edge_join->condition = std::move(edge_on);
-				select_node->from_table = std::move(edge_join);
-
-				// LEFT JOIN next vertex ON next.dst_pk = edge.dst_fk (+ optional label)
+				// LEFT JOIN ((edge read both ways) JOIN next ON next.pk = edge.dst [AND label]) ON prev.pk = edge.src:
+				// the edge and its far vertex match together or not at all. The union is the one a MATCH reads
+				// (a self-loop once, not once per direction).
+				auto un_sub = UndirectedEdgeUnion(*edge_table, edge_binding);
 				unique_ptr<ParsedExpression> vertex_on = CreateMatchJoinExpression(
 				    PGQStrs(edge_table->destination_pk), PGQStrs(edge_table->destination_fk), next_binding, edge_binding);
+				bool far_end_cannot_fail = pg_table.verified;
 				if (!next_elem->label.empty()) {
 					vector<unique_ptr<ParsedExpression>> label_conds;
 					CheckInheritance(next_vertex_table, next_elem, label_conds);
 					if (!label_conds.empty()) {
+						far_end_cannot_fail = false;
 						vertex_on = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND,
 						                                             std::move(vertex_on), CreateWhereClause(label_conds));
 					}
 				}
-				auto vertex_ref = next_vertex_table->CreateBaseTableRef(next_binding);
-				auto vertex_join = make_uniq<JoinRef>(JoinRefType::REGULAR);
-				vertex_join->type = JoinType::LEFT;
-				vertex_join->left = std::move(select_node->from_table);
-				vertex_join->right = std::move(vertex_ref);
-				vertex_join->condition = std::move(vertex_on);
-				select_node->from_table = std::move(vertex_join);
+				JoinOptionalHop(select_node, std::move(un_sub),
+				                CreateMatchJoinExpression(PGQStrs(edge_table->source_pk), PGQStrs(edge_table->source_fk),
+				                                          prev_binding, edge_binding),
+				                next_vertex_table->CreateBaseTableRef(next_binding), std::move(vertex_on),
+				                far_end_cannot_fail,
+				                OptionalSeedSemiJoin(where_hint, prev_binding, prev_vertex_table,
+				                                     PGQStr(edge_table->source_pk[0]),
+				                                     PGQColRef(edge_table->source_fk[0], edge_binding)));
 
 				opt_alias_map[edge_binding] = edge_table;
 				opt_alias_map[next_binding] = next_vertex_table;
@@ -5387,60 +5435,41 @@ void PGQMatchFunction::ProcessOptionalPathList(
 				// lose a match: only an artifact that preserves multiplicity may stand in for the bridge.
 				if (path_info && (counts_exactly ? counts_exactly(*path_info) : path_info->preserves_multiplicity)) {
 					const string pt_alias = "_pgq_pt_" + std::to_string(extra_alias_counter++);
-					// v0_binding: for right-directed = prev, for left-directed = next
-					// v1_binding: for right-directed = next, for left-directed = prev
-					const string &v0_binding = pt_left_dir ? next_binding : prev_binding;
-					const string &v1_binding = pt_left_dir ? prev_binding : next_binding;
-					const string &v0_pk = PGQStr(edge_table->source_pk[0]);
-					const string &v1_pk = PGQStr(edge_table->destination_pk[0]);
+					// The artifact row runs v0 -> v1 along the stored edge: prev is v0 when right-directed and
+					// v1 when left-directed, next the other end.
+					const string bound_col = pt_left_dir ? "v1" : "v0";
+					const string free_col = pt_left_dir ? "v0" : "v1";
+					const string &bound_pk = PGQStr(pt_left_dir ? edge_table->destination_pk[0] : edge_table->source_pk[0]);
+					const string &free_pk = PGQStr(pt_left_dir ? edge_table->source_pk[0] : edge_table->destination_pk[0]);
 
-					// LEFT JOIN path_table pt ON (v0_binding.src_pk = pt.v0)
-					{
-						auto bt          = make_uniq<BaseTableRef>();
-						bt->SetQualifiedName(Identifier(path_info->catalog_name), bt->GetQualifiedName().Schema(), bt->Table());
-						bt->SetQualifiedName(bt->GetQualifiedName().Catalog(), Identifier(path_info->schema_name), bt->Table());
-						bt->SetTable(Identifier(path_info->table_name));
-						bt->alias        = Identifier(pt_alias);
-						auto on_cond = make_uniq<ComparisonExpression>(
-						    ExpressionType::COMPARE_EQUAL,
-						    PGQColRef(v0_pk, v0_binding),
-						    PGQColRef("v0", pt_alias));
-						auto left_join       = make_uniq<JoinRef>(JoinRefType::REGULAR);
-						left_join->type      = JoinType::LEFT;
-						left_join->left      = std::move(select_node->from_table);
-						left_join->right     = std::move(bt);
-						left_join->condition = std::move(on_cond);
-						select_node->from_table = std::move(left_join);
-					}
-
-					// LEFT JOIN the v1 vertex (semantic destination) ON (v1_binding.dst_pk = pt.v1)
-					// For right-directed: v1_binding = next_binding, vertex table = next_vertex_table
-					// For left-directed:  v1_binding = prev_binding, vertex table = prev_vertex_table
-					{
-						// v1 is the semantic destination vertex
-						const shared_ptr<PropertyGraphTable> &v1_vtable = pt_left_dir ? prev_vertex_table : next_vertex_table;
-						PathElement *v1_elem = pt_left_dir ? prev_elem : next_elem;
-						unique_ptr<ParsedExpression> vertex_on_cond = make_uniq<ComparisonExpression>(
-						    ExpressionType::COMPARE_EQUAL,
-						    PGQColRef(v1_pk, v1_binding),
-						    PGQColRef("v1", pt_alias));
-						if (!v1_elem->label.empty()) {
-							vector<unique_ptr<ParsedExpression>> label_conds;
-							CheckInheritance(v1_vtable, v1_elem, label_conds);
-							if (!label_conds.empty()) {
-								vertex_on_cond = make_uniq<ConjunctionExpression>(
-								    ExpressionType::CONJUNCTION_AND,
-								    std::move(vertex_on_cond), CreateWhereClause(label_conds));
-							}
+					// LEFT JOIN (path_table pt JOIN next ON next.pk = pt.<free end> [AND label]) ON prev.pk = pt.<bound
+					// end> (JoinOptionalHop): an artifact row whose far vertex is missing or of another label leaves no
+					// half-matched row behind.
+					auto bt = make_uniq<BaseTableRef>();
+					bt->SetQualifiedName(Identifier(path_info->catalog_name), bt->GetQualifiedName().Schema(), bt->Table());
+					bt->SetQualifiedName(bt->GetQualifiedName().Catalog(), Identifier(path_info->schema_name), bt->Table());
+					bt->SetTable(Identifier(path_info->table_name));
+					bt->alias = Identifier(pt_alias);
+					unique_ptr<ParsedExpression> vertex_on_cond = make_uniq<ComparisonExpression>(
+					    ExpressionType::COMPARE_EQUAL, PGQColRef(free_pk, next_binding), PGQColRef(free_col, pt_alias));
+					bool far_end_cannot_fail = pg_table.verified;
+					if (!next_elem->label.empty()) {
+						vector<unique_ptr<ParsedExpression>> label_conds;
+						CheckInheritance(next_vertex_table, next_elem, label_conds);
+						if (!label_conds.empty()) {
+							far_end_cannot_fail = false;
+							vertex_on_cond = make_uniq<ConjunctionExpression>(
+							    ExpressionType::CONJUNCTION_AND, std::move(vertex_on_cond), CreateWhereClause(label_conds));
 						}
-						auto vertex_ref      = v1_vtable->CreateBaseTableRef(v1_binding);
-						auto left_join       = make_uniq<JoinRef>(JoinRefType::REGULAR);
-						left_join->type      = JoinType::LEFT;
-						left_join->left      = std::move(select_node->from_table);
-						left_join->right     = std::move(vertex_ref);
-						left_join->condition = std::move(vertex_on_cond);
-						select_node->from_table = std::move(left_join);
 					}
+					JoinOptionalHop(select_node, std::move(bt),
+					                make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+					                                                PGQColRef(bound_pk, prev_binding),
+					                                                PGQColRef(bound_col, pt_alias)),
+					                next_vertex_table->CreateBaseTableRef(next_binding), std::move(vertex_on_cond),
+					                far_end_cannot_fail,
+					                OptionalSeedSemiJoin(where_hint, prev_binding, prev_vertex_table, bound_pk,
+					                                     PGQColRef(bound_col, pt_alias)));
 
 					opt_alias_map[next_binding] = next_vertex_table;
 					used_path_table = true;
@@ -5473,38 +5502,27 @@ void PGQMatchFunction::ProcessOptionalPathList(
 				}
 
 				// If the next vertex has a sub-label condition, fold it into the vertex ON clause.
+				bool far_end_cannot_fail = pg_table.verified;
 				if (!next_elem->label.empty()) {
 					vector<unique_ptr<ParsedExpression>> label_conds;
 					CheckInheritance(next_vertex_table, next_elem, label_conds);
 					if (!label_conds.empty()) {
+						far_end_cannot_fail = false;
 						auto label_cond = CreateWhereClause(label_conds);
 						vertex_on_cond = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND,
 						                                                   std::move(vertex_on_cond),
 						                                                   std::move(label_cond));
 					}
 				}
-
-				// LEFT JOIN edge table ON edge_on_cond
-				{
-					auto edge_ref = edge_table->CreateBaseTableRef(edge_binding);
-					auto left_join = make_uniq<JoinRef>(JoinRefType::REGULAR);
-					left_join->type = JoinType::LEFT;
-					left_join->left = std::move(select_node->from_table);
-					left_join->right = std::move(edge_ref);
-					left_join->condition = std::move(edge_on_cond);
-					select_node->from_table = std::move(left_join);
-				}
-
-				// LEFT JOIN next vertex table ON vertex_on_cond
-				{
-					auto vertex_ref = next_vertex_table->CreateBaseTableRef(next_binding);
-					auto left_join = make_uniq<JoinRef>(JoinRefType::REGULAR);
-					left_join->type = JoinType::LEFT;
-					left_join->left = std::move(select_node->from_table);
-					left_join->right = std::move(vertex_ref);
-					left_join->condition = std::move(vertex_on_cond);
-					select_node->from_table = std::move(left_join);
-				}
+				const bool right = edge_elem->match_type == PGQMatchType::MATCH_EDGE_RIGHT;
+				JoinOptionalHop(select_node, edge_table->CreateBaseTableRef(edge_binding), std::move(edge_on_cond),
+				                next_vertex_table->CreateBaseTableRef(next_binding), std::move(vertex_on_cond),
+				                far_end_cannot_fail,
+				                OptionalSeedSemiJoin(
+				                    where_hint, prev_binding, prev_vertex_table,
+				                    PGQStr(right ? edge_table->source_pk[0] : edge_table->destination_pk[0]),
+				                    PGQColRef(right ? edge_table->source_fk[0] : edge_table->destination_fk[0],
+				                              edge_binding)));
 
 				opt_alias_map[edge_binding] = edge_table;
 				opt_alias_map[next_binding] = next_vertex_table;
@@ -5513,6 +5531,284 @@ void PGQMatchFunction::ProcessOptionalPathList(
 			prev_elem = next_elem;
 			prev_vertex_table = next_vertex_table;
 		}
+	}
+}
+
+// The hop-by-hop OPTIONAL MATCH translation joins each element as it goes, which is a left join of the whole
+// pattern only for one hop whose far end cannot fail separately from its edge: a fixed edge (joined with its far
+// vertex as one block), or a bounded directed quantifier over one edge label (a LEFT JOIN of the reachability
+// enumeration). Everything else (several hops, several patterns, element predicates, unbounded quantifiers,
+// selectors, path modes and path variables) is matched as a MATCH of its own and left-joined as a whole. So are
+// the undirected hop and the bounded quantifier when ABI artifacts cover their edge label: the hop-by-hop forms
+// never read them, the MATCH does. Both forms give the same rows; without artifacts the hop-by-hop one is the
+// cheaper (measured: an unseeded {1,2} over 5M edges, 3.3 s against 4.8 s).
+bool PGQMatchFunction::OptionalGroupNeedsJoin(const vector<unique_ptr<PathPattern>> &opt_patterns,
+                                              const PGQPathTableCache *path_table_cache) {
+	if (opt_patterns.size() != 1) {
+		return true;
+	}
+	auto &pattern = *opt_patterns[0];
+	if (pattern.shortest || pattern.cheapest || pattern.topk || pattern.all || pattern.where_clause) {
+		return true;
+	}
+	auto &elements = pattern.path_elements;
+	if (elements.size() != 3) {
+		return true;
+	}
+	auto *src = GetPathElement(elements[0]);
+	auto *dst = GetPathElement(elements[2]);
+	if (!src || !dst || src->match_type != PGQMatchType::MATCH_VERTEX || dst->match_type != PGQMatchType::MATCH_VERTEX) {
+		return true;
+	}
+	auto covered_by_artifacts = [&](const string &label) {
+		if (!path_table_cache || label.empty()) {
+			return false;
+		}
+		for (auto &entry : path_table_cache->catalog) {
+			for (auto &part : StringUtil::Split(entry.second.edge_label_sequence, ',')) {
+				if (StringUtil::CIEquals(StringUtil::Replace(part, " ", ""), label)) {
+					return true;
+				}
+			}
+		}
+		return false;
+	};
+	if (auto *edge = GetPathElement(elements[1])) {
+		// The undirected hop reads the edge table both ways; a MATCH of it can read an artifact instead.
+		return edge->match_type == PGQMatchType::MATCH_VERTEX ||
+		       (edge->match_type == PGQMatchType::MATCH_EDGE_ANY && covered_by_artifacts(edge->label));
+	}
+	auto *quantified = GetSubPath(elements[1]);
+	if (!quantified || quantified->path_list.size() != 1 || quantified->where_clause || quantified->cost_expr ||
+	    !quantified->path_variable.empty() || quantified->path_mode > PGQPathMode::WALK ||
+	    quantified->upper >= static_cast<int64_t>(1 << 30)) {
+		return true;
+	}
+	auto *edge = GetPathElement(quantified->path_list[0]);
+	if (!edge || edge->label.empty() || IsCompoundLabel(edge->label) ||
+	    (edge->match_type != PGQMatchType::MATCH_EDGE_RIGHT && edge->match_type != PGQMatchType::MATCH_EDGE_LEFT)) {
+		return true;
+	}
+	return covered_by_artifacts(edge->label);
+}
+
+// Visits every element of a pattern; `quantified` is true inside a quantified edge, whose variable is a group
+// variable (one value per step) rather than a single element.
+static void VisitOptionalElements(PathReference &reference, bool quantified,
+                                  const std::function<void(PathElement &, bool)> &visit) {
+	if (reference.path_reference_type == PGQPathReferenceType::PATH_ELEMENT) {
+		visit(static_cast<PathElement &>(reference), quantified);
+		return;
+	}
+	auto &subpath = static_cast<SubPath &>(reference);
+	// A single-element subpath around a vertex carries its element WHERE; around an edge it is a quantifier.
+	const bool edge_quantifier = subpath.path_list.size() == 1 && subpath.path_list[0]->path_reference_type ==
+	                                                                  PGQPathReferenceType::PATH_ELEMENT &&
+	                             static_cast<PathElement &>(*subpath.path_list[0]).match_type != PGQMatchType::MATCH_VERTEX;
+	for (auto &child : subpath.path_list) {
+		VisitOptionalElements(*child, quantified || edge_quantifier, visit);
+	}
+}
+
+// OPTIONAL MATCH as SQL/PGQ defines it: the group is a pattern of its own, and each row of the bindings built so
+// far is extended by every match of it that agrees on the variables they share, or kept once with NULLs when
+// there is none. That is exactly
+//   <bindings so far> LEFT JOIN (MATCH <group> COLUMNS (<rowid of each variable>)) ON <shared rowids are equal>
+// followed by a join of each new variable's table on its rowid. The inner MATCH is rewritten like any other, so
+// it uses every route a mandatory pattern of that shape does: ABI artifacts, the path enumeration, the CSR
+// path functions. Predicates of the MATCH WHERE on a shared variable alone are also given to the inner MATCH
+// (they still filter the outer rows), which seeds its traversal.
+void PGQMatchFunction::AddOptionalGroupJoin(ClientContext &context, const MatchExpression &outer,
+                                            const vector<unique_ptr<PathPattern>> &opt_patterns,
+                                            unique_ptr<SelectNode> &select_node,
+                                            case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &opt_alias_map,
+                                            CreatePropertyGraphInfo &pg_table, int32_t &extra_alias_counter,
+                                            const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &mandatory_alias_map,
+                                            const ParsedExpression *where_hint) {
+	auto bound_table = [&](const string &binding) -> shared_ptr<PropertyGraphTable> {
+		auto entry = mandatory_alias_map.find(binding);
+		if (entry != mandatory_alias_map.end()) {
+			return entry->second;
+		}
+		entry = opt_alias_map.find(binding);
+		return entry != opt_alias_map.end() ? entry->second : nullptr;
+	};
+
+	auto inner = make_uniq<MatchExpression>();
+	inner->pg_name = outer.pg_name;
+	inner->pg_catalog = outer.pg_catalog;
+	inner->pg_schema = outer.pg_schema;
+	for (auto &pattern : opt_patterns) {
+		inner->path_patterns.push_back(pattern->Copy());
+	}
+
+	// A path variable of the group would have to be carried out of the inner MATCH; refuse rather than drop it.
+	for (auto &pattern : inner->path_patterns) {
+		for (auto &element : pattern->path_elements) {
+			auto *subpath = GetSubPath(element);
+			if (!subpath || subpath->path_variable.empty()) {
+				continue;
+			}
+			bool referenced = where_hint && ReferencesPathVariable(*where_hint, subpath->path_variable);
+			for (auto &column : outer.column_list) {
+				referenced = referenced || ReferencesPathVariable(*column, subpath->path_variable);
+			}
+			if (referenced) {
+				throw NotImplementedException("The path variable '%s' of an OPTIONAL MATCH pattern cannot be used in "
+				                              "COLUMNS or WHERE yet; name the path in a MATCH pattern instead.",
+				                              subpath->path_variable);
+			}
+		}
+	}
+
+	// Variables already bound keep their table: an unlabeled reference such as (t) gets t's label, so the inner
+	// MATCH resolves it the same way (the rowid join below restores t's own rows and labels).
+	// What the rest of the query reads of each variable; a variable it does not read is not rejoined.
+	case_insensitive_set_t referenced;
+	bool all_vertices = false;
+	auto collect_references = [&](const ParsedExpression &expression) {
+		ParsedExpressionIterator::VisitExpression<ColumnRefExpression>(expression, [&](const ColumnRefExpression &col) {
+			if (!col.ColumnNames().empty()) {
+				referenced.insert(PGQStr(col.ColumnNames()[0]));
+			}
+		});
+		ParsedExpressionIterator::VisitExpression<StarExpression>(expression, [&](const StarExpression &star) {
+			auto relation = PGQStr(star.RelationName().GetIdentifierName());
+			if (relation.empty()) {
+				all_vertices = true;
+			} else {
+				referenced.insert(relation);
+			}
+		});
+	};
+	for (auto &column : outer.column_list) {
+		collect_references(*column);
+	}
+	if (where_hint) {
+		collect_references(*where_hint);
+	}
+
+	vector<string> bindings;
+	case_insensitive_map_t<PGQMatchType> binding_types;
+	case_insensitive_set_t seen;
+	for (auto &pattern : inner->path_patterns) {
+		for (auto &element : pattern->path_elements) {
+			VisitOptionalElements(*element, false, [&](PathElement &path_element, bool quantified) {
+				if (quantified || path_element.variable_binding.empty()) {
+					return;
+				}
+				auto table = bound_table(path_element.variable_binding);
+				if (table && path_element.label.empty() && !table->main_label.empty()) {
+					path_element.label = PGQStr(table->main_label);
+				}
+				if (seen.insert(path_element.variable_binding).second) {
+					bindings.push_back(path_element.variable_binding);
+					binding_types[path_element.variable_binding] = path_element.match_type;
+				}
+			});
+		}
+	}
+
+	case_insensitive_set_t stubs;
+	auto inner_tables = PopulateGraphTableAliasMap(pg_table, *inner, &stubs);
+	const string sub_alias = "__pgq_opt_" + std::to_string(extra_alias_counter++);
+	struct OptionalBinding {
+		string name;
+		string column;
+		shared_ptr<PropertyGraphTable> table;
+		bool shared;
+		//! An undirected edge, rejoined as the same oriented union the inner MATCH read it from.
+		bool undirected;
+	};
+	vector<OptionalBinding> projected;
+	vector<unique_ptr<ParsedExpression>> seeds;
+	for (auto &binding : bindings) {
+		auto table = bound_table(binding);
+		const bool shared = table != nullptr;
+		const auto match_type = binding_types[binding];
+		if (!shared) {
+			const bool read = referenced.find(binding) != referenced.end() ||
+			                  (all_vertices && match_type == PGQMatchType::MATCH_VERTEX);
+			if (!read) {
+				continue;
+			}
+			auto entry = inner_tables.find(binding);
+			if (entry == inner_tables.end() || stubs.find(binding) != stubs.end()) {
+				continue; // no single table: nothing to rejoin by rowid
+			}
+			table = entry->second;
+		}
+		const string column = "__pgq_opt_rowid_" + std::to_string(projected.size());
+		const bool undirected = !shared && match_type == PGQMatchType::MATCH_EDGE_ANY;
+		auto rowid = PGQColRef(undirected ? kUndirectedEdgeRowid : "rowid", binding);
+		rowid->SetAlias(Identifier(column));
+		inner->column_list.push_back(std::move(rowid));
+		if (undirected) {
+			auto direction = PGQColRef(kUndirectedEdgeDirection, binding);
+			direction->SetAlias(Identifier(column + "_dir"));
+			inner->column_list.push_back(std::move(direction));
+		}
+		if (shared && where_hint) {
+			auto seed = ExtractSrcFilter(*where_hint, binding);
+			if (seed) {
+				seeds.push_back(std::move(seed));
+			}
+		}
+		projected.push_back({binding, column, table, shared, undirected});
+	}
+	if (inner->column_list.empty()) {
+		// Nothing to carry: the group still decides whether a row is extended, so keep one column.
+		inner->column_list.push_back(ConstantExpression::FromValue(Value::BOOLEAN(true)));
+	}
+	if (!seeds.empty()) {
+		inner->where_clause = CreateWhereClause(seeds);
+	}
+	inner->alias = sub_alias;
+
+	auto sub = BuildMatchRef(context, *inner);
+	sub->alias = Identifier(sub_alias);
+
+	vector<unique_ptr<ParsedExpression>> on_conditions;
+	for (auto &binding : projected) {
+		if (binding.shared) {
+			on_conditions.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+			                                                        PGQColRef("rowid", binding.name),
+			                                                        PGQColRef(binding.column, sub_alias)));
+		}
+	}
+	auto join = make_uniq<JoinRef>(JoinRefType::REGULAR);
+	join->type = JoinType::LEFT;
+	join->left = std::move(select_node->from_table);
+	join->right = std::move(sub);
+	join->condition = on_conditions.empty() ? ConstantExpression::FromValue(Value::BOOLEAN(true))
+	                                        : CreateWhereClause(on_conditions);
+	select_node->from_table = std::move(join);
+
+	for (auto &binding : projected) {
+		if (binding.shared) {
+			continue;
+		}
+		auto table_join = make_uniq<JoinRef>(JoinRefType::REGULAR);
+		table_join->type = JoinType::LEFT;
+		table_join->left = std::move(select_node->from_table);
+		if (binding.undirected) {
+			table_join->right = UndirectedEdgeUnion(*binding.table, binding.name);
+			table_join->condition = make_uniq<ConjunctionExpression>(
+			    ExpressionType::CONJUNCTION_AND,
+			    make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+			                                    PGQColRef(kUndirectedEdgeRowid, binding.name),
+			                                    PGQColRef(binding.column, sub_alias)),
+			    make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+			                                    PGQColRef(kUndirectedEdgeDirection, binding.name),
+			                                    PGQColRef(binding.column + "_dir", sub_alias)));
+		} else {
+			table_join->right = binding.table->CreateBaseTableRef(binding.name);
+			table_join->condition = make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+			                                                        PGQColRef("rowid", binding.name),
+			                                                        PGQColRef(binding.column, sub_alias));
+		}
+		select_node->from_table = std::move(table_join);
+		opt_alias_map[binding.name] = binding.table;
 	}
 }
 
@@ -5695,8 +5991,9 @@ void PGQMatchFunction::CheckColumnBinding(
 		    column_ref->ColumnNames()[0].GetIdentifierName().find("_pgq_pt_") == 0) {
 			continue;
 		}
-		// 'rowid' is a column duckdb binds automatically.
-		if (column_ref->ColumnNames().back() == "rowid") {
+		// 'rowid' is a column duckdb binds automatically; __pgq_* columns are the rewrite's own.
+		if (column_ref->ColumnNames().back() == "rowid" ||
+		    PGQStr(column_ref->ColumnNames().back()).find("__pgq_") == 0) {
 			continue;
 		}
 		if (column_ref->ColumnNames().size() == 1) {
@@ -10138,6 +10435,12 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	auto *ref = match_copy.get();
 	NormalizeMatchExpression(*ref);
 	duckpgq_state->BeginRewriteDiagnostics(context);
+	return BuildMatchRef(context, *ref);
+}
+
+unique_ptr<TableRef> PGQMatchFunction::BuildMatchRef(ClientContext &context, MatchExpression &match) {
+	auto duckpgq_state = GetDuckPGQState(context);
+	auto *ref = &match;
 	QualifiedName graph_name(Identifier(ref->pg_catalog), Identifier(ref->pg_schema), Identifier(ref->pg_name));
 	auto *pg_table = duckpgq_state->GetPropertyGraph(context, graph_name);
 
@@ -10233,6 +10536,11 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	// Process OPTIONAL MATCH groups — each group becomes a chain of LEFT JOINs.
 	case_insensitive_map_t<shared_ptr<PropertyGraphTable>> optional_alias_map;
 	for (auto &opt_group : ref->optional_match_patterns) {
+		if (OptionalGroupNeedsJoin(opt_group, DisableABIRewrite(context) ? nullptr : &path_table_cache)) {
+			AddOptionalGroupJoin(context, *ref, opt_group, final_select_node, optional_alias_map, *pg_table,
+			                     extra_alias_counter, alias_map, ref->where_clause.get());
+			continue;
+		}
 		ProcessOptionalPathList(opt_group, final_select_node, optional_alias_map, *pg_table, extra_alias_counter, alias_map,
 		                        path_table_cache, require_abi_paths, ref->where_clause.get(), optional_counts_exactly);
 	}
@@ -10404,6 +10712,11 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 
 		case_insensitive_map_t<shared_ptr<PropertyGraphTable>> branch_opt_alias_map;
 		for (auto &opt_group : branch.optional_match_patterns) {
+			if (OptionalGroupNeedsJoin(opt_group, DisableABIRewrite(context) ? nullptr : &path_table_cache)) {
+				AddOptionalGroupJoin(context, *ref, opt_group, branch_select, branch_opt_alias_map, *pg_table,
+				                     branch_counter, branch_alias_map, branch.where_clause.get());
+				continue;
+			}
 			ProcessOptionalPathList(opt_group, branch_select, branch_opt_alias_map, *pg_table, branch_counter,
 			                        branch_alias_map, path_table_cache, require_abi_paths, branch.where_clause.get(),
 			                        optional_counts_exactly);
