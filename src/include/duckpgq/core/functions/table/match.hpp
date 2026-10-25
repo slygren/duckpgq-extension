@@ -269,6 +269,10 @@ public:
 	//! The rewrite of one normalized MATCH block (with its UNION branches) into a subquery.
 	static unique_ptr<TableRef> BuildMatchRef(ClientContext &context, MatchExpression &match);
 
+	//! Aggregates and window functions of a COLUMNS shared by path pattern union operands or UNION [ALL] blocks,
+	//! computed once over all their rows; nullptr when the MATCH has none.
+	static unique_ptr<TableRef> AggregateOverUnion(ClientContext &context, MatchExpression &ref);
+
 	//! Whether an OPTIONAL MATCH group is left-joined as a whole (AddOptionalGroupJoin) rather than hop by hop.
 	static bool OptionalGroupNeedsJoin(const vector<unique_ptr<PathPattern>> &opt_patterns,
 	                                   const PGQPathTableCache *path_table_cache);

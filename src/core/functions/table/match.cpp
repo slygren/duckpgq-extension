@@ -12599,6 +12599,141 @@ static void SplitZeroOrOneHopEdges(MatchExpression &block, CreatePropertyGraphIn
 	}
 }
 
+//------------------------------------------------------------------------------
+// Aggregates and window functions in a COLUMNS shared by several MATCH results
+//------------------------------------------------------------------------------
+// A path pattern union (A | B, A |+| B, and the zero-hop split of `?`) and UNION [ALL] MATCH blocks with one shared
+// COLUMNS are built as one query per operand or block, each with its own copy of the COLUMNS. An aggregate or window
+// function there would be computed once per operand (|+| with count(*) gave two counts). They are computed once
+// instead, over all the rows: the MATCH projects what the aggregates read, and the COLUMNS are evaluated on top,
+// exactly as an outer SELECT ... FROM GRAPH_TABLE (... COLUMNS (<inputs>)) would.
+
+static bool IsAggregateCall(ClientContext &context, const ParsedExpression &expression) {
+	if (expression.GetExpressionClass() != ExpressionClass::FUNCTION) {
+		return false;
+	}
+	auto &function = expression.Cast<FunctionExpression>();
+	try {
+		EntryLookupInfo lookup(CatalogType::AGGREGATE_FUNCTION_ENTRY, function.GetQualifiedName());
+		auto &entry = Catalog::GetEntry(context, lookup);
+		return entry.type == CatalogType::AGGREGATE_FUNCTION_ENTRY;
+	} catch (...) {
+		return false;
+	}
+}
+
+static bool ComputedOverRows(ClientContext &context, const ParsedExpression &expression) {
+	return expression.GetExpressionClass() == ExpressionClass::WINDOW || IsAggregateCall(context, expression);
+}
+
+static bool HasRowsFunction(ClientContext &context, const ParsedExpression &expression) {
+	if (ComputedOverRows(context, expression)) {
+		return true;
+	}
+	if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		return false;
+	}
+	bool found = false;
+	ParsedExpressionIterator::EnumerateChildren(expression, [&](const ParsedExpression &child) {
+		found = found || HasRowsFunction(context, child);
+	});
+	return found;
+}
+
+static bool HasRowsFunction(ClientContext &context, const vector<unique_ptr<ParsedExpression>> &columns) {
+	for (auto &column : columns) {
+		if (HasRowsFunction(context, *column)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//! Replaces every maximal subexpression of `expression` that holds no aggregate or window function (constants
+//! aside) by a column of the inner MATCH, which it adds to `inputs`.
+static unique_ptr<ParsedExpression> SplitRowsFunctionInputs(ClientContext &context,
+                                                            unique_ptr<ParsedExpression> expression,
+                                                            vector<unique_ptr<ParsedExpression>> &inputs) {
+	if (!HasRowsFunction(context, *expression)) {
+		if (expression->GetExpressionClass() == ExpressionClass::CONSTANT) {
+			return expression;
+		}
+		const string name = "__pgq_agg_input_" + std::to_string(inputs.size());
+		expression->SetAlias(Identifier(name));
+		inputs.push_back(std::move(expression));
+		return make_uniq<ColumnRefExpression>(Identifier(name));
+	}
+	ParsedExpressionIterator::EnumerateChildren(*expression, [&](unique_ptr<ParsedExpression> &child) {
+		child = SplitRowsFunctionInputs(context, std::move(child), inputs);
+	});
+	return expression;
+}
+
+static bool BlockHasPatternUnion(const MatchExpression &block) {
+	for (auto &pattern : block.path_patterns) {
+		if (!pattern->union_operands.empty()) {
+			return true;
+		}
+	}
+	return false;
+}
+
+unique_ptr<TableRef> PGQMatchFunction::AggregateOverUnion(ClientContext &context, MatchExpression &ref) {
+	const bool shared_columns = !ref.union_matches.empty() && ref.union_matches[0]->column_list.empty();
+	if (!ref.union_matches.empty() && !shared_columns) {
+		// Each block has its own COLUMNS, aggregated over that block's rows, as in a SQL UNION; only a block that is
+		// itself a path pattern union would aggregate per operand.
+		auto check = [&](const MatchExpression &block) {
+			if (BlockHasPatternUnion(block) && HasRowsFunction(context, block.column_list)) {
+				throw NotImplementedException("An aggregate or window function in the COLUMNS of a MATCH block that is a "
+				                              "path pattern union (or uses '?') is not supported when the blocks of a "
+				                              "UNION each have their own COLUMNS; aggregate over the GRAPH_TABLE "
+				                              "outside instead");
+			}
+		};
+		check(ref);
+		for (auto &branch : ref.union_matches) {
+			check(*branch);
+		}
+		return nullptr;
+	}
+	bool combined = shared_columns || BlockHasPatternUnion(ref);
+	for (auto &branch : ref.union_matches) {
+		combined = combined || BlockHasPatternUnion(*branch);
+	}
+	if (!combined || !HasRowsFunction(context, ref.column_list)) {
+		return nullptr;
+	}
+	for (idx_t i = 0; i < ref.union_all_flags.size(); i++) {
+		if (!ref.union_all_flags[i]) {
+			throw NotImplementedException("An aggregate or window function in the COLUMNS shared by MATCH blocks combined "
+			                              "with UNION (without ALL) is not supported: which rows the UNION removes before "
+			                              "aggregating is not defined. Use UNION ALL, or aggregate outside the GRAPH_TABLE");
+		}
+	}
+	vector<unique_ptr<ParsedExpression>> outer_columns;
+	vector<unique_ptr<ParsedExpression>> inputs;
+	for (auto &column : ref.column_list) {
+		const auto name = column->GetName();
+		auto outer = SplitRowsFunctionInputs(context, column->Copy(), inputs);
+		outer->SetAlias(Identifier(name));
+		outer_columns.push_back(std::move(outer));
+	}
+	if (inputs.empty()) {
+		inputs.push_back(ConstantExpression::FromValue(Value::BOOLEAN(true)));
+		inputs.back()->SetAlias(Identifier("__pgq_agg_input_0"));
+	}
+	auto inner = unique_ptr_cast<ParsedExpression, MatchExpression>(ref.Copy());
+	inner->column_list = std::move(inputs);
+	inner->alias = "__pgq_agg";
+	auto outer = make_uniq<SelectNode>();
+	outer->from_table = BuildMatchRef(context, *inner);
+	outer->select_list = std::move(outer_columns);
+	auto statement = make_uniq<SelectStatement>();
+	statement->node = std::move(outer);
+	return make_uniq<SubqueryRef>(std::move(statement), PGQId(ref.alias));
+}
+
 unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, TableFunctionBindInput &bind_input) {
 	auto duckpgq_state = GetDuckPGQState(context);
 
@@ -12619,6 +12754,9 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 		}
 	}
 	duckpgq_state->BeginRewriteDiagnostics(context);
+	if (auto aggregated = AggregateOverUnion(context, *ref)) {
+		return aggregated;
+	}
 	return BuildMatchRef(context, *ref);
 }
 
