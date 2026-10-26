@@ -169,6 +169,30 @@ FROM GRAPH_TABLE (
 2	[1, 10, 100]	[Tag, Workorder, Operation]	[HasWorkorder, HasOperation]	Operation
 2	[1, 20, 100]	[Tag, Notification, Operation]	[HasNotification, NotifiedOperation]	Operation
 
+# {1,1}: the labels of the walked edge, not of the label expression's first table. They were folded into constants
+# before route selection, from a table that "!HasParent" was read as ([Tag, Tag], [HasParent]).
+query ITTTT rowsort
+FROM GRAPH_TABLE (
+    test_graph
+    MATCH p = (t:Tag)-[:!HasParent]->{1,1}(x)
+    WHERE t.id = 1
+    COLUMNS (
+        path_length(p) AS depth,
+        vertices(p) AS vertex_ids,
+        vertex_labels(p) AS vertex_labels,
+        edge_labels(p) AS edge_labels,
+        label(x) AS dst_label
+    )
+);
+----
+1	[1, 10]	[Tag, Workorder]	[HasWorkorder]	Workorder
+1	[1, 20]	[Tag, Notification]	[HasNotification]	Notification
+
+query T
+SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+abi_context_expansion
+
 query ITT rowsort
 FROM GRAPH_TABLE (
     test_graph

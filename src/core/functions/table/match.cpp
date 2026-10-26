@@ -1345,12 +1345,34 @@ static vector<string> SplitTopLevel(const string &expr, char op) {
 	return parts;
 }
 
-// Remove outer parentheses if the entire string is wrapped in them.
+// Remove outer parentheses if the entire string is wrapped in them: "((A))" is A, but "(!A)&(!B)" -- whose first and
+// last parentheses are not a pair -- stays as it is.
 static string StripParens(const string &s) {
-	if (s.size() >= 2 && s.front() == '(' && s.back() == ')') {
-		return s.substr(1, s.size() - 2);
+	string result = s;
+	StringUtil::Trim(result);
+	while (result.size() >= 2 && result.front() == '(' && result.back() == ')') {
+		int depth = 0;
+		bool outer_pair = true;
+		for (idx_t i = 0; i + 1 < result.size(); i++) {
+			depth += result[i] == '(' ? 1 : result[i] == ')' ? -1 : 0;
+			if (depth == 0) {
+				outer_pair = false;
+				break;
+			}
+		}
+		if (!outer_pair) {
+			break;
+		}
+		result = result.substr(1, result.size() - 2);
+		StringUtil::Trim(result);
 	}
-	return s;
+	return result;
+}
+
+// Whether a label expression is a negation as a whole: '!' binds tighter than '&' and '|', so "!A&B" is (!A)&B.
+static bool IsTopLevelNegation(const string &expr) {
+	return !expr.empty() && expr[0] == '!' && SplitTopLevel(expr, '|').size() == 1 &&
+	       SplitTopLevel(expr, '&').size() == 1;
 }
 
 static bool LabelExpressionAllows(const string &raw_expr, const string &label) {
@@ -1359,7 +1381,7 @@ static bool LabelExpressionAllows(const string &raw_expr, const string &label) {
 	if (expr.empty()) {
 		return true;
 	}
-	if (!expr.empty() && expr[0] == '!') {
+	if (IsTopLevelNegation(expr)) {
 		return !LabelExpressionAllows(expr.substr(1), label);
 	}
 	auto or_parts = SplitTopLevel(expr, '|');
@@ -1487,7 +1509,7 @@ static unique_ptr<ParsedExpression> BuildLabelExprCond(const string &raw_expr,
 	string expr = StripParens(raw_expr);
 
 	// NOT: starts with '!' (after stripping outer parens)
-	if (!expr.empty() && expr[0] == '!') {
+	if (IsTopLevelNegation(expr)) {
 		auto inner = BuildLabelExprCond(StripParens(expr.substr(1)), tbl, var_alias, pg_name);
 		if (!inner) {
 			// "NOT always-true" → false constant (shouldn't happen in practice)
@@ -1566,7 +1588,7 @@ static shared_ptr<PropertyGraphTable> ResolveLabelExprTable(const string &raw_ex
 	std::function<shared_ptr<PropertyGraphTable>(const string &)> resolve_single =
 	    [&](const string &expr) -> shared_ptr<PropertyGraphTable> {
 		string e = StripParens(expr);
-		if (!e.empty() && e[0] == '!') {
+		if (IsTopLevelNegation(e)) {
 			return resolve_single(e.substr(1));
 		}
 		auto or_parts = SplitTopLevel(e, '|');
@@ -5285,15 +5307,32 @@ static shared_ptr<PropertyGraphTable> EdgeEndTable(const PropertyGraphTable &edg
 	}
 }
 
+static shared_ptr<PropertyGraphTable> CompoundLabelTable(const string &label, PGQMatchType match_type,
+                                                         const CreatePropertyGraphInfo &graph);
+
 static PGQPathLabels ResolvePathLabels(vector<unique_ptr<PathReference>> &path_list,
                                        CreatePropertyGraphInfo &pg_table, const string &function_call) {
+	// The one table a label names. A label expression (!A, A|B, A&B) names one only when exactly one table has
+	// elements it selects: ResolveTable would read !A as A's table, and A|B over two tables as the first.
+	auto label_table = [&](const string &label, PGQMatchType match_type) {
+		if (!IsCompoundLabel(label)) {
+			return ResolveTable(label, match_type, pg_table);
+		}
+		auto table = CompoundLabelTable(label, match_type, pg_table);
+		if (!table) {
+			throw BinderException("%s cannot be answered: the label expression %s selects elements of several tables, "
+			                      "so the labels depend on the row",
+			                      function_call, label);
+		}
+		return table;
+	};
 	if (path_list.size() < 3 || path_list.size() % 2 == 0) {
 		throw BinderException("%s cannot be answered: the path is not an alternating vertex/edge pattern",
 		                      function_call);
 	}
 	auto vertex_label = [&](PathElement *vertex, const shared_ptr<PropertyGraphTable> &implied) -> string {
 		if (!vertex->label.empty()) {
-			return PGQStr(ResolveTable(vertex->label, PGQMatchType::MATCH_VERTEX, pg_table)->main_label);
+			return PGQStr(label_table(vertex->label, PGQMatchType::MATCH_VERTEX)->main_label);
 		}
 		if (implied) {
 			return PGQStr(implied->main_label);
@@ -5318,7 +5357,7 @@ static PGQPathLabels ResolvePathLabels(vector<unique_ptr<PathReference>> &path_l
 		if (!previous || !edge || !next) {
 			throw BinderException("%s cannot be answered for a path with nested sub-paths", function_call);
 		}
-		const auto edge_table = ResolveTable(edge->label, edge->match_type, pg_table);
+		const auto edge_table = label_table(edge->label, edge->match_type);
 		if (idx == 1) {
 			result.first_vertex_label = vertex_label(previous, EdgeEndTable(*edge_table, edge->match_type, false));
 		}
@@ -7089,7 +7128,13 @@ static void ResolveStubBindingsFromEdges(const CreatePropertyGraphInfo &pg_table
 	// vertices around it are siblings in this same list.
 	vector<PathElement *> flat;
 	for (const auto &ref : path_elements) {
-		flat.push_back(PGQMatchFunction::GetPathElement(ref));
+		auto *element = PGQMatchFunction::GetPathElement(ref);
+		// A quantified edge of at least one hop ({1,1}, {1,3}) ends where its edge does, as a single edge does.
+		auto *segment = element ? nullptr : PGQMatchFunction::GetSubPath(ref);
+		if (segment && segment->path_list.size() == 1 && segment->lower >= 1 && !segment->quantified_group) {
+			element = PGQMatchFunction::GetPathElement(segment->path_list[0]);
+		}
+		flat.push_back(element);
 	}
 	for (idx_t idx = 1; idx + 1 < flat.size(); idx++) {
 		PathElement *edge = flat[idx];
@@ -16029,7 +16074,7 @@ static PGQLabelOnTable LabelOnTable(const string &raw_expr, const PropertyGraphT
 		return result;
 	}
 	auto expr = StripParens(raw_expr);
-	if (!expr.empty() && expr[0] == '!') {
+	if (IsTopLevelNegation(expr)) {
 		auto inner = LabelOnTable(expr.substr(1), table, graph);
 		if (inner.truth == PGQLabelTruth::ROW) {
 			result.truth = PGQLabelTruth::ROW;
@@ -16078,6 +16123,24 @@ static PGQLabelOnTable LabelOnTable(const string &raw_expr, const PropertyGraphT
 			result.residual = PGQStr(sub_label);
 			return result;
 		}
+	}
+	return result;
+}
+
+//! The one table whose elements a label expression selects (all or some of its rows), or null when it selects
+//! elements of several tables or of none.
+static shared_ptr<PropertyGraphTable> CompoundLabelTable(const string &label, PGQMatchType match_type,
+                                                         const CreatePropertyGraphInfo &graph) {
+	const auto &tables = match_type == PGQMatchType::MATCH_VERTEX ? graph.vertex_tables : graph.edge_tables;
+	shared_ptr<PropertyGraphTable> result;
+	for (auto &table : tables) {
+		if (LabelOnTable(label, *table, graph).truth == PGQLabelTruth::NO) {
+			continue;
+		}
+		if (result) {
+			return nullptr;
+		}
+		result = table;
 	}
 	return result;
 }
@@ -16274,7 +16337,7 @@ static bool LabelsRegistered(const string &raw_expr, const CreatePropertyGraphIn
 	if (expr.empty()) {
 		return true;
 	}
-	if (expr[0] == '!') {
+	if (IsTopLevelNegation(expr)) {
 		return LabelsRegistered(expr.substr(1), graph);
 	}
 	for (char op : {'|', '&'}) {
@@ -18090,6 +18153,58 @@ static void HoistVertexElementWhere(MatchExpression &match) {
 	}
 }
 
+//! Whether the COLUMNS or WHERE of a MATCH (or of a branch of its union) call function `name`.
+static bool MatchCalls(const MatchExpression &match, const string &name) {
+	bool found = false;
+	std::function<void(const ParsedExpression &)> visit = [&](const ParsedExpression &expression) {
+		if (found) {
+			return;
+		}
+		if (expression.GetExpressionClass() == ExpressionClass::FUNCTION &&
+		    StringUtil::CIEquals(PGQStr(expression.Cast<FunctionExpression>().FunctionName()), name)) {
+			found = true;
+			return;
+		}
+		ParsedExpressionIterator::EnumerateChildren(expression, visit);
+	};
+	for (auto &column : match.column_list) {
+		if (column) {
+			visit(*column);
+		}
+	}
+	if (match.where_clause) {
+		visit(*match.where_clause);
+	}
+	for (auto &branch : match.union_matches) {
+		found = found || MatchCalls(*branch, name);
+	}
+	return found;
+}
+
+//! Whether the translation still calls function `name`: a graph function that no route answered.
+static bool TranslationCalls(TableRef &ref, const string &name) {
+	bool found = false;
+	std::function<void(unique_ptr<ParsedExpression> &)> visit = [&](unique_ptr<ParsedExpression> &expression) {
+		if (!expression || found) {
+			return;
+		}
+		if (expression->GetExpressionClass() == ExpressionClass::FUNCTION &&
+		    StringUtil::CIEquals(PGQStr(expression->Cast<FunctionExpression>().FunctionName()), name)) {
+			found = true;
+			return;
+		}
+		if (expression->GetExpressionClass() == ExpressionClass::SUBQUERY) {
+			auto &subquery = expression->Cast<SubqueryExpression>().SubqueryMutable();
+			if (subquery && subquery->node) {
+				ParsedExpressionIterator::EnumerateQueryNodeChildren(*subquery->node, visit);
+			}
+		}
+		ParsedExpressionIterator::EnumerateChildren(*expression, visit);
+	};
+	ParsedExpressionIterator::EnumerateTableRefChildren(ref, visit);
+	return found;
+}
+
 unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, TableFunctionBindInput &bind_input) {
 	auto duckpgq_state = GetDuckPGQState(context);
 	duckpgq_state->graph_table_query = context.transaction.GetActiveQuery();
@@ -18101,6 +18216,7 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	// Rewrite a copy: the expansion consumes the expression, and a prepared statement can be bound again.
 	auto match_copy = unique_ptr_cast<ParsedExpression, MatchExpression>(match_info->match->Copy());
 	auto *ref = match_copy.get();
+	const bool reads_vertex_properties = MatchCalls(*ref, "vertex_properties");
 	{
 		QualifiedName graph_name(Identifier(ref->pg_catalog), Identifier(ref->pg_schema), Identifier(ref->pg_name));
 		NormalizeExtraLabels(*ref, *duckpgq_state->GetPropertyGraph(context, graph_name));
@@ -18129,6 +18245,16 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	}
 	QualifiedName graph_name(Identifier(ref->pg_catalog), Identifier(ref->pg_schema), Identifier(ref->pg_name));
 	PGQElementRelations::Apply(context, *duckpgq_state->GetPropertyGraph(context, graph_name), result);
+	if (reads_vertex_properties && TranslationCalls(*result, "vertex_properties")) {
+		// Only the ABI context expansion answers it; left to DuckDB it fails on the path variable it cannot bind.
+		throw BinderException(
+		    "vertex_properties(p) is only answered by the ABI context expansion, as a COLUMNS item of its own, and "
+		    "here it is nested in an expression or another route (an edge, fixed-path or closure artifact, or the "
+		    "traversal) answers this MATCH. The expansion takes "
+		    "MATCH p = (a:Label)-[:<label expression>]->{m,n}(x) with 1 <= m <= n: one right-directed edge whose "
+		    "variable is not read, from a labeled vertex, over the graph's ABI artifacts (pgq_abi_build), without ONE "
+		    "ROW PER, CHEAPEST or COST. Otherwise read vertices(p) and vertex_labels(p) and join the vertex tables");
+	}
 	return result;
 }
 

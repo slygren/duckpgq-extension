@@ -1,0 +1,159 @@
+# name: test/sql/path_finding/quantified_one_hop_labels.test
+# description: Path labels of a pattern whose edge label expression selects several tables ({1,1}, a single edge, & and
+#              !(A|B)): vertex_labels(p) / edge_labels(p) are the walked path's, on the ABI context expansion and on
+#              the traversal alike. They were folded to constants from the table a negation was read as. A quantified
+#              edge of one label determines its far end, as a single edge does (label(x), x.prop). vertex_properties(p)
+#              outside the context expansion is refused with the shapes that support it.
+# group: [path_finding]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE tag(id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO tag VALUES (1, 'Pump A'), (2, 'Parent');
+
+statement ok
+CREATE TABLE workorder(id INTEGER, title VARCHAR);
+
+statement ok
+INSERT INTO workorder VALUES (10, 'WO-10');
+
+statement ok
+CREATE TABLE notification(id INTEGER, title VARCHAR);
+
+statement ok
+INSERT INTO notification VALUES (20, 'N-20');
+
+statement ok
+CREATE TABLE operation(id INTEGER, title VARCHAR);
+
+statement ok
+INSERT INTO operation VALUES (100, 'Inspect');
+
+statement ok
+CREATE TABLE has_parent AS SELECT * FROM (VALUES (1, 2)) t(src, dst);
+
+statement ok
+CREATE TABLE has_workorder AS SELECT * FROM (VALUES (1, 10)) t(src, dst);
+
+statement ok
+CREATE TABLE has_notification AS SELECT * FROM (VALUES (1, 20)) t(src, dst);
+
+statement ok
+CREATE TABLE has_operation AS SELECT * FROM (VALUES (10, 100)) t(src, dst);
+
+statement ok
+CREATE TABLE notified_operation AS SELECT * FROM (VALUES (20, 100)) t(src, dst);
+
+statement ok
+CREATE PROPERTY GRAPH g
+VERTEX TABLES (tag LABEL Tag, workorder LABEL Workorder, notification LABEL Notification, operation LABEL Operation)
+EDGE TABLES (
+    has_parent SOURCE KEY (src) REFERENCES tag (id) DESTINATION KEY (dst) REFERENCES tag (id) LABEL HasParent,
+    has_workorder SOURCE KEY (src) REFERENCES tag (id) DESTINATION KEY (dst) REFERENCES workorder (id) LABEL HasWorkorder,
+    has_notification SOURCE KEY (src) REFERENCES tag (id) DESTINATION KEY (dst) REFERENCES notification (id) LABEL HasNotification,
+    has_operation SOURCE KEY (src) REFERENCES workorder (id) DESTINATION KEY (dst) REFERENCES operation (id) LABEL HasOperation,
+    notified_operation SOURCE KEY (src) REFERENCES notification (id) DESTINATION KEY (dst) REFERENCES operation (id) LABEL NotifiedOperation);
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('g', max_hops := 2);
+
+loop route 0 2
+
+statement ok
+SET pgq_disable_abi_rewrite = ${route};
+
+# {1,1} over the negated label: each row's own edge
+query TTT
+FROM GRAPH_TABLE (g MATCH p = (t:Tag)-[:!HasParent]->{1,1}(x) WHERE t.id = 1
+    COLUMNS (vertex_labels(p) AS vl, edge_labels(p) AS el, label(x) AS lx)) ORDER BY ALL;
+----
+[Tag, Notification]	[HasNotification]	Notification
+[Tag, Workorder]	[HasWorkorder]	Workorder
+
+# the same edge unquantified
+query TTT
+FROM GRAPH_TABLE (g MATCH p = (t:Tag)-[:!HasParent]->(x) WHERE t.id = 1
+    COLUMNS (vertex_labels(p) AS vl, edge_labels(p) AS el, label(x) AS lx)) ORDER BY ALL;
+----
+[Tag, Notification]	[HasNotification]	Notification
+[Tag, Workorder]	[HasWorkorder]	Workorder
+
+# & of negations, and a negated disjunction: "(!A)&(!B)" is not "!(A)&(!B" (the outer parentheses are no pair)
+query TTT
+FROM GRAPH_TABLE (g MATCH p = (t:Tag)-[:!HasParent&!HasNotification]->{1,2}(x) WHERE t.id = 1
+    COLUMNS (vertex_labels(p) AS vl, edge_labels(p) AS el, label(x) AS lx)) ORDER BY ALL;
+----
+[Tag, Workorder]	[HasWorkorder]	Workorder
+[Tag, Workorder, Operation]	[HasWorkorder, HasOperation]	Operation
+
+query TTT
+FROM GRAPH_TABLE (g MATCH p = (t:Tag)-[:!(HasParent|HasNotification)]->{1,1}(x) WHERE t.id = 1
+    COLUMNS (vertex_labels(p) AS vl, edge_labels(p) AS el, label(x) AS lx)) ORDER BY ALL;
+----
+[Tag, Workorder]	[HasWorkorder]	Workorder
+
+# one edge label: the far end is that edge's destination, {1,1} and {1,2} as the unquantified edge
+query TTTT
+FROM GRAPH_TABLE (g MATCH p = (t:Tag)-[:HasWorkorder]->{1,1}(x) WHERE t.id = 1
+    COLUMNS (vertex_labels(p) AS vl, edge_labels(p) AS el, label(x) AS lx, x.title AS title)) ORDER BY ALL;
+----
+[Tag, Workorder]	[HasWorkorder]	Workorder	WO-10
+
+query TT
+FROM GRAPH_TABLE (g MATCH p = (t:Tag)-[:HasWorkorder]->{1,2}(x) WHERE t.id = 1 COLUMNS (label(x) AS lx, x.title AS title)) ORDER BY ALL;
+----
+Workorder	WO-10
+
+endloop
+
+# vertex_properties(p): answered by the context expansion, {1,1} included
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+query IT
+SELECT len(vp), lx FROM GRAPH_TABLE (g MATCH p = (t:Tag)-[:!HasParent]->{1,1}(x) WHERE t.id = 1
+    COLUMNS (vertex_properties(p) AS vp, label(x) AS lx)) ORDER BY ALL;
+----
+2	Notification
+2	Workorder
+
+query T
+SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+abi_context_expansion
+
+# nested in an expression it is not answered
+statement error
+FROM GRAPH_TABLE (g MATCH p = (t:Tag)-[:!HasParent]->{1,1}(x) WHERE t.id = 1 COLUMNS (len(vertex_properties(p)) AS n));
+----
+<REGEX>:.*vertex_properties\(p\) is only answered by the ABI context expansion, as a COLUMNS item of its own.*
+
+# ... and refused, with the reason, by every other route
+statement error
+FROM GRAPH_TABLE (g MATCH p = (t:Tag)-[:!HasParent]->(x) WHERE t.id = 1 COLUMNS (vertex_properties(p)));
+----
+<REGEX>:.*vertex_properties\(p\) is only answered by the ABI context expansion.*
+
+statement error
+FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (t:Tag)-[:HasWorkorder]->{1,2}(x:Workorder) COLUMNS (vertex_properties(p)));
+----
+<REGEX>:.*vertex_properties\(p\) is only answered by the ABI context expansion.*
+
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement error
+FROM GRAPH_TABLE (g MATCH p = (t:Tag)-[:!HasParent]->{1,2}(x) WHERE t.id = 1 COLUMNS (vertex_properties(p)));
+----
+<REGEX>:.*vertex_properties\(p\) is only answered by the ABI context expansion.*
+
+statement error
+SELECT vertex_properties(1);
+----
+<REGEX>:.*vertex_properties\(p\) is only allowed inside a GRAPH_TABLE.*
