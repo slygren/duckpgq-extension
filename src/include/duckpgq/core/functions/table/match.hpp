@@ -380,7 +380,8 @@ public:
 	                                    bool require_abi_paths = false,
 	                                    const ParsedExpression *where_hint = nullptr,
 	                                    const std::function<bool(const PGQPathTableInfo &)> &counts_exactly = nullptr,
-	                                    const std::function<bool(const PGQPathTableInfo &)> &endpoints_complete = nullptr);
+	                                    const std::function<bool(const PGQPathTableInfo &)> &endpoints_complete = nullptr,
+	                                    const case_insensitive_set_t *referenced_bindings = nullptr);
 
 	static void CheckNamedSubpath(SubPath &subpath, MatchExpression &original_ref, CreatePropertyGraphInfo &pg_table,
 	                              unique_ptr<SelectNode> &final_select_node,

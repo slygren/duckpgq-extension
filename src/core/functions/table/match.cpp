@@ -2368,7 +2368,63 @@ struct PGQElementScope {
 	case_insensitive_set_t undirected_edges;
 	//! Variables NULL in the rows where their OPTIONAL MATCH found nothing: a function of such an element is NULL there.
 	case_insensitive_set_t optional;
+	//! Each single (unquantified) edge variable's neighbours in its pattern, and the pattern's direction for it.
+	struct EdgeEnds {
+		string previous;
+		string next;
+		PGQMatchType direction;
+	};
+	case_insensitive_map_t<EdgeEnds> edge_ends;
 };
+
+//! The element of a pattern position: the element itself, or the one inside its element-WHERE subpath.
+static PathElement *PositionElement(const unique_ptr<PathReference> &reference, bool &single) {
+	single = true;
+	if (reference->path_reference_type == PGQPathReferenceType::PATH_ELEMENT) {
+		return static_cast<PathElement *>(reference.get());
+	}
+	auto &subpath = static_cast<SubPath &>(*reference);
+	single = subpath.lower == 1 && subpath.upper == 1 && !subpath.quantified_group;
+	if (subpath.path_list.size() != 1 || subpath.path_list[0]->path_reference_type != PGQPathReferenceType::PATH_ELEMENT) {
+		return nullptr;
+	}
+	return static_cast<PathElement *>(subpath.path_list[0].get());
+}
+
+//! Records the ends of every single edge of a pattern's element sequence, looking inside named-path subpaths.
+static void CollectEdgeEnds(const vector<unique_ptr<PathReference>> &sequence, PGQElementScope &scope) {
+	if (sequence.size() == 1 && sequence[0]->path_reference_type == PGQPathReferenceType::SUBPATH) {
+		auto &wrapper = static_cast<SubPath &>(*sequence[0]);
+		if (wrapper.path_list.size() > 1 && wrapper.lower == 1 && wrapper.upper == 1 && !wrapper.quantified_group) {
+			CollectEdgeEnds(wrapper.path_list, scope);
+			return;
+		}
+	}
+	for (idx_t i = 1; i + 1 < sequence.size(); i += 2) {
+		bool single = true;
+		bool previous_single = true;
+		bool next_single = true;
+		auto *edge = PositionElement(sequence[i], single);
+		auto *previous = PositionElement(sequence[i - 1], previous_single);
+		auto *next = PositionElement(sequence[i + 1], next_single);
+		if (!edge || !previous || !next || !single || edge->match_type == PGQMatchType::MATCH_VERTEX ||
+		    previous->match_type != PGQMatchType::MATCH_VERTEX || next->match_type != PGQMatchType::MATCH_VERTEX) {
+			continue;
+		}
+		scope.edge_ends[edge->variable_binding] = {previous->variable_binding, next->variable_binding, edge->match_type};
+	}
+}
+
+static void CollectEdgeEnds(const MatchExpression &match, PGQElementScope &scope) {
+	for (auto &pattern : match.path_patterns) {
+		CollectEdgeEnds(pattern->path_elements, scope);
+	}
+	for (auto &group : match.optional_match_patterns) {
+		for (auto &pattern : group) {
+			CollectEdgeEnds(pattern->path_elements, scope);
+		}
+	}
+}
 
 //! The element variable an element function's argument names, or empty when it is not a plain variable reference.
 static string ElementArgument(FunctionExpression &function, idx_t index) {
@@ -2470,6 +2526,88 @@ static unique_ptr<ParsedExpression> RewriteElementFunction(FunctionExpression &f
 			test = make_uniq<OperatorExpression>(ExpressionType::OPERATOR_NOT, std::move(test));
 		}
 		return NullWhereElementNull(scope, variable, std::move(test));
+	}
+	if ((name == "is_source_of" || name == "is_destination_of") && argument_count == 2) {
+		const bool source = name == "is_source_of";
+		const char *predicate = source ? "IS SOURCE OF" : "IS DESTINATION OF";
+		auto vertex = ElementArgument(function, 0);
+		auto edge = ElementArgument(function, 1);
+		auto vertex_table = table_of(vertex);
+		auto edge_table = table_of(edge);
+		if (!vertex_table || !vertex_table->is_vertex_table) {
+			throw BinderException("%s: '%s' must be a vertex variable of the MATCH", predicate,
+			                      vertex.empty() ? function.GetArgumentsMutable()[0].GetExpression().ToString() : vertex);
+		}
+		if (!edge_table || edge_table->is_vertex_table) {
+			throw BinderException("%s: '%s' must be an edge variable of the MATCH", predicate,
+			                      edge.empty() ? function.GetArgumentsMutable()[1].GetExpression().ToString() : edge);
+		}
+		auto ends = scope.edge_ends.find(edge);
+		if (ends == scope.edge_ends.end()) {
+			throw BinderException("%s needs a single edge: '%s' is a quantified edge or group variable, which stands for "
+			                      "a list of edges",
+			                      predicate, edge);
+		}
+		// The vertex at the edge's source (destination) end, by the pattern's direction.
+		auto same_vertex = [&](const string &end) -> unique_ptr<ParsedExpression> {
+			if (StringUtil::CIEquals(end, vertex)) {
+				return ConstantExpression::FromValue(Value::BOOLEAN(true));
+			}
+			auto end_table = table_of(end);
+			if (!end_table || !end_table->SameTableIdentity(*vertex_table)) {
+				return ConstantExpression::FromValue(Value::BOOLEAN(false));
+			}
+			return make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL, ElementRowid(scope, vertex),
+			                                       ElementRowid(scope, end));
+		};
+		auto &previous = ends->second.previous;
+		auto &next = ends->second.next;
+		unique_ptr<ParsedExpression> result;
+		switch (ends->second.direction) {
+		case PGQMatchType::MATCH_EDGE_RIGHT:
+			result = same_vertex(source ? previous : next);
+			break;
+		case PGQMatchType::MATCH_EDGE_LEFT:
+			result = same_vertex(source ? next : previous);
+			break;
+		default: {
+			auto end_table = edge_table->source_pg_table;
+			auto far_table = edge_table->destination_pg_table;
+			if (!source) {
+				std::swap(end_table, far_table);
+			}
+			auto previous_table = table_of(previous);
+			auto next_table = table_of(next);
+			const bool previous_fits = previous_table && end_table && previous_table->SameTableIdentity(*end_table);
+			const bool next_fits = next_table && end_table && next_table->SameTableIdentity(*end_table);
+			if (previous_fits && next_fits) {
+				// Read both ways: the union's __pgq_edir says which (0 as stored, from previous to next).
+				if (!scope.undirected_edges.count(edge)) {
+					throw NotImplementedException("%s over the undirected edge '%s' is not supported on the route "
+					                              "chosen for this pattern",
+					                              predicate, edge);
+				}
+				auto stored = make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+				                                              PGQColRef("__pgq_edir", edge),
+				                                              ConstantExpression::FromValue(Value::INTEGER(0)));
+				auto choice = make_uniq<CaseExpression>();
+				CaseCheck check;
+				check.when_expr = std::move(stored);
+				check.then_expr = same_vertex(source ? previous : next);
+				choice->CaseChecksMutable().push_back(std::move(check));
+				choice->ElseMutable() = same_vertex(source ? next : previous);
+				result = std::move(choice);
+			} else if (previous_fits) {
+				result = same_vertex(previous);
+			} else if (next_fits) {
+				result = same_vertex(next);
+			} else {
+				result = ConstantExpression::FromValue(Value::BOOLEAN(false));
+			}
+			break;
+		}
+		}
+		return NullWhereElementNull(scope, vertex, NullWhereElementNull(scope, edge, std::move(result)));
 	}
 	if (name == "all_different") {
 		vector<string> variables;
@@ -6029,7 +6167,8 @@ void PGQMatchFunction::ProcessOptionalPathList(
     const PGQPathTableCache &path_table_cache,
     bool require_abi_paths, const ParsedExpression *where_hint,
     const std::function<bool(const PGQPathTableInfo &)> &counts_exactly,
-    const std::function<bool(const PGQPathTableInfo &)> &endpoints_complete) {
+    const std::function<bool(const PGQPathTableInfo &)> &endpoints_complete,
+    const case_insensitive_set_t *referenced_bindings) {
 	const string &graph_name = pg_table.property_graph_name;
 
 	for (auto &path_pattern : opt_patterns) {
@@ -6240,7 +6379,9 @@ void PGQMatchFunction::ProcessOptionalPathList(
 			// next_binding.src_pk = pt.v0.
 			bool used_path_table = false;
 			const bool pt_left_dir = (edge_elem->match_type == PGQMatchType::MATCH_EDGE_LEFT);
-			if ((edge_elem->match_type == PGQMatchType::MATCH_EDGE_RIGHT || pt_left_dir) &&
+			// An artifact row carries no edge: a query that reads the edge variable joins the edge table.
+			const bool edge_read = referenced_bindings && referenced_bindings->count(edge_binding);
+			if ((edge_elem->match_type == PGQMatchType::MATCH_EDGE_RIGHT || pt_left_dir) && !edge_read &&
 			    !edge_table->source_pk.empty() && !edge_table->destination_pk.empty()) {
 				// For right-directed: table is prev_label__edge__next_label, v0=prev pk, v1=next pk.
 				// For left-directed:  table is next_label__edge__prev_label, v0=next pk, v1=prev pk.
@@ -10178,8 +10319,15 @@ static unique_ptr<ParsedExpression> BuildExistsSubquery(
 	if (inner_match.where_clause) {
 		conditions.push_back(std::move(inner_match.where_clause));
 	}
+	// The FROM aliases (outer variables included) and the pattern's own elements: an undirected edge, read from a
+	// union, is not among the FROM aliases.
+	auto element_tables = inner_alias_map;
+	for (auto &entry : PGQMatchFunction::PopulateGraphTableAliasMap(pg_table, inner_match, nullptr)) {
+		element_tables.emplace(entry.first, entry.second);
+	}
 	PGQElementScope element_scope;
-	element_scope.tables = &inner_alias_map;
+	element_scope.tables = &element_tables;
+	CollectEdgeEnds(inner_match, element_scope);
 	CollectUndirectedEdgeBindings(inner_select->from_table.get(), element_scope.undirected_edges);
 	for (auto &condition : conditions) {
 		condition = RewriteElementFunctions(std::move(condition), element_scope);
@@ -11764,6 +11912,10 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 			// Require explicit, single edge label and same-type (or unlabeled) vertices.
 			if (s.edge->label.empty() || IsCompoundLabel(s.edge->label)) {
 				return false; // undirected enumeration is future work — use Case A path
+			}
+			// The union carries no edge row and no direction: a query that reads the edge variable traverses.
+			if (binding_is_referenced(s.edge->variable_binding)) {
+				return false;
 			}
 			const string &src_label_u = s.src->label;
 			const string &dst_label_u = s.dst->label;
@@ -17790,7 +17942,7 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 		}
 		ProcessOptionalPathList(context, opt_group, final_select_node, optional_alias_map, *pg_table, extra_alias_counter, alias_map,
 		                        path_table_cache, require_abi_paths, ref->where_clause.get(), optional_counts_exactly,
-		                        endpoints_complete);
+		                        endpoints_complete, &referenced_bindings);
 	}
 
 	// Maps from table alias to table, including vertex and edge tables.
@@ -17803,6 +17955,7 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 	PGQElementScope element_scope;
 	element_scope.tables = &alias_to_vertex_and_edge_tables;
 	element_scope.stubs = &stub_bindings;
+	CollectEdgeEnds(*ref, element_scope);
 	for (auto &entry : optional_alias_map) {
 		if (alias_map.find(entry.first) == alias_map.end()) {
 			element_scope.optional.insert(entry.first);
@@ -18036,7 +18189,7 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 			}
 			ProcessOptionalPathList(context, opt_group, branch_select, branch_opt_alias_map, *pg_table, branch_counter,
 			                        branch_alias_map, path_table_cache, require_abi_paths, branch.where_clause.get(),
-			                        optional_counts_exactly, endpoints_complete);
+			                        optional_counts_exactly, endpoints_complete, &branch_referenced_bindings);
 		}
 
 		case_insensitive_set_t branch_stub_bindings;
@@ -18047,6 +18200,7 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 		PGQElementScope branch_scope;
 		branch_scope.tables = &branch_alias_to_ve;
 		branch_scope.stubs = &branch_stub_bindings;
+		CollectEdgeEnds(branch, branch_scope);
 		for (auto &entry : branch_opt_alias_map) {
 			if (branch_alias_map.find(entry.first) == branch_alias_map.end()) {
 				branch_scope.optional.insert(entry.first);

@@ -5,6 +5,7 @@
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/conjunction_expression.hpp"
+#include "duckdb/parser/expression/operator_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
@@ -796,6 +797,22 @@ arena_ptr<TransformResultValue> TransformIsLabeled(PEGTransformer &transformer, 
 	return transformer.MakeResult<unique_ptr<ParsedExpression>>(std::move(result));
 }
 
+// ColId 'IS' 'NOT'? ('SOURCE' / 'DESTINATION') 'OF' ColId: is_source_of(a, e) / is_destination_of(a, e), under NOT
+// for the negated form. The MATCH expansion rewrites them into comparisons of the vertex with the edge's endpoint.
+template <bool SOURCE>
+arena_ptr<TransformResultValue> TransformSourceDestination(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	vector<unique_ptr<ParsedExpression>> children;
+	children.push_back(make_uniq<ColumnRefExpression>(transformer.Transform<Identifier>(list.GetChild(0))));
+	children.push_back(make_uniq<ColumnRefExpression>(transformer.Transform<Identifier>(list.GetChild(5))));
+	unique_ptr<ParsedExpression> result =
+	    make_uniq<FunctionExpression>(Identifier(SOURCE ? "is_source_of" : "is_destination_of"), std::move(children));
+	if (list.Child<OptionalParseResult>(2).HasResult()) {
+		result = make_uniq<OperatorExpression>(ExpressionType::OPERATOR_NOT, std::move(result));
+	}
+	return transformer.MakeResult<unique_ptr<ParsedExpression>>(std::move(result));
+}
+
 // 'EXISTS' '{' List(DuckPGQPathPattern) WhereClause? '}'
 // Becomes EXISTS (SELECT 1 FROM duckpgq_exists_pattern()) carrying the pattern in bind_info. Inside a GRAPH_TABLE
 // the MATCH expansion rewrites it into a correlated subquery; anywhere else the table function rejects it.
@@ -1020,7 +1037,13 @@ void DuckPGQAddGraphTableGrammar(vector<GrammarChange> &changes) {
 	    GrammarChange::SetTransformProcess("DuckPGQExistsPattern", StartTransform<TransformExistsPattern>));
 	changes.push_back(
 	    GrammarChange::SetTransformProcess("DuckPGQPropertyProjection", StartTransform<TransformPropertyProjection>));
+	changes.push_back(
+	    GrammarChange::SetTransformProcess("DuckPGQIsSourceOf", StartTransform<TransformSourceDestination<true>>));
+	changes.push_back(GrammarChange::SetTransformProcess("DuckPGQIsDestinationOf",
+	                                                     StartTransform<TransformSourceDestination<false>>));
 	changes.push_back(GrammarChange::PrependChoice("SingleExpression", "DuckPGQIsLabeled"));
+	changes.push_back(GrammarChange::PrependChoice("SingleExpression", "DuckPGQIsSourceOf"));
+	changes.push_back(GrammarChange::PrependChoice("SingleExpression", "DuckPGQIsDestinationOf"));
 	changes.push_back(GrammarChange::PrependChoice("SingleExpression", "DuckPGQExistsPattern"));
 	changes.push_back(GrammarChange::PrependChoice("SingleExpression", "DuckPGQPropertyProjection"));
 }
