@@ -256,10 +256,13 @@ void CreatePropertyGraphFunction::CheckPropertyGraphTableColumns(const shared_pt
 		// The properties another label of the table lists come after the expanded columns.
 		auto listed_names = std::move(pg_table->column_names);
 		auto listed_aliases = std::move(pg_table->column_aliases);
+		auto listed_expressions = std::move(pg_table->property_expressions);
+		listed_expressions.resize(listed_names.size());
 		pg_table->column_names = ExpandAllColumnsExcept(IdentifiersToStrings(table.names), pg_table->except_columns);
 		pg_table->column_aliases = pg_table->column_names;
+		pg_table->property_expressions.assign(pg_table->column_names.size(), string());
 		for (idx_t i = 0; i < listed_names.size(); i++) {
-			if (!table.Exists(PGQIdentifier(listed_names[i]))) {
+			if (listed_expressions[i].empty() && !table.Exists(PGQIdentifier(listed_names[i]))) {
 				throw Exception(ExceptionType::INVALID,
 				                "Column " + listed_names[i] + " not found in table " + pg_table->table_name);
 			}
@@ -270,7 +273,8 @@ void CreatePropertyGraphFunction::CheckPropertyGraphTableColumns(const shared_pt
 					continue;
 				}
 				if (!StringUtil::CIEquals(pg_table->column_names[j].GetIdentifierName(),
-				                          listed_names[i].GetIdentifierName())) {
+				                          listed_names[i].GetIdentifierName()) ||
+				    !listed_expressions[i].empty()) {
 					throw Exception(ExceptionType::INVALID, "Property " + listed_aliases[i] + " of element table " +
 					                                            pg_table->table_name + " is defined twice, differently");
 				}
@@ -279,15 +283,56 @@ void CreatePropertyGraphFunction::CheckPropertyGraphTableColumns(const shared_pt
 			if (!known) {
 				pg_table->column_names.push_back(listed_names[i]);
 				pg_table->column_aliases.push_back(listed_aliases[i]);
+				pg_table->property_expressions.push_back(listed_expressions[i]);
 			}
 		}
 		return;
 	}
 
-	for (auto &column : pg_table->column_names) {
-		if (!table.Exists(PGQIdentifier(column))) {
+	for (idx_t i = 0; i < pg_table->column_names.size(); i++) {
+		auto &column = pg_table->column_names[i];
+		if (pg_table->PropertyExpression(i).empty() && !table.Exists(PGQIdentifier(column))) {
 			throw Exception(ExceptionType::INVALID, "Column " + column + " not found in table " + pg_table->table_name);
 		}
+	}
+}
+
+//! A property that is not a plain column of its own name -- a renamed column or an expression -- becomes a column of
+//! the table's element relation (see PGQElementRelations), next to the table's own columns: its name must not be one
+//! of them. A computed property must bind against the table.
+static void CheckPropertyRelation(ClientContext &context, const PropertyGraphTable &pg_table,
+                                  const CreatePropertyGraphFunction::ElementColumns &table) {
+	vector<string> expressions;
+	for (idx_t i = 0; i < pg_table.column_names.size(); i++) {
+		auto &name = pg_table.PropertyName(i);
+		auto expression = pg_table.PropertyExpression(i);
+		const bool renamed = !StringUtil::CIEquals(name.GetIdentifierName(), pg_table.column_names[i].GetIdentifierName());
+		if (expression.empty() && !renamed) {
+			continue;
+		}
+		if (table.Exists(name) || StringUtil::CIEquals(name.GetIdentifierName(), "rowid")) {
+			throw Exception(ExceptionType::INVALID, "Property " + name + " of element table " + pg_table.table_name +
+			                                            " is also the name of a column of the table: name it "
+			                                            "differently");
+		}
+		if (!expression.empty()) {
+			expressions.push_back("(" + expression + ") AS " + DuckPGQSQL::Identifier(name));
+		}
+	}
+	if (expressions.empty()) {
+		return;
+	}
+	// Bound as the element relation reads it, next to the table's columns: an aggregate is refused there.
+	auto statement = DuckPGQSQL::ParseSelect("SELECT *, " + StringUtil::Join(expressions, ", ") + " FROM " +
+	                                             DuckPGQSQL::TableRef(pg_table) + " LIMIT 0",
+	                                         "computed properties");
+	try {
+		auto binder = Binder::CreateBinder(context);
+		binder->Bind(static_cast<SQLStatement &>(*statement));
+	} catch (std::exception &e) {
+		ErrorData error(e);
+		throw Exception(ExceptionType::INVALID,
+		                "A computed property of element table " + pg_table.table_name + " is invalid: " + error.RawMessage());
 	}
 }
 
@@ -411,6 +456,7 @@ unique_ptr<FunctionData> CreatePropertyGraphFunction::CreatePropertyGraphBind(Cl
 			table = ResolveElementColumns(context, *vertex_table);
 			CheckElementKey(*vertex_table, table);
 			CheckPropertyGraphTableColumns(vertex_table, table);
+			CheckPropertyRelation(context, *vertex_table, table);
 			CheckPropertyGraphTableLabels(vertex_table, table);
 		} catch (CatalogException &e) {
 			throw Exception(ExceptionType::INVALID, e.what());
@@ -432,6 +478,7 @@ unique_ptr<FunctionData> CreatePropertyGraphFunction::CreatePropertyGraphBind(Cl
 			CheckElementKey(*edge_table, table);
 			edge_table->is_view = table.is_view;
 			CheckPropertyGraphTableColumns(edge_table, table);
+			CheckPropertyRelation(context, *edge_table, table);
 			CheckPropertyGraphTableLabels(edge_table, table);
 			BindPropertyGraphReference(context, edge_table->source_catalog, edge_table->source_schema);
 			BindPropertyGraphReference(context, edge_table->destination_catalog, edge_table->destination_schema);
@@ -642,8 +689,20 @@ static string StringListSQL(const vector<Identifier> &values) {
 
 //! The values of the __duckpgq_internal columns after abi_options, for one element table.
 static string ElementColumnsSQL(const PropertyGraphTable &table) {
+	string expressions = "NULL";
+	for (idx_t i = 0; i < table.column_names.size(); i++) {
+		if (!table.PropertyExpression(i).empty()) {
+			vector<string> values;
+			for (idx_t j = 0; j < table.column_names.size(); j++) {
+				auto expression = table.PropertyExpression(j);
+				values.push_back(expression.empty() ? "NULL" : KeywordHelper::WriteQuoted(expression, '\''));
+			}
+			expressions = "[" + StringUtil::Join(values, ", ") + "]::VARCHAR[]";
+			break;
+		}
+	}
 	return string(table.is_view ? "true" : "NULL") + ", " + StringListSQL(table.identity_columns) + ", " +
-	       StringListSQL(table.extra_labels) + ", " + StringListSQL(table.element_key);
+	       StringListSQL(table.extra_labels) + ", " + StringListSQL(table.element_key) + ", " + expressions;
 }
 
 //! A KEY must identify the table's rows (SQL/PGQ element key). A PRIMARY KEY or UNIQUE constraint on the same columns

@@ -4,6 +4,8 @@
 #include "duckdb/parser/peg/transformer/peg_transformer.hpp"
 #include "duckdb/parser/statement/extension_statement.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckpgq/parser/parsed_data/create_property_graph_info.hpp"
 #include "duckpgq_create_property_graph_grammar.hpp"
 
@@ -27,7 +29,27 @@ struct PropertyClause {
 	vector<Identifier> except_columns;
 	vector<Identifier> column_names;
 	vector<Identifier> column_aliases;
+	vector<string> property_expressions;
 };
+
+//! A computed property's expression, as SQL text; refused where a property cannot be one value of its own row.
+static string PropertyExpressionSQL(ParsedExpression &expression, const Identifier &name) {
+	bool unsupported = false;
+	std::function<void(ParsedExpression &)> check = [&](ParsedExpression &child) {
+		if (child.GetExpressionClass() == ExpressionClass::SUBQUERY ||
+		    child.GetExpressionClass() == ExpressionClass::WINDOW ||
+		    child.GetExpressionClass() == ExpressionClass::STAR) {
+			unsupported = true;
+		}
+		ParsedExpressionIterator::EnumerateChildren(child, check);
+	};
+	check(expression);
+	if (unsupported) {
+		throw ParserException("Property %s: a property expression cannot contain a subquery, a window function or *",
+		                      name.GetIdentifierName());
+	}
+	return expression.ToString();
+}
 
 static PropertyClause TransformProperties(PEGTransformer &transformer, ParseResult &properties) {
 	PropertyClause clause;
@@ -40,13 +62,33 @@ static PropertyClause TransformProperties(PEGTransformer &transformer, ParseResu
 		auto &items = PEGTransformerFactory::ExtractResultFromParens(list.GetChild(1));
 		for (auto &item : PEGTransformerFactory::ExtractParseResultsFromList(items)) {
 			auto &property = item.get().Cast<ListParseResult>();
-			auto column = transformer.Transform<Identifier>(property.GetChild(0));
+			auto expression = transformer.Transform<unique_ptr<ParsedExpression>>(property.GetChild(0));
+			if (expression->GetExpressionClass() == ExpressionClass::STAR) {
+				throw ParserException("syntax error at or near \"*\": write PROPERTIES ARE ALL COLUMNS for every "
+				                      "column, or leave the clause out");
+			}
 			auto &alias = property.Child<OptionalParseResult>(1);
-			clause.column_names.push_back(column);
-			clause.column_aliases.push_back(
-			    alias.HasResult()
-			        ? transformer.Transform<Identifier>(alias.GetResult().Cast<ListParseResult>().GetChild(1))
-			        : column);
+			optional<Identifier> name;
+			if (alias.HasResult()) {
+				name = transformer.Transform<Identifier>(alias.GetResult().Cast<ListParseResult>().GetChild(1));
+			}
+			if (expression->GetExpressionClass() == ExpressionClass::COLUMN_REF &&
+			    expression->Cast<ColumnRefExpression>().ColumnNames().size() == 1) {
+				// A column, possibly renamed.
+				auto column = expression->Cast<ColumnRefExpression>().ColumnNames()[0];
+				clause.column_names.push_back(column);
+				clause.column_aliases.push_back(name ? *name : column);
+				clause.property_expressions.emplace_back();
+				continue;
+			}
+			if (!name) {
+				throw ParserException("Property %s is an expression and needs a name: %s AS <name>",
+				                      expression->ToString(), expression->ToString());
+			}
+			// A computed property: its name stands in for the column it reads from.
+			clause.column_names.push_back(*name);
+			clause.column_aliases.push_back(*name);
+			clause.property_expressions.push_back(PropertyExpressionSQL(*expression, *name));
 		}
 	} else if (choice.Name() == "DuckPGQAllColumnsExcept") {
 		clause.except_columns = TransformParensList<Identifier>(transformer, list.GetChild(5));
@@ -103,7 +145,8 @@ static void ApplyPropertyUnion(const vector<PropertyClause> &clauses, PropertyGr
 					continue;
 				}
 				if (!StringUtil::CIEquals(table.column_names[j].GetIdentifierName(),
-				                          clause.column_names[i].GetIdentifierName())) {
+				                          clause.column_names[i].GetIdentifierName()) ||
+				    table.property_expressions[j] != clause.property_expressions[i]) {
 					throw ParserException("Property %s of element table %s is defined twice, differently",
 					                      alias.GetIdentifierName(), table.table_name.GetIdentifierName());
 				}
@@ -114,6 +157,7 @@ static void ApplyPropertyUnion(const vector<PropertyClause> &clauses, PropertyGr
 			}
 			table.column_names.push_back(clause.column_names[i]);
 			table.column_aliases.push_back(alias);
+			table.property_expressions.push_back(clause.property_expressions[i]);
 		}
 	}
 	if (table.all_columns) {

@@ -34,7 +34,8 @@ DuckPGQAllColumnsExcept <- 'PROPERTIES' 'ARE'? 'ALL' 'COLUMNS' 'EXCEPT' Parens(L
 DuckPGQAllProperties <- 'ALL' 'PROPERTIES'
 DuckPGQNoProperties <- 'NO' 'PROPERTIES'
 DuckPGQPropertyList <- 'PROPERTIES' Parens(List(DuckPGQProperty))
-DuckPGQProperty <- ColId DuckPGQPropertyAlias?
+# A property is a column, or any expression over the table's columns with a name (age + 1 AS age_next).
+DuckPGQProperty <- Expression DuckPGQPropertyAlias?
 DuckPGQPropertyAlias <- 'AS' ColId
 
 # Discriminator sub-labels: rows whose discriminator has bit i set also carry the i-th of these labels.

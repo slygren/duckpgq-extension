@@ -109,7 +109,8 @@ CREATE [OR REPLACE] PROPERTY GRAPH [IF NOT EXISTS] g
           DESTINATION KEY (dst) REFERENCES person [(id)] LABEL Knows [properties], …)
   [WITH ABI (max_hops := 2, closures := ['Knows'])];      -- see ABI path tables
 
--- properties: PROPERTIES (col [AS name], …) | PROPERTIES [ARE] ALL COLUMNS [EXCEPT (…)] | NO PROPERTIES
+-- properties: PROPERTIES (col [AS name] | expression AS name, …)
+--           | PROPERTIES [ARE] ALL COLUMNS [EXCEPT (…)] | NO PROPERTIES
 -- The first label's properties may also come before it: person PROPERTIES (id, name) LABEL Person.
 
 DROP PROPERTY GRAPH [IF EXISTS] g;
@@ -126,6 +127,13 @@ LABEL`, its label is its alias (or table name). Every row has all of them, so `(
 matches, on every route and with the same ABI artifacts. `label(x)` is the first declared label, and `IS LABELED`
 accepts any of them. Each label may have its own `PROPERTIES` clause, and the table has the properties of all its
 labels; a label without one has all columns, as SQL/PGQ says. A label still names one table (see Limitations).
+
+A property may rename a column (`name AS fullname`) or be an **expression** over the table's columns (`age + 1 AS
+age_next`, `lower(name) AS lname`; not a subquery, window function or aggregate). Either is read by its name
+everywhere a property is: `COLUMNS`, `WHERE`, element `WHERE`, `COST`, `x.*`, `vertex_property(p, …)`, and on the ABI
+routes (artifacts hold keys; properties come from the tables). Such a table is read through its element relation,
+`(SELECT *, <expression> AS <name>, … FROM t)`, so a fixed-length pattern costs the expression and nothing else, and
+a property's name must not be another column of the table. A renamed column also stays readable by its column name.
 
 `KEY (…)` declares the columns that identify a table's vertices or edges, for tables (and views) without a PRIMARY
 KEY. It wins over the PRIMARY KEY: `REFERENCES person` without a column list references person's `KEY`, else its
@@ -671,7 +679,9 @@ building in [abi_build.cpp](src/core/functions/table/abi_build.cpp); vertex-join
 - **One DuckDB version per binary**, and unsigned (see [Deployment](#deployment)).
 - **Graph definition:** a label names one element table; SQL/PGQ also lets several tables share a label (refused:
   "Label … is not unique"). Properties are per table, the union of its labels' clauses, so a label does not restrict
-  which properties a pattern on it may read.
+  which properties a pattern on it may read. `WHERE` may also read columns that are no property (only `COLUMNS` is
+  checked). A graph created before renamed properties worked, whose alias is another column's name, keeps reading
+  that column under the name (CREATE refuses such a graph now).
 - **Patterns not supported:** `LATERAL` inside `MATCH`, graph updates (`INSERT`/`DELETE` of vertices or edges; the
   graph is a view over tables).
 - **Quantified path patterns** are written out per repetition count. A group allows at most 8 repetitions, and a

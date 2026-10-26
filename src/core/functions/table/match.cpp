@@ -144,20 +144,32 @@ void PopulateFullyQualifiedColName(const vector<shared_ptr<PropertyGraphTable>> 
                                    const case_insensitive_map_t<vector<string>> &tbl_name_to_aliases,
                                    case_insensitive_set_t &col_names) {
 	for (const auto &cur_tbl : tbls) {
-		for (const auto &cur_col : cur_tbl->column_names) {
+		// A property is read by its name; a renamed column is also still read by the column's name, as before
+		// renamed properties were readable.
+		vector<string> names;
+		names.reserve(cur_tbl->column_names.size());
+		for (idx_t i = 0; i < cur_tbl->column_names.size(); i++) {
+			auto &property = PGQStr(cur_tbl->PropertyName(i));
+			names.push_back(property);
+			auto &column = PGQStr(cur_tbl->column_names[i]);
+			if (cur_tbl->PropertyExpression(i).empty() && !StringUtil::CIEquals(column, property)) {
+				names.push_back(column);
+			}
+		}
+		for (const auto &cur_col : names) {
 			// It's legal to query by `<col>` instead of `<table>.<col>`.
-			col_names.insert(PGQStr(cur_col));
+			col_names.insert(cur_col);
 
 			const string &tbl_name = PGQStr(cur_tbl->table_name);
 			auto iter = tbl_name_to_aliases.find(tbl_name);
 			// Prefer to use table alias specified in the statement, otherwise use
 			// table name.
 			if (iter == tbl_name_to_aliases.end()) {
-				col_names.insert(StringUtil::Format("%s.%s", tbl_name, PGQStr(cur_col)));
+				col_names.insert(StringUtil::Format("%s.%s", tbl_name, cur_col));
 			} else {
 				const auto &all_aliases = iter->second;
 				for (const auto &cur_alias : all_aliases) {
-					col_names.insert(StringUtil::Format("%s.%s", cur_alias, PGQStr(cur_col)));
+					col_names.insert(StringUtil::Format("%s.%s", cur_alias, cur_col));
 				}
 			}
 		}
@@ -190,8 +202,8 @@ GetColRefExprFromPg(const case_insensitive_map_t<shared_ptr<PropertyGraphTable>>
 	D_ASSERT(iter != alias_map.end());
 	const auto &tbl = iter->second;
 	registered_col_names.reserve(tbl->column_names.size());
-	for (const auto &cur_col : tbl->column_names) {
-		auto new_col_names = vector<Identifier> {Identifier(alias), cur_col};
+	for (idx_t i = 0; i < tbl->column_names.size(); i++) {
+		auto new_col_names = vector<Identifier> {Identifier(alias), tbl->PropertyName(i)};
 		registered_col_names.emplace_back(PGQColRef(std::move(new_col_names)));
 	}
 	return registered_col_names;
@@ -209,8 +221,8 @@ GetColRefExprFromPg(const case_insensitive_map_t<shared_ptr<PropertyGraphTable>>
 		const auto &tbl = alias_and_table.second;
 		// Skip edge table.
 		registered_col_names.reserve(registered_col_names.size() + tbl->column_names.size());
-		for (const auto &cur_col : tbl->column_names) {
-			auto new_col_names = vector<Identifier> {Identifier(alias), cur_col};
+		for (idx_t i = 0; i < tbl->column_names.size(); i++) {
+			auto new_col_names = vector<Identifier> {Identifier(alias), tbl->PropertyName(i)};
 			registered_col_names.emplace_back(PGQColRef(std::move(new_col_names)));
 		}
 	}
@@ -8833,11 +8845,9 @@ static string BuildJsonScalarSQL(const string &value_expr) {
 static string BuildJsonObjectExpression(const shared_ptr<PropertyGraphTable> &vertex_table, const string &table_alias) {
 	vector<string> entries;
 	for (idx_t idx = 0; idx < vertex_table->column_names.size(); idx++) {
-		const string &column_name = PGQStr(vertex_table->column_names[idx]);
-		const string property_name = idx < vertex_table->column_aliases.size() && !vertex_table->column_aliases[idx].empty()
-		                                 ? PGQStr(vertex_table->column_aliases[idx])
-		                                 : column_name;
-		const string column_expr = table_alias + "." + KeywordHelper::WriteOptionallyQuoted(column_name);
+		const string property_name = PGQStr(vertex_table->PropertyName(idx));
+		// The element relation has every property as a column of its name (see PGQElementRelations).
+		const string column_expr = table_alias + "." + KeywordHelper::WriteOptionallyQuoted(property_name);
 		entries.push_back(KeywordHelper::WriteQuoted("\"" + JsonEscapeSQLPropertyName(property_name) + "\":", '\'') +
 		                  " || " + BuildJsonScalarSQL(column_expr));
 	}
@@ -13483,12 +13493,7 @@ static LogicalType PathPropertyColumnType(ClientContext &context, const Property
 }
 
 static bool TableHasProperty(const PropertyGraphTable &table, const string &property) {
-	for (auto &column : table.column_names) {
-		if (StringUtil::CIEquals(PGQStr(column), property)) {
-			return true;
-		}
-	}
-	return false;
+	return table.HasProperty(property);
 }
 
 //! An expression another part of the query can evaluate as one column: a property reference, a graph function of
@@ -14609,12 +14614,7 @@ static unique_ptr<PGQGroupLeaf> BuildGroupLeaf(const MatchExpression &block, con
 			tables_by_key[TableKey(*table)] = table;
 		}
 		auto has_property = [](const PropertyGraphTable &table, const string &property) {
-			for (auto &column : table.column_names) {
-				if (StringUtil::CIEquals(PGQStr(column), property)) {
-					return true;
-				}
-			}
-			return false;
+			return table.HasProperty(property);
 		};
 		std::function<void(unique_ptr<ParsedExpression> &)> null_missing = [&](unique_ptr<ParsedExpression> &expression) {
 			if (!expression) {

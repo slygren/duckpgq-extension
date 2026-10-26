@@ -16,12 +16,23 @@
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckpgq/core/utils/duckpgq_sql.hpp"
 #include "duckpgq/core/utils/duckpgq_identifier.hpp"
+#include "duckpgq/core/utils/duckpgq_utils.hpp"
 #include "duckpgq/parser/parsed_data/create_property_graph_info.hpp"
 
 namespace duckdb {
 
 bool PGQElementRelations::Needs(const PropertyGraphTable &table) {
-	return table.is_view;
+	if (table.is_view) {
+		return true;
+	}
+	for (idx_t i = 0; i < table.column_names.size(); i++) {
+		if (!table.PropertyExpression(i).empty() ||
+		    !StringUtil::CIEquals(table.PropertyName(i).GetIdentifierName(),
+		                          table.column_names[i].GetIdentifierName())) {
+			return true;
+		}
+	}
+	return false;
 }
 
 bool PGQElementRelations::Needs(const CreatePropertyGraphInfo &graph) {
@@ -39,6 +50,10 @@ bool PGQElementRelations::Needs(const CreatePropertyGraphInfo &graph) {
 }
 
 string PGQElementRelations::RelationSQL(const PropertyGraphTable &table) {
+	return RelationSQL(table, {});
+}
+
+string PGQElementRelations::RelationSQL(const PropertyGraphTable &table, const vector<string> &properties) {
 	string id;
 	if (table.is_view) {
 		// A view has no rowid. Its rows are numbered densely (the CSR addresses vertices 0..n-1) in an order that is
@@ -55,7 +70,11 @@ string PGQElementRelations::RelationSQL(const PropertyGraphTable &table) {
 	} else {
 		id = "rowid";
 	}
-	return "SELECT *, " + id + " AS rowid FROM " + DuckPGQSQL::QualifiedTableName(table);
+	string extra;
+	for (auto &property : properties) {
+		extra += ", " + property;
+	}
+	return "SELECT *, " + id + " AS rowid" + extra + " FROM " + DuckPGQSQL::QualifiedTableName(table);
 }
 
 namespace {
@@ -63,8 +82,44 @@ namespace {
 struct ElementRelationRewriter {
 	ElementRelationRewriter(ClientContext &context, const CreatePropertyGraphInfo &graph) : context(context) {
 		auto add = [&](const shared_ptr<PropertyGraphTable> &table) {
-			if (PGQElementRelations::Needs(*table)) {
-				tables.emplace_back(Resolve(table->catalog_name, table->schema_name, table->table_name), table.get());
+			if (!PGQElementRelations::Needs(*table)) {
+				return;
+			}
+			auto name = Resolve(table->catalog_name, table->schema_name, table->table_name);
+			bool known = false;
+			for (auto &entry : tables) {
+				known = known || entry.first == name;
+			}
+			if (!known) {
+				tables.emplace_back(name, table.get());
+			}
+			// Several element tables over one table share its relation, with all of their properties.
+			auto &columns = properties[name];
+			for (idx_t i = 0; i < table->column_names.size(); i++) {
+				auto &property = table->PropertyName(i);
+				auto expression = table->PropertyExpression(i);
+				if (expression.empty() &&
+				    StringUtil::CIEquals(property.GetIdentifierName(), table->column_names[i].GetIdentifierName())) {
+					continue;
+				}
+				// A graph persisted before renamed properties were read may name one after another column of the
+				// table; that name keeps reading the column, as it always did.
+				if (expression.empty() &&
+				    PGQRelationColumnType(context, PGQStr(table->catalog_name), PGQStr(table->schema_name),
+				                          PGQStr(table->table_name), PGQStr(property))
+				            .id() != LogicalTypeId::INVALID) {
+					continue;
+				}
+				auto definition = (expression.empty() ? DuckPGQSQL::Identifier(table->column_names[i])
+				                                      : "(" + expression + ")") +
+				                  " AS " + DuckPGQSQL::Identifier(property);
+				bool present = false;
+				for (auto &column : columns) {
+					present = present || column == definition;
+				}
+				if (!present) {
+					columns.push_back(definition);
+				}
 			}
 		};
 		for (auto &table : graph.vertex_tables) {
@@ -77,6 +132,7 @@ struct ElementRelationRewriter {
 
 	ClientContext &context;
 	vector<std::pair<string, const PropertyGraphTable *>> tables;
+	unordered_map<string, vector<string>> properties;
 
 	//! catalog.schema.name the way DuckDB binds the reference (a lone qualifier names a catalog if one is attached under
 	//! that name), so that differently spelled references to one table compare equal.
@@ -95,6 +151,10 @@ struct ElementRelationRewriter {
 		}
 		return StringUtil::Lower(catalog.GetIdentifierName() + "." + schema.GetIdentifierName() + "." +
 		                         name.GetIdentifierName());
+	}
+
+	const vector<string> &Properties(const PropertyGraphTable &table) {
+		return properties[Resolve(table.catalog_name, table.schema_name, table.table_name)];
 	}
 
 	const PropertyGraphTable *Find(const BaseTableRef &ref) {
@@ -143,8 +203,8 @@ struct ElementRelationRewriter {
 				return;
 			}
 			auto alias = base.alias.empty() ? table->table_name : base.alias;
-			auto relation = DuckPGQSQL::ParseSubqueryRef(PGQElementRelations::RelationSQL(*table), PGQStr(alias),
-			                                            "element relation");
+			auto relation = DuckPGQSQL::ParseSubqueryRef(
+			    PGQElementRelations::RelationSQL(*table, Properties(*table)), PGQStr(alias), "element relation");
 			relation->column_name_alias = std::move(base.column_name_alias);
 			relation->sample = std::move(base.sample);
 			ref = std::move(relation);
@@ -240,6 +300,7 @@ void PGQElementRelations::Apply(ClientContext &context, const CreatePropertyGrap
 	if (!Needs(graph)) {
 		return;
 	}
+
 	ElementRelationRewriter rewriter(context, graph);
 	rewriter.Rewrite(ref);
 }
