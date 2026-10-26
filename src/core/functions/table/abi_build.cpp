@@ -454,19 +454,25 @@ private:
 		       TableSql(vertex_table) + ")";
 	}
 
+	//! Read through the planner's own connection, as the row estimates are: a catalog lookup on the calling context
+	//! would open a transaction on the edge's catalog in the calling statement, which a DuckLake over SQLite cannot
+	//! have while the build's connection commits there (CallerHoldsSQLiteLake).
 	LogicalType ColumnTypeOf(const PropertyGraphTable &table, const string &column) {
-		try {
-			const string catalog = PGQStr(table.catalog_name).empty() ? PGQStr(DatabaseManager::GetDefaultDatabase(context))
-			                                                          : PGQStr(table.catalog_name);
-			const string schema = PGQStr(table.schema_name).empty() ? string(DEFAULT_SCHEMA) : PGQStr(table.schema_name);
-			auto entry = Catalog::GetEntry<TableCatalogEntry>(
-			    context, QualifiedName(Identifier(catalog), Identifier(schema), table.table_name), OnEntryNotFound::RETURN_NULL);
-			if (entry && entry->ColumnExists(Identifier(column))) {
-				return entry->GetColumn(Identifier(column)).Type();
-			}
-		} catch (...) {
+		const auto key = TableSql(table) + "|" + column;
+		auto cached = column_types.find(key);
+		if (cached != column_types.end()) {
+			return cached->second;
 		}
-		return LogicalType::INVALID;
+		LogicalType type = LogicalType::INVALID;
+		if (!estimate_connection) {
+			estimate_connection = make_uniq<Connection>(*context.db);
+		}
+		auto result = estimate_connection->Query("SELECT " + Ident(column) + " FROM " + TableSql(table) + " LIMIT 0");
+		if (result && !result->HasError() && result->ColumnCount() == 1) {
+			type = result->GetTypes()[0];
+		}
+		column_types[key] = type;
+		return type;
 	}
 
 	static string EdgeHash(const AbiEdge &edge, const string &alias) {
@@ -1013,6 +1019,7 @@ private:
 	bool is_ducklake = false;
 	PGQAbiPlan plan;
 	unique_ptr<Connection> estimate_connection;
+	case_insensitive_map_t<LogicalType> column_types;
 	case_insensitive_map_t<string> snapshot_cache;
 	bool catalog_columns_loaded = false;
 	case_insensitive_set_t catalog_columns;
