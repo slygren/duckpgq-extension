@@ -235,6 +235,7 @@ else by its text (`path_length(p)`, `(p.id + 1)`) -- on every route, ABI artifac
 | `v.prop`, `v.{a, b}` | a property; a struct of several (`struct_pack(a := v.a, b := v.b)`) |
 | `v.link.prop`, `v.link.{a, b}` | a property of the vertex a single-valued link points to, when the graph's ABI catalog declares that link |
 | `element_id(x)`, `label(x)` | element id (the row id; for an undirected edge the edge's own row); label as declared in `CREATE PROPERTY GRAPH` (a table with sub-labels reports its main label). `label(x) = 'Person'` is case-sensitive; `IS LABELED` is not |
+| `labels(x)` | every label of the element, in declaration order and declared case: its table's label, then each discriminator sub-label the row has (`[Member, Student]`) |
 | `x IS [NOT] LABELED L` | label test; for a discriminator sub-label (`LABEL Member IN kind (Student, Teacher)`) the row's own bit |
 | `SAME(a, b, …)`, `ALL_DIFFERENT(a, b, …)` | all arguments are the same element / no two are. An element is its table and its row, so elements of two tables (a vertex and an edge, a `Person` and a `Course` with the same row id) are never the same |
 | `PROPERTY_EXISTS(a, p)` | whether element `a` has property `p` as the graph declares its table's properties (an alias in `PROPERTIES (c AS p)` names the property; `NO PROPERTIES` has none). A name no table of the graph has as a property is an error, which catches a misspelt name |
@@ -247,7 +248,7 @@ else by its text (`path_length(p)`, `(p.id + 1)`) -- on every route, ABI artifac
 | `cost(p)` | total cost of an `ANY`/`ALL CHEAPEST` path, its steps' costs added in path order: BIGINT for integer costs, DOUBLE for any other number (DECIMAL included). For a constant `COST c` (the pattern is then `SHORTEST`), `c` added once per step |
 | `path_tree_json(…)`, `graph_tree_json(…)` | nest paths into a JSON tree |
 
-The element functions and predicates (`element_id`, `label`, `IS [NOT] LABELED`, `SAME`, `ALL_DIFFERENT`,
+The element functions and predicates (`element_id`, `label`, `labels`, `IS [NOT] LABELED`, `SAME`, `ALL_DIFFERENT`,
 `PROPERTY_EXISTS`, `IS SOURCE OF`, `IS DESTINATION OF`) can stand anywhere an expression can: nested in other
 expressions (`NOT`, `CASE`, function arguments), in `COLUMNS`, in an element `WHERE`, in the `WHERE` of an
 `EXISTS { }` pattern and of a `UNION` branch. Of an `OPTIONAL MATCH` element that matched nothing they are NULL, so

@@ -38,6 +38,11 @@ static unique_ptr<FunctionData> ElementPropertyBind(BindScalarFunctionInput &) {
 	throw BinderException("PROPERTY_EXISTS is only allowed inside a GRAPH_TABLE, on an element variable of its MATCH");
 }
 
+// labels(a) lists the labels of graph element a; the MATCH expansion answers it.
+static unique_ptr<FunctionData> ElementLabelsBind(BindScalarFunctionInput &) {
+	throw BinderException("labels() is only allowed inside a GRAPH_TABLE, on an element variable of its MATCH");
+}
+
 //------------------------------------------------------------------------------
 // Register functions
 //------------------------------------------------------------------------------
@@ -46,6 +51,9 @@ void CoreScalarFunctions::RegisterGraphPredicateScalarFunctions(ExtensionLoader 
 		loader.RegisterFunction(Fallible(ScalarFunction(name, {LogicalType::ANY, LogicalType::VARCHAR}, LogicalType::BOOLEAN,
 		                                       LabelPredicateFunction, LabelPredicateBind)));
 	}
+	loader.RegisterFunction(Fallible(ScalarFunction("labels", {LogicalType::ANY},
+	                                                LogicalType::LIST(LogicalType::VARCHAR), ElementComparisonFunction,
+	                                                ElementLabelsBind)));
 	loader.RegisterFunction(Fallible(ScalarFunction("property_exists", {LogicalType::ANY, LogicalType::ANY},
 	                                                LogicalType::BOOLEAN, ElementComparisonFunction,
 	                                                ElementPropertyBind)));

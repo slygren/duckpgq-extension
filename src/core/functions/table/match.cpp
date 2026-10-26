@@ -2524,6 +2524,34 @@ static unique_ptr<ParsedExpression> RewriteElementFunction(FunctionExpression &f
 		}
 		return NullWhereElementNull(scope, variable, ConstantExpression::FromValue(Value(PGQStr(table->main_label))));
 	}
+	if (name == "labels" && argument_count == 1) {
+		auto variable = ElementArgument(function, 0);
+		auto table = table_of(variable);
+		if (!table) {
+			return nullptr;
+		}
+		if (scope.stubs && scope.stubs->count(variable)) {
+			throw BinderException("labels(%s) cannot be resolved: '%s' has no label in the pattern and the edge reaching "
+			                      "it does not determine one. Give it a label in the pattern",
+			                      variable, variable);
+		}
+		// The main label, then each discriminator sub-label the row has, in declaration order and declared case.
+		unique_ptr<ParsedExpression> result = ConstantExpression::FromValue(
+		    Value::LIST(LogicalType::VARCHAR, {Value(PGQStr(table->main_label))}));
+		for (auto &sub_label : table->sub_labels) {
+			auto has = make_uniq<CaseExpression>();
+			CaseCheck check;
+			check.when_expr = MakeSingleLabelCond(PGQStr(sub_label), table, variable);
+			check.then_expr = ConstantExpression::FromValue(Value::LIST(LogicalType::VARCHAR, {Value(PGQStr(sub_label))}));
+			has->CaseChecksMutable().push_back(std::move(check));
+			has->ElseMutable() = ConstantExpression::FromValue(Value::LIST(LogicalType::VARCHAR, vector<Value>()));
+			vector<unique_ptr<ParsedExpression>> arguments;
+			arguments.push_back(std::move(result));
+			arguments.push_back(std::move(has));
+			result = make_uniq<FunctionExpression>("list_concat", std::move(arguments));
+		}
+		return NullWhereElementNull(scope, variable, std::move(result));
+	}
 	if ((name == "is_labeled" || name == "not_labeled") && argument_count == 2) {
 		auto variable = ElementArgument(function, 0);
 		auto table = table_of(variable);

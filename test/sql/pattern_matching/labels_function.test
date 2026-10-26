@@ -1,0 +1,112 @@
+# name: test/sql/pattern_matching/labels_function.test
+# description: labels(x): every label of the element, in declaration order and declared case -- the table's label,
+#              then each discriminator sub-label the row has. label(x) stays the table's label. In COLUMNS and
+#              WHERE, nested, NULL for an OPTIONAL element that matched nothing, per repetition for a group variable;
+#              traversed and with ABI artifacts built.
+# group: [pattern_matching]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+# kind is a bit mask over the sub-labels: 1 Student, 2 Teacher, 3 both, 0 neither
+statement ok
+CREATE TABLE S(id BIGINT PRIMARY KEY, kind INTEGER);
+
+statement ok
+INSERT INTO S VALUES (1, 1), (2, 2), (3, 3), (4, 0);
+
+statement ok
+CREATE TABLE F(a BIGINT, b BIGINT, how INTEGER);
+
+statement ok
+INSERT INTO F VALUES (1, 2, 1), (2, 3, 2), (3, 4, 0), (4, 1, 3);
+
+statement ok
+CREATE TABLE D(did BIGINT PRIMARY KEY);
+
+statement ok
+INSERT INTO D VALUES (1);
+
+statement ok
+CREATE TABLE H(sid BIGINT, did BIGINT);
+
+statement ok
+INSERT INTO H VALUES (1, 1), (3, 1);
+
+statement ok
+CREATE PROPERTY GRAPH g
+VERTEX TABLES (S LABEL Member IN kind (Student, Teacher), D LABEL dept)
+EDGE TABLES (F SOURCE KEY (a) REFERENCES S (id) DESTINATION KEY (b) REFERENCES S (id) LABEL Follows IN how (Mentors, Likes),
+             H SOURCE KEY (sid) REFERENCES S (id) DESTINATION KEY (did) REFERENCES D (did) LABEL MemberOf);
+
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+loop pass 0 2
+
+query III
+FROM GRAPH_TABLE (g MATCH (m:Member) COLUMNS (m.id, labels(m) AS l, label(m) AS one)) ORDER BY ALL;
+----
+1	[Member, Student]	Member
+2	[Member, Teacher]	Member
+3	[Member, Student, Teacher]	Member
+4	[Member]	Member
+
+# an edge's labels, and a table without sub-labels (declared case kept)
+query IIII
+FROM GRAPH_TABLE (g MATCH (m:Member)-[f:Follows]->(n:Member) COLUMNS (m.id, n.id, labels(f) AS l, len(labels(n)) AS k)) ORDER BY ALL;
+----
+1	2	[Follows, Mentors]	2
+2	3	[Follows, Likes]	3
+3	4	[Follows]	1
+4	1	[Follows, Mentors, Likes]	2
+
+query II
+FROM GRAPH_TABLE (g MATCH (m:Member)-[h:MemberOf]->(d:dept) COLUMNS (m.id, labels(d) AS l)) ORDER BY ALL;
+----
+1	[dept]
+3	[dept]
+
+# in WHERE, against IS LABELED
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH (m:Member)
+    WHERE list_contains(labels(m), 'Teacher') <> (m IS LABELED Teacher) COLUMNS (m.id));
+----
+0
+
+query I
+FROM GRAPH_TABLE (g MATCH (m:Member) WHERE list_contains(labels(m), 'Student') COLUMNS (m.id)) ORDER BY ALL;
+----
+1
+3
+
+# OPTIONAL MATCH: NULL where the element is missing
+query II
+FROM GRAPH_TABLE (g MATCH (m:Member) OPTIONAL MATCH (m)-[h:MemberOf]->(d:dept) COLUMNS (m.id, labels(d) AS l)) ORDER BY ALL;
+----
+1	[dept]
+2	NULL
+3	[dept]
+4	NULL
+
+# a group variable: the labels of each repetition's element
+query II
+FROM GRAPH_TABLE (g MATCH (a:Member WHERE a.id = 1) ((x:Member)-[f:Follows]->(y:Member)){2,2} (b:Member)
+                  COLUMNS (b.id, labels(y) AS l));
+----
+3	[[Member, Teacher], [Member, Student, Teacher]]
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('g', exclude_self_referential := false, max_hops := 2);
+
+endloop
+
+statement error
+SELECT labels(1);
+----
+only allowed inside a GRAPH_TABLE
