@@ -1,4 +1,6 @@
 #include "duckdb/common/vector_operations/vector_operations.hpp"
+#include "duckdb/common/operator/multiply.hpp"
+#include "duckdb/common/vector_operations/binary_executor.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckpgq/common.hpp"
@@ -292,30 +294,75 @@ static void CheapestPathFunction(DataChunk &args, ExpressionState &state, Vector
 	call.state.csr_to_delete.insert(call.csr_id);
 }
 
-//! Every simple path from src to dst whose cost is the least: the paths of the tight edges, those on which
-//! dist[v] + w = dist[n], walked back from dst. A zero-cost cycle makes the tight edges cyclic, which is why each path
-//! keeps track of the vertices it holds.
+//! The edges that can lie on a cheapest path into each vertex. BIGINT: the tight ones, dist[v] + w = dist[n]. DOUBLE:
+//! a path whose prefix is not the cheapest to its vertex can still tie the least cost once rounded (0.2 + 0.1 then
+//! + 0.7 is 1.0, as 0.3 + 0.7 is), so also those within a relative 1e-9 of tight; the walk then checks each path.
+template <class T>
+static bool MayLieOnCheapest(T candidate, T dist) {
+	return candidate == dist;
+}
+
+template <>
+bool MayLieOnCheapest(double candidate, double dist) {
+	return candidate <= dist + dist * 1e-9;
+}
+
+//! The most the prefix up to a step's start may cost, given the most the prefix up to its end may: exact for BIGINT,
+//! with a slack far above one addition's rounding for DOUBLE.
+template <class T>
+static bool PrefixBudget(T budget, T weight, T &prefix_budget) {
+	prefix_budget = budget - weight;
+	return prefix_budget >= 0;
+}
+
+template <>
+bool PrefixBudget(double budget, double weight, double &prefix_budget) {
+	prefix_budget = (budget - weight) + budget * 1e-12;
+	return prefix_budget >= 0;
+}
+
+struct CheapestInEdge {
+	int64_t from;
+	int64_t edge_id;
+	idx_t position;
+};
+
+//! Every simple path from src to dst whose cost is the least: walked back from dst over the edges that may lie on one
+//! (MayLieOnCheapest) whose start is cheap enough for the rest of the path (PrefixBudget), each path kept if its cost
+//! added from src is the least. For BIGINT costs that is the walk over the tight edges. A zero-cost cycle makes those
+//! edges cyclic, which is why each path keeps track of the vertices it holds.
 template <class T>
 static void AllCheapestPaths(ClientContext &context, const CSR &csr, const vector<T> &weights,
                              const CheapestSearch<T> &search, idx_t lane, int64_t v_size,
-                             const vector<vector<pair<int64_t, int64_t>>> &tight_in, int64_t src, int64_t dst,
+                             const vector<vector<CheapestInEdge>> &tight_in, int64_t src, int64_t dst,
                              vector<Value> &paths) {
 	if (src == dst) {
 		paths.push_back(Value::LIST(LogicalType::BIGINT, {Value::BIGINT(src)}));
 		return;
 	}
-	if (search.Dist(dst, lane) == CheapestSearch<T>::Unreached()) {
+	const T least = search.Dist(dst, lane);
+	if (least == CheapestSearch<T>::Unreached()) {
 		return;
 	}
 	vector<bool> on_path(static_cast<idx_t>(v_size), false);
 	vector<int64_t> current {dst};
+	vector<T> costs; // the cost of each step, from dst back
 	on_path[static_cast<idx_t>(dst)] = true;
 	idx_t steps = 0;
-	std::function<void(int64_t)> walk = [&](int64_t vertex) {
+	std::function<void(int64_t, T)> walk = [&](int64_t vertex, T budget) {
 		if (++steps % 4096 == 0) {
 			context.BlockingInterruptCheck();
 		}
 		if (vertex == src) {
+			T total = 0;
+			for (auto it = costs.rbegin(); it != costs.rend(); ++it) {
+				if (!AddCost(total, *it, total)) {
+					return;
+				}
+			}
+			if (total != least) {
+				return;
+			}
 			vector<Value> path;
 			for (auto it = current.rbegin(); it != current.rend(); ++it) {
 				path.push_back(Value::BIGINT(*it));
@@ -324,21 +371,27 @@ static void AllCheapestPaths(ClientContext &context, const CSR &csr, const vecto
 			return;
 		}
 		for (auto &edge : tight_in[static_cast<idx_t>(vertex)]) {
-			auto previous = edge.first;
+			auto previous = edge.from;
 			if (on_path[static_cast<idx_t>(previous)]) {
 				continue;
 			}
+			const T weight = weights[edge.position];
+			T prefix_budget;
+			if (!PrefixBudget(budget, weight, prefix_budget) || search.Dist(previous, lane) > prefix_budget) {
+				continue;
+			}
 			on_path[static_cast<idx_t>(previous)] = true;
-			current.push_back(edge.second);
+			current.push_back(edge.edge_id);
 			current.push_back(previous);
-			walk(previous);
+			costs.push_back(weight);
+			walk(previous, prefix_budget);
+			costs.pop_back();
 			current.pop_back();
 			current.pop_back();
 			on_path[static_cast<idx_t>(previous)] = false;
 		}
 	};
-	walk(dst);
-	(void)weights;
+	walk(dst, least);
 	(void)csr;
 }
 
@@ -353,7 +406,7 @@ static void AllCheapestPathRows(ClientContext &context, DataChunk &args, Cheapes
 		CheapestSearch<T> search;
 		Search(context, call.csr, weights, call.v_size, rows.batch_sources[batch], false, search);
 		// The tight edges into each vertex, per lane that has rows, built once per lane.
-		vector<vector<vector<pair<int64_t, int64_t>>>> tight_in(search.lanes);
+		vector<vector<vector<CheapestInEdge>>> tight_in(search.lanes);
 		vector<bool> built(search.lanes, false);
 		for (auto &entry : rows.batch_rows[batch]) {
 			auto lane = entry.second;
@@ -369,9 +422,9 @@ static void AllCheapestPathRows(ClientContext &context, DataChunk &args, Cheapes
 						auto n = call.csr.e[static_cast<idx_t>(position)];
 						T candidate;
 						if (AddCost(v_dist, weights[static_cast<idx_t>(position)], candidate) &&
-						    candidate == search.Dist(n, lane)) {
-							tight_in[lane][static_cast<idx_t>(n)].emplace_back(
-							    v, call.csr.edge_ids[static_cast<idx_t>(position)]);
+						    MayLieOnCheapest(candidate, search.Dist(n, lane))) {
+							tight_in[lane][static_cast<idx_t>(n)].push_back(
+							    {v, call.csr.edge_ids[static_cast<idx_t>(position)], static_cast<idx_t>(position)});
 						}
 					}
 				}
@@ -464,6 +517,38 @@ static void CostZeroResolveTypes(ResolveScalarFunctionTypesInput &input) {
 	input.GetBoundFunction().SetReturnType(PGQCostType(input.GetArgumentType(0)));
 }
 
+//! pgq_repeat_cost(c, n): the cost of a path of n steps that each cost c, added left to right as the searches add
+//! the costs of a path (for DOUBLE, n additions; for BIGINT, overflow is an error). NULL n (no path) gives NULL.
+static void RepeatCostFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	if (result.GetType().id() == LogicalTypeId::BIGINT) {
+		BinaryExecutor::Execute<int64_t, int64_t, int64_t>(args.data[0], args.data[1], result, args.size(),
+		                                                   [](int64_t cost, int64_t steps) {
+			                                                   int64_t total = 0;
+			                                                   if (steps > 0 && !TryMultiplyOperator::Operation(
+			                                                                        cost, steps, total)) {
+				                                                   throw ConstraintException(
+				                                                       "A CHEAPEST path cost exceeds the BIGINT range");
+			                                                   }
+			                                                   return total;
+		                                                   });
+		return;
+	}
+	BinaryExecutor::Execute<double, int64_t, double>(args.data[0], args.data[1], result, args.size(),
+	                                                 [](double cost, int64_t steps) {
+		                                                 double total = 0;
+		                                                 for (int64_t i = 0; i < steps; i++) {
+			                                                 total += cost;
+		                                                 }
+		                                                 return total;
+	                                                 });
+}
+
+static void RepeatCostResolveTypes(ResolveScalarFunctionTypesInput &input) {
+	auto type = PGQCostType(input.GetArgumentType(0));
+	input.GetBoundFunction().GetArguments()[0] = type;
+	input.GetBoundFunction().SetReturnType(type);
+}
+
 } // namespace
 
 //------------------------------------------------------------------------------
@@ -501,6 +586,12 @@ void CoreScalarFunctions::RegisterCheapestPathLengthScalarFunction(ExtensionLoad
 	// It refuses some inputs, so the optimizer must not evaluate it on rows the query does not produce.
 	cost.SetFallible();
 	loader.RegisterFunction(cost);
+
+	ScalarFunction repeat("pgq_repeat_cost", {LogicalType::ANY, LogicalType::BIGINT}, LogicalType::BIGINT,
+	                      RepeatCostFunction);
+	repeat.SetResolveTypesCallback(RepeatCostResolveTypes);
+	repeat.SetFallible();
+	loader.RegisterFunction(repeat);
 
 	ScalarFunction zero("pgq_cost_zero", {LogicalType::ANY}, LogicalType::BIGINT, CostZeroFunction);
 	zero.SetResolveTypesCallback(CostZeroResolveTypes);

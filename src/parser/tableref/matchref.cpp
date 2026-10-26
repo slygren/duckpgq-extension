@@ -66,7 +66,7 @@ bool MatchExpression::Equals(const BaseExpression &other_p) const {
 
 	if (path_patterns.size() != other.path_patterns.size() ||
 	    optional_match_patterns.size() != other.optional_match_patterns.size() ||
-	    union_matches.size() != other.union_matches.size()) {
+	    joined_patterns.size() != other.joined_patterns.size() || union_matches.size() != other.union_matches.size()) {
 		return false;
 	}
 	if (one_row_per != other.one_row_per || one_row_per_vars != other.one_row_per_vars ||
@@ -139,6 +139,10 @@ unique_ptr<ParsedExpression> MatchExpression::Copy() const {
 			group_copy.push_back(path->Copy());
 		}
 		copy->optional_match_patterns.push_back(std::move(group_copy));
+	}
+
+	for (auto &path : joined_patterns) {
+		copy->joined_patterns.push_back(path->Copy());
 	}
 
 	for (auto &column : column_list) {

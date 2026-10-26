@@ -1,6 +1,11 @@
 # name: test/sql/path_finding/optional_cheapest.test
-# description: ANY / ALL CHEAPEST as the pattern of an OPTIONAL MATCH is refused (not yet verified on every route)
+# description: ANY / ALL CHEAPEST as the pattern of an OPTIONAL MATCH, against the LEFT JOIN of the same CHEAPEST MATCH
 # group: [path_finding]
+
+# SQL/PGQ's OPTIONAL MATCH extends each row by every match of its group that agrees on the shared variables, or keeps
+# it once with NULLs. So each form below must equal the LEFT JOIN of the vertices with the same pattern matched on its
+# own (whose paths cheapest_paths.test checks against brute force). Both sides are materialised first: two similar
+# GRAPH_TABLEs in one statement can be merged wrongly by DuckDB's common_subplan optimizer.
 
 require duckpgq
 
@@ -8,13 +13,13 @@ statement ok
 SET active_grammar_extensions = ['duckpgq'];
 
 statement ok
-CREATE TABLE P(id BIGINT PRIMARY KEY);
+CREATE TABLE P(id BIGINT PRIMARY KEY, f BIGINT);
 
 statement ok
 CREATE TABLE K(src BIGINT, dst BIGINT, w DOUBLE);
 
 statement ok
-INSERT INTO P VALUES (1), (2), (3), (4), (5), (6);
+INSERT INTO P VALUES (1, 1), (2, 2), (3, 1), (4, 2), (5, 1), (6, 2);
 
 statement ok
 INSERT INTO K VALUES (1, 2, 5), (1, 2, 1), (2, 3, 1), (1, 3, 3), (3, 4, 1), (2, 4, 4), (4, 1, 2), (2, 1, 1), (3, 5, 2);
@@ -23,83 +28,310 @@ statement ok
 CREATE PROPERTY GRAPH g VERTEX TABLES (P LABEL P)
 EDGE TABLES (K SOURCE KEY (src) REFERENCES P (id) DESTINATION KEY (dst) REFERENCES P (id) LABEL K);
 
-# The form that returned every path instead of the cheapest per pair on one build
-statement error
+# ANY CHEAPEST (a)-[e:K COST e.w]->{1,3}(b:P)
+statement ok
+CREATE TABLE ref0 AS SELECT m.id AS a, o.b FROM P m
+LEFT JOIN (FROM GRAPH_TABLE (g MATCH ANY CHEAPEST (a:P)-[e:K COST e.w]->{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b))) o ON o.a = m.id;
+
+statement ok
+CREATE TABLE opt0 AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH ANY CHEAPEST (a)-[e:K COST e.w]->{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+query III
+SELECT (SELECT count(*) FROM (FROM opt0 EXCEPT ALL FROM ref0)), (SELECT count(*) FROM (FROM ref0 EXCEPT ALL FROM opt0)),
+       (SELECT count(*) FROM opt0) > 6;
+----
+0	0	true
+
+# ALL CHEAPEST (a)-[e:K COST e.w]->{1,3}(b:P)
+statement ok
+CREATE TABLE ref1 AS SELECT m.id AS a, o.b FROM P m
+LEFT JOIN (FROM GRAPH_TABLE (g MATCH ALL CHEAPEST (a:P)-[e:K COST e.w]->{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b))) o ON o.a = m.id;
+
+statement ok
+CREATE TABLE opt1 AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH ALL CHEAPEST (a)-[e:K COST e.w]->{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+query III
+SELECT (SELECT count(*) FROM (FROM opt1 EXCEPT ALL FROM ref1)), (SELECT count(*) FROM (FROM ref1 EXCEPT ALL FROM opt1)),
+       (SELECT count(*) FROM opt1) > 6;
+----
+0	0	true
+
+# ANY CHEAPEST (a)-[e:K COST e.w]->+(b:P)
+statement ok
+CREATE TABLE ref2 AS SELECT m.id AS a, o.b FROM P m
+LEFT JOIN (FROM GRAPH_TABLE (g MATCH ANY CHEAPEST (a:P)-[e:K COST e.w]->+(b:P) COLUMNS (a.id AS a, b.id AS b))) o ON o.a = m.id;
+
+statement ok
+CREATE TABLE opt2 AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH ANY CHEAPEST (a)-[e:K COST e.w]->+(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+query III
+SELECT (SELECT count(*) FROM (FROM opt2 EXCEPT ALL FROM ref2)), (SELECT count(*) FROM (FROM ref2 EXCEPT ALL FROM opt2)),
+       (SELECT count(*) FROM opt2) > 6;
+----
+0	0	true
+
+# ALL CHEAPEST (a)-[e:K COST e.w]->*(b:P)
+statement ok
+CREATE TABLE ref3 AS SELECT m.id AS a, o.b FROM P m
+LEFT JOIN (FROM GRAPH_TABLE (g MATCH ALL CHEAPEST (a:P)-[e:K COST e.w]->*(b:P) COLUMNS (a.id AS a, b.id AS b))) o ON o.a = m.id;
+
+statement ok
+CREATE TABLE opt3 AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH ALL CHEAPEST (a)-[e:K COST e.w]->*(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+query III
+SELECT (SELECT count(*) FROM (FROM opt3 EXCEPT ALL FROM ref3)), (SELECT count(*) FROM (FROM ref3 EXCEPT ALL FROM opt3)),
+       (SELECT count(*) FROM opt3) > 6;
+----
+0	0	true
+
+# ANY CHEAPEST (a)<-[e:K COST e.w DEFAULT 1]-{2,3}(b:P)
+statement ok
+CREATE TABLE ref4 AS SELECT m.id AS a, o.b FROM P m
+LEFT JOIN (FROM GRAPH_TABLE (g MATCH ANY CHEAPEST (a:P)<-[e:K COST e.w DEFAULT 1]-{2,3}(b:P) COLUMNS (a.id AS a, b.id AS b))) o ON o.a = m.id;
+
+statement ok
+CREATE TABLE opt4 AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH ANY CHEAPEST (a)<-[e:K COST e.w DEFAULT 1]-{2,3}(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+query III
+SELECT (SELECT count(*) FROM (FROM opt4 EXCEPT ALL FROM ref4)), (SELECT count(*) FROM (FROM ref4 EXCEPT ALL FROM opt4)),
+       (SELECT count(*) FROM opt4) > 6;
+----
+0	0	true
+
+# ANY CHEAPEST (a)-[e:K COST e.w]-{1,2}(b:P)
+statement ok
+CREATE TABLE ref5 AS SELECT m.id AS a, o.b FROM P m
+LEFT JOIN (FROM GRAPH_TABLE (g MATCH ANY CHEAPEST (a:P)-[e:K COST e.w]-{1,2}(b:P) COLUMNS (a.id AS a, b.id AS b))) o ON o.a = m.id;
+
+statement ok
+CREATE TABLE opt5 AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH ANY CHEAPEST (a)-[e:K COST e.w]-{1,2}(b:P) COLUMNS (a.id AS a, b.id AS b));
+
+query III
+SELECT (SELECT count(*) FROM (FROM opt5 EXCEPT ALL FROM ref5)), (SELECT count(*) FROM (FROM ref5 EXCEPT ALL FROM opt5)),
+       (SELECT count(*) FROM opt5) > 6;
+----
+0	0	true
+
+# p = ANY CHEAPEST (a)-[e:K COST e.w]->+(b:P)
+statement ok
+CREATE TABLE ref6 AS SELECT m.id AS a, o.b, o.c, o.vs, o.es, o.len FROM P m
+LEFT JOIN (FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:P)-[e:K COST e.w]->+(b:P) COLUMNS (a.id AS a, b.id AS b, COST(p) AS c, vertices(p) AS vs, edges(p) AS es, path_length(p) AS len))) o ON o.a = m.id;
+
+statement ok
+CREATE TABLE opt6 AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = ANY CHEAPEST (a)-[e:K COST e.w]->+(b:P) COLUMNS (a.id AS a, b.id AS b, COST(p) AS c, vertices(p) AS vs, edges(p) AS es, path_length(p) AS len));
+
+query III
+SELECT (SELECT count(*) FROM (FROM opt6 EXCEPT ALL FROM ref6)), (SELECT count(*) FROM (FROM ref6 EXCEPT ALL FROM opt6)),
+       (SELECT count(*) FROM opt6) > 6;
+----
+0	0	true
+
+# p = ALL CHEAPEST (a)-[e:K COST e.w]->{1,3}(b:P)
+statement ok
+CREATE TABLE ref7 AS SELECT m.id AS a, o.b, o.c, o.vs, o.es, o.len FROM P m
+LEFT JOIN (FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:P)-[e:K COST e.w]->{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b, COST(p) AS c, vertices(p) AS vs, edges(p) AS es, path_length(p) AS len))) o ON o.a = m.id;
+
+statement ok
+CREATE TABLE opt7 AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = ALL CHEAPEST (a)-[e:K COST e.w]->{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b, COST(p) AS c, vertices(p) AS vs, edges(p) AS es, path_length(p) AS len));
+
+query III
+SELECT (SELECT count(*) FROM (FROM opt7 EXCEPT ALL FROM ref7)), (SELECT count(*) FROM (FROM ref7 EXCEPT ALL FROM opt7)),
+       (SELECT count(*) FROM opt7) > 6;
+----
+0	0	true
+
+# p = ANY CHEAPEST (a)-[e:K COST 1]->{1,3}(b:P)
+statement ok
+CREATE TABLE ref8 AS SELECT m.id AS a, o.b, o.c, o.vs, o.es, o.len FROM P m
+LEFT JOIN (FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:P)-[e:K COST 1]->{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b, COST(p) AS c, vertices(p) AS vs, edges(p) AS es, path_length(p) AS len))) o ON o.a = m.id;
+
+statement ok
+CREATE TABLE opt8 AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = ANY CHEAPEST (a)-[e:K COST 1]->{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b, COST(p) AS c, vertices(p) AS vs, edges(p) AS es, path_length(p) AS len));
+
+query III
+SELECT (SELECT count(*) FROM (FROM opt8 EXCEPT ALL FROM ref8)), (SELECT count(*) FROM (FROM ref8 EXCEPT ALL FROM opt8)),
+       (SELECT count(*) FROM opt8) > 6;
+----
+0	0	true
+
+# p = ALL CHEAPEST (a)<-[e:K COST e.w]-+(b:P)
+statement ok
+CREATE TABLE ref9 AS SELECT m.id AS a, o.b, o.c, o.vs, o.es, o.len FROM P m
+LEFT JOIN (FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:P)<-[e:K COST e.w]-+(b:P) COLUMNS (a.id AS a, b.id AS b, COST(p) AS c, vertices(p) AS vs, edges(p) AS es, path_length(p) AS len))) o ON o.a = m.id;
+
+statement ok
+CREATE TABLE opt9 AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = ALL CHEAPEST (a)<-[e:K COST e.w]-+(b:P) COLUMNS (a.id AS a, b.id AS b, COST(p) AS c, vertices(p) AS vs, edges(p) AS es, path_length(p) AS len));
+
+query III
+SELECT (SELECT count(*) FROM (FROM opt9 EXCEPT ALL FROM ref9)), (SELECT count(*) FROM (FROM ref9 EXCEPT ALL FROM opt9)),
+       (SELECT count(*) FROM opt9) > 6;
+----
+0	0	true
+
+# p = ALL CHEAPEST (a)-[e:K COST e.w]-+(b:P)
+statement ok
+CREATE TABLE ref10 AS SELECT m.id AS a, o.b, o.c, o.vs, o.es, o.len FROM P m
+LEFT JOIN (FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:P)-[e:K COST e.w]-+(b:P) COLUMNS (a.id AS a, b.id AS b, COST(p) AS c, vertices(p) AS vs, edges(p) AS es, path_length(p) AS len))) o ON o.a = m.id;
+
+statement ok
+CREATE TABLE opt10 AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = ALL CHEAPEST (a)-[e:K COST e.w]-+(b:P) COLUMNS (a.id AS a, b.id AS b, COST(p) AS c, vertices(p) AS vs, edges(p) AS es, path_length(p) AS len));
+
+query III
+SELECT (SELECT count(*) FROM (FROM opt10 EXCEPT ALL FROM ref10)), (SELECT count(*) FROM (FROM ref10 EXCEPT ALL FROM opt10)),
+       (SELECT count(*) FROM opt10) > 6;
+----
+0	0	true
+
+# p = ANY CHEAPEST (a)-[e:K COST e.w]->{2,}(b:P)
+statement ok
+CREATE TABLE ref11 AS SELECT m.id AS a, o.b, o.c, o.vs, o.es, o.len FROM P m
+LEFT JOIN (FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:P)-[e:K COST e.w]->{2,}(b:P) COLUMNS (a.id AS a, b.id AS b, COST(p) AS c, vertices(p) AS vs, edges(p) AS es, path_length(p) AS len))) o ON o.a = m.id;
+
+statement ok
+CREATE TABLE opt11 AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = ANY CHEAPEST (a)-[e:K COST e.w]->{2,}(b:P) COLUMNS (a.id AS a, b.id AS b, COST(p) AS c, vertices(p) AS vs, edges(p) AS es, path_length(p) AS len));
+
+query III
+SELECT (SELECT count(*) FROM (FROM opt11 EXCEPT ALL FROM ref11)), (SELECT count(*) FROM (FROM ref11 EXCEPT ALL FROM opt11)),
+       (SELECT count(*) FROM opt11) > 6;
+----
+0	0	true
+
+# p = ALL CHEAPEST (a)-[e:K WHERE e.w < 4 COST e.w]->+(b:P)
+statement ok
+CREATE TABLE ref12 AS SELECT m.id AS a, o.b, o.c, o.vs, o.es, o.len FROM P m
+LEFT JOIN (FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:P)-[e:K WHERE e.w < 4 COST e.w]->+(b:P) COLUMNS (a.id AS a, b.id AS b, COST(p) AS c, vertices(p) AS vs, edges(p) AS es, path_length(p) AS len))) o ON o.a = m.id;
+
+statement ok
+CREATE TABLE opt12 AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = ALL CHEAPEST (a)-[e:K WHERE e.w < 4 COST e.w]->+(b:P) COLUMNS (a.id AS a, b.id AS b, COST(p) AS c, vertices(p) AS vs, edges(p) AS es, path_length(p) AS len));
+
+query III
+SELECT (SELECT count(*) FROM (FROM opt12 EXCEPT ALL FROM ref12)), (SELECT count(*) FROM (FROM ref12 EXCEPT ALL FROM opt12)),
+       (SELECT count(*) FROM opt12) > 6;
+----
+0	0	true
+
+# p = ANY CHEAPEST (a)-[e:K COST e.w * a.f]->+(b:P)
+statement ok
+CREATE TABLE ref13 AS SELECT m.id AS a, o.b, o.c, o.vs, o.es, o.len FROM P m
+LEFT JOIN (FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:P)-[e:K COST e.w * a.f]->+(b:P) COLUMNS (a.id AS a, b.id AS b, COST(p) AS c, vertices(p) AS vs, edges(p) AS es, path_length(p) AS len))) o ON o.a = m.id;
+
+statement ok
+CREATE TABLE opt13 AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = ANY CHEAPEST (a)-[e:K COST e.w * a.f]->+(b:P) COLUMNS (a.id AS a, b.id AS b, COST(p) AS c, vertices(p) AS vs, edges(p) AS es, path_length(p) AS len));
+
+query III
+SELECT (SELECT count(*) FROM (FROM opt13 EXCEPT ALL FROM ref13)), (SELECT count(*) FROM (FROM ref13 EXCEPT ALL FROM opt13)),
+       (SELECT count(*) FROM opt13) > 6;
+----
+0	0	true
+
+# The form that returned every path instead of the cheapest per pair on one build: one row per destination
+query II rowsort
 FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH ANY CHEAPEST (a)-[e:K COST e.w]->{1,3}(b:P) WHERE a.id = 1
     COLUMNS (a.id AS a, b.id AS b));
 ----
-ANY CHEAPEST / ALL CHEAPEST is not supported in an OPTIONAL MATCH pattern yet
+1	2
+1	3
+1	4
+1	5
 
-statement error
-FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH ALL CHEAPEST (a)-[e:K COST e.w]->{1,3}(b:P)
-    COLUMNS (a.id AS a, b.id AS b));
+# A vertex without a path keeps one row of NULLs
+query IIIT
+FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = ANY CHEAPEST (a)-[e:K COST e.w]->+(b:P) WHERE a.id IN (5, 6)
+    COLUMNS (a.id AS a, b.id AS b, COST(p) AS c, vertices(p) AS vs)) ORDER BY a;
 ----
-ANY CHEAPEST / ALL CHEAPEST is not supported in an OPTIONAL MATCH pattern yet
+5	NULL	NULL	NULL
+6	NULL	NULL	NULL
 
-statement error
-FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH ANY CHEAPEST (a)-[e:K COST e.w]->+(b:P)
-    COLUMNS (a.id AS a, b.id AS b));
+# COST(p) in the WHERE filters the extended rows (NULL where there is no path)
+query IIR rowsort
+FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = ANY CHEAPEST (a)-[e:K COST e.w]->+(b:P) WHERE COST(p) < 2
+    COLUMNS (a.id AS a, b.id AS b, COST(p) AS c));
 ----
-ANY CHEAPEST / ALL CHEAPEST is not supported in an OPTIONAL MATCH pattern yet
+1	2	1.0
+2	1	1.0
+2	3	1.0
+3	4	1.0
 
-statement error
-FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH ALL CHEAPEST (a)-[e:K COST e.w]->*(b:P)
-    COLUMNS (a.id AS a, b.id AS b));
+# Both ends bound: the cheapest path between them, or NULLs (1 reaches 2 in two steps or more only through 1 again)
+query IIR rowsort
+FROM GRAPH_TABLE (g MATCH (a:P), (b:P) OPTIONAL MATCH p = ANY CHEAPEST (a)-[e:K COST e.w]->{2,}(b)
+    WHERE a.id = 1 AND b.id IN (2, 3, 6) COLUMNS (a.id AS a, b.id AS b, COST(p) AS c));
 ----
-ANY CHEAPEST / ALL CHEAPEST is not supported in an OPTIONAL MATCH pattern yet
+1	2	NULL
+1	3	2.0
+1	6	NULL
 
-statement error
-FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH ANY CHEAPEST (a)<-[e:K COST e.w DEFAULT 1]-{2,3}(b:P)
-    COLUMNS (a.id AS a, b.id AS b));
+# Two OPTIONAL groups, one of them CHEAPEST
+statement ok
+CREATE TABLE two_opt AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH (a)-[f:K]->(c:P)
+    OPTIONAL MATCH p = ANY CHEAPEST (a)-[e:K COST e.w]->{1,2}(b:P) COLUMNS (a.id AS a, c.id AS c, b.id AS b, COST(p) AS cost));
+
+statement ok
+CREATE TABLE two_ref AS SELECT m.id AS a, h.c, o.b, o.cost FROM P m
+LEFT JOIN (FROM GRAPH_TABLE (g MATCH (a:P)-[f:K]->(c:P) COLUMNS (a.id AS a, c.id AS c))) h ON h.a = m.id
+LEFT JOIN (FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:P)-[e:K COST e.w]->{1,2}(b:P) COLUMNS (a.id AS a, b.id AS b, COST(p) AS cost))) o
+    ON o.a = m.id;
+
+query II
+SELECT (SELECT count(*) FROM (FROM two_opt EXCEPT ALL FROM two_ref)), (SELECT count(*) FROM (FROM two_ref EXCEPT ALL FROM two_opt));
 ----
-ANY CHEAPEST / ALL CHEAPEST is not supported in an OPTIONAL MATCH pattern yet
+0	0
 
-statement error
-FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH ANY CHEAPEST (a)-[e:K COST e.w]-{1,2}(b:P)
-    COLUMNS (a.id AS a, b.id AS b));
-----
-ANY CHEAPEST / ALL CHEAPEST is not supported in an OPTIONAL MATCH pattern yet
-
-# With path functions and COST(p)
-statement error
-FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = ANY CHEAPEST (a)-[e:K COST e.w]->+(b:P)
-    COLUMNS (a.id AS a, b.id AS b, cost(p) AS c));
-----
-ANY CHEAPEST / ALL CHEAPEST is not supported in an OPTIONAL MATCH pattern yet
-
-statement error
-FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = ALL CHEAPEST (a)-[e:K COST e.w]->{1,3}(b:P)
-    COLUMNS (a.id AS a, vertices(p) AS vs, edges(p) AS es, path_length(p) AS l));
-----
-ANY CHEAPEST / ALL CHEAPEST is not supported in an OPTIONAL MATCH pattern yet
-
-# A constant cost (CHEAPEST that is SHORTEST), a second optional group, a UNION branch
-statement error
-FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH ANY CHEAPEST (a)-[e:K COST 1]->{1,3}(b:P)
-    COLUMNS (a.id AS a, b.id AS b));
-----
-ANY CHEAPEST / ALL CHEAPEST is not supported in an OPTIONAL MATCH pattern yet
-
-statement error
-FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH (a)-[f:K]->(c:P) OPTIONAL MATCH ANY CHEAPEST (a)-[e:K COST e.w]->{1,2}(b:P)
-    COLUMNS (a.id AS a, b.id AS b));
-----
-ANY CHEAPEST / ALL CHEAPEST is not supported in an OPTIONAL MATCH pattern yet
-
-statement error
-FROM GRAPH_TABLE (g MATCH (a:P)-[f:K]->(c:P) COLUMNS (a.id AS a, c.id AS b)
+# A UNION branch with its own COLUMNS (it read the head's COLUMNS, and failed to bind b, on the base)
+statement ok
+CREATE TABLE union_opt AS FROM GRAPH_TABLE (g MATCH (a:P)-[f:K]->(c:P) COLUMNS (a.id AS a, c.id AS b)
     UNION ALL MATCH (a:P) OPTIONAL MATCH ANY CHEAPEST (a)-[e:K COST e.w]->{1,2}(b:P) COLUMNS (a.id AS a, b.id AS b));
-----
-ANY CHEAPEST / ALL CHEAPEST is not supported in an OPTIONAL MATCH pattern yet
 
-# A MATCH whose own pattern is a CHEAPEST search with a varying COST cannot have an OPTIONAL MATCH either
+statement ok
+CREATE TABLE union_ref AS SELECT src AS a, dst AS b FROM K UNION ALL SELECT m.id, o.b FROM P m
+LEFT JOIN (FROM GRAPH_TABLE (g MATCH ANY CHEAPEST (a:P)-[e:K COST e.w]->{1,2}(b:P) COLUMNS (a.id AS a, b.id AS b))) o ON o.a = m.id;
+
+query II
+SELECT (SELECT count(*) FROM (FROM union_opt EXCEPT ALL FROM union_ref)), (SELECT count(*) FROM (FROM union_ref EXCEPT ALL FROM union_opt));
+----
+0	0
+
+# A MATCH whose own pattern is CHEAPEST, with an OPTIONAL MATCH
+statement ok
+CREATE TABLE main_opt AS FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:P)-[e:K COST e.w]->+(b:P) OPTIONAL MATCH (b)-[f:K]->(c:P)
+    COLUMNS (a.id AS a, b.id AS b, COST(p) AS cost, vertices(p) AS vs, c.id AS c));
+
+statement ok
+CREATE TABLE main_ref AS SELECT m.*, h.c FROM
+    (FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:P)-[e:K COST e.w]->+(b:P) COLUMNS (a.id AS a, b.id AS b, COST(p) AS cost, vertices(p) AS vs))) m
+LEFT JOIN (FROM GRAPH_TABLE (g MATCH (b:P)-[f:K]->(c:P) COLUMNS (b.id AS b, c.id AS c))) h ON h.b = m.b;
+
+query III
+SELECT (SELECT count(*) FROM (FROM main_opt EXCEPT ALL FROM main_ref)), (SELECT count(*) FROM (FROM main_ref EXCEPT ALL FROM main_opt)),
+       (SELECT count(*) FROM main_opt) > 0;
+----
+0	0	true
+
+# The path itself (not a path function of it) is still not carried out of an OPTIONAL MATCH
 statement error
-FROM GRAPH_TABLE (g MATCH ANY CHEAPEST (a:P)-[e:K COST e.w]->+(b:P) OPTIONAL MATCH (b)-[f:K]->(c:P) COLUMNS (a.id AS a));
+FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = ANY CHEAPEST (a)-[e:K COST e.w]->+(b:P) COLUMNS (a.id AS a, p));
 ----
-not supported with OPTIONAL
+cannot be used in COLUMNS or WHERE yet
 
-# The same CHEAPEST as a MATCH of its own still answers
-query I
-SELECT count(*) FROM GRAPH_TABLE (g MATCH ANY CHEAPEST (a:P)-[e:K COST e.w]->{1,3}(b:P) WHERE a.id = 1 COLUMNS (b.id AS b));
+# With ABI artifacts built: the constant COST may read them inside the group, a varying one is searched; same rows
+statement ok
+FROM pgq_abi_build('g', exclude_self_referential := false, closures := ['K']);
+
+statement ok
+CREATE TABLE opt_abi8 AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = ANY CHEAPEST (a)-[e:K COST 1]->{1,3}(b:P)
+    COLUMNS (a.id AS a, b.id AS b, COST(p) AS c, vertices(p) AS vs, edges(p) AS es, path_length(p) AS len));
+
+query II
+SELECT (SELECT count(*) FROM (SELECT a, b, c, len FROM opt_abi8 EXCEPT ALL SELECT a, b, c, len FROM ref8)),
+       (SELECT count(*) FROM (SELECT a, b, c, len FROM ref8 EXCEPT ALL SELECT a, b, c, len FROM opt_abi8));
 ----
-4
+0	0
+
+statement ok
+CREATE TABLE opt_abi7 AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = ALL CHEAPEST (a)-[e:K COST e.w]->{1,3}(b:P)
+    COLUMNS (a.id AS a, b.id AS b, COST(p) AS c, vertices(p) AS vs, edges(p) AS es, path_length(p) AS len));
+
+query II
+SELECT (SELECT count(*) FROM (FROM opt_abi7 EXCEPT ALL FROM ref7)), (SELECT count(*) FROM (FROM ref7 EXCEPT ALL FROM opt_abi7));
+----
+0	0

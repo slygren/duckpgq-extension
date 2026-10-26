@@ -319,6 +319,813 @@ FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->{1,3}(b
 ----
 [2, 3, 4]	[Person, Person, Person]	[Link, Link]
 
+# ── COST(p) in the MATCH's WHERE filters the chosen paths, as a filter outside the GRAPH_TABLE does ──────────────
+# The WHERE outside the path pattern applies after the selector: the cheapest path is chosen first, then kept or not.
+
+# Unbounded ANY, COST(p) alone (the cost search) and with the path (the materialised path)
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person) WHERE COST(p) > 3
+        COLUMNS (a.id AS src, b.id AS dst)))
+    EXCEPT ALL (SELECT src, dst FROM any_w WHERE cost > 3));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person)
+            WHERE COST(p) > 3 COLUMNS (a.id)))
+     = (SELECT count(*) FROM any_w WHERE cost > 3) AND (SELECT count(*) FROM any_w WHERE cost > 3) > 0;
+----
+true
+
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person) WHERE COST(p) <= 3 AND a.id < 6
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost)))
+    EXCEPT (SELECT src, dst, vs, es, cost FROM cheapest_by('w', 1, 99) WHERE cost <= 3 AND src < 6));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person)
+            WHERE COST(p) <= 3 AND a.id < 6 COLUMNS (vertices(p))))
+     = (SELECT count(*) FROM any_w WHERE cost <= 3 AND src < 6);
+----
+true
+
+# ALL, unbounded and bounded, integer and DOUBLE costs
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person) WHERE COST(p) = 3
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost)))
+    EXCEPT ALL (SELECT src, dst, vs, es, cost FROM all_w WHERE cost = 3));
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT src, dst, vs, es, cost FROM all_w WHERE cost = 3)
+    EXCEPT ALL (FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person) WHERE COST(p) = 3
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost))));
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT src, dst, vs, es, cost FROM all_b WHERE cost BETWEEN 3 AND 5)
+    EXCEPT ALL (FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST e.w]->{2,3}(b:Person)
+        WHERE COST(p) BETWEEN 3 AND 5
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost))));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST e.w]->{2,3}(b:Person)
+            WHERE COST(p) BETWEEN 3 AND 5 COLUMNS (a.id)))
+     = (SELECT count(*) FROM all_b WHERE cost BETWEEN 3 AND 5);
+----
+true
+
+# DOUBLE costs compare as the search sums them (0.1 + 0.2 > 0.3)
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.d]->{1,2}(b:Person) WHERE COST(p) > 0.3
+        COLUMNS (a.id AS src, b.id AS dst, COST(p) AS cost)))
+    EXCEPT ALL (SELECT src, dst, cost FROM any_b WHERE cost > 0.3));
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT src, dst, cost FROM any_b WHERE cost > 0.3)
+    EXCEPT ALL (FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.d]->{1,2}(b:Person) WHERE COST(p) > 0.3
+        COLUMNS (a.id AS src, b.id AS dst, COST(p) AS cost))));
+----
+0
+
+# Inside an expression, OR-ed with an endpoint predicate, and next to the source's seed
+query II rowsort
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person)
+    WHERE a.id = 0 AND (COST(p) * 2 > 12 OR b.id = 1) COLUMNS (b.id, COST(p)));
+----
+1	2
+5	7
+
+# With ONE ROW PER, the path functions and COST(p) describe each row's path (they read the steps' own path)
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person) ONE ROW PER VERTEX (v)
+        COLUMNS (a.id AS src, b.id AS dst, v.id AS v, vertices(p) AS vs, COST(p) AS cost, path_length(p) AS len)))
+    EXCEPT ALL (SELECT src, dst, unnest(vs) AS v, vs, cost, len(vs) - 1 FROM all_w));
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT src, dst, unnest(es) AS x, es, cost FROM all_b)
+    EXCEPT ALL (FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST e.w]->{2,3}(b:Person) ONE ROW PER EDGE (x)
+        COLUMNS (a.id AS src, b.id AS dst, x.rowid AS x, edges(p) AS es, COST(p) AS cost))));
+----
+0
+
+# With ONE ROW PER: the filter keeps whole paths
+query I
+SELECT (SELECT count(*) FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person)
+            ONE ROW PER VERTEX (v) WHERE COST(p) = 3 COLUMNS (v.id)))
+     = (SELECT sum(len(vs)) FROM all_w WHERE cost = 3);
+----
+true
+
+# ── A constant COST: the shortest paths, and COST(p) is the constant added once per step ─────────────────────────
+# The paths of ANY / ALL SHORTEST within the bounds, per pair; for DOUBLE the steps are added left to right.
+
+statement ok
+CREATE MACRO shortest_by(lo, hi) AS TABLE
+SELECT src, dst, vs, es, depth FROM every_path WHERE depth BETWEEN lo AND hi
+QUALIFY depth = min(depth) OVER (PARTITION BY src, dst);
+
+statement ok
+CREATE MACRO repeated(c, n) AS CASE WHEN n = 0 THEN 0 * c ELSE list_reduce(list_transform(range(n), lambda x: c), lambda l, r: l + r) END;
+
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST 2]->{2,3}(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost)))
+    EXCEPT ALL (SELECT src, dst, vs, es, 2 * depth FROM shortest_by(2, 3)));
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT src, dst, vs, es, 2 * depth FROM shortest_by(2, 3))
+    EXCEPT ALL (FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST 2]->{2,3}(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost))));
+----
+0
+
+# ANY: one of the shortest per pair, at its cost
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 0.1]->{2,}(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost)))
+    EXCEPT (SELECT src, dst, vs, es, repeated(0.1::DOUBLE, depth) FROM shortest_by(2, 99)));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 0.1]->{2,}(b:Person)
+            COLUMNS (COST(p))))
+     = (SELECT count(DISTINCT (src, dst)) FROM shortest_by(2, 99));
+----
+true
+
+query T
+SELECT DISTINCT typeof(c) FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 0.1]->{2,}(b:Person)
+    COLUMNS (COST(p) AS c));
+----
+DOUBLE
+
+# Left-directed and undirected, bounded and not, the empty path for *
+query I
+SELECT count(*) FROM (
+    (SELECT src, dst, list_reverse(vs), list_reverse(es), cost FROM GRAPH_TABLE (g MATCH
+        p = ALL CHEAPEST (a:Person)<-[e:Link COST 3]-+(b:Person)
+        COLUMNS (b.id AS src, a.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost)))
+    EXCEPT ALL (SELECT src, dst, vs, es, 3 * depth FROM shortest_by(1, 99)));
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT src, dst, vs, es, 3 * depth FROM shortest_by(1, 99))
+    EXCEPT ALL (SELECT src, dst, list_reverse(vs), list_reverse(es), cost FROM GRAPH_TABLE (g MATCH
+        p = ALL CHEAPEST (a:Person)<-[e:Link COST 3]-+(b:Person)
+        COLUMNS (b.id AS src, a.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost))));
+----
+0
+
+statement ok
+CREATE TABLE undirected_shortest AS
+WITH RECURSIVE both_ways AS (SELECT rowid AS eid, src, dst FROM link UNION ALL SELECT rowid, dst, src FROM link),
+paths(src, dst, depth, vs, es) AS (
+    SELECT id, id, 0, [id], []::BIGINT[] FROM person
+    UNION ALL
+    SELECT p.src, l.dst, p.depth + 1, list_append(p.vs, l.dst), list_append(p.es, l.eid)
+    FROM paths p JOIN both_ways l ON l.src = p.dst
+    WHERE NOT list_contains(p.vs, l.dst) AND p.depth < 2)
+SELECT src, dst, vs, es, depth FROM paths WHERE depth BETWEEN 1 AND 2
+QUALIFY depth = min(depth) OVER (PARTITION BY src, dst);
+
+statement ok
+CREATE TABLE undirected_constant AS FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST 0.5]-{1,2}(b:Person)
+    COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost));
+
+query I
+SELECT count(*) FROM (
+    (FROM undirected_constant)
+    EXCEPT ALL (SELECT src, dst, vs, es, repeated(0.5::DOUBLE, depth) FROM undirected_shortest));
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT src, dst, vs, es, repeated(0.5::DOUBLE, depth) FROM undirected_shortest)
+    EXCEPT ALL (FROM undirected_constant));
+----
+0
+
+query II
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 4]->*(b:Person) WHERE a.id = 9 COLUMNS (b.id, COST(p)));
+----
+9	0
+
+# In the WHERE, and with ONE ROW PER
+query II rowsort
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 2]->{1,3}(b:Person) WHERE a.id = 0 AND COST(p) > 2
+    COLUMNS (b.id, COST(p)));
+----
+3	4
+4	4
+
+query I
+SELECT (SELECT count(*) FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST 2]->{2,3}(b:Person)
+            ONE ROW PER VERTEX (v) COLUMNS (v.id, COST(p))))
+     = (SELECT sum(depth + 1) FROM shortest_by(2, 3));
+----
+true
+
+# ── The search by cost: <- and - without an upper bound, a lower bound above 1, an element WHERE ─────────────────
+# Each against the brute force: the cheapest simple paths within the bounds, per pair.
+
+# Left-directed without an upper bound: the right-directed paths, read from the other end
+statement ok
+CREATE TABLE left_u AS SELECT src, dst, list_reverse(vs) AS vs, list_reverse(es) AS es, cost
+FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)<-[e:Link COST e.w]-+(b:Person)
+    COLUMNS (b.id AS src, a.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost));
+
+query I
+SELECT count(*) FROM (SELECT * FROM left_u EXCEPT ALL SELECT src, dst, vs, es, cost FROM cheapest_by('w', 1, 99));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT src, dst, vs, es, cost FROM cheapest_by('w', 1, 99) EXCEPT ALL SELECT * FROM left_u);
+----
+0
+
+# DOUBLE costs are added in path order, which for <- runs against the stored direction: a brute force over the
+# reversed edges, summing from the path's start
+statement ok
+CREATE TABLE every_left_path AS
+WITH RECURSIVE paths(src, dst, depth, vs, es, d) AS (
+    SELECT id, id, 0, [id], []::BIGINT[], 0::DOUBLE FROM person
+    UNION ALL
+    SELECT p.src, l.src, p.depth + 1, list_append(p.vs, l.src), list_append(p.es, l.rowid), p.d + l.d
+    FROM paths p JOIN link l ON l.dst = p.dst
+    WHERE NOT list_contains(p.vs, l.src))
+FROM paths;
+
+statement ok
+CREATE MACRO cheapest_left(lo, hi) AS TABLE
+SELECT src, dst, vs, es, d AS cost FROM every_left_path WHERE depth BETWEEN lo AND hi
+QUALIFY d = min(d) OVER (PARTITION BY src, dst);
+
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)<-[e:Link COST e.d]-*(b:Person) WHERE b.id <> a.id
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost)))
+    EXCEPT (FROM cheapest_left(1, 99)));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM GRAPH_TABLE (g MATCH ANY CHEAPEST (a:Person)<-[e:Link COST e.d]-+(b:Person) COLUMNS (a.id)))
+     = (SELECT count(DISTINCT (src, dst)) FROM cheapest_left(1, 99));
+----
+true
+
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)<-[e:Link COST e.d]-{2,}(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost)))
+    EXCEPT ALL (FROM cheapest_left(2, 99)));
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (FROM cheapest_left(2, 99))
+    EXCEPT ALL (FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)<-[e:Link COST e.d]-{2,}(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost))));
+----
+0
+
+# The empty path for *, and only for *
+query II rowsort
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)<-[e:Link COST e.w]-*(b:Person) WHERE a.id = 9 COLUMNS (b.id, COST(p)));
+----
+9	0
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH ANY CHEAPEST (a:Person)<-[e:Link COST e.w]-+(b:Person) WHERE a.id = b.id COLUMNS (a.id));
+----
+0
+
+# Undirected without an upper bound
+statement ok
+CREATE TABLE undirected_every AS
+WITH RECURSIVE both_ways AS (SELECT rowid AS eid, src, dst, w, d FROM link UNION ALL SELECT rowid, dst, src, w, d FROM link WHERE src <> dst),
+paths(src, dst, depth, vs, es, w, d) AS (
+    SELECT id, id, 0, [id], []::BIGINT[], 0::BIGINT, 0::DOUBLE FROM person
+    UNION ALL
+    SELECT p.src, l.dst, p.depth + 1, list_append(p.vs, l.dst), list_append(p.es, l.eid), p.w + l.w, p.d + l.d
+    FROM paths p JOIN both_ways l ON l.src = p.dst
+    WHERE NOT list_contains(p.vs, l.dst))
+FROM paths;
+
+statement ok
+CREATE TABLE undirected_all AS FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST e.w]-+(b:Person)
+    COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost));
+
+query I
+SELECT count(*) FROM (
+    (FROM undirected_all)
+    EXCEPT ALL (SELECT src, dst, vs, es, w FROM undirected_every WHERE depth > 0 QUALIFY w = min(w) OVER (PARTITION BY src, dst)));
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT src, dst, vs, es, w FROM undirected_every WHERE depth > 0 QUALIFY w = min(w) OVER (PARTITION BY src, dst))
+    EXCEPT ALL (FROM undirected_all));
+----
+0
+
+statement ok
+CREATE TABLE undirected_any AS FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.d]-+(b:Person)
+    COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost));
+
+query I
+SELECT count(*) FROM (
+    (FROM undirected_any)
+    EXCEPT (SELECT src, dst, vs, es, d FROM undirected_every WHERE depth > 0 QUALIFY d = min(d) OVER (PARTITION BY src, dst)));
+----
+0
+
+query I
+SELECT count(*) = count(DISTINCT (src, dst)) AND count(*) = (SELECT count(DISTINCT (src, dst)) FROM undirected_every WHERE depth > 0)
+FROM undirected_any;
+----
+true
+
+# A lower bound above 1 without an upper bound: the cheapest path of at least that many steps, not the cheapest one
+statement ok
+CREATE TABLE all_l3 AS FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST e.w]->{3,}(b:Person)
+    COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost));
+
+query I
+SELECT count(*) FROM (SELECT * FROM all_l3 EXCEPT ALL SELECT src, dst, vs, es, cost FROM cheapest_by('w', 3, 99));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT src, dst, vs, es, cost FROM cheapest_by('w', 3, 99) EXCEPT ALL SELECT * FROM all_l3);
+----
+0
+
+statement ok
+CREATE TABLE any_l2 AS FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.d]->{2,}(b:Person)
+    COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost));
+
+query I
+SELECT count(*) FROM (SELECT * FROM any_l2 EXCEPT SELECT src, dst, vs, es, cost FROM cheapest_by('d', 2, 99));
+----
+0
+
+query I
+SELECT count(*) = count(DISTINCT (src, dst)) AND count(*) = (SELECT count(DISTINCT (src, dst)) FROM cheapest_by('d', 2, 99))
+FROM any_l2;
+----
+true
+
+# 0 -> 1 costs 2 directly, but in at least three steps 0-2-... has no way back to 1 under 4: the cheapest is 0-2-3-...
+query II
+SELECT count(*), min(cost) FROM all_l3 WHERE src = 0 AND dst = 1;
+----
+0	NULL
+
+# Seeded destinations take the search's A* order; it answers what the unseeded search does for them
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST e.w]->{3,}(b:Person) WHERE b.id IN (3, 5)
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost)))
+    EXCEPT ALL (SELECT * FROM all_l3 WHERE dst IN (3, 5)));
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM all_l3 WHERE dst IN (3, 5))
+    EXCEPT ALL (FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST e.w]->{3,}(b:Person) WHERE b.id IN (3, 5)
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost))));
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.d]->{2,}(b:Person) WHERE a.id = 0 AND b.id = 5
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost)))
+    EXCEPT (SELECT src, dst, vs, es, cost FROM cheapest_by('d', 2, 99) WHERE src = 0 AND dst = 5));
+----
+0
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.d]->{2,}(b:Person) WHERE a.id = 0 AND b.id = 5
+    COLUMNS (a.id));
+----
+1
+
+# Left-directed and undirected from a lower bound above 1
+query I
+SELECT count(*) FROM (
+    (SELECT src, dst, list_reverse(vs), list_reverse(es), cost FROM GRAPH_TABLE (g MATCH
+        p = ALL CHEAPEST (a:Person)<-[e:Link COST e.w]-{2,}(b:Person)
+        COLUMNS (b.id AS src, a.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost)))
+    EXCEPT ALL (SELECT src, dst, vs, es, cost FROM cheapest_by('w', 2, 99)));
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT src, dst, vs, es, w FROM undirected_every WHERE depth >= 3 QUALIFY w = min(w) OVER (PARTITION BY src, dst))
+    EXCEPT ALL (FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST e.w]-{3,}(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost))));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST e.w]-{3,}(b:Person) COLUMNS (a.id)))
+     = (SELECT count(*) FROM (SELECT src FROM undirected_every WHERE depth >= 3 QUALIFY w = min(w) OVER (PARTITION BY src, dst)));
+----
+true
+
+# An element WHERE on the costed edge filters its steps before the search: every path's edges pass it
+statement ok
+CREATE MACRO cheapest_where(cost_column, lo, hi, allowed) AS TABLE
+SELECT src, dst, vs, es, cost FROM (
+    SELECT src, dst, vs, es, CASE WHEN cost_column = 'w' THEN w ELSE d END AS cost FROM every_path
+    WHERE depth BETWEEN lo AND hi AND list_has_all(allowed, es))
+QUALIFY cost = min(cost) OVER (PARTITION BY src, dst);
+
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link WHERE e.d > 0.1 AND e.w <> 3 COST e.w]->+(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost)))
+    EXCEPT ALL (FROM cheapest_where('w', 1, 99, (SELECT list(rowid) FROM link WHERE d > 0.1 AND w <> 3))));
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (FROM cheapest_where('w', 1, 99, (SELECT list(rowid) FROM link WHERE d > 0.1 AND w <> 3)))
+    EXCEPT ALL (FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link WHERE e.d > 0.1 AND e.w <> 3 COST e.w]->+(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost))));
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (FROM cheapest_where('d', 2, 3, (SELECT list(rowid) FROM link WHERE w > 0)))
+    EXCEPT ALL (FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link WHERE e.w > 0 COST e.d]->{2,3}(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost))));
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link WHERE e.w > 0 COST e.d]->{2,3}(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost)))
+    EXCEPT ALL (FROM cheapest_where('d', 2, 3, (SELECT list(rowid) FROM link WHERE w > 0))));
+----
+0
+
+# A constant COST with an element WHERE: the shortest paths over the edges that pass it, searched by cost
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link WHERE e.w > 1 COST 2]->+(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost)))
+    EXCEPT ALL (SELECT src, dst, vs, es, 2 * depth FROM every_path
+                WHERE depth > 0 AND list_has_all((SELECT list(rowid) FROM link WHERE w > 1), es)
+                QUALIFY depth = min(depth) OVER (PARTITION BY src, dst)));
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT src, dst, vs, es, 2 * depth FROM every_path
+     WHERE depth > 0 AND list_has_all((SELECT list(rowid) FROM link WHERE w > 1), es)
+     QUALIFY depth = min(depth) OVER (PARTITION BY src, dst))
+    EXCEPT ALL (FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link WHERE e.w > 1 COST 2]->+(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost))));
+----
+0
+
+query I
+SELECT count(*) = count(DISTINCT (src, dst)) AND count(*) = (SELECT count(DISTINCT (src, dst)) FROM every_path
+    WHERE depth BETWEEN 1 AND 2 AND list_has_all((SELECT list(rowid) FROM link WHERE w > 1), es))
+FROM GRAPH_TABLE (g MATCH ANY CHEAPEST (a:Person)-[e:Link WHERE e.w > 1 COST 0.5]->{1,2}(b:Person) COLUMNS (a.id AS src, b.id AS dst));
+----
+true
+
+# The edges a WHERE excludes are not searched, nor costed (a NULL cost there is no error)
+query II rowsort
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link WHERE e.src < 6 COST CASE WHEN e.src < 6 THEN e.w END]->+(b:Person)
+    WHERE a.id = 6 OR b.id = 6 COLUMNS (a.id, b.id));
+----
+
+# Rows alone, ONE ROW PER, the label functions and the WHERE on COST(p) read the same search
+query I
+SELECT (SELECT count(*) FROM GRAPH_TABLE (g MATCH ALL CHEAPEST (a:Person)-[e:Link COST e.w]-+(b:Person) COLUMNS (a.id)))
+     = (SELECT count(*) FROM undirected_all);
+----
+true
+
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST e.w]-+(b:Person) ONE ROW PER VERTEX (v)
+        COLUMNS (a.id AS src, b.id AS dst, v.id AS v, vertices(p) AS vs, COST(p) AS cost)))
+    EXCEPT ALL (SELECT src, dst, unnest(vs), vs, cost FROM undirected_all));
+----
+0
+
+query TT
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->{3,}(b:Person) WHERE a.id = 2 AND b.id = 4
+    COLUMNS (vertex_labels(p), edge_labels(p)));
+----
+[Person, Person, Person, Person]	[Link, Link, Link]
+
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST e.w]->{3,}(b:Person) WHERE COST(p) >= 6
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost)))
+    EXCEPT ALL (SELECT * FROM all_l3 WHERE cost >= 6));
+----
+0
+
+# ── A COST or element WHERE that reads the pattern's endpoints: singletons, the same on every step ───────────────
+# Searched once per distinct value of what they read (a context); checked against the brute force per pair.
+
+statement ok
+CREATE TABLE factor(id BIGINT, f BIGINT, h DOUBLE);
+
+statement ok
+INSERT INTO factor SELECT id, 1 + id % 3, 0.25 * (id % 4) FROM person;
+
+statement ok
+CREATE TABLE every_costed_path AS
+WITH RECURSIVE paths(src, dst, depth, vs, es, ws, ds) AS (
+    SELECT id, id, 0, [id], []::BIGINT[], []::BIGINT[], []::DOUBLE[] FROM person
+    UNION ALL
+    SELECT p.src, l.dst, p.depth + 1, list_append(p.vs, l.dst), list_append(p.es, l.rowid), list_append(p.ws, l.w),
+           list_append(p.ds, l.d)
+    FROM paths p JOIN link l ON l.src = p.dst
+    WHERE NOT list_contains(p.vs, l.dst))
+SELECT p.*, fa.f AS af, fa.h AS ah, fb.f AS bf, fb.h AS bh FROM paths p JOIN factor fa ON fa.id = p.src JOIN factor fb ON fb.id = p.dst;
+
+statement ok
+CREATE TABLE person_f AS SELECT p.*, f.f, f.h FROM person p JOIN factor f USING (id) ORDER BY id;
+
+statement ok
+CREATE PROPERTY GRAPH gf VERTEX TABLES (person_f LABEL Person)
+EDGE TABLES (link SOURCE KEY (src) REFERENCES person_f (id) DESTINATION KEY (dst) REFERENCES person_f (id) LABEL Link);
+
+# COST e.w * a.f: each step costs its weight times the source's factor
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (gf MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST e.w * a.f]->+(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost)))
+    EXCEPT ALL (SELECT src, dst, vs, es, af * list_sum(ws) AS cost FROM every_costed_path WHERE depth > 0
+                QUALIFY cost = min(cost) OVER (PARTITION BY src, dst)));
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT src, dst, vs, es, af * list_sum(ws) AS cost FROM every_costed_path WHERE depth > 0
+     QUALIFY cost = min(cost) OVER (PARTITION BY src, dst))
+    EXCEPT ALL (FROM GRAPH_TABLE (gf MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST e.w * a.f]->+(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost))));
+----
+0
+
+# COST e.w + b.f within bounds: each step costs its weight plus the destination's factor
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (gf MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST e.w + b.f]->{1,3}(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost)))
+    EXCEPT ALL (SELECT src, dst, vs, es, list_sum(ws) + depth * bf AS cost FROM every_costed_path WHERE depth BETWEEN 1 AND 3
+                QUALIFY cost = min(cost) OVER (PARTITION BY src, dst)));
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT src, dst, vs, es, list_sum(ws) + depth * bf AS cost FROM every_costed_path WHERE depth BETWEEN 1 AND 3
+     QUALIFY cost = min(cost) OVER (PARTITION BY src, dst))
+    EXCEPT ALL (FROM GRAPH_TABLE (gf MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST e.w + b.f]->{1,3}(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost))));
+----
+0
+
+# Both endpoints, DOUBLE, from a lower bound above 1: the steps' costs added left to right
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (gf MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.d * a.f + b.h]->{2,}(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost)))
+    EXCEPT (SELECT src, dst, vs, es, list_reduce(list_transform(ds, lambda x: x * af + bh), lambda l, r: l + r) AS cost
+            FROM every_costed_path WHERE depth >= 2 QUALIFY cost = min(cost) OVER (PARTITION BY src, dst)));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM GRAPH_TABLE (gf MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.d * a.f + b.h]->{2,}(b:Person)
+            COLUMNS (a.id)))
+     = (SELECT count(DISTINCT (src, dst)) FROM every_costed_path WHERE depth >= 2);
+----
+true
+
+# An element WHERE reading the source: the steps each source may take
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (gf MATCH p = ALL CHEAPEST (a:Person)-[e:Link WHERE e.w <= a.f COST e.w]->+(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost)))
+    EXCEPT ALL (SELECT src, dst, vs, es, list_sum(ws) AS cost FROM every_costed_path WHERE depth > 0 AND list_max(ws) <= af
+                QUALIFY cost = min(cost) OVER (PARTITION BY src, dst)));
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (SELECT src, dst, vs, es, list_sum(ws) AS cost FROM every_costed_path WHERE depth > 0 AND list_max(ws) <= af
+     QUALIFY cost = min(cost) OVER (PARTITION BY src, dst))
+    EXCEPT ALL (FROM GRAPH_TABLE (gf MATCH p = ALL CHEAPEST (a:Person)-[e:Link WHERE e.w <= a.f COST e.w]->+(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost))));
+----
+0
+
+# Seeded: a source's own context only, and a seeded destination
+query IIT rowsort
+FROM GRAPH_TABLE (gf MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w * a.id]->+(b:Person) WHERE a.id = 1 AND b.id IN (0, 4)
+    COLUMNS (b.id, COST(p), vertices(p)));
+----
+0	6	[1, 3, 5, 0]
+4	4	[1, 3, 4]
+
+# Every source with its own context is a copy of the graph per source: past the budget, a clear error
+statement ok
+SET pgq_max_vl_fallback_rows = 100;
+
+statement error
+FROM GRAPH_TABLE (gf MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w * a.id]->+(b:Person) COLUMNS (COST(p)));
+----
+contexts of the graph exceed pgq_max_vl_fallback_rows
+
+statement ok
+RESET pgq_max_vl_fallback_rows;
+
+# Other variables stay out of a COST
+statement error
+FROM GRAPH_TABLE (gf MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w * c.f]->+(b:Person), (c:Person) COLUMNS (COST(p)));
+----
+may only read properties of its own edge
+
+# ── Several CHEAPEST patterns in one MATCH: each selected on its own, then joined on their shared variables ──────
+# Against the join of the same patterns matched one per GRAPH_TABLE (materialised first).
+
+statement ok
+CREATE TABLE two_w AS FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person)
+    COLUMNS (a.id AS a, b.id AS b, COST(p) AS cp, vertices(p) AS vp));
+
+statement ok
+CREATE TABLE two_d AS FROM GRAPH_TABLE (g MATCH q = ALL CHEAPEST (b:Person)-[f:Link COST f.d]->{1,3}(c:Person)
+    COLUMNS (b.id AS b, c.id AS c, COST(q) AS cq, edges(q) AS eq));
+
+# Different COSTs (and selectors, bounds), path functions of both
+statement ok
+CREATE TABLE two_both AS FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person),
+    q = ALL CHEAPEST (b)-[f:Link COST f.d]->{1,3}(c:Person)
+    COLUMNS (a.id AS a, b.id AS b, c.id AS c, COST(p) AS cp, vertices(p) AS vp, COST(q) AS cq, edges(q) AS eq));
+
+statement ok
+CREATE TABLE two_ref AS SELECT w.a, w.b, d.c, w.cp, w.vp, d.cq, d.eq FROM two_w w JOIN two_d d ON d.b = w.b;
+
+query III
+SELECT (SELECT count(*) FROM (FROM two_both EXCEPT ALL FROM two_ref)), (SELECT count(*) FROM (FROM two_ref EXCEPT ALL FROM two_both)),
+       (SELECT count(*) FROM two_both) > 0;
+----
+0	0	true
+
+# With the MATCH WHERE on both, which seeds each pattern
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person),
+        q = ALL CHEAPEST (b)-[f:Link COST f.d]->{1,3}(c:Person) WHERE a.id = 0 AND c.id = 5 AND COST(p) + COST(q) < 5
+        COLUMNS (a.id AS a, b.id AS b, c.id AS c, COST(p) AS cp, vertices(p) AS vp, COST(q) AS cq, edges(q) AS eq)))
+    EXCEPT ALL (SELECT * FROM two_ref WHERE a = 0 AND c = 5 AND cp + cq < 5));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person),
+            q = ALL CHEAPEST (b)-[f:Link COST f.d]->{1,3}(c:Person) WHERE a.id = 0 AND c.id = 5 AND COST(p) + COST(q) < 5
+            COLUMNS (a.id)))
+     = (SELECT count(*) FROM two_ref WHERE a = 0 AND c = 5 AND cp + cq < 5);
+----
+true
+
+# The same COST, but more than COST(p) of each (one path CTE per block): split too
+statement ok
+CREATE TABLE same_both AS FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person),
+    q = ANY CHEAPEST (b)-[f:Link COST f.w]->+(c:Person) COLUMNS (a.id AS a, b.id AS b, c.id AS c, vertices(p) AS vp, vertices(q) AS vq));
+
+query II
+SELECT (SELECT count(*) FROM (FROM same_both EXCEPT ALL SELECT w.a, w.b, v.b, w.vp, v.vp FROM two_w w JOIN two_w v ON v.a = w.b)),
+       (SELECT count(*) FROM (SELECT w.a, w.b, v.b, w.vp, v.vp FROM two_w w JOIN two_w v ON v.a = w.b EXCEPT ALL FROM same_both));
+----
+0	0
+
+# A CHEAPEST pattern next to another variable-length pattern
+statement ok
+CREATE TABLE next_vl AS FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person), (b)-[f:Link]->{1,2}(c:Person)
+    COLUMNS (a.id AS a, b.id AS b, c.id AS c, COST(p) AS cp));
+
+statement ok
+CREATE TABLE vl_only AS FROM GRAPH_TABLE (g MATCH (b:Person)-[f:Link]->{1,2}(c:Person) COLUMNS (b.id AS b, c.id AS c));
+
+query II
+SELECT (SELECT count(*) FROM (FROM next_vl EXCEPT ALL SELECT w.a, w.b, v.c, w.cp FROM two_w w JOIN vl_only v ON v.b = w.b)),
+       (SELECT count(*) FROM (SELECT w.a, w.b, v.c, w.cp FROM two_w w JOIN vl_only v ON v.b = w.b EXCEPT ALL FROM next_vl));
+----
+0	0
+
+# A constant COST(p) next to a varying one, and three patterns in a chain
+query II
+SELECT (SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person), q = ANY CHEAPEST (b)-[f:Link COST 1]->+(c:Person)
+        COLUMNS (a.id AS a, b.id AS b, c.id AS c, COST(p) AS cp, COST(q) AS cq)))
+    EXCEPT ALL (SELECT w.a, w.b, s.dst, w.cp, s.depth FROM two_w w JOIN shortest_by(1, 99) s ON s.src = w.b
+                QUALIFY row_number() OVER (PARTITION BY w.a, w.b, s.dst) = 1))),
+       (SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person), q = ANY CHEAPEST (b)-[f:Link COST f.d]->+(c:Person),
+        r = ANY CHEAPEST (c)-[h:Link COST h.w * 2]->+(d:Person) WHERE a.id = 0
+        COLUMNS (a.id AS a, b.id AS b, c.id AS c, d.id AS d, COST(p) AS cp, COST(r) AS cr)))
+    EXCEPT ALL (SELECT w.a, w.b, x.dst, v.b, w.cp, 2 * v.cp FROM two_w w JOIN any_d x ON x.src = w.b JOIN two_w v ON v.a = x.dst
+                WHERE w.a = 0)));
+----
+0	0
+
+# A search too large for pgq_max_vl_fallback_rows says so; one that runs too long is interrupted
+statement ok
+CREATE TABLE kv(id BIGINT);
+
+statement ok
+INSERT INTO kv SELECT i FROM range(13) r(i);
+
+statement ok
+CREATE TABLE ke(src BIGINT, dst BIGINT, w BIGINT);
+
+statement ok
+INSERT INTO ke SELECT a.id, b.id, 1 + (a.id * 7 + b.id * 3) % 5 FROM kv a, kv b WHERE a.id <> b.id;
+
+statement ok
+CREATE PROPERTY GRAPH complete VERTEX TABLES (kv LABEL V)
+EDGE TABLES (ke SOURCE KEY (src) REFERENCES kv (id) DESTINATION KEY (dst) REFERENCES kv (id) LABEL E);
+
+statement ok
+SET pgq_max_vl_fallback_rows = 1000;
+
+statement error
+SELECT count(*) FROM GRAPH_TABLE (complete MATCH ALL CHEAPEST (a:V)-[e:E COST e.w]->{12,}(b:V) COLUMNS (a.id));
+----
+exceeding pgq_max_vl_fallback_rows
+
+statement ok
+SET pgq_max_vl_fallback_rows = 0;
+
+statement ok
+SET max_execution_time = 500;
+
+statement error
+SELECT count(*) FROM GRAPH_TABLE (complete MATCH ALL CHEAPEST (a:V)-[e:E COST e.w]->{12,}(b:V) COLUMNS (a.id));
+----
+maximum execution time
+
+statement ok
+SET max_execution_time = 0;
+
+statement ok
+RESET pgq_max_vl_fallback_rows;
+
 # ── With ABI artifacts: a cost that varies is still searched by cost ───────────────────────────────────────────────
 
 statement ok
@@ -349,3 +1156,155 @@ SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MA
     (a:Person)-[e:Link COST 1]->{1,3}(b:Person) WHERE a.id = 0 COLUMNS (b.id))');
 ----
 match	true
+
+# COST(p) in the WHERE with artifacts present: still the search by cost
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person) WHERE COST(p) = 3
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost)))
+    EXCEPT ALL (SELECT src, dst, vs, es, cost FROM all_w WHERE cost = 3));
+----
+0
+
+query I
+SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+0
+
+# A constant COST(p) within bounds reads the path the artifact route answers, and agrees with the traversal
+query TT
+SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST
+    (a:Person)-[e:Link COST 2]->{1,3}(b:Person) WHERE a.id = 0 COLUMNS (b.id, COST(p)))');
+----
+match	true
+
+query II rowsort
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 2]->{1,3}(b:Person) WHERE a.id = 0 COLUMNS (b.id, COST(p)));
+----
+1	2
+2	2
+3	4
+4	4
+5	2
+
+# The search by cost with artifacts present: never an artifact, the same answers
+query I
+SELECT count(*) FROM (
+    (SELECT src, dst, list_reverse(vs), list_reverse(es), cost FROM GRAPH_TABLE (g MATCH
+        p = ALL CHEAPEST (a:Person)<-[e:Link COST e.w]-+(b:Person)
+        COLUMNS (b.id AS src, a.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost)))
+    EXCEPT ALL (SELECT * FROM left_u));
+----
+0
+
+query I
+SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+0
+
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST e.w]->{3,}(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, vertices(p) AS vs, edges(p) AS es, COST(p) AS cost)))
+    EXCEPT ALL (SELECT * FROM all_l3));
+----
+0
+
+# A pattern matched on its own shares its variables with an OPTIONAL MATCH group after it
+statement ok
+CREATE TABLE split_opt AS FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person),
+    q = ALL CHEAPEST (b)-[f:Link COST f.d]->{1,3}(c:Person) OPTIONAL MATCH (c)-[h:Link]->(d:Person) WHERE a.id = 0
+    COLUMNS (a.id AS a, b.id AS b, c.id AS c, d.id AS d, COST(q) AS cq));
+
+statement ok
+CREATE TABLE split_opt_ref AS SELECT r.a, r.b, r.c, l.dst AS d, r.cq FROM (SELECT * FROM two_ref WHERE a = 0) r
+LEFT JOIN link l ON l.src = r.c;
+
+query II
+SELECT (SELECT count(*) FROM (FROM split_opt EXCEPT ALL FROM split_opt_ref)), (SELECT count(*) FROM (FROM split_opt_ref EXCEPT ALL FROM split_opt));
+----
+0	0
+
+# COST(p) in COLUMNS shared by UNION blocks: each block's own p, its own search (a varying, a constant COST)
+query II
+SELECT (SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person)
+        UNION ALL MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 2]->{2,3}(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, COST(p) AS cost)))
+    EXCEPT ALL (SELECT src, dst, cost FROM any_w UNION ALL SELECT DISTINCT src, dst, 2 * depth FROM shortest_by(2, 3)))),
+       (SELECT count(*) FROM (
+    (SELECT src, dst, cost FROM any_w UNION ALL SELECT DISTINCT src, dst, 2 * depth FROM shortest_by(2, 3))
+    EXCEPT ALL (FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person)
+        UNION ALL MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 2]->{2,3}(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, COST(p) AS cost)))));
+----
+0	0
+
+query I
+SELECT (SELECT count(*) FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person)
+            UNION ALL MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST e.w]->{3,}(b:Person)
+            COLUMNS (a.id AS src, b.id AS dst, COST(p) AS cost, vertices(p) AS vs)))
+     = (SELECT count(*) FROM any_w) + (SELECT count(*) FROM all_l3);
+----
+true
+
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person) WHERE a.id < 6
+        UNION ALL MATCH p = ALL CHEAPEST (a:Person)-[e:Link COST e.w]->{3,}(b:Person)
+        COLUMNS (a.id AS src, b.id AS dst, COST(p) AS cost, vertices(p) AS vs, edges(p) AS es)))
+    EXCEPT ALL (SELECT src, dst, cost, vs, es FROM any_w WHERE src < 6 UNION ALL SELECT src, dst, cost, vs, es FROM all_l3));
+----
+0
+
+# ── DOUBLE ties that rounding makes: 0.2 + 0.1 is not 0.3, but 0.2 + 0.1 + 0.7 is 0.3 + 0.7 ───────────────────────
+# Both paths 9-7-5-1 and 9-5-1 cost 1.0 added left to right; ALL CHEAPEST returns both on every route.
+statement ok
+CREATE TABLE tv(id BIGINT);
+
+statement ok
+INSERT INTO tv SELECT i FROM range(10) r(i);
+
+statement ok
+CREATE TABLE te(src BIGINT, dst BIGINT, d DOUBLE);
+
+statement ok
+INSERT INTO te VALUES (9, 7, 0.2), (7, 5, 0.1), (9, 5, 0.3), (5, 1, 0.7);
+
+statement ok
+CREATE PROPERTY GRAPH tie VERTEX TABLES (tv LABEL V)
+EDGE TABLES (te SOURCE KEY (src) REFERENCES tv (id) DESTINATION KEY (dst) REFERENCES tv (id) LABEL E);
+
+query TR
+FROM GRAPH_TABLE (tie MATCH p = ALL CHEAPEST (a:V)-[e:E COST e.d]->+(b:V) WHERE a.id = 9 AND b.id = 1 COLUMNS (vertices(p), COST(p)))
+ORDER BY ALL;
+----
+[9, 5, 1]	1.0
+[9, 7, 5, 1]	1.0
+
+query TR
+FROM GRAPH_TABLE (tie MATCH p = ALL CHEAPEST (a:V)-[e:E COST e.d]-+(b:V) WHERE a.id = 9 AND b.id = 1 COLUMNS (vertices(p), COST(p)))
+ORDER BY ALL;
+----
+[9, 5, 1]	1.0
+[9, 7, 5, 1]	1.0
+
+query TR
+FROM GRAPH_TABLE (tie MATCH p = ALL CHEAPEST (a:V)-[e:E COST e.d]->{2,}(b:V) WHERE a.id = 9 AND b.id = 1 COLUMNS (vertices(p), COST(p)))
+ORDER BY ALL;
+----
+[9, 5, 1]	1.0
+[9, 7, 5, 1]	1.0
+
+query TR
+FROM GRAPH_TABLE (tie MATCH p = ALL CHEAPEST (a:V)-[e:E COST e.d]->{1,3}(b:V) WHERE a.id = 9 AND b.id = 1 COLUMNS (vertices(p), COST(p)))
+ORDER BY ALL;
+----
+[9, 5, 1]	1.0
+[9, 7, 5, 1]	1.0
+
+# and to 5, where they do not tie (0.3 against 0.30000000000000004)
+query T
+FROM GRAPH_TABLE (tie MATCH p = ALL CHEAPEST (a:V)-[e:E COST e.d]->+(b:V) WHERE a.id = 9 AND b.id = 5 COLUMNS (vertices(p)));
+----
+[9, 5]

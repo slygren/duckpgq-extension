@@ -128,10 +128,10 @@ put over DuckLake catalogs. A graph is stored in the database it is created in a
 | `(t) ((a)-[e:R]->(b) WHERE e.w > 1){1,3} (z)`, `[(a)-[e:R]->(b)]{1,3}`, `{n}`, `{,m}`, `?` | quantified path pattern: the parenthesized (or bracketed) body repeated, its optional `WHERE` per repetition; its variables are lists outside it (see [Quantified path patterns](#quantified-path-patterns)) |
 | `MATCH (t)-[:A]->(a), (t)-[:B]->(b)` | several patterns sharing a variable |
 | `MATCH p = …` | path variable |
-| `ANY SHORTEST`, `ALL SHORTEST`, `ANY CHEAPEST`, `ALL CHEAPEST` | path search; `COST expr [DEFAULT n]` on an edge gives its weight, a number (`DEFAULT` where `expr` is NULL). A NULL cost without `DEFAULT`, and a negative or non-finite one, is an error. CHEAPEST returns the path(s) of the least total cost within the quantifier's bounds (`ALL`: every tied path), and the path functions, `ONE ROW PER` and `cost(p)` all describe them |
+| `ANY SHORTEST`, `ALL SHORTEST`, `ANY CHEAPEST`, `ALL CHEAPEST` | path search; `COST expr [DEFAULT n]` on an edge gives its weight, a number (`DEFAULT` where `expr` is NULL). A NULL cost without `DEFAULT`, and a negative or non-finite one, is an error. CHEAPEST returns the path(s) of the least total cost within the quantifier's bounds (`ALL`: every tied path), in every direction, from any lower bound, and the path functions, `ONE ROW PER` and `cost(p)` (in `COLUMNS` and `WHERE`) all describe them. The `COST` and an element `WHERE` on the costed edge (which filters its steps) may read the edge and the pattern's two endpoints (see [CHEAPEST](#cheapest-paths)) |
 | `SHORTEST k` | the k shortest paths per endpoint pair (one quantified edge between two vertices); walks unless a path mode is given |
 | `WALK`, `TRAIL`, `SIMPLE`, `ACYCLIC` | path mode |
-| `OPTIONAL MATCH …` | the whole pattern left-joined onto the bindings so far (a row without a match keeps NULLs); any pattern a `MATCH` answers |
+| `OPTIONAL MATCH …` | the whole pattern left-joined onto the bindings so far (a row without a match keeps NULLs); any pattern a `MATCH` answers, `ANY`/`ALL CHEAPEST` included |
 | `WHERE EXISTS { (t)-[:HAS_WORKORDER]->() }`, `NOT EXISTS { … }` | correlated pattern existence |
 | `MATCH … UNION [ALL] MATCH … COLUMNS (…)` | several MATCH blocks sharing the final `COLUMNS` |
 | `MATCH … COLUMNS (…) UNION [ALL] MATCH … COLUMNS (…)` | each MATCH block with its own `COLUMNS`, combined by position as in a SQL `UNION` |
@@ -241,7 +241,7 @@ else by its text (`path_length(p)`, `(p.id + 1)`) -- on every route, ABI artifac
 | `g.x`, `element_id(g)`, `label(g)` of a group variable `g` (declared in a quantified path pattern, or on a quantified edge) | the list of its elements' values in repetition (path) order; `[]` for zero repetitions |
 | `SUM(g.x)`, `COUNT(g)`, `AVG`, `MIN`, `MAX`, `LIST(g.x)` over a group variable | the aggregate along the list, per match (horizontal aggregation); an aggregate over anything else in `COLUMNS` is over the rows |
 | `vertex_property(p, 'x')`, `edge_property(p, 'x')` | property `x` of every vertex / edge of path `p`, in path order (NULL where an element's table has no `x`), for aggregating along the path: `list_sum(edge_property(p, 'weight'))`, `list_avg`, `list_min`, `list_max`, `len`. In COLUMNS and WHERE, on every route that answers `vertices(p)` / `edges(p)`, ABI artifacts included; `edge_property` is traversed, like `edges(p)` |
-| `cost(p)` | total cost of an `ANY`/`ALL CHEAPEST` path: BIGINT for integer costs, DOUBLE for any other number (DECIMAL included) |
+| `cost(p)` | total cost of an `ANY`/`ALL CHEAPEST` path, its steps' costs added in path order: BIGINT for integer costs, DOUBLE for any other number (DECIMAL included). For a constant `COST c` (the pattern is then `SHORTEST`), `c` added once per step |
 | `path_tree_json(…)`, `graph_tree_json(…)` | nest paths into a JSON tree |
 
 Examples on a larger graph (the maintenance graph the ABI work was built for) are in
@@ -493,6 +493,35 @@ artifact applies. A pattern seeded on a few vertices searches once from each see
 that search (`ANY SHORTEST (t)-[:H]->+(x) WHERE t.id = …` over a 1M-vertex tree: 53 s before, 0.07 s now); many
 distinct sources at once share the lane search, 512 sources per pass.
 
+### CHEAPEST paths
+
+`MATCH p = ANY CHEAPEST (a)-[e:Link COST e.w]->+(b)` returns, per endpoint pair, a path of the least total cost;
+`ALL CHEAPEST` every path of that cost. Paths are simple (no vertex twice, never back to the start; unlike `ANY` /
+`ALL SHORTEST`, which match walks), and their cost is the sum of the steps' costs added in path order (DOUBLE sums depend on the order, so
+`ALL` keeps exactly the paths that tie once rounded).
+
+- **Any direction and bounds:** `->`, `<-`, `-` (and `<->`, read as `-`), `+`, `*`, `{n,m}`, `{n,}`. Without an upper
+  bound and from at most one step up the search is Dijkstra (the cheapest walk is then a simple path). From a lower
+  bound above 1 it is Dijkstra over (vertex, steps taken) states, which gives the cheapest walk of at least that many
+  steps; where none of a destination's cheapest walks is simple it searches simple paths in cost order (A* towards
+  seeded destinations). The cheapest simple path of at least n steps is NP-hard in general: that last search is
+  bounded by `pgq_max_vl_fallback_rows` partial paths per query, and every search honours cancellation and
+  `max_execution_time`. Bounded patterns over the edge alone enumerate their paths.
+- **What a `COST` and an element `WHERE` on the costed edge read:** the edge (`e.w`), and the pattern's endpoints as
+  singletons, the same on every step of a path: `-[e COST e.w * a.factor]->+(b)`, `-[e WHERE e.since < b.joined COST
+  e.w]->+(b)`. The search then runs once per distinct value of the endpoint properties read, over a copy of the graph
+  per value; past `pgq_max_vl_fallback_rows` (values × (vertices + edges)) it is refused before it starts. To read
+  the vertices of each step (PGQL's `(-[e]->(x) COST x.w)*`) a parenthesized quantified group is needed, which this
+  fork does not have yet.
+- **`cost(p)` in the MATCH's `WHERE`** filters the chosen paths, as a filter outside the `GRAPH_TABLE` does (the WHERE
+  outside a path pattern applies after its selector).
+- **Several CHEAPEST patterns in one MATCH** are selected each on its own and joined on their shared variables, as
+  SQL/PGQ joins path patterns.
+- **OPTIONAL MATCH** with a CHEAPEST pattern left-joins its cheapest paths; `cost(p)` and the other path functions of
+  that path are NULL where it did not match.
+- A `COST` that is one positive constant makes the pattern `SHORTEST` (and lets ABI artifacts answer it), except over
+  an edge with an element `WHERE` or for `cost(p)` without an upper bound, which are searched by cost.
+
 ## Settings
 
 | Setting | Default | Meaning |
@@ -628,8 +657,8 @@ building in [abi_build.cpp](src/core/functions/table/abi_build.cpp); vertex-join
   operands; operands that may match the same variable-length walk need `|+|` or disjoint labels.
 - **`vertex_property(p, 'x')` / `edge_property(p, 'x')`** take a literal property name. The lists are looked up
   after the match (one join per element table), so they cost about what the equivalent hand-written join does.
-- **`OPTIONAL MATCH`**: its pattern cannot be `ANY CHEAPEST` / `ALL CHEAPEST` yet (refused). Its path variable can be
-  read in `COLUMNS` and `WHERE` (NULL where it did not match), but not in `COLUMNS` shared by `UNION` branches.
+- **`OPTIONAL MATCH`**: its path variable can be read in `COLUMNS` and `WHERE` (NULL where it did not match), `cost(p)`
+  of an `ANY` / `ALL CHEAPEST` pattern included, but not in `COLUMNS` shared by `UNION` branches.
 - **`SHORTEST k`** takes one quantified edge between two vertices over one edge table (no element `WHERE` on the
   edge); longer patterns are refused. Inside a longer pattern, an unbounded quantifier with only a path mode or with a
   lower bound above 1 is answered from the CSR, which finds one shortest path per pair (refused for `<-`).
@@ -638,13 +667,13 @@ building in [abi_build.cpp](src/core/functions/table/abi_build.cpp); vertex-join
   traverse.
 - **`FROM pgq_abi_build` on a DuckLake with a SQLite catalog** refuses while the calling statement reads that lake
   (after `USE lake`): use `PRAGMA pgq_abi_build`, which builds in one transaction on the caller's connection.
-- **CHEAPEST with a cost that varies by edge** takes one quantified edge between two vertices, whose `COST` reads
-  only that edge's properties and that has no element `WHERE`. Without an upper bound the edge must be
-  right-directed and quantified with `+` or `*`; with one (`{1,3}`, `{2,5}`, …) any direction works.
-  It is not supported with `OPTIONAL MATCH`. It must be the only variable-length pattern of its MATCH block, or every
-  one of them must search the same edges and `COST` with nothing but `cost(p)`. `cost(p)` is not available in the
-  MATCH's `WHERE` (filter on it outside the `GRAPH_TABLE`). With the same positive constant on every edge the pattern
-  is `SHORTEST`, and `cost(p)` there needs an unbounded `+` or `*`.
+- **CHEAPEST** takes one quantified edge between two vertices, over one edge table whose two ends are one vertex
+  table; a pattern of several edges, a `COST` on a vertex, and a `COST` reading anything but its edge and the
+  pattern's endpoints are refused. `ONE ROW PER` next to other variable-length patterns in the same MATCH is refused
+  (which path it unnests would be ambiguous). From a lower bound above 1, a destination none of whose cheapest walks
+  is a simple path (dense graphs, high bounds) is searched over simple paths and can exceed
+  `pgq_max_vl_fallback_rows` (a clear error); seed the destination. There is no `CHEAPEST k` (PGQL's `CHEAPEST k
+  PATHS`).
 
 ## Documentation map
 

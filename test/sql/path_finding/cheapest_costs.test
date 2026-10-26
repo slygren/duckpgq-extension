@@ -236,7 +236,7 @@ C	1	2
 D	1	2
 E	2	4
 
-# COST(p) inside an expression; in WHERE it is refused, filter outside
+# COST(p) inside an expression, and in the MATCH's WHERE, which filters the chosen paths as a filter outside does
 query TR
 SELECT * FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person) WHERE a.name = 'A'
     COLUMNS (b.name, round(COST(p) * 10, 6) AS c)) WHERE c > 10 ORDER BY ALL;
@@ -244,10 +244,25 @@ SELECT * FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]
 C	14.0
 E	28.5
 
-statement error
-FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person) WHERE COST(p) > 1 COLUMNS (b.name));
+query TT
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person) WHERE COST(p) > 1
+    COLUMNS (a.name, b.name)) ORDER BY ALL;
 ----
-is not supported in the WHERE of a MATCH
+A	C
+A	E
+B	E
+C	E
+D	E
+
+query I
+SELECT count(*) FROM (
+    (FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person) WHERE COST(p) > 1
+        COLUMNS (a.name, b.name, COST(p) AS c)))
+    EXCEPT ALL
+    (SELECT * FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person)
+        COLUMNS (a.name, b.name, COST(p) AS c)) WHERE c > 1));
+----
+0
 
 query TR
 FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 0.5]->+(b:Person) WHERE a.name = 'A'
@@ -320,33 +335,79 @@ FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 1]->(m:Person
 ----
 supports one quantified edge between two vertices
 
-# Without an upper bound the search goes forward from at most one hop up
-statement error
-FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->{2,}(b:Person) COLUMNS (COST(p)));
+# Without an upper bound: from a lower bound above 1, and left-directed (the search by cost)
+query TTR
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->{2,}(b:Person)
+    COLUMNS (a.name, b.name, round(COST(p), 9))) ORDER BY ALL;
 ----
-CHEAPEST without an upper bound supports a right-directed edge
+A	D	0.9
+A	E	2.85
+B	E	2.7
+C	E	2.35
 
-statement error
-FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)<-[e:Link COST e.w]-+(b:Person) COLUMNS (COST(p)));
+query TTR
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)<-[e:Link COST e.w]-+(b:Person)
+    COLUMNS (a.name, b.name, round(COST(p), 9))) ORDER BY ALL;
 ----
-CHEAPEST without an upper bound supports a right-directed edge
+B	A	0.45
+C	A	1.4
+D	A	0.6
+D	B	0.45
+D	C	0.1
+E	A	2.85
+E	B	2.7
+E	C	2.35
+E	D	2.25
 
-# COST(p) of a constant cost is a search over those costs, without bounds
-statement error
-FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 1]->{2,}(b:Person) COLUMNS (COST(p)));
+# COST(p) of a constant cost within other bounds: the constant once per step of the shortest path within them
+query TTIT
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 1]->{2,}(b:Person)
+    COLUMNS (a.name, b.name, COST(p), vertices(p))) ORDER BY ALL;
 ----
-COST(p) of a constant COST supports one right-directed edge
+A	D	2	[0, 1, 3]
+A	E	2	[0, 3, 4]
+B	E	2	[1, 3, 4]
+C	E	2	[2, 3, 4]
 
-# A COST reads its own edge; an element WHERE on the costed edge is not supported
-statement error
-FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST a.id]->+(b:Person) COLUMNS (COST(p)));
+# A COST reads its own edge and the pattern's endpoints (the same on every step); an element WHERE on the costed edge
+# filters its steps. From A every step costs 0.
+query TTI
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST a.id]->+(b:Person) COLUMNS (a.name, b.name, COST(p)))
+ORDER BY ALL;
 ----
-may only read properties of its own edge
+A	B	0
+A	C	0
+A	D	0
+A	E	0
+B	D	1
+B	E	2
+C	D	2
+C	E	4
+D	E	3
 
-statement error
-FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link WHERE e.i > 1 COST e.w]->+(b:Person) COLUMNS (COST(p)));
+query TTR
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link WHERE e.i > 1 COST e.w]->+(b:Person)
+    COLUMNS (a.name, b.name, round(COST(p), 9))) ORDER BY ALL;
 ----
-element WHERE on the costed edge
+A	B	0.45
+A	C	1.4
+A	D	0.6
+A	E	2.85
+B	D	0.45
+B	E	2.7
+D	E	2.25
+
+query TTR
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link WHERE e.i > a.id COST e.w]->+(b:Person)
+    COLUMNS (a.name, b.name, round(COST(p), 9))) ORDER BY ALL;
+----
+A	B	0.45
+A	C	1.4
+A	D	0.6
+A	E	2.85
+B	D	0.45
+B	E	2.7
+D	E	2.25
 
 # COST(p) of a path that is not chosen by cost
 statement error
@@ -369,13 +430,15 @@ FROM GRAPH_TABLE (g MATCH
 ----
 0.6	2.7
 
-statement error
+# Different COSTs: each pattern its own search, joined (here a cross product: no shared variable)
+query RR
 FROM GRAPH_TABLE (g MATCH
     p = ANY CHEAPEST (a:Person)-[e:Link COST e.w]->+(b:Person),
     q = ANY CHEAPEST (c:Person)-[f:Link COST 1]->+(d:Person)
-    COLUMNS (COST(p) AS cp, COST(q) AS cq));
+    WHERE a.name = 'A' AND b.name = 'D' AND c.name = 'B' AND d.name = 'E'
+    COLUMNS (round(COST(p), 9) AS cp, COST(q) AS cq));
 ----
-<REGEX>:.*(must search the same edge label|must be the only variable-length pattern).*
+0.6	2
 
 # COST belongs on edges
 statement error
@@ -421,10 +484,19 @@ C	0.5
 D	0.5
 E	1.0
 
-statement error
-FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 0.5]->{1,3}(b:Person) COLUMNS (COST(p) AS c));
+query TTR
+FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (a:Person)-[e:Link COST 0.5]->{1,3}(b:Person) COLUMNS (a.name, b.name, COST(p) AS c))
+ORDER BY ALL;
 ----
-COST(p) of a constant COST supports one right-directed edge
+A	B	0.5
+A	C	0.5
+A	D	0.5
+A	E	1.0
+B	D	0.5
+B	E	1.0
+C	D	0.5
+C	E	1.0
+D	E	0.5
 
 # A cost that varies is traversed, artifacts or not, and answers the same
 query TR
@@ -465,9 +537,10 @@ EDGE TABLES (chain_e SOURCE KEY (src) REFERENCES chain_v (id) DESTINATION KEY (d
 statement ok
 SET max_execution_time = 500;
 
+# 10000 searches of 20000 steps or more (about 5 s); the limit stops them.
 statement error
-SELECT count(*) FROM GRAPH_TABLE (chain MATCH p = ANY CHEAPEST (a:V)-[e:E COST e.w]->+(b:V) WHERE a.id >= 29000 AND b.id = 0
-    COLUMNS (vertices(p) AS vs, COST(p) AS c));
+SELECT count(*) FROM GRAPH_TABLE (chain MATCH p = ANY CHEAPEST (a:V)-[e:E COST e.w]->+(b:V) WHERE a.id >= 20000 AND b.id = 0
+    COLUMNS (COST(p) AS c));
 ----
 maximum execution time
 

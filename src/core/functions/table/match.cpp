@@ -1799,8 +1799,15 @@ static unique_ptr<ParsedExpression> ExtractSafeCTEConjuncts(const ParsedExpressi
 		}
 		return result;
 	}
-	// Leaf conjunct: safe iff it has no EXISTS { ... } inside.
-	if (!ContainsPGQExists(expr)) {
+	// Leaf conjunct: safe iff it has no EXISTS { ... } inside, and reads nothing of the path CTE itself (COST(p) of a
+	// materialised path is its `cost` column).
+	bool reads_path_cte = false;
+	ParsedExpressionIterator::VisitExpression<ColumnRefExpression>(expr, [&](const ColumnRefExpression &column) {
+		reads_path_cte = reads_path_cte || (column.ColumnNames().size() == 2 &&
+		                                    (StringUtil::CIEquals(PGQStr(column.ColumnNames()[0]), "shortest_path_cte") ||
+		                                     StringUtil::CIEquals(PGQStr(column.ColumnNames()[0]), "__orp_steps")));
+	});
+	if (!ContainsPGQExists(expr) && !reads_path_cte) {
 		return expr.Copy();
 	}
 	return nullptr;
@@ -2608,8 +2615,11 @@ static void ClaimCSRSlot(PGQCSRSlot &csr_slot, const string &edge_key, int32_t &
 //!   ->  the stored direction;  <-  reversed;  -  either way (a self-loop once; <-> is read as -).
 //! Both ends of a step must be vertices of the table (an edge to a missing vertex is no step). The label
 //! expression applies to every edge a step uses.
+//! `extra_select` adds columns to every step (", <expr> AS name", over the step's edge __e and its stored source __a
+//! and destination __b), `extra_where` a condition on them.
 static string StepRelationSQL(const shared_ptr<PropertyGraphTable> &edge_table, PGQMatchType edge_type,
-                              const string &edge_label) {
+                              const string &edge_label, const string &extra_select = string(),
+                              const string &extra_where = string(), const string &extra_join = string()) {
 	const string edges = QualifiedTableName(PGQStr(edge_table->catalog_name), PGQStr(edge_table->schema_name),
 	                                        PGQStr(edge_table->table_name));
 	auto &vertex_table = *edge_table->source_pg_table;
@@ -2627,18 +2637,19 @@ static string StepRelationSQL(const shared_ptr<PropertyGraphTable> &edge_table, 
 		return cond ? cond->ToString() : "true";
 	};
 	// e from a (its source) to b (its destination)
-	const string stored = StringUtil::Format("FROM %s __e JOIN %s __a ON __a.%s = __e.%s JOIN %s __b ON __b.%s = __e.%s "
-	                                         "WHERE %s",
-	                                         edges, vertices, src_pk, src_fk, vertices, dst_pk, dst_fk,
-	                                         label_condition("__e"));
+	const string stored = StringUtil::Format("%s FROM %s __e JOIN %s __a ON __a.%s = __e.%s JOIN %s __b ON __b.%s = "
+	                                         "__e.%s%s WHERE %s%s",
+	                                         extra_select, edges, vertices, src_pk, src_fk, vertices, dst_pk, dst_fk,
+	                                         extra_join, label_condition("__e"),
+	                                         extra_where.empty() ? string() : " AND (" + extra_where + ")");
 	switch (edge_type) {
 	case PGQMatchType::MATCH_EDGE_RIGHT:
-		return "SELECT __a.rowid AS src_rowid, __b.rowid AS dst_rowid, __e.rowid AS edge_rowid " + stored;
+		return "SELECT __a.rowid AS src_rowid, __b.rowid AS dst_rowid, __e.rowid AS edge_rowid" + stored;
 	case PGQMatchType::MATCH_EDGE_LEFT:
-		return "SELECT __b.rowid AS src_rowid, __a.rowid AS dst_rowid, __e.rowid AS edge_rowid " + stored;
+		return "SELECT __b.rowid AS src_rowid, __a.rowid AS dst_rowid, __e.rowid AS edge_rowid" + stored;
 	case PGQMatchType::MATCH_EDGE_ANY:
-		return "SELECT __a.rowid AS src_rowid, __b.rowid AS dst_rowid, __e.rowid AS edge_rowid " + stored +
-		       " UNION ALL SELECT __b.rowid AS src_rowid, __a.rowid AS dst_rowid, __e.rowid AS edge_rowid " + stored +
+		return "SELECT __a.rowid AS src_rowid, __b.rowid AS dst_rowid, __e.rowid AS edge_rowid" + stored +
+		       " UNION ALL SELECT __b.rowid AS src_rowid, __a.rowid AS dst_rowid, __e.rowid AS edge_rowid" + stored +
 		       " AND __a.rowid <> __b.rowid";
 	default:
 		throw InternalException("StepRelationSQL: not an edge");
@@ -2664,6 +2675,24 @@ static unique_ptr<CommonTableExpressionInfo> CreateStepCSRCTE(const shared_ptr<P
 	    "ON __s.src_rowid = __v.rowid GROUP BY __v.rowid) __sub) AS BIGINT), (SELECT count(*) FROM (%s) __c), "
 	    "__s.src_rowid, __s.dst_rowid, __s.edge_rowid) AS temp FROM (%s) __s",
 	    csr_id, v_size, csr_id, v_size, vertices, steps, steps, steps);
+	auto info = make_uniq<CommonTableExpressionInfo>();
+	info->query_node = std::move(ParseSelectStatement(sql)->node);
+	return info;
+}
+
+//! "cte1" for a CHEAPEST search: a CSR over `steps` (src_rowid, dst_rowid, edge_rowid; the steps a costed quantified
+//! edge takes, StepRelationSQL in any direction, less those its element WHERE excludes), weighted by the `cost` column
+//! of `costed_steps` (the same rows), over the vertices `dense_ids` (dense_id) lists, `v_size` of them.
+//! create_csr_edge refuses a NULL, negative or non-finite cost as for the directed weighted CSR.
+static unique_ptr<CommonTableExpressionInfo> CreateCostedStepCSRCTE(const string &steps, const string &costed_steps,
+                                                                    const string &dense_ids, const string &v_size,
+                                                                    int32_t csr_id) {
+	const string sql = StringUtil::Format(
+	    "SELECT create_csr_edge(%d, %s, CAST((SELECT sum(create_csr_vertex(%d, %s, __sub.dense_id, __sub.cnt)) "
+	    "FROM (SELECT __v.dense_id, count(__s.src_rowid) AS cnt FROM (%s) __v LEFT JOIN (%s) __s "
+	    "ON __s.src_rowid = __v.dense_id GROUP BY __v.dense_id) __sub) AS BIGINT), (SELECT count(*) FROM (%s) __c), "
+	    "__s.src_rowid, __s.dst_rowid, __s.edge_rowid, __s.cost) AS temp FROM (%s) __s",
+	    csr_id, v_size, csr_id, v_size, dense_ids, steps, steps, costed_steps);
 	auto info = make_uniq<CommonTableExpressionInfo>();
 	info->query_node = std::move(ParseSelectStatement(sql)->node);
 	return info;
@@ -3142,8 +3171,10 @@ static unique_ptr<ParsedExpression> CostTypeProbe(const SubPath &edge, const sha
 //! semantics (and TRAIL, SIMPLE) let a path return to its start, so with a lower bound of 1 or more the shortest
 //! path from a vertex to itself is its shortest closed walk -- what SHORTEST k returns too. ACYCLIC forbids it, and
 //! a lower bound of 0 makes it the zero-length path.
+//! Not for CHEAPEST, whose paths are simple: a searched cost marks the edge (cheapest), a constant COST stays on it.
 static bool ClosedWalks(const SubPath &edge_subpath) {
-	return edge_subpath.lower >= 1 && edge_subpath.path_mode != PGQPathMode::ACYCLIC && !edge_subpath.cheapest;
+	return edge_subpath.lower >= 1 && edge_subpath.path_mode != PGQPathMode::ACYCLIC && !edge_subpath.cheapest &&
+	       !edge_subpath.cost_expr;
 }
 
 unique_ptr<CommonTableExpressionInfo>
@@ -5183,13 +5214,16 @@ static unique_ptr<ParsedExpression> ReplaceCostCalls(unique_ptr<ParsedExpression
 }
 
 static bool UsesPathOutsideCost(ParsedExpression &expression, const string &path_variable);
+static bool ConstantCostSearch(const SubPath &edge, OneRowPerMode one_row_per);
 
 void PGQMatchFunction::CheckNamedSubpath(SubPath &subpath, MatchExpression &original_ref,
                                          CreatePropertyGraphInfo &pg_table, unique_ptr<SelectNode> &final_select_node,
                                          vector<unique_ptr<ParsedExpression>> &conditions, int32_t &csr_id_counter,
                                          PGQCSRSlot &csr_slot, bool all_shortest, bool any_shortest) {
-	// cost(p), anywhere in COLUMNS: the cheapest cost between the path's endpoints. First, so that the CSR the other
-	// path functions share is the weighted one.
+	// cost(p), anywhere in COLUMNS or the WHERE: the cheapest cost between the path's endpoints. First, so that the CSR
+	// the other path functions share is the weighted one.
+	const bool where_uses_path =
+	    original_ref.where_clause && UsesPathOutsideCost(*original_ref.where_clause, subpath.path_variable);
 	auto make_cost = [&]() -> unique_ptr<ParsedExpression> {
 		// Find edge subpath with cost_expr within this named subpath's path_list.
 		// A vertex with an element-local WHERE arrives wrapped in a single-element subpath.
@@ -5219,13 +5253,27 @@ void PGQMatchFunction::CheckNamedSubpath(SubPath &subpath, MatchExpression &orig
 			                      subpath.path_variable);
 		}
 		auto edge_table = ResolveTable(edge_elem->label, edge_elem->match_type, pg_table);
+		if (!edge_sub->cheapest && IsConstantPositiveCost(*edge_sub->cost_expr) &&
+		    !ConstantCostSearch(*edge_sub, original_ref.one_row_per)) {
+			// A constant COST: the matched paths are the shortest ones, and each step costs the constant.
+			auto path = CreatePathFindingFunction(subpath.path_list, pg_table, subpath.path_variable, final_select_node,
+			                                      conditions, csr_id_counter, csr_slot, all_shortest, any_shortest,
+			                                      original_ref.where_clause.get());
+			vector<unique_ptr<ParsedExpression>> len_children;
+			len_children.push_back(std::move(path));
+			vector<unique_ptr<ParsedExpression>> div_children;
+			div_children.push_back(make_uniq<FunctionExpression>("len", std::move(len_children)));
+			div_children.push_back(ConstantExpression::FromValue(Value::BIGINT(2)));
+			vector<unique_ptr<ParsedExpression>> repeat_children;
+			repeat_children.push_back(edge_sub->cost_expr->Copy());
+			repeat_children.push_back(make_uniq<FunctionExpression>("//", std::move(div_children)));
+			return make_uniq<FunctionExpression>("pgq_repeat_cost", std::move(repeat_children));
+		}
 		// Where the paths themselves are materialised (bounds, ALL CHEAPEST, ONE ROW PER, the other path functions),
 		// the cost is the materialised path's, so that it always describes the same path.
 		bool materialised = edge_sub->cheapest &&
 		                    (edge_sub->upper < static_cast<int64_t>(1 << 30) || all_shortest ||
-		                     original_ref.one_row_per != OneRowPerMode::NONE ||
-		                     (original_ref.where_clause &&
-		                      UsesPathOutsideCost(*original_ref.where_clause, subpath.path_variable)));
+		                     original_ref.one_row_per != OneRowPerMode::NONE || where_uses_path);
 		for (auto &column : original_ref.column_list) {
 			// The column being rewritten has been moved out of the list.
 			materialised = materialised ||
@@ -5270,6 +5318,11 @@ void PGQMatchFunction::CheckNamedSubpath(SubPath &subpath, MatchExpression &orig
 		if (top_level) {
 			column->SetAlias(name);
 		}
+	}
+	if (original_ref.where_clause) {
+		// Rewritten on a copy: the path search below still reads the WHERE for the endpoints' seeds.
+		auto where = ReplaceCostCalls(original_ref.where_clause->Copy(), subpath.path_variable, make_cost);
+		original_ref.where_clause = std::move(where);
 	}
 	for (idx_t idx_i = 0; idx_i < original_ref.column_list.size(); idx_i++) {
 		auto parsed_ref = dynamic_cast<FunctionExpression *>(original_ref.column_list[idx_i].get());
@@ -6336,6 +6389,8 @@ static void VisitOptionalElements(PathReference &reference, bool quantified,
 // it uses every route a mandatory pattern of that shape does: ABI artifacts, the path enumeration, the CSR
 // path functions. Predicates of the MATCH WHERE on a shared variable alone are also given to the inner MATCH
 // (they still filter the outer rows), which seeds its traversal.
+static void PrepareCheapest(MatchExpression &match, bool shared_union_columns);
+
 void PGQMatchFunction::AddOptionalGroupJoin(ClientContext &context, const MatchExpression &outer,
                                             const vector<unique_ptr<PathPattern>> &opt_patterns,
                                             unique_ptr<SelectNode> &select_node,
@@ -6343,7 +6398,10 @@ void PGQMatchFunction::AddOptionalGroupJoin(ClientContext &context, const MatchE
                                             CreatePropertyGraphInfo &pg_table, int32_t &extra_alias_counter,
                                             const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &mandatory_alias_map,
                                             vector<unique_ptr<ParsedExpression>> &columns,
-                                            unique_ptr<ParsedExpression> &where) {
+                                            unique_ptr<ParsedExpression> &where, bool optional) {
+	// optional = false: a mandatory pattern matched on its own (MatchExpression::joined_patterns), joined rather than
+	// left-joined; every vertex it binds is rejoined (a later pattern or group may share it), and the MATCH WHERE's
+	// predicates on any one of its vertices seed it.
 	const ParsedExpression *where_hint = where.get();
 	auto bound_table = [&](const string &binding) -> shared_ptr<PropertyGraphTable> {
 		auto entry = mandatory_alias_map.find(binding);
@@ -6362,7 +6420,9 @@ void PGQMatchFunction::AddOptionalGroupJoin(ClientContext &context, const MatchE
 		inner->path_patterns.push_back(pattern->Copy());
 	}
 
-	// The group's path variables: what COLUMNS and WHERE read of them is computed by the inner MATCH (below).
+	// The group's path variables: what COLUMNS and WHERE read of them is computed by the inner MATCH (below), a
+	// CHEAPEST path's COST(p) among them.
+	const string sub_alias = "__pgq_opt_" + std::to_string(extra_alias_counter++);
 	vector<string> path_variables;
 	for (auto &pattern : inner->path_patterns) {
 		for (auto &element : pattern->path_elements) {
@@ -6393,7 +6453,7 @@ void PGQMatchFunction::AddOptionalGroupJoin(ClientContext &context, const MatchE
 			}
 		});
 	};
-	for (auto &column : outer.column_list) {
+	for (auto &column : columns) {
 		collect_references(*column);
 	}
 	if (where_hint) {
@@ -6423,7 +6483,6 @@ void PGQMatchFunction::AddOptionalGroupJoin(ClientContext &context, const MatchE
 
 	case_insensitive_set_t stubs;
 	auto inner_tables = PopulateGraphTableAliasMap(pg_table, *inner, &stubs);
-	const string sub_alias = "__pgq_opt_" + std::to_string(extra_alias_counter++);
 	struct OptionalBinding {
 		string name;
 		string column;
@@ -6440,7 +6499,7 @@ void PGQMatchFunction::AddOptionalGroupJoin(ClientContext &context, const MatchE
 		const auto match_type = binding_types[binding];
 		if (!shared) {
 			const bool read = referenced.find(binding) != referenced.end() ||
-			                  (all_vertices && match_type == PGQMatchType::MATCH_VERTEX);
+			                  ((all_vertices || !optional) && match_type == PGQMatchType::MATCH_VERTEX);
 			if (!read) {
 				continue;
 			}
@@ -6460,7 +6519,7 @@ void PGQMatchFunction::AddOptionalGroupJoin(ClientContext &context, const MatchE
 			direction->SetAlias(Identifier(column + "_dir"));
 			inner->column_list.push_back(std::move(direction));
 		}
-		if (shared && where_hint) {
+		if ((shared || (!optional && match_type == PGQMatchType::MATCH_VERTEX)) && where_hint) {
 			auto seed = ExtractSrcFilter(*where_hint, binding);
 			if (seed) {
 				seeds.push_back(std::move(seed));
@@ -6522,6 +6581,19 @@ void PGQMatchFunction::AddOptionalGroupJoin(ClientContext &context, const MatchE
 			carry(where);
 		}
 	}
+	// Anything else that reads the path variable (p itself, p.x) has no value outside the inner MATCH.
+	for (auto &path_variable : path_variables) {
+		bool reads = where && ReferencesPathVariable(*where, path_variable);
+		for (auto &column : columns) {
+			reads = reads || ReferencesPathVariable(*column, path_variable);
+		}
+		if (reads) {
+			throw NotImplementedException("The path variable '%s' of an OPTIONAL MATCH pattern cannot be used in COLUMNS "
+			                              "or WHERE yet except through its path functions (path_length(%s), "
+			                              "vertices(%s), cost(%s), ...)",
+			                              path_variable, path_variable, path_variable, path_variable);
+		}
+	}
 	if (carried > 0 && &columns == &outer.column_list) {
 		for (auto &branch : outer.union_matches) {
 			if (branch->column_list.empty()) {
@@ -6530,6 +6602,9 @@ void PGQMatchFunction::AddOptionalGroupJoin(ClientContext &context, const MatchE
 			}
 		}
 	}
+	// The checks and the cost marking a CHEAPEST pattern gets in a MATCH (it is the inner MATCH's own pattern now,
+	// with any COST(p) the COLUMNS or WHERE read carried into its columns).
+	PrepareCheapest(*inner, false);
 	auto sub = BuildMatchRef(context, *inner);
 	sub->alias = Identifier(sub_alias);
 
@@ -6542,7 +6617,7 @@ void PGQMatchFunction::AddOptionalGroupJoin(ClientContext &context, const MatchE
 		}
 	}
 	auto join = make_uniq<JoinRef>(JoinRefType::REGULAR);
-	join->type = JoinType::LEFT;
+	join->type = optional ? JoinType::LEFT : JoinType::INNER;
 	join->left = std::move(select_node->from_table);
 	join->right = std::move(sub);
 	join->condition = on_conditions.empty() ? ConstantExpression::FromValue(Value::BOOLEAN(true))
@@ -6753,8 +6828,8 @@ void PGQMatchFunction::CheckColumnBinding(
 		if (column_ref == nullptr) {
 			continue;
 		}
-		// 'shortest_path_cte' is a special table populated by pgq.
-		if (column_ref->ColumnNames()[0] == "shortest_path_cte") {
+		// 'shortest_path_cte' is a special table populated by pgq, as is '__orp_steps', which carries its columns.
+		if (column_ref->ColumnNames()[0] == "shortest_path_cte" || column_ref->ColumnNames()[0] == "__orp_steps") {
 			continue;
 		}
 		// Named ABI path rewrites expose synthetic columns on an internal subquery.
@@ -6794,8 +6869,8 @@ void PGQMatchFunction::CheckColumnBinding(
 // For VERTEX: one column __orp_v_rowid  (vertices: positions 1,3,5,... i.e. slice(1,-1,2))
 // For EDGE:   one column __orp_e_rowid  (edges:    positions 2,4,6,... i.e. slice(2,-1,2))
 // For STEP:   three columns v1/e1/v2 rowids (slices 1, 2, 3)
-static unique_ptr<CommonTableExpressionInfo> BuildORPStepsCTE(OneRowPerMode mode,
-                                                               const string &path_cte_name) {
+static unique_ptr<CommonTableExpressionInfo> BuildORPStepsCTE(OneRowPerMode mode, const string &path_cte_name,
+                                                               bool with_cost) {
 	auto sel = make_uniq<SelectNode>();
 
 	auto make_unnest_slice = [&](int start, const string &alias_name) {
@@ -6836,6 +6911,15 @@ static unique_ptr<CommonTableExpressionInfo> BuildORPStepsCTE(OneRowPerMode mode
 	auto dst_col = PGQColRef("dst_rowid", path_cte_name);
 	dst_col->SetAlias(Identifier("__orp_dst_rowid"));
 	sel->select_list.push_back(std::move(dst_col));
+	// And the path's own columns (path, cost), which the path functions and COST(p) read on every row of the path.
+	auto path_col = PGQColRef("path", path_cte_name);
+	path_col->SetAlias(Identifier("path"));
+	sel->select_list.push_back(std::move(path_col));
+	if (with_cost) {
+		auto cost_col = PGQColRef("cost", path_cte_name);
+		cost_col->SetAlias(Identifier("cost"));
+		sel->select_list.push_back(std::move(cost_col));
+	}
 
 	// FROM path_cte WHERE path IS NOT NULL
 	auto from_ref = make_uniq<BaseTableRef>();
@@ -8235,8 +8319,26 @@ static void ApplyOneRowPer(MatchExpression &ref, CreatePropertyGraphInfo &pg_tab
 		    "or batched property lookups");
 	}
 
-	// Add __orp_steps CTE
-	final_select_node->cte_map.map[Identifier(kORPCTE)] = BuildORPStepsCTE(ref.one_row_per, kPathCTE);
+	// Add __orp_steps CTE. The path functions and COST(p) of the MATCH read the path CTE's columns; they read them
+	// from the steps instead, which carry them.
+	bool reads_cost = false;
+	auto redirect = [&](unique_ptr<ParsedExpression> &expression) {
+		if (!expression) {
+			return;
+		}
+		ParsedExpressionIterator::VisitExpressionMutable<ColumnRefExpression>(*expression, [&](ColumnRefExpression &column) {
+			auto &names = column.ColumnNamesMutable();
+			if (names.size() == 2 && StringUtil::CIEquals(PGQStr(names[0]), kPathCTE)) {
+				reads_cost = reads_cost || StringUtil::CIEquals(PGQStr(names[1]), "cost");
+				names[0] = Identifier(kORPCTE);
+			}
+		});
+	};
+	for (auto &column : ref.column_list) {
+		redirect(column);
+	}
+	redirect(ref.where_clause);
+	final_select_node->cte_map.map[Identifier(kORPCTE)] = BuildORPStepsCTE(ref.one_row_per, kPathCTE, reads_cost);
 
 	// Replace from_clause: start from __orp_steps
 	auto orp_ref = make_uniq<BaseTableRef>();
@@ -12126,8 +12228,9 @@ static SubPath *SingleQuantifiedEdge(const vector<unique_ptr<PathReference>> &el
 	return element && element->match_type != PGQMatchType::MATCH_VERTEX ? edge : nullptr;
 }
 
-//! Whether every column the COST reads is a property of its own edge (constants and functions of them aside).
-static bool CostReadsOnlyEdge(const ParsedExpression &expression, const string &edge_variable) {
+//! Whether every column the expression reads is a property of one of `variables` (constants and functions of them
+//! aside).
+static bool ReadsOnly(const ParsedExpression &expression, const vector<string> &variables) {
 	if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY ||
 	    expression.GetExpressionClass() == ExpressionClass::LAMBDA ||
 	    expression.GetExpressionClass() == ExpressionClass::STAR) {
@@ -12135,13 +12238,38 @@ static bool CostReadsOnlyEdge(const ParsedExpression &expression, const string &
 	}
 	if (expression.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 		auto &names = expression.Cast<ColumnRefExpression>().ColumnNames();
-		return names.size() == 2 && StringUtil::CIEquals(PGQStr(names[0]), edge_variable);
+		if (names.size() != 2) {
+			return false;
+		}
+		for (auto &variable : variables) {
+			if (StringUtil::CIEquals(PGQStr(names[0]), variable)) {
+				return true;
+			}
+		}
+		return false;
 	}
-	bool only_edge = true;
-	ParsedExpressionIterator::EnumerateChildren(expression, [&](const ParsedExpression &child) {
-		only_edge = only_edge && CostReadsOnlyEdge(child, edge_variable);
-	});
-	return only_edge;
+	bool only = true;
+	ParsedExpressionIterator::EnumerateChildren(
+	    expression, [&](const ParsedExpression &child) { only = only && ReadsOnly(child, variables); });
+	return only;
+}
+
+//! The binding of a path's endpoint vertex, possibly wrapped in a subpath carrying its element WHERE.
+static string EndpointBinding(const unique_ptr<PathReference> &reference) {
+	if (reference->path_reference_type == PGQPathReferenceType::PATH_ELEMENT) {
+		return reinterpret_cast<const PathElement &>(*reference).variable_binding;
+	}
+	auto &wrapper = reinterpret_cast<const SubPath &>(*reference);
+	return reinterpret_cast<const PathElement &>(*wrapper.path_list[0]).variable_binding;
+}
+
+//! Whether COST(p) of a constant COST over this quantified edge is searched by cost (Dijkstra over the constant
+//! costs): one right-directed edge quantified with + or *, no element WHERE, no ONE ROW PER. Elsewhere it is the
+//! constant added once per step of the shortest path the pattern matched.
+static bool ConstantCostSearch(const SubPath &edge, OneRowPerMode one_row_per) {
+	auto &element = reinterpret_cast<const PathElement &>(*edge.path_list[0]);
+	return edge.lower <= 1 && edge.upper >= (1 << 30) && !edge.where_clause &&
+	       element.match_type == PGQMatchType::MATCH_EDGE_RIGHT && one_row_per == OneRowPerMode::NONE;
 }
 
 //! CHEAPEST and COST(p) in one MATCH block, checked before the translation. A COST that is the same positive constant
@@ -12149,23 +12277,16 @@ static bool CostReadsOnlyEdge(const ParsedExpression &expression, const string &
 //! a search over the constant costs. Any other COST marks its edge `cheapest`: the paths are chosen by cost, by a
 //! weighted search over the CSR without an upper bound, and by enumerating the paths within the bounds with one.
 static void PrepareCheapest(MatchExpression &match, bool shared_union_columns) {
+	// COST(p) in COLUMNS shared with UNION branches names each branch's own p (each branch is checked with them).
+	(void)shared_union_columns;
 	vector<string> cost_calls;
 	for (auto &column : match.column_list) {
 		CollectCostCalls(*column, cost_calls);
 	}
+	// COST(p) in the MATCH's own WHERE filters the chosen paths (the WHERE outside a path pattern applies after its
+	// selector), so it reads the same cost the COLUMNS do.
 	if (match.where_clause) {
-		vector<string> where_calls;
-		CollectCostCalls(*match.where_clause, where_calls);
-		if (!where_calls.empty()) {
-			throw NotImplementedException("COST(%s) is not supported in the WHERE of a MATCH; filter on it outside the "
-			                              "GRAPH_TABLE",
-			                              where_calls[0]);
-		}
-	}
-	if (!cost_calls.empty() && shared_union_columns) {
-		throw BinderException("COST(%s) in the COLUMNS shared by the MATCH blocks of a UNION is not supported: give "
-		                      "each block its own COLUMNS",
-		                      cost_calls[0]);
+		CollectCostCalls(*match.where_clause, cost_calls);
 	}
 	static constexpr const char *kExample = "MATCH p = ANY CHEAPEST (a)-[e:Link COST e.weight]->+(b)";
 	case_insensitive_set_t costed_paths;
@@ -12174,8 +12295,13 @@ static void PrepareCheapest(MatchExpression &match, bool shared_union_columns) {
 	idx_t searches = 0;
 	bool needs_path_cte = false;
 	idx_t variable_length = 0;
-	bool constant_cost_search = false;
+	bool different_searches = false;
+	// The patterns that search by cost (or over constant costs) with a CSR or path CTE of their own: split off into
+	// MATCHes of their own when the block cannot hold them all.
+	vector<bool> searching(match.path_patterns.size(), false);
+	idx_t pattern_index = 0;
 	for (auto &pattern : match.path_patterns) {
+		const idx_t this_pattern = pattern_index++;
 		string path_variable;
 		auto &elements = PatternPath(*pattern, path_variable);
 		variable_length += PatternHasVariableLength(pattern->path_elements) ? 1 : 0;
@@ -12196,64 +12322,68 @@ static void PrepareCheapest(MatchExpression &match, bool shared_union_columns) {
 			continue;
 		}
 		bool found = false;
-		const bool constant = AllCostsConstant(pattern->path_elements, found) && found;
 		auto *edge = SingleQuantifiedEdge(elements);
 		auto *edge_element = edge ? dynamic_cast<PathElement *>(edge->path_list[0].get()) : nullptr;
+		// A constant COST is SHORTEST, except over an edge with an element WHERE, which only the search by cost
+		// filters step by step, and where COST(p) asks for the cost over an unbounded right-directed edge, which the
+		// search by cost answers (Dijkstra): there it is searched like any other COST.
+		const bool constant = AllCostsConstant(pattern->path_elements, found) && found &&
+		                      !(edge && (edge->where_clause || (costed && ConstantCostSearch(*edge, match.one_row_per))));
 		if (constant) {
 			if (!costed) {
 				continue;
 			}
-			// COST(p) of a constant cost is a search over those costs: the cheapest cost over any number of hops, the
-			// pattern's own only for one right-directed edge quantified with + or *.
-			if (!edge || edge->lower > 1 || edge->upper < (1 << 30) || edge->where_clause ||
-			    edge_element->match_type != PGQMatchType::MATCH_EDGE_RIGHT) {
-				throw NotImplementedException("COST(%s) of a constant COST supports one right-directed edge, without "
-				                              "an element WHERE, quantified with + or * between two vertices, e.g. %s",
+			// The paths are the shortest ones, and COST(p) is the constant added once per step of the path
+			// (pgq_repeat_cost over path_length). (Over an unbounded right-directed edge COST(p) is searched by cost,
+			// above.)
+			if (!edge) {
+				throw NotImplementedException("COST(%s) of a constant COST supports one quantified edge between two "
+				                              "vertices, e.g. %s",
 				                              path_variable, kExample);
 			}
-			if (!match.optional_match_patterns.empty() || match.one_row_per != OneRowPerMode::NONE) {
-				throw NotImplementedException("COST(%s) of a constant COST is not supported with OPTIONAL MATCH or ONE "
-				                              "ROW PER",
-				                              path_variable);
-			}
-			constant_cost_search = true;
 		} else {
 			if (!edge) {
 				throw NotImplementedException("ANY / ALL CHEAPEST with a COST that is not the same positive constant on "
 				                              "every edge supports one quantified edge between two vertices, e.g. %s",
 				                              kExample);
 			}
-			if (!CostReadsOnlyEdge(*edge->cost_expr, edge_element->variable_binding)) {
-				throw NotImplementedException("A COST may only read properties of its own edge (%s.<property>): %s",
-				                              edge_element->variable_binding, edge->cost_expr->ToString());
+			// The COST and an element WHERE on the costed edge (which filters its steps before the search, as a WHERE
+			// inside a quantified pattern does) read the edge and, as singletons the same on every step, the
+			// pattern's two endpoints.
+			const vector<string> readable {edge_element->variable_binding, EndpointBinding(elements[0]),
+			                               EndpointBinding(elements[2])};
+			if (!ReadsOnly(*edge->cost_expr, readable)) {
+				throw NotImplementedException("A COST may only read properties of its own edge (%s.<property>) and of "
+				                              "the pattern's endpoints (%s, %s): %s",
+				                              readable[0], readable[1], readable[2], edge->cost_expr->ToString());
 			}
-			if (edge->where_clause) {
-				throw NotImplementedException("An element WHERE on the costed edge of a CHEAPEST pattern is not "
-				                              "supported; filter the edges with a label, or the endpoints with WHERE");
-			}
-			if (edge->upper >= (1 << 30) &&
-			    (edge->lower > 1 || edge_element->match_type != PGQMatchType::MATCH_EDGE_RIGHT)) {
-				throw NotImplementedException(
-				    "CHEAPEST without an upper bound supports a right-directed edge quantified with + or *; give the "
-				    "quantifier an upper bound for other directions or a lower bound above 1, e.g. ->{2,10}");
-			}
-			if (!match.optional_match_patterns.empty()) {
-				throw NotImplementedException("CHEAPEST with a COST that varies by edge is not supported with OPTIONAL "
-				                              "MATCH");
+			if (edge->where_clause && !ReadsOnly(*edge->where_clause, readable)) {
+				throw NotImplementedException("An element WHERE on the costed edge of a CHEAPEST pattern may only read "
+				                              "properties of its own edge (%s.<property>) and of the pattern's endpoints "
+				                              "(%s, %s): %s",
+				                              readable[0], readable[1], readable[2], edge->where_clause->ToString());
 			}
 			edge->cheapest = true;
 			auto canonical = RebindColumnAlias(edge->cost_expr->Copy(), edge_element->variable_binding, "__pgq_edge");
 			auto signature = StringUtil::Lower(edge_element->label) + "|" + std::to_string(edge->lower) + "|" +
 			                 std::to_string(edge->upper) + "|" + canonical->ToString() + "|" +
-			                 (edge->has_default ? std::to_string(edge->default_value) : string());
-			if (searches > 0 && signature != search_signature) {
-				throw NotImplementedException("Several CHEAPEST patterns in one MATCH block must search the same edge "
-				                              "label, bounds and COST; put %s in a GRAPH_TABLE of its own",
-				                              path_variable.empty() ? string("one of them") : path_variable);
-			}
+			                 (edge->has_default ? std::to_string(edge->default_value) : string()) + "|" +
+			                 std::to_string(static_cast<int>(edge_element->match_type)) + "|" +
+			                 (edge->where_clause ? RebindColumnAlias(edge->where_clause->Copy(),
+			                                                         edge_element->variable_binding, "__pgq_edge")
+			                                           ->ToString()
+			                                     : string());
+			different_searches = different_searches || (searches > 0 && signature != search_signature);
 			search_signature = signature;
 			searches++;
-			bool uses_path = match.one_row_per != OneRowPerMode::NONE || pattern->all || edge->upper < (1 << 30);
+			searching[this_pattern] = true;
+			// The search by cost (without an upper bound, with an element WHERE, with a COST reading the endpoints)
+			// always materialises its paths.
+			const bool searched_by_cost =
+			    edge->where_clause || !ReadsOnly(*edge->cost_expr, {edge_element->variable_binding}) ||
+			    edge->upper >= (1 << 30);
+			bool uses_path = match.one_row_per != OneRowPerMode::NONE || pattern->all || edge->upper < (1 << 30) ||
+			                 searched_by_cost;
 			if (!path_variable.empty()) {
 				uses_path = uses_path || (match.where_clause && UsesPathOutsideCost(*match.where_clause, path_variable));
 				for (auto &column : match.column_list) {
@@ -12263,22 +12393,49 @@ static void PrepareCheapest(MatchExpression &match, bool shared_union_columns) {
 			}
 			needs_path_cte = needs_path_cte || uses_path;
 		}
-		if (costed && !constant && !match.optional_match_patterns.empty()) {
-			throw NotImplementedException("COST(%s) is not supported with OPTIONAL MATCH", path_variable);
+	}
+	// COST(q) of an OPTIONAL MATCH pattern's path is computed by that group's own MATCH (AddOptionalGroupJoin).
+	case_insensitive_set_t optional_paths;
+	for (auto &group : match.optional_match_patterns) {
+		for (auto &pattern : group) {
+			string path_variable;
+			PatternPath(*pattern, path_variable);
+			if (!path_variable.empty() && pattern->cheapest) {
+				optional_paths.insert(path_variable);
+			}
 		}
 	}
 	for (auto &call : cost_calls) {
-		if (!costed_paths.count(call)) {
+		if (!costed_paths.count(call) && !optional_paths.count(call)) {
 			throw BinderException("COST(%s): %s is not a named path of this MATCH (MATCH %s = ANY CHEAPEST ...)", call,
 			                      call, call);
 		}
 	}
 	// A cost search shares the block's CSR with every other variable-length pattern, and a path CTE is one per block.
-	if ((searches > 0 && variable_length > searches) || (searches > 1 && needs_path_cte) ||
-	    (constant_cost_search && variable_length > costed_paths.size())) {
-		throw NotImplementedException("A CHEAPEST pattern searched by cost must be the only variable-length pattern of "
-		                              "its MATCH block (or all of them must be ANY CHEAPEST over the same edges and "
-		                              "COST, with nothing but COST(p)); put the others in a GRAPH_TABLE of their own");
+	// Patterns over the same edges and COST asking for nothing but COST(p) share one search; otherwise the searching
+	// patterns are matched each as a MATCH of its own, joined onto the others on the variables they share
+	// (BuildMatchRef), as several path patterns of one MATCH are: selected each on its own, then joined.
+	if (different_searches || (searches > 0 && variable_length > searches) || (searches > 1 && needs_path_cte)) {
+		if (match.one_row_per != OneRowPerMode::NONE) {
+			throw NotImplementedException("ONE ROW PER with a CHEAPEST pattern next to other variable-length patterns "
+			                              "is not supported; put the others in a GRAPH_TABLE of their own");
+		}
+		idx_t split = 0;
+		for (idx_t i = 0; i < searching.size(); i++) {
+			split += searching[i] ? 1 : 0;
+		}
+		// At least one pattern stays: the first searching one when all of them search.
+		bool keep_first = split == match.path_patterns.size();
+		vector<unique_ptr<PathPattern>> kept;
+		for (idx_t i = 0; i < match.path_patterns.size(); i++) {
+			if (searching[i] && !keep_first) {
+				match.joined_patterns.push_back(std::move(match.path_patterns[i]));
+			} else {
+				kept.push_back(std::move(match.path_patterns[i]));
+				keep_first = keep_first && !searching[i];
+			}
+		}
+		match.path_patterns = std::move(kept);
 	}
 }
 
@@ -12315,14 +12472,6 @@ static void NormalizeMatchExpression(MatchExpression &match) {
 	NormalizeEdgeDirections(match.path_patterns);
 	for (auto &group : match.optional_match_patterns) {
 		NormalizeEdgeDirections(group);
-		// Not yet verified on every route that answers an optional pattern (some forms returned every path
-		// rather than the cheapest one): refused until it is.
-		for (auto &pattern : group) {
-			if (pattern->cheapest) {
-				throw NotImplementedException("ANY CHEAPEST / ALL CHEAPEST is not supported in an OPTIONAL MATCH "
-				                              "pattern yet; match it in a GRAPH_TABLE of its own and LEFT JOIN that");
-			}
-		}
 	}
 	NormalizePatterns(match.path_patterns);
 	for (auto &group : match.optional_match_patterns) {
@@ -12339,7 +12488,17 @@ static void NormalizeMatchExpression(MatchExpression &match) {
 	bool shared_union_columns = !match.union_matches.empty() && match.union_matches[0]->column_list.empty();
 	PrepareCheapest(match, shared_union_columns);
 	for (auto &branch : match.union_matches) {
+		// A branch sharing the head's COLUMNS is checked against them (COST(p) names its own p); it keeps none.
+		const bool shared = shared_union_columns && branch->column_list.empty();
+		if (shared) {
+			for (auto &column : match.column_list) {
+				branch->column_list.push_back(column->Copy());
+			}
+		}
 		NormalizeMatchExpression(*branch);
+		if (shared) {
+			branch->column_list.clear();
+		}
 	}
 }
 
@@ -16458,6 +16617,9 @@ static PGQFixedPathSelection SelectorOverFixedPattern(PathPattern &pattern, Matc
 //! A pattern the native path search answers (pgq_shortest_k_paths): one quantified edge between two vertices.
 struct PGQNativePathSearch {
 	bool applies = false;
+	//! A CHEAPEST pattern whose COST varies by edge, outside what the long-standing routes answer (see
+	//! NativePathSearchFor): searched by cost (pgq_cheapest_paths).
+	bool cheapest = false;
 	//! paths per destination, < 0 for all; ignored with all_shortest
 	int64_t k = 1;
 	bool all_shortest = false;
@@ -16543,7 +16705,27 @@ static PGQNativePathSearch NativePathSearchFor(PathPattern &pattern, bool one_ro
 	if (!search.edge || search.edge->match_type == PGQMatchType::MATCH_VERTEX) {
 		return refuse("the edge is not quantified");
 	}
-	if (search.quantifier->where_clause || search.quantifier->cost_expr) {
+	if (search.quantifier->cheapest) {
+		// A COST that varies by edge (PrepareCheapest marked the edge). The bounded enumeration answers a bounded
+		// edge without an element WHERE and with a COST over the edge alone; the search by cost answers the rest:
+		// every edge without an upper bound (Dijkstra from at most one step up, a layered search above), an element
+		// WHERE on the costed edge, and a COST that reads the endpoints.
+		const bool unbounded_edge = search.quantifier->upper >= static_cast<int64_t>(1 << 30);
+		const bool long_standing =
+		    !search.quantifier->where_clause &&
+		    ReadsOnly(*search.quantifier->cost_expr, {search.edge->variable_binding}) && !unbounded_edge;
+		if (long_standing) {
+			return search;
+		}
+		search.applies = true;
+		search.cheapest = true;
+		search.all_shortest = pattern.all;
+		return search;
+	}
+	// CHEAPEST with one positive constant COST is SHORTEST (PrepareCheapest leaves its edge unmarked).
+	const bool constant_cost = pattern.cheapest && search.quantifier->cost_expr && !search.quantifier->cheapest &&
+	                           IsConstantPositiveCost(*search.quantifier->cost_expr);
+	if (search.quantifier->where_clause || (search.quantifier->cost_expr && !constant_cost)) {
 		return refuse("the quantified edge has an element predicate or a cost");
 	}
 	if (search.quantifier->path_mode != PGQPathMode::NONE) {
@@ -16552,12 +16734,15 @@ static PGQNativePathSearch NativePathSearchFor(PathPattern &pattern, bool one_ro
 	const bool unbounded = search.quantifier->upper >= static_cast<int64_t>(1 << 30);
 	const bool undirected = search.edge->match_type == PGQMatchType::MATCH_EDGE_ANY ||
 	                        search.edge->match_type == PGQMatchType::MATCH_EDGE_LEFT_RIGHT;
+	// A CHEAPEST with one positive constant COST is searched as SHORTEST, over CHEAPEST's simple paths: the walks
+	// below are ANY / ALL SHORTEST's (SQL/PGQ), and CHEAPEST with every cost equal answers as that constant does.
+	const bool shortest = pattern.shortest || constant_cost;
 	if (topk) {
 		search.k = pattern.topk;
 		search.mode = PathModeName(mode);
-	} else if (pattern.cheapest) {
+	} else if (pattern.cheapest && !constant_cost) {
 		return search;
-	} else if (pattern.shortest && mode != PGQPathMode::ACYCLIC &&
+	} else if (pattern.shortest && !pattern.cheapest && mode != PGQPathMode::ACYCLIC &&
 	           (search.quantifier->lower > 1 || (search.quantifier->lower == 1 && mode == PGQPathMode::TRAIL && undirected)) &&
 	           // ANY SHORTEST over bounded walks, where only the endpoints are read, needs no enumeration: the
 	           // walk-reachability CTE (or a k-hop artifact holding every k-hop walk) has the least depth per pair.
@@ -16572,10 +16757,10 @@ static PGQNativePathSearch NativePathSearchFor(PathPattern &pattern, bool one_ro
 		search.walks = true;
 	} else if (!unbounded) {
 		return search;
-	} else if (!pattern.shortest && mode > PGQPathMode::WALK) {
+	} else if (!shortest && mode > PGQPathMode::WALK) {
 		search.k = -1;
 		search.mode = "acyclic";
-	} else if (pattern.shortest && search.quantifier->lower > 1) {
+	} else if (shortest && search.quantifier->lower > 1) {
 		// ACYCLIC from a lower bound above 1
 		search.k = 1;
 		search.all_shortest = pattern.all;
@@ -16700,6 +16885,299 @@ static void AddNativePathSearch(ClientContext &context, const PGQNativePathSearc
 	RecordRewriteDiagnostic(context, std::move(diagnostic));
 }
 
+//! Sets up the search by cost for a CHEAPEST pattern `search` (NativePathSearchFor's `cheapest`): the costed step CSR
+//! as "cte1" (the edge's element WHERE filters its steps, its COST weighs them), and the cheapest paths from every
+//! source the MATCH WHERE (or the source's element WHERE) admits to every destination it admits, as
+//! "shortest_path_cte" (path, src_rowid, dst_rowid, cost), joined to both endpoints. ProcessPathList then binds the
+//! vertices and the path functions with csr_slot.path_search_premade set; COST(p) reads the cost column.
+static void AddCheapestPathSearch(ClientContext &context, const PGQNativePathSearch &search, MatchExpression &ref,
+                                  CreatePropertyGraphInfo &pg_table, unique_ptr<SelectNode> &select_node,
+                                  vector<unique_ptr<ParsedExpression>> &conditions, PGQCSRSlot &csr_slot) {
+	auto &edge = *search.edge;
+	auto &quantifier = *search.quantifier;
+	shared_ptr<PropertyGraphTable> edge_table;
+	try {
+		edge_table = ResolveTable(edge.label, edge.match_type, pg_table);
+	} catch (const Exception &) {
+		throw NotImplementedException("CHEAPEST needs one edge table; the label expression '%s' spans several",
+		                              edge.label);
+	}
+	if (!StringUtil::CIEquals(PGQStr(edge_table->source_reference), PGQStr(edge_table->destination_reference))) {
+		throw NotImplementedException("This CHEAPEST search needs an edge whose two ends are one vertex table; '%s' "
+		                              "connects '%s' and '%s'",
+		                              PGQStr(edge_table->table_name), PGQStr(edge_table->source_reference),
+		                              PGQStr(edge_table->destination_reference));
+	}
+	if (EdgeLabelAdmitsNothing(edge.label, edge_table)) {
+		throw NotImplementedException("The edge label expression '%s' admits no edge of %s", edge.label,
+		                              PGQStr(edge_table->table_name));
+	}
+	const string &src = search.src->variable_binding;
+	const string &dst = search.dst->variable_binding;
+	auto &vertex_table = *edge_table->source_pg_table;
+	const string vertices = QualifiedTableName(PGQStr(vertex_table.catalog_name), PGQStr(vertex_table.schema_name),
+	                                           PGQStr(vertex_table.table_name));
+	const string edges = QualifiedTableName(PGQStr(edge_table->catalog_name), PGQStr(edge_table->schema_name),
+	                                        PGQStr(edge_table->table_name));
+	const string pk = KeywordHelper::WriteOptionallyQuoted(PGQStr(edge_table->source_pk[0]));
+
+	auto seed = [&](const string &binding, SubPath *wrapper) -> string {
+		vector<string> parts;
+		if (wrapper && wrapper->where_clause) {
+			parts.push_back("(" + wrapper->where_clause->ToString() + ")");
+		}
+		if (ref.where_clause) {
+			if (auto pushed = ExtractSrcFilter(*ref.where_clause, binding)) {
+				parts.push_back("(" + pushed->ToString() + ")");
+			}
+		}
+		return StringUtil::Join(parts, " AND ");
+	};
+	const string src_seed = seed(src, search.src_wrapper);
+	const string dst_seed = seed(dst, search.dst_wrapper);
+	const string q_src = KeywordHelper::WriteOptionallyQuoted(src);
+	const string q_dst = KeywordHelper::WriteOptionallyQuoted(dst);
+	const string destinations =
+	    dst_seed.empty() ? "NULL::BIGINT[]"
+	                     : StringUtil::Format("(SELECT list(%s.rowid) FROM %s AS %s WHERE %s)", q_dst, vertices, q_dst,
+	                                          dst_seed);
+
+	// The COST and the element WHERE, over the step's edge __e and, as singletons, the pattern's endpoints. The WHERE
+	// is consumed here: it filters steps, not rows.
+	auto cost = CostWithDefault(quantifier);
+	unique_ptr<ParsedExpression> filter;
+	if (quantifier.where_clause) {
+		filter = std::move(quantifier.where_clause);
+	}
+	// The endpoint properties they read, each a column of the endpoint context relation (__pgq_cost_ctx): a search
+	// runs per source and context, over the steps costed (and filtered) in that context.
+	vector<pair<string, string>> context_columns; // (binding, property)
+	auto collect = [&](const ParsedExpression &expression) {
+		ParsedExpressionIterator::VisitExpression<ColumnRefExpression>(expression, [&](const ColumnRefExpression &col) {
+			auto &names = col.ColumnNames();
+			if (names.size() != 2) {
+				return;
+			}
+			const string binding = PGQStr(names[0]);
+			if (!StringUtil::CIEquals(binding, src) && !StringUtil::CIEquals(binding, dst)) {
+				return;
+			}
+			const pair<string, string> key(StringUtil::CIEquals(binding, src) ? src : dst, PGQStr(names[1]));
+			for (auto &existing : context_columns) {
+				if (StringUtil::CIEquals(existing.first, key.first) && StringUtil::CIEquals(existing.second, key.second)) {
+					return;
+				}
+			}
+			context_columns.push_back(key);
+		});
+	};
+	collect(*cost);
+	if (filter) {
+		collect(*filter);
+	}
+	const bool contexts = !context_columns.empty();
+	bool src_context = false;
+	bool dst_context = false;
+	for (auto &column : context_columns) {
+		src_context = src_context || StringUtil::CIEquals(column.first, src);
+		dst_context = dst_context || StringUtil::CIEquals(column.first, dst);
+	}
+	auto context_name = [&](const string &binding, const string &property) {
+		for (idx_t i = 0; i < context_columns.size(); i++) {
+			if (StringUtil::CIEquals(context_columns[i].first, binding) &&
+			    StringUtil::CIEquals(context_columns[i].second, property)) {
+				return "__ctx_" + std::to_string(i);
+			}
+		}
+		throw InternalException("CHEAPEST: endpoint property %s.%s has no context column", binding, property);
+	};
+	// Over the step: the edge is __e, an endpoint property its context column.
+	auto over_step = [&](const ParsedExpression &expression) {
+		auto rebound = RebindColumnAlias(expression.Copy(), edge.variable_binding, "__e");
+		ParsedExpressionIterator::VisitExpressionMutable<ColumnRefExpression>(*rebound, [&](ColumnRefExpression &col) {
+			auto &names = col.ColumnNamesMutable();
+			if (names.size() == 2 &&
+			    (StringUtil::CIEquals(PGQStr(names[0]), src) || StringUtil::CIEquals(PGQStr(names[0]), dst))) {
+				const string binding = StringUtil::CIEquals(PGQStr(names[0]), src) ? src : dst;
+				names[1] = Identifier(context_name(binding, PGQStr(names[1])));
+				names[0] = Identifier("__ctx");
+			}
+		});
+		return rebound->ToString();
+	};
+	const string step_cost = over_step(*cost);
+	const string step_filter = filter ? over_step(*filter) : string();
+	// The COST's type, from no rows: the edge __p and the endpoints __pa, __pb.
+	auto probe_cost = RebindColumnAlias(cost->Copy(), edge.variable_binding, "__p");
+	probe_cost = RebindColumnAlias(std::move(probe_cost), src, "__pa");
+	probe_cost = RebindColumnAlias(std::move(probe_cost), dst, "__pb");
+	const string cost_probe = StringUtil::Format("(SELECT %s FROM %s __p, %s __pa, %s __pb LIMIT 0)",
+	                                             probe_cost->ToString(), edges, vertices, vertices);
+
+	const string v_count = StringUtil::Format("(SELECT count(__v.%s) FROM %s __v)", pk, vertices);
+	const int64_t budget = MaxVLFallbackRows(context);
+	string steps, costed_steps, dense_ids, v_size;
+	if (!contexts) {
+		steps = StepRelationSQL(edge_table, edge.match_type, edge.label, string(), step_filter);
+		costed_steps = StepRelationSQL(edge_table, edge.match_type, edge.label, ", (" + step_cost + ") AS cost",
+		                               step_filter);
+		dense_ids = StringUtil::Format("SELECT __v.rowid AS dense_id FROM %s __v", vertices);
+		v_size = v_count;
+	} else {
+		// The contexts: the distinct values of the properties read, over the endpoints the seeds admit. Vertex v in
+		// context c is c * V + v of the CSR, so the contexts' searches never meet.
+		vector<string> context_select;
+		for (idx_t i = 0; i < context_columns.size(); i++) {
+			context_select.push_back(StringUtil::Format(
+			    "%s.%s AS __ctx_%llu", KeywordHelper::WriteOptionallyQuoted(context_columns[i].first),
+			    KeywordHelper::WriteOptionallyQuoted(context_columns[i].second), static_cast<unsigned long long>(i)));
+		}
+		vector<string> from;
+		vector<string> where;
+		if (src_context) {
+			from.push_back(StringUtil::Format("%s AS %s", vertices, q_src));
+			if (!src_seed.empty()) {
+				where.push_back(src_seed);
+			}
+		}
+		if (dst_context) {
+			from.push_back(StringUtil::Format("%s AS %s", vertices, q_dst));
+			if (!dst_seed.empty()) {
+				where.push_back(dst_seed);
+			}
+		}
+		const string context_sql = StringUtil::Format(
+		    "SELECT (row_number() OVER ()) - 1 AS __ctx_id, * FROM (SELECT DISTINCT %s FROM %s%s)",
+		    StringUtil::Join(context_select, ", "), StringUtil::Join(from, ", "),
+		    where.empty() ? "" : " WHERE " + StringUtil::Join(where, " AND "));
+		auto context_info = make_uniq<CommonTableExpressionInfo>();
+		context_info->query_node = std::move(ParseSelectStatement(context_sql)->node);
+		// Numbered once: the CSR and the search read the same numbering.
+		context_info->materialized = CTEMaterialize::CTE_MATERIALIZE_ALWAYS;
+		select_node->cte_map.map[Identifier("__pgq_cost_ctx")] = std::move(context_info);
+		const string context_join = " CROSS JOIN __pgq_cost_ctx __ctx";
+		auto offset = [&](const string &inner, bool with_cost) {
+			return StringUtil::Format("SELECT __ctx_id * %s + src_rowid AS src_rowid, __ctx_id * %s + dst_rowid AS "
+			                          "dst_rowid, edge_rowid%s FROM (%s)",
+			                          v_count, v_count, with_cost ? ", cost" : "", inner);
+		};
+		steps = offset(StepRelationSQL(edge_table, edge.match_type, edge.label, ", __ctx.__ctx_id AS __ctx_id",
+		                               step_filter, context_join),
+		               false);
+		costed_steps = offset(StepRelationSQL(edge_table, edge.match_type, edge.label,
+		                                      ", __ctx.__ctx_id AS __ctx_id, (" + step_cost + ") AS cost", step_filter,
+		                                      context_join),
+		                      true);
+		dense_ids =
+		    StringUtil::Format("SELECT __c.__ctx_id * %s + __v.rowid AS dense_id FROM %s __v, __pgq_cost_ctx __c",
+		                       v_count, vertices);
+		// The CSR holds every context's copy of the graph: refused past the budget before it is built.
+		const string edge_count = StringUtil::Format("(SELECT count(*) FROM %s)", edges);
+		v_size = StringUtil::Format(
+		    "(SELECT CASE WHEN %lld > 0 AND __n * (%s + %s) > %lld THEN CAST(error('A CHEAPEST search whose COST or "
+		    "element WHERE reads the endpoints runs once per distinct value of what it reads: ' || __n || ' contexts "
+		    "of the graph exceed pgq_max_vl_fallback_rows (%lld). Constrain the endpoints, or raise or disable the "
+		    "budget with SET pgq_max_vl_fallback_rows.') AS BIGINT) ELSE __n * %s END FROM (SELECT count(*) AS __n "
+		    "FROM __pgq_cost_ctx))",
+		    static_cast<long long>(budget), v_count, edge_count, static_cast<long long>(budget),
+		    static_cast<long long>(budget), v_count);
+	}
+
+	ClaimCSRSlot(csr_slot,
+	             CSRKeyFor(edge_table, edge.match_type, edge.label, true) + "|cost:" + step_cost + "|where:" + step_filter,
+	             CSRIdCounter(context));
+	if (select_node->cte_map.map.find("cte1") == select_node->cte_map.map.end()) {
+		select_node->cte_map.map["cte1"] = CreateCostedStepCSRCTE(steps, costed_steps, dense_ids, v_size, csr_slot.slot);
+	}
+	const int64_t upper = std::min<int64_t>(quantifier.upper, static_cast<int64_t>(1 << 30));
+	const string paths_cte = "__pgq_paths_" + std::to_string(select_node->cte_map.map.size());
+	string source = StringUtil::Format("%s.rowid", q_src);
+	string search_from = StringUtil::Format("%s AS %s", vertices, q_src);
+	string search_destinations = destinations;
+	if (contexts) {
+		// Each source with each context its own properties admit; the destinations of its context.
+		auto matches = [&](const string &binding, const string &alias) {
+			vector<string> parts;
+			for (idx_t i = 0; i < context_columns.size(); i++) {
+				if (StringUtil::CIEquals(context_columns[i].first, binding)) {
+					parts.push_back(StringUtil::Format("%s.%s IS NOT DISTINCT FROM __c.__ctx_%llu", alias,
+					                                   KeywordHelper::WriteOptionallyQuoted(context_columns[i].second),
+					                                   static_cast<unsigned long long>(i)));
+				}
+			}
+			return parts.empty() ? string("true") : StringUtil::Join(parts, " AND ");
+		};
+		source = StringUtil::Format("__c.__ctx_id * %s + %s.rowid", v_count, q_src);
+		search_from = StringUtil::Format("%s AS %s JOIN __pgq_cost_ctx __c ON %s", vertices, q_src, matches(src, q_src));
+		if (dst_context || !dst_seed.empty()) {
+			vector<string> dst_where;
+			if (!dst_seed.empty()) {
+				dst_where.push_back(dst_seed);
+			}
+			if (dst_context) {
+				dst_where.push_back(matches(dst, q_dst));
+			}
+			search_destinations = StringUtil::Format("(SELECT list(__c.__ctx_id * %s + %s.rowid) FROM %s AS %s WHERE %s)",
+			                                         v_count, q_dst, vertices, q_dst,
+			                                         StringUtil::Join(dst_where, " AND "));
+		}
+	}
+	const string search_sql = StringUtil::Format(
+	    "SELECT %s.rowid AS src_rowid, unnest(pgq_cheapest_paths(%d, %s, %s, %s, %lld, %lld, '%s', %lld, %s, "
+	    "__x.temp)) AS __found FROM %s, (SELECT 0 * count(cte1.temp) AS temp FROM cte1) AS __x%s",
+	    q_src, csr_slot.slot, contexts ? StringUtil::Format("(SELECT count(*) FROM __pgq_cost_ctx) * %s", v_count)
+	                                   : v_count,
+	    source, search_destinations, static_cast<long long>(quantifier.lower), static_cast<long long>(upper),
+	    search.all_shortest ? "all" : "any", static_cast<long long>(budget), cost_probe, search_from,
+	    src_seed.empty() ? "" : " WHERE " + src_seed);
+	auto search_info = make_uniq<CommonTableExpressionInfo>();
+	search_info->query_node = std::move(ParseSelectStatement(search_sql)->node);
+	select_node->cte_map.map[Identifier(paths_cte)] = std::move(search_info);
+
+	// In contexts, vertex ids are c * V + v: the path's vertices (its odd positions) and the destination are v.
+	const string path_sql =
+	    contexts ? StringUtil::Format("SELECT list_transform(__found.path, lambda __x, __i: CASE WHEN __i %% 2 = 1 THEN "
+	                                  "__x %% __vc.__n ELSE __x END) AS path, src_rowid, __found.dst %% __vc.__n AS "
+	                                  "dst_rowid, __found.cost AS cost FROM %s, (SELECT %s AS __n) __vc",
+	                                  KeywordHelper::WriteOptionallyQuoted(paths_cte), v_count)
+	             : StringUtil::Format("SELECT __found.path AS path, src_rowid, __found.dst AS dst_rowid, __found.cost "
+	                                  "AS cost FROM %s",
+	                                  KeywordHelper::WriteOptionallyQuoted(paths_cte));
+	auto path_info = make_uniq<CommonTableExpressionInfo>();
+	path_info->query_node = std::move(ParseSelectStatement(path_sql)->node);
+	path_info->materialized = CTEMaterialize::CTE_MATERIALIZE_ALWAYS;
+	select_node->cte_map.map["shortest_path_cte"] = std::move(path_info);
+
+	auto path_ref = make_uniq<BaseTableRef>();
+	path_ref->SetTable(Identifier("shortest_path_cte"));
+	if (select_node->from_table) {
+		auto join = make_uniq<JoinRef>(JoinRefType::CROSS);
+		join->left = std::move(select_node->from_table);
+		join->right = std::move(path_ref);
+		select_node->from_table = std::move(join);
+	} else {
+		select_node->from_table = std::move(path_ref);
+	}
+	conditions.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+	                                                     PGQColRef("src_rowid", "shortest_path_cte"),
+	                                                     PGQColRef("rowid", src)));
+	conditions.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+	                                                     PGQColRef("dst_rowid", "shortest_path_cte"),
+	                                                     PGQColRef("rowid", dst)));
+
+	PGQRewriteDiagnostic diagnostic;
+	diagnostic.graph_name = pg_table.property_graph_name;
+	diagnostic.rewrite_type = "path_search";
+	diagnostic.status = "traversal";
+	diagnostic.reason = StringUtil::Format("search by cost: %s cheapest, steps %lld..%lld%s%s",
+	                                       search.all_shortest ? "all" : "any",
+	                                       static_cast<long long>(quantifier.lower), static_cast<long long>(upper),
+	                                       step_filter.empty() ? "" : ", steps filtered",
+	                                       contexts ? ", per endpoint context" : "");
+	diagnostic.edge_label_sequence = edge.label.empty() ? "*" : edge.label;
+	RecordRewriteDiagnostic(context, std::move(diagnostic));
+}
+
 unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &context, MatchExpression *ref,
                                                             bool allow_abi) {
 	auto duckpgq_state = GetDuckPGQState(context);
@@ -16710,6 +17188,21 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 
 	auto final_select_node = make_uniq<SelectNode>();
 	case_insensitive_map_t<shared_ptr<PropertyGraphTable>> alias_map;
+
+	// COLUMNS shared with UNION branches that read COST(p): each branch computes the cost of its own p, so it copies
+	// them as written, before the head rewrites them for its own search. (Other shared COLUMNS are copied after.)
+	vector<unique_ptr<ParsedExpression>> shared_cost_columns;
+	if (!ref->union_matches.empty() && ref->union_matches[0]->column_list.empty()) {
+		vector<string> cost_calls;
+		for (auto &column : ref->column_list) {
+			CollectCostCalls(*column, cost_calls);
+		}
+		if (!cost_calls.empty()) {
+			for (auto &column : ref->column_list) {
+				shared_cost_columns.push_back(column->Copy());
+			}
+		}
+	}
 
 	// Build/reuse session-local path-table metadata once per graph. Prefer DBT's
 	// __pgq_path_catalog ABI metadata, with a name-scan fallback for older layouts.
@@ -16807,7 +17300,7 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 			native_search.applies = false;
 		}
 		if (native_search.applies &&
-		    (path_pattern->topk > 0 || (native_search.walks && !artifact_walks) || !allow_abi ||
+		    (path_pattern->topk > 0 || native_search.cheapest || (native_search.walks && !artifact_walks) || !allow_abi ||
 		     !TryPathTableRewrite(context, *pg_table, path_pattern->path_elements, *ref, conditions, final_select_node,
 		                          alias_map, extra_alias_counter, path_table_cache, referenced_bindings,
 		                          covered_columns, ref->one_row_per, ref->where_clause.get(),
@@ -16815,7 +17308,11 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 			if (require_abi_paths) {
 				ThrowABIPathRequired();
 			}
-			AddNativePathSearch(context, native_search, *ref, *pg_table, final_select_node, conditions, cte1_slot);
+			if (native_search.cheapest) {
+				AddCheapestPathSearch(context, native_search, *ref, *pg_table, final_select_node, conditions, cte1_slot);
+			} else {
+				AddNativePathSearch(context, native_search, *ref, *pg_table, final_select_node, conditions, cte1_slot);
+			}
 			cte1_slot.path_search_premade = true;
 			ProcessPathList(context, path_pattern->path_elements, conditions, final_select_node, alias_map, *pg_table,
 			                extra_alias_counter, *ref, CSRIdCounter(context), cte1_slot, true, false,
@@ -16879,8 +17376,15 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 		}
 	}
 
-	// Process OPTIONAL MATCH groups — each group becomes a chain of LEFT JOINs.
+	// Process OPTIONAL MATCH groups — each group becomes a chain of LEFT JOINs. First the patterns matched on their
+	// own (MatchExpression::joined_patterns), joined: the groups may share their variables.
 	case_insensitive_map_t<shared_ptr<PropertyGraphTable>> optional_alias_map;
+	for (auto &joined : ref->joined_patterns) {
+		vector<unique_ptr<PathPattern>> group;
+		group.push_back(joined->Copy());
+		AddOptionalGroupJoin(context, *ref, group, final_select_node, optional_alias_map, *pg_table, extra_alias_counter,
+		                     alias_map, ref->column_list, ref->where_clause, false);
+	}
 	for (auto &opt_group : ref->optional_match_patterns) {
 		if (OptionalGroupNeedsJoin(opt_group, DisableABIRewrite(context) ? nullptr : &path_table_cache)) {
 			AddOptionalGroupJoin(context, *ref, opt_group, final_select_node, optional_alias_map, *pg_table,
@@ -16979,7 +17483,7 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 	for (size_t ui = 0; ui < ref->union_matches.size(); ui++) {
 		vector<unique_ptr<ParsedExpression>> branch_cols;
 		if (ref->union_matches[ui]->column_list.empty()) {
-			for (auto &expr : ref->column_list) {
+			for (auto &expr : shared_cost_columns.empty() ? ref->column_list : shared_cost_columns) {
 				branch_cols.push_back(expr->Copy());
 			}
 		}
@@ -17008,7 +17512,11 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 		bool all = ref->union_all_flags[ui];
 		// The branch's own COLUMNS, or its copy of the shared ones.
 		const bool own_columns = !branch.column_list.empty();
-		auto &branch_columns = own_columns ? branch.column_list : union_col_copies[ui];
+		if (!own_columns && !shared_cost_columns.empty()) {
+			// Shared COLUMNS reading COST(p), as written: the branch rewrites them for its own patterns.
+			branch.column_list = std::move(union_col_copies[ui]);
+		}
+		auto &branch_columns = !branch.column_list.empty() ? branch.column_list : union_col_copies[ui];
 
 		auto branch_select = make_uniq<SelectNode>();
 		case_insensitive_map_t<shared_ptr<PropertyGraphTable>> branch_alias_map;
@@ -17038,7 +17546,7 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 			}
 			auto native_search = NativePathSearchFor(*path_pattern, branch.one_row_per != OneRowPerMode::NONE);
 			if (native_search.applies &&
-			    (path_pattern->topk > 0 || native_search.walks ||
+			    (path_pattern->topk > 0 || native_search.cheapest || native_search.walks ||
 			     !TryPathTableRewrite(context, *pg_table, path_pattern->path_elements, branch, branch_conditions,
 			                          branch_select, branch_alias_map, branch_counter, path_table_cache,
 			                          branch_referenced_bindings, branch_covered_columns, branch.one_row_per,
@@ -17047,8 +17555,13 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 					ThrowABIPathRequired();
 				}
 				PGQCSRSlot branch_cte1_slot;
-				AddNativePathSearch(context, native_search, branch, *pg_table, branch_select, branch_conditions,
-				                    branch_cte1_slot);
+				if (native_search.cheapest) {
+					AddCheapestPathSearch(context, native_search, branch, *pg_table, branch_select, branch_conditions,
+					                      branch_cte1_slot);
+				} else {
+					AddNativePathSearch(context, native_search, branch, *pg_table, branch_select, branch_conditions,
+					                    branch_cte1_slot);
+				}
 				branch_cte1_slot.path_search_premade = true;
 				ProcessPathList(context, path_pattern->path_elements, branch_conditions, branch_select,
 				                branch_alias_map, *pg_table, branch_counter, branch, CSRIdCounter(context),
@@ -17101,8 +17614,15 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 		}
 
 		case_insensitive_map_t<shared_ptr<PropertyGraphTable>> branch_opt_alias_map;
+		for (auto &joined : branch.joined_patterns) {
+			vector<unique_ptr<PathPattern>> group;
+			group.push_back(joined->Copy());
+			AddOptionalGroupJoin(context, *ref, group, branch_select, branch_opt_alias_map, *pg_table, branch_counter,
+			                     branch_alias_map, branch_columns, branch.where_clause, false);
+		}
 		for (auto &opt_group : branch.optional_match_patterns) {
 			if (OptionalGroupNeedsJoin(opt_group, DisableABIRewrite(context) ? nullptr : &path_table_cache)) {
+				// The branch's own COLUMNS decide what of the group is read (its copy of the head's when shared).
 				AddOptionalGroupJoin(context, *ref, opt_group, branch_select, branch_opt_alias_map, *pg_table,
 				                     branch_counter, branch_alias_map, branch_columns, branch.where_clause);
 				continue;
