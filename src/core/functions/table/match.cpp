@@ -11265,9 +11265,9 @@ static string EndpointBinding(const unique_ptr<PathReference> &reference) {
 	return reinterpret_cast<const PathElement &>(*wrapper.path_list[0]).variable_binding;
 }
 
-//! Whether COST(p) of a constant COST over this quantified edge is the search over the constant costs
-//! (cheapest_path_length over a weighted CSR): one right-directed edge quantified with + or *, no element WHERE, no
-//! ONE ROW PER. Elsewhere it is the constant added once per step of the path the pattern matched.
+//! Whether COST(p) of a constant COST over this quantified edge is searched by cost (Dijkstra over the constant
+//! costs): one right-directed edge quantified with + or *, no element WHERE, no ONE ROW PER. Elsewhere it is the
+//! constant added once per step of the shortest path the pattern matched.
 static bool ConstantCostSearch(const SubPath &edge, OneRowPerMode one_row_per) {
 	auto &element = reinterpret_cast<const PathElement &>(*edge.path_list[0]);
 	return edge.lower <= 1 && edge.upper >= (1 << 30) && !edge.where_clause &&
@@ -11297,7 +11297,6 @@ static void PrepareCheapest(MatchExpression &match, bool shared_union_columns) {
 	idx_t searches = 0;
 	bool needs_path_cte = false;
 	idx_t variable_length = 0;
-	bool constant_cost_search = false;
 	bool different_searches = false;
 	// The patterns that search by cost (or over constant costs) with a CSR or path CTE of their own: split off into
 	// MATCHes of their own when the block cannot hold them all.
@@ -11328,24 +11327,21 @@ static void PrepareCheapest(MatchExpression &match, bool shared_union_columns) {
 		auto *edge = SingleQuantifiedEdge(elements);
 		auto *edge_element = edge ? dynamic_cast<PathElement *>(edge->path_list[0].get()) : nullptr;
 		// A constant COST is SHORTEST, except over an edge with an element WHERE, which only the search by cost
-		// filters step by step: there it is searched like any other COST.
-		const bool constant =
-		    AllCostsConstant(pattern->path_elements, found) && found && !(edge && edge->where_clause);
+		// filters step by step, and where COST(p) asks for the cost over an unbounded right-directed edge, which the
+		// search by cost answers (Dijkstra): there it is searched like any other COST.
+		const bool constant = AllCostsConstant(pattern->path_elements, found) && found &&
+		                      !(edge && (edge->where_clause || (costed && ConstantCostSearch(*edge, match.one_row_per))));
 		if (constant) {
 			if (!costed) {
 				continue;
 			}
 			// The paths are the shortest ones, and COST(p) is the constant added once per step of the path
-			// (ConstantPathCost). One right-directed edge quantified with + or * keeps its search over the constant
-			// costs (cheapest_path_length), which shares the block's CSR.
+			// (pgq_repeat_cost over path_length). (Over an unbounded right-directed edge COST(p) is searched by cost,
+			// above.)
 			if (!edge) {
 				throw NotImplementedException("COST(%s) of a constant COST supports one quantified edge between two "
 				                              "vertices, e.g. %s",
 				                              path_variable, kExample);
-			}
-			if (ConstantCostSearch(*edge, match.one_row_per)) {
-				constant_cost_search = true;
-				searching[this_pattern] = true;
 			}
 		} else {
 			if (!edge) {
@@ -11383,12 +11379,11 @@ static void PrepareCheapest(MatchExpression &match, bool shared_union_columns) {
 			search_signature = signature;
 			searches++;
 			searching[this_pattern] = true;
-			// The search by cost (any direction but -> without an upper bound, a lower bound above 1 without one, an
-			// element WHERE) always materialises its paths.
+			// The search by cost (without an upper bound, with an element WHERE, with a COST reading the endpoints)
+			// always materialises its paths.
 			const bool searched_by_cost =
 			    edge->where_clause || !ReadsOnly(*edge->cost_expr, {edge_element->variable_binding}) ||
-			    (edge->upper >= (1 << 30) &&
-			     (edge->lower > 1 || edge_element->match_type != PGQMatchType::MATCH_EDGE_RIGHT));
+			    edge->upper >= (1 << 30);
 			bool uses_path = match.one_row_per != OneRowPerMode::NONE || pattern->all || edge->upper < (1 << 30) ||
 			                 searched_by_cost;
 			if (!path_variable.empty()) {
@@ -11422,8 +11417,7 @@ static void PrepareCheapest(MatchExpression &match, bool shared_union_columns) {
 	// Patterns over the same edges and COST asking for nothing but COST(p) share one search; otherwise the searching
 	// patterns are matched each as a MATCH of its own, joined onto the others on the variables they share
 	// (BuildMatchRef), as several path patterns of one MATCH are: selected each on its own, then joined.
-	if (different_searches || (searches > 0 && variable_length > searches) || (searches > 1 && needs_path_cte) ||
-	    (constant_cost_search && variable_length > costed_paths.size())) {
+	if (different_searches || (searches > 0 && variable_length > searches) || (searches > 1 && needs_path_cte)) {
 		if (match.one_row_per != OneRowPerMode::NONE) {
 			throw NotImplementedException("ONE ROW PER with a CHEAPEST pattern next to other variable-length patterns "
 			                              "is not supported; put the others in a GRAPH_TABLE of their own");
@@ -13073,17 +13067,14 @@ static PGQNativePathSearch NativePathSearchFor(PathPattern &pattern) {
 		return refuse("the edge is not quantified");
 	}
 	if (search.quantifier->cheapest) {
-		// A COST that varies by edge (PrepareCheapest marked the edge). The long-standing routes answer a right-directed
-		// + or * without an element WHERE (Bellman-Ford over the weighted CSR) and any bounded edge without one (the
-		// bounded enumeration), both with a COST over the edge alone; the search by cost answers the rest: <- and -
-		// without an upper bound, a lower bound above 1 without one, an element WHERE on the costed edge, and a COST
-		// that reads the endpoints.
+		// A COST that varies by edge (PrepareCheapest marked the edge). The bounded enumeration answers a bounded
+		// edge without an element WHERE and with a COST over the edge alone; the search by cost answers the rest:
+		// every edge without an upper bound (Dijkstra from at most one step up, a layered search above), an element
+		// WHERE on the costed edge, and a COST that reads the endpoints.
 		const bool unbounded_edge = search.quantifier->upper >= static_cast<int64_t>(1 << 30);
 		const bool long_standing =
 		    !search.quantifier->where_clause &&
-		    ReadsOnly(*search.quantifier->cost_expr, {search.edge->variable_binding}) &&
-		    (!unbounded_edge ||
-		     (search.quantifier->lower <= 1 && search.edge->match_type == PGQMatchType::MATCH_EDGE_RIGHT));
+		    ReadsOnly(*search.quantifier->cost_expr, {search.edge->variable_binding}) && !unbounded_edge;
 		if (long_standing) {
 			return search;
 		}

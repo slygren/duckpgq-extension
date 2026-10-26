@@ -537,9 +537,10 @@ EDGE TABLES (chain_e SOURCE KEY (src) REFERENCES chain_v (id) DESTINATION KEY (d
 statement ok
 SET max_execution_time = 500;
 
+# 10000 searches of 20000 steps or more (about 5 s); the limit stops them.
 statement error
-SELECT count(*) FROM GRAPH_TABLE (chain MATCH p = ANY CHEAPEST (a:V)-[e:E COST e.w]->+(b:V) WHERE a.id >= 29000 AND b.id = 0
-    COLUMNS (vertices(p) AS vs, COST(p) AS c));
+SELECT count(*) FROM GRAPH_TABLE (chain MATCH p = ANY CHEAPEST (a:V)-[e:E COST e.w]->+(b:V) WHERE a.id >= 20000 AND b.id = 0
+    COLUMNS (COST(p) AS c));
 ----
 maximum execution time
 
