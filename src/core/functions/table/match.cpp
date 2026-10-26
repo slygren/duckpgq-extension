@@ -2375,7 +2375,23 @@ struct PGQElementScope {
 		PGQMatchType direction;
 	};
 	case_insensitive_map_t<EdgeEnds> edge_ends;
+	//! The property graph, for what is defined on any of its tables.
+	const CreatePropertyGraphInfo *graph = nullptr;
 };
+
+//! The names of the properties an element of `table` has, as declared (`PROPERTIES (c AS name)` names it `name`).
+static const vector<Identifier> &ElementPropertyNames(const PropertyGraphTable &table) {
+	return table.column_aliases.size() == table.column_names.size() ? table.column_aliases : table.column_names;
+}
+
+static bool ElementHasProperty(const PropertyGraphTable &table, const string &property) {
+	for (auto &name : ElementPropertyNames(table)) {
+		if (StringUtil::CIEquals(PGQStr(name), property)) {
+			return true;
+		}
+	}
+	return false;
+}
 
 //! The element of a pattern position: the element itself, or the one inside its element-WHERE subpath.
 static PathElement *PositionElement(const unique_ptr<PathReference> &reference, bool &single) {
@@ -2526,6 +2542,47 @@ static unique_ptr<ParsedExpression> RewriteElementFunction(FunctionExpression &f
 			test = make_uniq<OperatorExpression>(ExpressionType::OPERATOR_NOT, std::move(test));
 		}
 		return NullWhereElementNull(scope, variable, std::move(test));
+	}
+	if (name == "property_exists" && argument_count == 2) {
+		auto variable = ElementArgument(function, 0);
+		auto table = table_of(variable);
+		if (!table) {
+			throw BinderException("PROPERTY_EXISTS: '%s' must be an element variable of the MATCH",
+			                      variable.empty() ? function.GetArgumentsMutable()[0].GetExpression().ToString()
+			                                       : variable);
+		}
+		// The property is a name (PROPERTY_EXISTS(a, age)), or a string literal.
+		auto &argument = function.GetArgumentsMutable()[1].GetExpressionMutable();
+		string property;
+		if (argument->GetExpressionClass() == ExpressionClass::COLUMN_REF &&
+		    argument->Cast<ColumnRefExpression>().ColumnNames().size() == 1) {
+			property = PGQStr(argument->Cast<ColumnRefExpression>().ColumnNames()[0]);
+		} else if (argument->GetExpressionClass() == ExpressionClass::CONSTANT &&
+		           argument->Cast<ConstantExpression>().GetLiteral().ToValue().type().id() == LogicalTypeId::VARCHAR) {
+			property = argument->Cast<ConstantExpression>().GetLiteral().ToValue().GetValue<string>();
+		} else {
+			throw BinderException("PROPERTY_EXISTS(%s, ...): the property must be a property name", variable);
+		}
+		if (scope.stubs && scope.stubs->count(variable)) {
+			throw BinderException("PROPERTY_EXISTS(%s, %s) cannot be resolved: '%s' has no label in the pattern and the "
+			                      "edge reaching it does not determine one. Give it a label in the pattern",
+			                      variable, property, variable);
+		}
+		if (scope.graph) {
+			bool defined = false;
+			for (auto *tables : {&scope.graph->vertex_tables, &scope.graph->edge_tables}) {
+				for (auto &candidate : *tables) {
+					defined = defined || ElementHasProperty(*candidate, property);
+				}
+			}
+			if (!defined) {
+				throw BinderException("PROPERTY_EXISTS(%s, %s): no vertex or edge table of property graph '%s' has a "
+				                      "property '%s'",
+				                      variable, property, scope.graph->property_graph_name, property);
+			}
+		}
+		return NullWhereElementNull(scope, variable,
+		                            ConstantExpression::FromValue(Value::BOOLEAN(ElementHasProperty(*table, property))));
 	}
 	if ((name == "is_source_of" || name == "is_destination_of") && argument_count == 2) {
 		const bool source = name == "is_source_of";
@@ -10362,6 +10419,7 @@ static unique_ptr<ParsedExpression> BuildExistsSubquery(
 	}
 	PGQElementScope element_scope;
 	element_scope.tables = &element_tables;
+	element_scope.graph = &pg_table;
 	CollectEdgeEnds(inner_match, element_scope);
 	CollectUndirectedEdgeBindings(inner_select->from_table.get(), element_scope.undirected_edges);
 	for (auto &condition : conditions) {
@@ -13638,7 +13696,7 @@ static bool IsGraphAtom(const ParsedExpression &expression) {
 		static const case_insensitive_set_t graph_functions {
 		    "element_id", "label",         "labels",      "vertices",          "edges",        "path_length",
 		    "vertex_labels", "edge_labels", "vertex_properties", "cost", "is_labeled", "not_labeled",
-		    "all_different"};
+		    "all_different", "same", "is_source_of", "is_destination_of", "property_exists"};
 		return graph_functions.find(name) != graph_functions.end();
 	}
 	default:
@@ -17990,6 +18048,7 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 	PGQElementScope element_scope;
 	element_scope.tables = &alias_to_vertex_and_edge_tables;
 	element_scope.stubs = &stub_bindings;
+	element_scope.graph = pg_table;
 	CollectEdgeEnds(*ref, element_scope);
 	for (auto &entry : optional_alias_map) {
 		if (alias_map.find(entry.first) == alias_map.end()) {
@@ -18235,6 +18294,7 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 		PGQElementScope branch_scope;
 		branch_scope.tables = &branch_alias_to_ve;
 		branch_scope.stubs = &branch_stub_bindings;
+		branch_scope.graph = pg_table;
 		CollectEdgeEnds(branch, branch_scope);
 		for (auto &entry : branch_opt_alias_map) {
 			if (branch_alias_map.find(entry.first) == branch_alias_map.end()) {

@@ -33,6 +33,11 @@ static void ElementComparisonFunction(DataChunk &, ExpressionState &, Vector &) 
 	throw InvalidInputException("SAME and ALL_DIFFERENT cannot be executed outside a GRAPH_TABLE");
 }
 
+// PROPERTY_EXISTS(a, p) asks whether graph element a has property p; the MATCH expansion answers it.
+static unique_ptr<FunctionData> ElementPropertyBind(BindScalarFunctionInput &) {
+	throw BinderException("PROPERTY_EXISTS is only allowed inside a GRAPH_TABLE, on an element variable of its MATCH");
+}
+
 //------------------------------------------------------------------------------
 // Register functions
 //------------------------------------------------------------------------------
@@ -41,6 +46,9 @@ void CoreScalarFunctions::RegisterGraphPredicateScalarFunctions(ExtensionLoader 
 		loader.RegisterFunction(Fallible(ScalarFunction(name, {LogicalType::ANY, LogicalType::VARCHAR}, LogicalType::BOOLEAN,
 		                                       LabelPredicateFunction, LabelPredicateBind)));
 	}
+	loader.RegisterFunction(Fallible(ScalarFunction("property_exists", {LogicalType::ANY, LogicalType::ANY},
+	                                                LogicalType::BOOLEAN, ElementComparisonFunction,
+	                                                ElementPropertyBind)));
 	for (auto name : {"same", "all_different"}) {
 		loader.RegisterFunction(Fallible(ScalarFunction(name, vector<LogicalType> {}, LogicalType::BOOLEAN,
 		                                                ElementComparisonFunction, ElementComparisonBind, nullptr,
