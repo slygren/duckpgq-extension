@@ -64,6 +64,10 @@ static void AddOutputColumns(vector<LogicalType> &return_types, vector<Identifie
 	return_types.emplace_back(LogicalType::BIGINT);
 	names.emplace_back("direct_link_rewrite_count");
 	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("estimated_cost");
+	return_types.emplace_back(LogicalType::DOUBLE);
+	names.emplace_back("alternatives");
+	return_types.emplace_back(LogicalType::VARCHAR);
 }
 
 static Value OptionalString(const string &value) {
@@ -124,6 +128,8 @@ void LastRewriteDiagnosticsFunction::LastRewriteDiagnosticsFunc(ClientContext &c
 		output.SetValue(24, out_idx, Value::BIGINT(row.endpoint_filter_count));
 		output.SetValue(25, out_idx, Value::BIGINT(row.property_filter_count));
 		output.SetValue(26, out_idx, Value::BIGINT(row.direct_link_rewrite_count));
+		output.SetValue(27, out_idx, row.estimated_cost < 0 ? Value() : Value::DOUBLE(row.estimated_cost));
+		output.SetValue(28, out_idx, OptionalString(row.alternatives));
 		out_idx++;
 	}
 	output.SetCardinality(out_idx);

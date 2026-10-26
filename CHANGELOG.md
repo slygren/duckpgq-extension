@@ -97,6 +97,9 @@ In every such case the old rows were wrong.
   from other builders it is probed once and cached.
 - **Mixed-direction and undirected chains** of two or three hops are answered from one path table per run of hops
   (edge and fixed-path tables, read either way, and reverse twins).
+- **Cost-based choice** between a fixed-path table and the chain of its edge tables, by estimated rows read; shown
+  in `pgq_last_rewrite_diagnostics()` (`estimated_cost`, `alternatives`).
+- **An exact length `{k,k}`** without a closure reads the k-hop fixed-path table instead of traversing.
 - **Diagnostics:** `pgq_last_rewrite_diagnostics()`, `pgq_explain_abi_path(…)`, `pgq_verify_abi_rewrite(…)`, and the
   `pgq_require_abi_paths` guard.
 

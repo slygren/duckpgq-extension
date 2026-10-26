@@ -9702,6 +9702,50 @@ BuildFinalColumnList(vector<unique_ptr<ParsedExpression>> col_list,
 	return final_column_list;
 }
 
+// Choosing between artifact routes that answer the same pattern: by the rows each reads, estimated from the
+// catalog's estimated_rows, so one catalog always gives one choice. An equality on the column an artifact is sorted
+// by reads a fraction of it (its row groups prune); a row a join produces costs a few scanned rows, and each further
+// artifact joined a fixed amount. A route replaces
+// the one chosen so far only when it is estimated at most half as costly, and an artifact without estimated_rows is
+// never chosen over another by cost. (A closure is preferred to the context expansion without costing: measured, it
+// is faster at every size, seeded or not.)
+static constexpr double PGQ_SORTED_LOOKUP_FRACTION = 1.0 / 64;
+static constexpr double PGQ_JOIN_ROW_WEIGHT = 4;
+//! Every artifact joined beyond the first: its scan, build and join cost about a millisecond whatever the rows (as
+//! much as scanning some 2M rows; measured on DuckDB tables, where a 2-hop chain bound on its middle vertex lost to a
+//! scan of the 4M-row fixed_path, and won against a 9M-row one by 3.5x).
+static constexpr double PGQ_JOIN_FIXED_ROWS = 2000000;
+static constexpr double PGQ_SWITCH_FACTOR = 2;
+
+//! Rows a scan of the artifact reads; -1 when the catalog has no estimate.
+static double ArtifactScanCost(const PGQPathTableInfo &info, bool sorted_column_bound) {
+	if (info.estimated_rows < 0) {
+		return -1;
+	}
+	return static_cast<double>(info.estimated_rows) * (sorted_column_bound ? PGQ_SORTED_LOOKUP_FRACTION : 1.0);
+}
+
+static string FormatRouteCost(double cost) {
+	return cost < 0 ? string("unknown") : StringUtil::Format("%.1f", cost);
+}
+
+//! A candidate route and its cost, for the diagnostics' alternatives column.
+static string RouteAlternative(const string &route, const string &table, double cost, bool chosen) {
+	return route + (table.empty() ? string() : " " + table) + ": " + FormatRouteCost(cost) + (chosen ? " (chosen)" : "");
+}
+
+//! How TryComposedChainRewrite competes with a route already found: one artifact per hop instead of a fixed_path per
+//! run, and the incumbent's cost to beat.
+struct PGQComposedChainChoice {
+	bool split_runs = false;
+	double incumbent_cost = -1;
+	//! The rows the incumbent answers with, which the chain's joins produce too (-1: unknown)
+	double incumbent_rows = -1;
+	string incumbent;
+	//! The composed chain's cost, set whether or not it was chosen (-1: unknown)
+	double cost = -1;
+};
+
 // A fixed-length chain answered by joining one artifact per run of its hops: the shapes no single artifact covers,
 // (a)<-[:R]-(b)-[:S]->(c) or (a)-[:R]-(b)-[:S]->(c), and a one-way chain whose fixed_path artifact is missing or
 // lost rows. A run of right- or left-directed hops reads its fixed_path artifact (a left run reads it from the far
@@ -9734,7 +9778,8 @@ static bool TryComposedChainRewrite(ClientContext &context, CreatePropertyGraphI
                                     const ReferencedBindings &referenced_bindings,
                                     const WhereConstraints &where_constraints, OneRowPerMode one_row_per_mode,
                                     PGQPathSelector selector,
-                                    const std::function<bool(const PGQPathTableInfo *)> &counts_exactly) {
+                                    const std::function<bool(const PGQPathTableInfo *)> &counts_exactly,
+                                    PGQComposedChainChoice *choice = nullptr) {
 	const idx_t n_hops = (elements.size() - 1) / 2;
 	if (n_hops < 2 || selector != PGQPathSelector::WALK || one_row_per_mode != OneRowPerMode::NONE ||
 	    PatternHasCost(path_elements)) {
@@ -9856,6 +9901,11 @@ static bool TryComposedChainRewrite(ClientContext &context, CreatePropertyGraphI
 		                            !bound(v0_vertex, reversed ? v0_hop.to_key : v0_hop.from_key);
 		auto *info = FindPathTableInfo(path_table_cache, name, count == 1 ? "edge" : "fixed_path", vertex_sequence,
 		                               edge_sequence, prefer_reverse);
+		// Competing with a route already found, never measure an artifact (a probe costs the first query; only a
+		// stored preserves_multiplicity takes part).
+		if (info && choice && choice->incumbent_cost >= 0 && !info->preserves_multiplicity) {
+			return nullptr;
+		}
 		return counts_exactly(info) ? info : nullptr;
 	};
 	vector<PGQComposedChainSegment> segments;
@@ -9868,7 +9918,7 @@ static bool TryComposedChainRewrite(ClientContext &context, CreatePropertyGraphI
 		}
 		const bool reversed = direction == PGQMatchType::MATCH_EDGE_LEFT;
 		PGQComposedChainSegment whole;
-		if (run > 1 && (whole.info = lookup(i, run, reversed))) {
+		if (run > 1 && !(choice && choice->split_runs) && (whole.info = lookup(i, run, reversed))) {
 			whole.first_hop = i, whole.hops = run, whole.reversed = reversed;
 			segments.push_back(whole);
 		} else {
@@ -9884,6 +9934,46 @@ static bool TryComposedChainRewrite(ClientContext &context, CreatePropertyGraphI
 			}
 		}
 		i += run;
+	}
+
+	// Its cost: each artifact's scan (pruned where its sorted column is bound), and the rows the joins produce:
+	// the incumbent's rows, or the largest artifact's, pruned when any vertex is bound.
+	double cost = 0;
+	double largest = 0;
+	bool any_bound = false;
+	for (const auto &segment : segments) {
+		const auto &info = *segment.info;
+		const idx_t v0_vertex = segment.reversed ? segment.first_hop + segment.hops : segment.first_hop;
+		const idx_t v1_vertex = segment.reversed ? segment.first_hop : segment.first_hop + segment.hops;
+		const auto &first = hops[segment.first_hop];
+		const auto &last = hops[segment.first_hop + segment.hops - 1];
+		const string &v0_key = segment.reversed ? last.to_key : first.from_key;
+		const string &v1_key = segment.reversed ? first.from_key : last.to_key;
+		const bool v0_bound = bound(v0_vertex, v0_key);
+		const bool v1_bound = bound(v1_vertex, v1_key);
+		any_bound |= v0_bound || v1_bound;
+		double scan = ArtifactScanCost(info, (v0_bound && info.is_sorted_by_v0) || (v1_bound && info.is_sorted_by_v1));
+		if (segment.undirected && scan >= 0) {
+			// Read once each way: the reversed reading binds v1 where the forward one binds v0
+			scan += ArtifactScanCost(info, (v1_bound && info.is_sorted_by_v0) || (v0_bound && info.is_sorted_by_v1));
+		}
+		if (scan < 0 || cost < 0) {
+			cost = -1;
+		} else {
+			cost += scan;
+		}
+		largest = MaxValue<double>(largest, static_cast<double>(MaxValue<int64_t>(info.estimated_rows, 0)));
+	}
+	if (cost >= 0) {
+		const double produced = choice && choice->incumbent_rows >= 0 ? choice->incumbent_rows : largest;
+		cost += PGQ_JOIN_ROW_WEIGHT * produced * (any_bound ? PGQ_SORTED_LOOKUP_FRACTION : 1.0) +
+		        PGQ_JOIN_FIXED_ROWS * static_cast<double>(segments.size() - 1);
+	}
+	if (choice) {
+		choice->cost = cost;
+		if (choice->incumbent_cost >= 0 && (cost < 0 || cost * PGQ_SWITCH_FACTOR > choice->incumbent_cost)) {
+			return false;
+		}
 	}
 
 	vector<string> table_names;
@@ -9984,6 +10074,10 @@ static bool TryComposedChainRewrite(ClientContext &context, CreatePropertyGraphI
 		endpoint_filters += bound(i, key) ? 1 : 0;
 	}
 	diagnostic.endpoint_filter_count = static_cast<int64_t>(endpoint_filters);
+	if (choice && choice->incumbent_cost >= 0) {
+		diagnostic.estimated_cost = cost;
+		diagnostic.alternatives = RouteAlternative("composed_chain", "", cost, true) + "; " + choice->incumbent;
+	}
 	RecordRewriteDiagnostic(context, std::move(diagnostic));
 	return true;
 }
@@ -10293,6 +10387,106 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 					                        tc_src->label + "__" + tc_edge->label;
 					const PGQPathTableInfo *tc_info =
 					    find_path_table(tc_tname, "transitive_closure", {tc_src->label, tc_dst->label}, {tc_edge->label});
+
+					// An exact length {k,k} where no closure answers: the k-hop fixed_path artifact holds every walk
+					// of k edges. Kept to the walks that visit no vertex twice (as every variable-length match) and
+					// whose middle vertices are vertices, it is exactly the traversal's answer. A closure that
+					// answers is preferred: although the fixed_path holds fewer rows, its vertex checks make it the
+					// slower of the two, seeded or not (measured on a 1M-vertex hierarchy). Only a fixed_path whose
+					// stored preserves_multiplicity says it lost no walk is used (it is never probed for this).
+					if (tc_sp->lower == tc_sp->upper && tc_sp->lower >= 2 && tc_sp->lower <= 8 &&
+					    selector == PGQPathSelector::WALK && one_row_per_mode == OneRowPerMode::NONE &&
+					    !HasTopLevelNamedPathFunction(match_ref, named_path_variable)) {
+						const idx_t k = static_cast<idx_t>(tc_sp->lower);
+						string fixed_name = "__pg_" + graph_name + "__" + tc_src->label;
+						vector<string> vertex_sequence {tc_src->label};
+						vector<string> edge_sequence;
+						for (idx_t i = 0; i < k; i++) {
+							fixed_name += "__" + tc_edge->label + "__" + tc_dst->label;
+							vertex_sequence.push_back(tc_dst->label);
+							edge_sequence.push_back(tc_edge->label);
+						}
+						const auto *fixed_info = find_path_table(fixed_name, "fixed_path", vertex_sequence, edge_sequence);
+						shared_ptr<PropertyGraphTable> vtable, etbl;
+						try {
+							vtable = ResolveTable(tc_src->label, PGQMatchType::MATCH_VERTEX, pg_table);
+							etbl = ResolveTable(tc_edge->label, PGQMatchType::MATCH_EDGE_RIGHT, pg_table);
+						} catch (...) {
+							fixed_info = nullptr;
+						}
+						if (fixed_info && fixed_info->preserves_multiplicity && etbl->source_pk.size() == 1 &&
+						    etbl->destination_pk.size() == 1 && etbl->source_pk[0] == etbl->destination_pk[0] &&
+						    !EdgeLabelRowFilter(tc_edge->label, etbl)) {
+							const string key = PGQStr(etbl->source_pk[0]);
+							const bool src_bound = HasEqualityConstraint(where_constraints, tc_src->variable_binding, key);
+							const double fixed_cost = ArtifactScanCost(*fixed_info, src_bound && fixed_info->is_sorted_by_v0);
+							const bool use_fixed =
+							    !(tc_info && ClosureAnswers(*tc_info, selector, tc_sp->lower, tc_sp->upper,
+							                                closure_exact(tc_info, tc_sp->upper)));
+							if (use_fixed) {
+								const string pt_alias = "_pgq_pt_" + to_string(extra_alias_counter++);
+								auto base = make_uniq<BaseTableRef>();
+								base->SetQualifiedName(Identifier(fixed_info->catalog_name),
+								                       Identifier(fixed_info->schema_name),
+								                       Identifier(fixed_info->table_name));
+								base->alias = Identifier(pt_alias);
+								unique_ptr<TableRef> pt_ref = std::move(base);
+								if (select_node->from_table) {
+									auto cross = make_uniq<JoinRef>(JoinRefType::CROSS);
+									cross->left = std::move(select_node->from_table);
+									cross->right = std::move(pt_ref);
+									select_node->from_table = std::move(cross);
+								} else {
+									select_node->from_table = std::move(pt_ref);
+								}
+								const string &src_binding = tc_src->variable_binding;
+								const string &dst_binding = tc_dst->variable_binding;
+								const string last = "v" + to_string(k);
+								alias_map[src_binding] = vtable;
+								alias_map[dst_binding] = vtable;
+								conditions.push_back(make_uniq<ComparisonExpression>(
+								    ExpressionType::COMPARE_EQUAL, PGQColRef(key, src_binding), PGQColRef("v0", pt_alias)));
+								conditions.push_back(make_uniq<ComparisonExpression>(
+								    ExpressionType::COMPARE_EQUAL, PGQColRef(key, dst_binding), PGQColRef(last, pt_alias)));
+								// No vertex twice, the start included
+								for (idx_t i = 0; i <= k; i++) {
+									for (idx_t j = i + 1; j <= k; j++) {
+										conditions.push_back(make_uniq<ComparisonExpression>(
+										    ExpressionType::COMPARE_NOTEQUAL, PGQColRef("v" + to_string(i), pt_alias),
+										    PGQColRef("v" + to_string(j), pt_alias)));
+									}
+								}
+								// Every vertex in between is a vertex: the artifact keeps edges to missing ones
+								for (idx_t i = 1; i < k; i++) {
+									auto subquery_expr = make_uniq<SubqueryExpression>();
+									auto select_statement = make_uniq<SelectStatement>();
+									auto vertex_select = make_uniq<SelectNode>();
+									const string vertex_alias = "__pgq_mid_" + to_string(extra_alias_counter++);
+									vertex_select->select_list.push_back(PGQColRef(key, vertex_alias));
+									auto vertex_ref = vtable->CreateBaseTableRef();
+									vertex_ref->alias = Identifier(vertex_alias);
+									vertex_select->from_table = std::move(vertex_ref);
+									select_statement->node = std::move(vertex_select);
+									subquery_expr->SubqueryMutable() = std::move(select_statement);
+									subquery_expr->GetSubqueryTypeMutable() = SubqueryType::ANY;
+									subquery_expr->GetComparisonTypeMutable() = ExpressionType::COMPARE_EQUAL;
+									subquery_expr->GetChildMutable() = PGQColRef("v" + to_string(i), pt_alias);
+									conditions.push_back(std::move(subquery_expr));
+								}
+								PushConstraintToPathTable(where_constraints, src_binding, key, "v0", pt_alias, conditions);
+								PushConstraintToPathTable(where_constraints, dst_binding, key, last, pt_alias, conditions);
+								auto diagnostic = MakeArtifactDiagnostic(
+								    graph_name, "fixed_path_exact_length",
+								    "selected the k-hop fixed_path artifact for an exact-length quantifier", *fixed_info,
+								    vertex_sequence, edge_sequence, pt_alias, one_row_per_mode);
+								diagnostic.endpoint_filter_count = CountEndpointFilters(
+								    where_constraints, {{src_binding, key}, {dst_binding, key}});
+								diagnostic.estimated_cost = fixed_cost;
+								RecordRewriteDiagnostic(context, std::move(diagnostic));
+								return true;
+							}
+						}
+					}
 					// Named path functions need a path, which this endpoint-only artifact does not have.
 					if (tc_info && !HasTopLevelNamedPathFunction(match_ref, named_path_variable) &&
 					    ClosureAnswers(*tc_info, selector, tc_sp->lower, tc_sp->upper,
@@ -10587,11 +10781,11 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 		specs.push_back({src, edge, dst, rev, undir});
 	}
 	const std::function<bool(const PGQPathTableInfo *)> counts_exactly_fn = counts_exactly;
-	auto composed_chain = [&]() {
+	auto composed_chain = [&](PGQComposedChainChoice *choice) {
 		return TryComposedChainRewrite(context, pg_table, path_elements, *rewrite_path_elements, match_ref, conditions,
 		                               select_node, alias_map, extra_alias_counter, path_table_cache,
 		                               referenced_bindings, where_constraints, one_row_per_mode, selector,
-		                               counts_exactly_fn);
+		                               counts_exactly_fn, choice);
 	};
 	// Several hops that do not all run one way: no single artifact holds the chain, but one per run of hops can.
 	if (n_hops >= 2) {
@@ -10602,7 +10796,7 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 			any_right |= !s.undirected && !s.reversed;
 		}
 		if (any_undirected || (any_left && any_right)) {
-			return composed_chain();
+			return composed_chain(nullptr);
 		}
 	}
 
@@ -11113,7 +11307,25 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 	                                                      edge_sequence, prefer_reverse_sorted);
 	if (!counts_exactly(path_info)) {
 		// No fixed_path artifact that counts exactly: the chain's edge artifacts may still answer it.
-		return n_hops >= 2 && composed_chain();
+		return n_hops >= 2 && composed_chain(nullptr);
+	}
+	// The chain's edge artifacts may read far fewer rows than the fixed_path artifact, when the pattern is bound on a
+	// vertex the fixed_path cannot prune on; then they answer it instead.
+	double fixed_cost = -1;
+	PGQComposedChainChoice chain_choice;
+	if (n_hops >= 2) {
+		const bool v1_bound = HasEqualityConstraint(where_constraints, hops[0].dst_binding, hops[0].dst_pk);
+		fixed_cost = ArtifactScanCost(*path_info, (src_endpoint_bound && path_info->is_sorted_by_v0) ||
+		                                              (v1_bound && path_info->is_sorted_by_v1));
+		if (fixed_cost >= 0) {
+			chain_choice.split_runs = true;
+			chain_choice.incumbent_cost = fixed_cost;
+			chain_choice.incumbent_rows = static_cast<double>(path_info->estimated_rows);
+			chain_choice.incumbent = RouteAlternative("fixed_path", path_info->table_name, fixed_cost, false);
+			if (composed_chain(&chain_choice)) {
+				return true;
+			}
+		}
 	}
 
 	// Rewrite: path table reference (plain BaseTableRef).
@@ -11232,6 +11444,11 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 	                                         *path_info, vertex_sequence, edge_sequence, pt_alias, one_row_per_mode);
 	diagnostic.endpoint_filter_count =
 	    CountEndpointFilters(where_constraints, endpoint_filter_keys) + semi_join_filters;
+	if (fixed_cost >= 0 && chain_choice.cost >= 0) {
+		diagnostic.estimated_cost = fixed_cost;
+		diagnostic.alternatives = RouteAlternative("fixed_path", path_info->table_name, fixed_cost, true) + "; " +
+		                          RouteAlternative("composed_chain", "", chain_choice.cost, false);
+	}
 	RecordRewriteDiagnostic(context, std::move(diagnostic));
 	return true;
 }

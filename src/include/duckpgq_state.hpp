@@ -41,6 +41,10 @@ struct PGQRewriteDiagnostic {
 	int64_t endpoint_filter_count = 0;
 	int64_t property_filter_count = 0;
 	int64_t direct_link_rewrite_count = 0;
+	//! Where several artifact routes answered: the chosen route's estimated cost (rows read) and every candidate
+	//! with its cost ("route table: cost; ..."). -1 and empty when there was no choice.
+	double estimated_cost = -1;
+	string alternatives;
 };
 
 class DuckPGQState : public ClientContextState {

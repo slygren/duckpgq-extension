@@ -278,6 +278,21 @@ traversal does. Such a chain traverses instead when it has a selector, path mode
 anonymous vertex, compound labels, an edge variable on an undirected hop, or an undirected hop between two different
 vertex tables.
 
+An exact length `{k,k}` (k >= 2, right-directed, no selector) that no closure answers is answered from the k-hop
+fixed_path artifact, kept to the walks that visit no vertex twice and whose middle vertices exist, when its stored
+`preserves_multiplicity` is true (`fixed_path_exact_length`). Where a closure answers it is used instead: the
+fixed_path holds fewer rows, but its vertex checks make it the slower of the two.
+
+**Where several routes answer**, the one estimated to read the fewest rows is taken: each artifact's catalog
+`estimated_rows`, a 64th of it for an equality on the column it is sorted by (its row groups prune), four per row a
+join produces, and 2M for every further artifact joined (a join's fixed cost). A one-way chain reads its fixed_path artifact unless the chain of its edge artifacts (with their
+reverse twins) is estimated at most half as costly -- when the pattern is bound on a vertex the fixed_path is not
+ordered by, say. The estimate is
+deterministic: the same catalog gives the same choice; an artifact without `estimated_rows` is never chosen by cost.
+`pgq_last_rewrite_diagnostics()` shows the chosen route's `estimated_cost` and every candidate with its cost in
+`alternatives`. A closure is preferred to the context expansion and to the fixed_path without costing: measured, it is
+faster at every size.
+
 Edge and fixed_path artifacts are `SELECT DISTINCT`, so an edge stored twice in its table is one artifact row.
 Where an answer counts matches (every fixed-length pattern, `OPTIONAL MATCH`, walks) such an artifact is used only
 when it lost nothing (`preserves_multiplicity`). `EXISTS` and `ANY SHORTEST` read it either way.
@@ -454,7 +469,7 @@ building in [abi_build.cpp](src/core/functions/table/abi_build.cpp); vertex-join
   lower bound above 1 is answered from the CSR, which finds one shortest path per pair (refused for `<-`).
 - **ABI rewrites** cover the common path shapes, not every pattern. Fixed-length chains longer than three hops, and
   chains with an undirected hop between two different vertex tables or an edge variable on an undirected hop,
-  traverse. Choosing between several matching artifacts is simple.
+  traverse.
 - **`FROM pgq_abi_build` on a DuckLake with a SQLite catalog** refuses while the calling statement reads that lake
   (after `USE lake`): use `PRAGMA pgq_abi_build`, which builds in one transaction on the caller's connection.
 - **CHEAPEST with a cost that varies by edge** takes one quantified edge between two vertices, whose `COST` reads

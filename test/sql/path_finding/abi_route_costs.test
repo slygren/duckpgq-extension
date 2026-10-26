@@ -1,0 +1,245 @@
+# name: test/sql/path_finding/abi_route_costs.test
+# description: Where several artifact routes answer a pattern, the one estimated to read fewest rows (catalog
+#              estimated_rows, sorted-column lookups pruned), shown in pgq_last_rewrite_diagnostics (estimated_cost,
+#              alternatives); every choice gives the traversal's rows
+# group: [path_finding]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+# ── A fixed_path artifact against a chain of edge artifacts ─────────────────────────────────────────────────────────
+# A hub: 3000 P reach W 1, and W 1 reaches 3000 O. The 2-hop fixed_path holds 9,000,000 rows, each edge artifact 3000.
+
+statement ok
+CREATE TABLE P AS SELECT i AS id FROM range(3000) t(i);
+
+statement ok
+CREATE TABLE W AS SELECT i AS id FROM range(3) t(i);
+
+statement ok
+CREATE TABLE O AS SELECT i AS id FROM range(3000) t(i);
+
+statement ok
+CREATE TABLE PW AS SELECT i AS src, 1 AS dst FROM range(3000) t(i);
+
+statement ok
+CREATE TABLE WO AS SELECT 1 AS src, i AS dst FROM range(3000) t(i);
+
+statement ok
+CREATE PROPERTY GRAPH m VERTEX TABLES (P LABEL P, W LABEL W, O LABEL O) EDGE TABLES (
+    PW SOURCE KEY (src) REFERENCES P (id) DESTINATION KEY (dst) REFERENCES W (id) LABEL PW,
+    WO SOURCE KEY (src) REFERENCES W (id) DESTINATION KEY (dst) REFERENCES O (id) LABEL WO);
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('m', max_hops := 2, reverse_twins := ['PW', 'WO']);
+
+# Bound on its last vertex, which the fixed_path artifact is not ordered by: the edge artifacts, the last one's twin
+query I
+SELECT count(*) FROM GRAPH_TABLE (m MATCH (p:P)-[:PW]->(w:W)-[:WO]->(o:O) WHERE o.id = 5 COLUMNS (p.id AS p));
+----
+3000
+
+query TTT
+SELECT rewrite_type, reason, alternatives FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+composed_chain	joined one artifact per run of hops: __pg_m__P__PW__W + __pg_m__W__WO__O__rev	composed_chain: 2565546.9 (chosen); fixed_path __pg_m__P__PW__W__WO__O: 9000000.0
+
+query TTI
+SELECT status, rewrite_fired, only_in_abi + only_in_fallback FROM pgq_verify_abi_rewrite($$FROM GRAPH_TABLE (m MATCH (p:P)-[:PW]->(w:W)-[:WO]->(o:O) WHERE o.id = 5 COLUMNS (p.id AS p))$$);
+----
+match	true	0
+
+# Bound on its first vertex: the fixed_path artifact, ordered by it
+query I
+SELECT count(*) FROM GRAPH_TABLE (m MATCH (p:P)-[:PW]->(w:W)-[:WO]->(o:O) WHERE p.id = 5 COLUMNS (o.id AS o));
+----
+3000
+
+query TTR
+SELECT rewrite_type, alternatives, estimated_cost FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+fixed_path	fixed_path __pg_m__P__PW__W__WO__O: 140625.0 (chosen); composed_chain: 2565546.9	140625.0
+
+# Unbound: the fixed_path artifact, a single scan
+query I
+SELECT count(*) FROM GRAPH_TABLE (m MATCH (p:P)-[:PW]->(w:W)-[:WO]->(o:O) COLUMNS (p.id AS p, o.id AS o));
+----
+9000000
+
+query TT
+SELECT rewrite_type, alternatives FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+fixed_path	fixed_path __pg_m__P__PW__W__WO__O: 9000000.0 (chosen); composed_chain: 38006000.0
+
+# Backwards, bound on the far end (the pattern's first vertex is the fixed_path's last)
+query I
+SELECT count(*) FROM GRAPH_TABLE (m MATCH (o:O)<-[:WO]-(w:W)<-[:PW]-(p:P) WHERE o.id = 5 COLUMNS (p.id AS p));
+----
+3000
+
+query T
+SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+composed_chain
+
+query TTI
+SELECT status, rewrite_fired, only_in_abi + only_in_fallback FROM pgq_verify_abi_rewrite($$FROM GRAPH_TABLE (m MATCH (o:O)<-[:WO]-(w:W)<-[:PW]-(p:P) WHERE o.id = 5 COLUMNS (p.id AS p))$$);
+----
+match	true	0
+
+# ── An exact length {k,k}: the k-hop fixed_path artifact, against the closure ───────────────────────────────────────
+# K: a small DAG with an edge to a missing vertex and back from it (1 -> 99 -> 2 is no path: 99 is no vertex)
+
+statement ok
+CREATE TABLE V AS SELECT i AS id, 'v' || i AS name FROM range(1, 9) t(i);
+
+statement ok
+CREATE TABLE K (src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO K VALUES (1, 2), (1, 3), (2, 4), (3, 4), (4, 5), (5, 6), (2, 6), (6, 7), (1, 99), (99, 8), (7, 8);
+
+statement ok
+CREATE PROPERTY GRAPH g VERTEX TABLES (V LABEL V) EDGE TABLES (
+    K SOURCE KEY (src) REFERENCES V (id) DESTINATION KEY (dst) REFERENCES V (id) LABEL K);
+
+statement ok
+CREATE TABLE trav_kk AS FROM GRAPH_TABLE (g MATCH (a:V)-[:K]->{2,2}(b:V) COLUMNS (a.id AS a, b.id AS b));
+
+statement ok
+CREATE TABLE trav_kkk AS FROM GRAPH_TABLE (g MATCH (a:V)-[:K]->{3,3}(b:V) COLUMNS (a.id AS a, b.name AS b));
+
+# Without a closure the exact length used to traverse
+statement ok
+SELECT count(*) FROM pgq_abi_build('g', exclude_self_referential := false, max_hops := 3);
+
+query II
+FROM GRAPH_TABLE (g MATCH (a:V)-[:K]->{2,2}(b:V) COLUMNS (a.id AS a, b.id AS b)) ORDER BY ALL;
+----
+1	4
+1	4
+1	6
+2	5
+2	7
+3	5
+4	6
+5	7
+6	8
+
+query TT
+SELECT rewrite_type, path_table_name FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+fixed_path_exact_length	__pg_g__V__K__V__K__V
+
+query I
+SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH (a:V)-[:K]->{2,2}(b:V) COLUMNS (a.id AS a, b.id AS b)) EXCEPT ALL FROM trav_kk);
+----
+0
+
+query I
+SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH (a:V)-[:K]->{3,3}(b:V) COLUMNS (a.id AS a, b.name AS b)) EXCEPT ALL FROM trav_kkk);
+----
+0
+
+query I
+SELECT count(*) FROM trav_kkk;
+----
+8
+
+# With a closure, which here is not exact (an edge leads to the missing vertex 99): the fixed_path alone
+statement ok
+SELECT count(*) FROM pgq_abi_build('g', exclude_self_referential := false, max_hops := 3, closures := ['K']);
+
+query TTI
+SELECT status, rewrite_fired, only_in_abi + only_in_fallback FROM pgq_verify_abi_rewrite($$FROM GRAPH_TABLE (g MATCH (a:V)-[:K]->{2,2}(b:V) WHERE a.id = 1 COLUMNS (b.id AS b, b.name AS n))$$);
+----
+match	true	0
+
+statement ok
+FROM GRAPH_TABLE (g MATCH (a:V)-[:K]->{2,2}(b:V) WHERE a.id = 1 COLUMNS (b.id AS b));
+
+query TR
+SELECT rewrite_type, estimated_cost FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+fixed_path_exact_length	0.15625
+
+# A hierarchy, whose closure is exact: both answer {2,2}, and the closure is preferred (measured faster: the fixed_path
+# needs its vertex checks)
+statement ok
+CREATE TABLE T AS SELECT i AS id FROM range(1000) t(i);
+
+statement ok
+CREATE TABLE H AS SELECT i AS child, (i - 1) // 3 AS parent FROM range(1, 1000) t(i);
+
+statement ok
+CREATE PROPERTY GRAPH h VERTEX TABLES (T LABEL T) EDGE TABLES (
+    H SOURCE KEY (child) REFERENCES T (id) DESTINATION KEY (parent) REFERENCES T (id) LABEL H);
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('h', exclude_self_referential := false, max_hops := 2, closures := ['H']);
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (h MATCH (c:T)-[:H]->{2,2}(a:T) COLUMNS (c.id AS c, a.id AS a));
+----
+996
+
+query T
+SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+transitive_closure
+
+# Without the closure, the fixed_path
+statement ok
+SELECT count(*) FROM pgq_abi_build('h', exclude_self_referential := false, max_hops := 2);
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (h MATCH (c:T)-[:H]->{2,2}(a:T) COLUMNS (c.id AS c, a.id AS a));
+----
+996
+
+query T
+SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+fixed_path_exact_length
+
+query TTI
+SELECT status, rewrite_fired, only_in_abi + only_in_fallback FROM pgq_verify_abi_rewrite($$FROM GRAPH_TABLE (h MATCH (c:T)-[:H]->{2,2}(a:T) WHERE c.id = 999 COLUMNS (a.id AS a))$$);
+----
+match	true	0
+
+# {1,2} is no exact length: the context expansion, as before
+statement ok
+FROM GRAPH_TABLE (h MATCH (c:T)-[:H]->{1,2}(a:T) COLUMNS (c.id AS c, a.id AS a));
+
+query T
+SELECT coalesce(string_agg(rewrite_type, ','), 'traversal') FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+abi_context_expansion
+
+# Not for ANY SHORTEST (one path per pair) or a named path: those keep their routes
+statement ok
+FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:V)-[:K]->{2,2}(b:V) COLUMNS (a.id AS a, b.id AS b));
+
+query T
+SELECT coalesce(string_agg(rewrite_type, ','), 'traversal') FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+abi_exact_length_scan
+
+# An edge stored twice: the fixed_path artifact lost a walk, so it is not used
+statement ok
+INSERT INTO K VALUES (1, 2);
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('g', exclude_self_referential := false, max_hops := 3);
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH (a:V)-[:K]->{2,2}(b:V) COLUMNS (a.id AS a, b.id AS b));
+----
+11
+
+query T
+SELECT coalesce(string_agg(rewrite_type, ','), 'traversal') FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+traversal
