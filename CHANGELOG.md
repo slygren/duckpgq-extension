@@ -152,6 +152,16 @@ In every such case the old rows were wrong.
 - **Diagnostics:** `pgq_last_rewrite_diagnostics()`, `pgq_explain_abi_path(…)`, `pgq_verify_abi_rewrite(…)`, and the
   `pgq_require_abi_paths` guard.
 
+**Graph algorithms**
+- **New:** `strongly_connected_component`, `triangle_count` / `total_triangle_count`, `betweenness_centrality`
+  (exact or sampled with `k`), `label_propagation`, `louvain`, `k_core`, `shortest_path_lengths` and `degree`, next to
+  `pagerank`, `weakly_connected_component` and `local_clustering_coefficient`.
+- **Checked against NetworkX** (`scripts/compare_graph_algorithms.py`): the deterministic ones give its answers.
+  Label propagation and Louvain follow its method with their own random generator, so their partitions differ;
+  Louvain's mean modularity is within 0.006 of NetworkX's. README "Graph algorithms" says how each reads direction,
+  self-loops and parallel edges.
+- **All of them honour sub-labels and cancellation.** Louvain runs 1M vertices / 5M edges in about 8 s.
+
 **Planner**
 - **Vertex-join elimination** where a FOREIGN KEY guarantees the vertex exists (`duckpgq_vertex_join_elimination`).
 - **Factorized joins** for counts and sums over n:m paths.
@@ -204,14 +214,15 @@ with identical answers.
 
 ### Known limitations
 
-See README "Limitations". Work in progress for the next release:
+See README "Limitations" and docs/FEATURES.md "Not supported yet". Work in progress for the next release:
 - **Patterns:** cross-table label disjunction and unlabeled vertices over several vertex tables.
 - **Graph definition:** graphs over views, several labels per table, a `KEY` clause, computed properties,
   `ALTER PROPERTY GRAPH`.
 - **Predicates:** `IS SOURCE/DESTINATION OF`, `SAME`, `PROPERTY_EXISTS`, `labels()`.
 - **Selectors:** `ANY k`, `SHORTEST k GROUP`.
-- **Repeated sub-patterns,** and edge variables under a quantifier.
-- **More graph algorithms.**
+- **Repeated sub-patterns** without an upper bound or above 8 repetitions, nested ones, and ones in OPTIONAL MATCH
+  or EXISTS.
+- **CHEAPEST** over a pattern of several edges, a cost on a vertex, and `CHEAPEST k`.
 - **DuckLake version coupling:** DuckDB 2.0 writes DuckLake format 1.1 and a newer file storage version, which 1.5
   tools can't read. A 2.0 write into a Postgres-backed 1.0 catalog once removed column statistics 1.5 then failed on
   (repaired by hand). See README "DuckLake versions": build lakes with the version their other writers use.

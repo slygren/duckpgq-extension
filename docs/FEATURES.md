@@ -346,12 +346,35 @@ Prepared-statement parameters work inside GRAPH_TABLE (`WHERE a.id = $1`).
 
 ## 4. Graph algorithms
 
+Table functions over a graph, a vertex label and an edge label; one row per vertex, keyed by the vertex table's key.
+How each reads the edges (direction, self-loops, parallel edges) and its cost are in README "Graph algorithms".
+
 ```sql
 SELECT * FROM pagerank('social', 'Person', 'Knows') ORDER BY 1;
 SELECT * FROM weakly_connected_component('social', 'Person', 'Knows') ORDER BY 1;
+SELECT * FROM strongly_connected_component('social', 'Person', 'Knows') ORDER BY 1;
 SELECT * FROM local_clustering_coefficient('social', 'Person', 'Knows') ORDER BY 1;
+SELECT * FROM triangle_count('social', 'Person', 'Knows') ORDER BY 1;
+SELECT * FROM total_triangle_count('social', 'Person', 'Knows');
+SELECT * FROM betweenness_centrality('social', 'Person', 'Knows', normalized := true, directed := true) ORDER BY 1;
+SELECT * FROM label_propagation('social', 'Person', 'Knows', seed := 7) ORDER BY 1;
+SELECT * FROM louvain('social', 'Person', 'Knows', resolution := 1.0, seed := 7) ORDER BY 1;
+SELECT * FROM k_core('social', 'Person', 'Knows') ORDER BY 1;
+SELECT * FROM shortest_path_lengths('social', 'Person', 'Knows', 1) ORDER BY 1;   -- from Ann (id 1)
+SELECT * FROM degree('social', 'Person', 'Knows') ORDER BY 1;
 ```
-PageRank rises along the chain (Ann 0.083 … Eve 0.311, as `networkx.pagerank` gives). All five people are in one weakly connected component.
+On the example graph:
+- **PageRank** rises along the chain (Ann 0.083 … Eve 0.311, as `networkx.pagerank` gives).
+- **Components:** all five people are in one weakly connected component. Every person is their own strongly
+  connected component, since `knows` has no cycle.
+- **Triangles:** the one triangle is Ann–Bob–Cid, and each of them counts 1; `total_triangle_count` is 1. The local
+  clustering coefficient is 1.0 for Ann and Bob, and 0.33 for Cid (three neighbours, one triangle).
+- **Betweenness** (directed, normalised): Cid 0.333, since 4 of the 12 ordered pairs pass through Cid; Dan 0.25;
+  the others 0.
+- **Communities:** Louvain splits {Ann, Bob, Cid} from {Dan, Eve}. Label propagation puts all five together.
+- **k-core:** the triangle is the 2-core; Dan and Eve are core 1.
+- **`shortest_path_lengths`** from Ann: Bob 1, Cid 1, Dan 2, Eve 3.
+- **`degree`:** Cid has in 2, out 1.
 
 ## 5. ABI path tables
 
@@ -423,7 +446,6 @@ Being worked on now:
 - **Repeated sub-patterns without an upper bound, or above 8 repetitions** (`((a)-[:R]->(b)-[:S]->(c))+`), nested
   ones, and ones in OPTIONAL MATCH or EXISTS.
 - **CHEAPEST over a longer pattern** (several edges), a cost on a vertex, and `CHEAPEST k`.
-- **More algorithms:** strongly connected components, betweenness, triangles, communities, k-core.
 
 By design:
 - **Graph updates:** insert or delete through the tables; the graph is a view over them.
