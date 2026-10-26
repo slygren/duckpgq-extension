@@ -57,6 +57,36 @@ SELECT table_name, label, is_vertex_table, sub_labels FROM (DESCRIBE PROPERTY GR
 
 `SUMMARIZE PROPERTY GRAPH social` gives statistics.
 
+### Views, keys, computed properties, several labels
+
+```sql
+CREATE VIEW people AS SELECT id, name, age FROM person;
+CREATE VIEW friendships AS SELECT src, dst, since FROM knows;
+CREATE PROPERTY GRAPH friends
+  VERTEX TABLES (people KEY (id) PROPERTIES (id, name AS fullname, age + 1 AS age_next_year) LABEL Person LABEL Human)
+  EDGE TABLES (friendships KEY (src, dst) SOURCE KEY (src) REFERENCES people (id)
+                                          DESTINATION KEY (dst) REFERENCES people (id) LABEL Knows);
+FROM GRAPH_TABLE (friends MATCH (a:Human WHERE a.fullname = 'Ann')-[:Knows]->(b:Person)
+  COLUMNS (b.fullname, b.age_next_year, labels(b) AS labels)) ORDER BY ALL;
+```
+Bob (46, `[Person, Human]`) and Cid (28, `[Person, Human]`).
+- **Views:** vertex and edge tables may be views. A view has no foreign keys, so its edges name their keys.
+- **`KEY`** identifies the rows of a table or view without a PRIMARY KEY.
+- **Properties:** `name AS fullname` renames a column; `age + 1 AS age_next_year` is computed. Both are read by name
+  everywhere a property is.
+- **Labels:** every row has every label of its table, so `(a:Human)` and `(b:Person)` match the same rows.
+
+### ALTER PROPERTY GRAPH
+
+```sql
+ALTER PROPERTY GRAPH friends ALTER VERTEX TABLE people ADD LABEL Member;
+ALTER PROPERTY GRAPH friends ADD VERTEX TABLES (city KEY (code) LABEL City);
+SELECT label, count(*) AS n FROM GRAPH_TABLE (friends MATCH (x:Member|City) COLUMNS (label(x) AS label))
+GROUP BY ALL ORDER BY ALL;
+```
+City 2, Person 5. `label(x)` is a table's first label. `DROP {VERTEX | EDGE} TABLES (…) [CASCADE | RESTRICT]` and
+`DROP LABEL` work the same way. An `ALTER` takes the graph's ABI tables out of use until `pgq_abi_build` rebuilds them.
+
 ## 2. Patterns
 
 ### One hop, with an edge property
@@ -80,12 +110,42 @@ FROM GRAPH_TABLE (social MATCH (t:Teacher) COLUMNS (t.name)) ORDER BY 1;
 ```
 The first returns Ann, Bob, Dan and Eve (each with label `Person`); the second returns Bob and Dan.
 
+### Labels over several tables
+
+```sql
+FROM GRAPH_TABLE (social MATCH (a:Person WHERE a.name = 'Ann')-[]->(x:Person|City) COLUMNS (label(x) AS label, x.name)) ORDER BY ALL;
+FROM GRAPH_TABLE (social MATCH (a:Person WHERE a.name = 'Bob')-[]->(x) COLUMNS (label(x) AS label, x.name)) ORDER BY ALL;
+FROM GRAPH_TABLE (social MATCH (x:!Person) COLUMNS (label(x) AS label, x.name)) ORDER BY ALL;
+```
+- **`(x:Person|City)`:** Ann reaches Bob and Cid (Person) and Oslo (City).
+- **Unlabeled `(x)`:** Bob reaches Cid and Oslo.
+- **`(x:!Person)`:** the two cities.
+
+A label expression, or a missing label, matches every table it selects. A property one of them lacks is NULL there.
+
 ### Element predicates
 
 ```sql
 FROM GRAPH_TABLE (social MATCH (a:Person WHERE a.age > 40)-[:LivesIn]->(c:City) COLUMNS (a.name, c.name AS city)) ORDER BY 1;
 ```
 Bob / Oslo, Dan / Bergen.
+
+### More predicates: SAME, IS SOURCE OF, PROPERTY_EXISTS, labels()
+
+```sql
+FROM GRAPH_TABLE (social MATCH (a:Person WHERE a.name = 'Cid')-[k:Knows]-(b:Person)
+  COLUMNS (b.name, a IS SOURCE OF k AS cid_knows_them)) ORDER BY ALL;
+FROM GRAPH_TABLE (social MATCH (a:Person)-[:Knows]->(m:Person)-[:Knows]->(b:Person) WHERE a.name = 'Ann' AND NOT SAME(a, b)
+  COLUMNS (m.name AS via, b.name)) ORDER BY ALL;
+FROM GRAPH_TABLE (social MATCH (x:Person|City WHERE x.name IN ('Ann', 'Oslo')) COLUMNS (x.name, PROPERTY_EXISTS(x, 'age') AS has_age)) ORDER BY ALL;
+FROM GRAPH_TABLE (social MATCH (x:Person WHERE x.name IN ('Ann', 'Bob')) COLUMNS (x.name, labels(x) AS labels)) ORDER BY ALL;
+```
+- **`IS SOURCE OF`:** of Cid's `knows` edges in either direction, only the one to Dan leaves Cid, so it alone is
+  true. `IS DESTINATION OF` is the mirror.
+- **`SAME`:** two hops from Ann reach Cid (via Bob) and Dan (via Cid).
+- **`PROPERTY_EXISTS`:** Ann has `age`, Oslo doesn't.
+- **`labels(x)`:** `[Person, Student]` for Ann and `[Person, Teacher]` for Bob (the table label, then the row's
+  sub-label).
 
 ### Directions
 
@@ -224,6 +284,19 @@ The cheapest route takes three hops (1 + 1 + 0.5) and beats the two-hop route th
 - **A cost or edge filter reading the endpoints:** `-[k:Knows WHERE k.w < 3 COST k.w * a.factor]->+(b)`; the
   endpoints are the same on every step.
 - **`cost(p)` in WHERE,** several CHEAPEST patterns in one MATCH, and CHEAPEST inside OPTIONAL MATCH.
+
+### ANY k and SHORTEST k GROUPS
+
+```sql
+FROM GRAPH_TABLE (social MATCH p = ANY 2 (a:Person WHERE a.name = 'Ann')-[:Knows]->+(b:Person WHERE b.name = 'Dan')
+  COLUMNS (vertex_property(p, 'name') AS route)) ORDER BY ALL;
+FROM GRAPH_TABLE (social MATCH p = SHORTEST 2 GROUPS (a:Person WHERE a.name = 'Ann')-[:Knows]->+(b:Person WHERE b.name = 'Dan')
+  COLUMNS (path_length(p) AS hops, vertex_property(p, 'name') AS route)) ORDER BY ALL;
+```
+- **`ANY 2`:** two paths per pair. Here they are the two `SHORTEST 2` returns: Ann–Cid–Dan and Ann–Bob–Cid–Dan.
+- **`SHORTEST 2 GROUPS`:** every path of the two shortest lengths, 2 hops (Ann–Cid–Dan) and 3 hops
+  (Ann–Bob–Cid–Dan). `SHORTEST 1 GROUP` is `ALL SHORTEST`, and a path mode goes before `GROUP`
+  (`SHORTEST 2 TRAIL GROUPS`).
 
 ### Path modes
 
@@ -432,20 +505,14 @@ The README covers each of these.
 
 ## Not supported yet
 
-Being worked on now:
-- **Cross-table label disjunction:** `(x:Person|City)` is refused; it works within one table's sub-labels.
-- **Unlabeled vertices with several vertex tables:** a vertex with no label, `(x)`, is refused when the graph has more than one vertex table.
-- **Graph definition:**
-  - graphs over views;
-  - several labels per table;
-  - an explicit `KEY` clause;
-  - computed properties;
-  - `ALTER PROPERTY GRAPH`.
-- **Predicates:** `IS SOURCE OF`, `IS DESTINATION OF`, `SAME`, `PROPERTY_EXISTS`, `labels()`.
-- **Selectors:** `ANY k` and `SHORTEST k GROUP`.
+Being worked on:
 - **Repeated sub-patterns without an upper bound, or above 8 repetitions** (`((a)-[:R]->(b)-[:S]->(c))+`), nested
   ones, and ones in OPTIONAL MATCH or EXISTS.
 - **CHEAPEST over a longer pattern** (several edges), a cost on a vertex, and `CHEAPEST k`.
+- **A label shared by several tables** (SQL/PGQ allows it; here a label names one table), and `ALTER … ALTER LABEL …
+  ADD / DROP PROPERTIES`.
+- **`SHORTEST k`, `ANY k` and `SHORTEST k GROUPS`** over a pattern that mixes fixed hops with a quantified edge,
+  or over several edge tables.
 
 By design:
 - **Graph updates:** insert or delete through the tables; the graph is a view over them.

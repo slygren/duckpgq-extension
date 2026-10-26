@@ -132,6 +132,29 @@ In every such case the old rows were wrong.
   - property projection `v.{a, b}`, `v.link.prop` (catalog-declared direct links), `path_tree_json`,
     `graph_tree_json`.
 
+**Graph definition**
+- **Graphs over views,** also views in attached databases and DuckLake catalogs.
+- **Several labels per table** (`LABEL Person LABEL Human`, `DEFAULT LABEL`), each with its own `PROPERTIES`.
+- **`KEY (…)`** for tables and views without a PRIMARY KEY.
+- **Renamed and computed properties** (`name AS fullname`, `age + 1 AS age_next`), read by name everywhere,
+  ABI routes included.
+- **`ALTER PROPERTY GRAPH`:**
+  - `ADD` / `DROP` vertex and edge tables (`CASCADE` / `RESTRICT`);
+  - `ALTER … ADD` / `DROP LABEL`;
+  - any `ALTER` takes the graph's ABI tables out of use until they are rebuilt.
+
+  Databases written by earlier builds open unchanged.
+
+**More query language**
+- **Label expressions over several tables** (`(x:Person|City)`, `(x:!Person)`) and unlabeled vertices or edges in
+  graphs with several tables. They are answered as one match per choice of table, each keeping its own routes,
+  ABI included.
+- **Quantified edges that walk across vertex tables** (`(t:Tag)-[:!HasParent]->+(x)`).
+- **Predicates:** `IS [NOT] SOURCE OF`, `IS [NOT] DESTINATION OF`, `SAME`, `PROPERTY_EXISTS`, `labels(x)`. The
+  element functions and predicates can stand anywhere an expression can.
+- **Selectors:** `ANY k` and `SHORTEST k GROUPS` / `GROUP`, with path modes (`SHORTEST 2 TRAIL GROUPS`), plus the
+  optional `PATH` / `PATHS` keywords.
+
 **Precomputed path tables (ABI)**
 - **The extension builds them itself:** `pgq_abi_build`, `pgq_abi_sql`, `pgq_abi_status` and `pgq_abi_drop`
   produce edge, fixed-path, transitive-closure, witness, chain, branch-summary and reverse tables. Parity with the
@@ -215,14 +238,11 @@ with identical answers.
 ### Known limitations
 
 See README "Limitations" and docs/FEATURES.md "Not supported yet". Work in progress for the next release:
-- **Patterns:** cross-table label disjunction and unlabeled vertices over several vertex tables.
-- **Graph definition:** graphs over views, several labels per table, a `KEY` clause, computed properties,
-  `ALTER PROPERTY GRAPH`.
-- **Predicates:** `IS SOURCE/DESTINATION OF`, `SAME`, `PROPERTY_EXISTS`, `labels()`.
-- **Selectors:** `ANY k`, `SHORTEST k GROUP`.
 - **Repeated sub-patterns** without an upper bound or above 8 repetitions, nested ones, and ones in OPTIONAL MATCH
   or EXISTS.
 - **CHEAPEST** over a pattern of several edges, a cost on a vertex, and `CHEAPEST k`.
+- **A label shared by several tables,** and `ALTER LABEL … ADD / DROP PROPERTIES`.
+- **`SHORTEST k` / `ANY k` / `SHORTEST k GROUPS`** over mixed fixed/quantified patterns or several edge tables.
 - **DuckLake version coupling:** DuckDB 2.0 writes DuckLake format 1.1 and a newer file storage version, which 1.5
   tools can't read. A 2.0 write into a Postgres-backed 1.0 catalog once removed column statistics 1.5 then failed on
   (repaired by hand). See README "DuckLake versions": build lakes with the version their other writers use.
