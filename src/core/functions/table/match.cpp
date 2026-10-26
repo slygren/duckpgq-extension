@@ -9225,9 +9225,9 @@ static string JsonEscapeSQLPropertyName(const string &input) {
 // backslash escapes, so the replace() chain this used turned every quote into `\\"` -- invalid JSON for any value
 // holding a quote -- and left single backslashes and control characters unescaped.
 static string BuildJsonScalarSQL(const string &value_expr) {
-	// A JSON-typed property is JSON already: it nests as it is (null when NULL) instead of becoming a string of JSON.
-	return "CASE WHEN typeof(" + value_expr + ") = 'JSON' THEN coalesce(CAST(" + value_expr +
-	       " AS VARCHAR), 'null') ELSE __pgq_json_string(CAST(" + value_expr + " AS VARCHAR)) END";
+	// __pgq_json_value: a JSON property nests as it is, a MAP or STRUCT as an object, a LIST or ARRAY as an array;
+	// any other value is its VARCHAR text as a JSON string, as properties always were.
+	return "__pgq_json_value(" + value_expr + ")";
 }
 
 static string BuildJsonObjectExpression(const shared_ptr<PropertyGraphTable> &vertex_table, const string &table_alias) {

@@ -1,6 +1,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckpgq/common.hpp"
+#include "duckpgq/core/utils/duckpgq_identifier.hpp"
 
 #include <duckpgq/core/functions/scalar.hpp>
 
@@ -370,6 +371,82 @@ static void JsonStringFunction(DataChunk &args, ExpressionState &state, Vector &
 	}
 }
 
+// Any value as JSON, for the property objects vertex_properties(p) builds: a MAP or STRUCT is an object, a LIST or
+// ARRAY an array, a JSON value is itself, and every other value is the JSON string of its VARCHAR text -- exactly
+// as properties always were, so scalar properties read the same. NULL, at any depth, is null.
+static void AppendJsonValue(const Value &value, string &out) {
+	if (value.IsNull()) {
+		out += "null";
+		return;
+	}
+	const auto &type = value.type();
+	if (type.IsJSONType()) {
+		out += value.GetValue<string>();
+		return;
+	}
+	switch (type.id()) {
+	case LogicalTypeId::MAP: {
+		out += '{';
+		bool first = true;
+		for (const auto &entry : MapValue::GetChildren(value)) {
+			const auto &pair = StructValue::GetChildren(entry);
+			if (!first) {
+				out += ',';
+			}
+			first = false;
+			out += JsonString(pair[0].IsNull() ? string("null") : pair[0].DefaultCastAs(LogicalType::VARCHAR).GetValue<string>());
+			out += ':';
+			AppendJsonValue(pair[1], out);
+		}
+		out += '}';
+		return;
+	}
+	case LogicalTypeId::STRUCT: {
+		out += '{';
+		const auto &children = StructValue::GetChildren(value);
+		for (idx_t idx = 0; idx < children.size(); idx++) {
+			if (idx > 0) {
+				out += ',';
+			}
+			out += JsonString(PGQStr(StructType::GetChildName(type, idx)));
+			out += ':';
+			AppendJsonValue(children[idx], out);
+		}
+		out += '}';
+		return;
+	}
+	case LogicalTypeId::LIST:
+	case LogicalTypeId::ARRAY: {
+		out += '[';
+		const auto &children = type.id() == LogicalTypeId::LIST ? ListValue::GetChildren(value) : ArrayValue::GetChildren(value);
+		for (idx_t idx = 0; idx < children.size(); idx++) {
+			if (idx > 0) {
+				out += ',';
+			}
+			AppendJsonValue(children[idx], out);
+		}
+		out += ']';
+		return;
+	}
+	default:
+		out += JsonString(value.DefaultCastAs(LogicalType::VARCHAR).GetValue<string>());
+		return;
+	}
+}
+
+static void JsonValueFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto out = FlatVector::GetDataMutable<string_t>(result);
+	for (idx_t row = 0; row < args.size(); row++) {
+		string json;
+		AppendJsonValue(args.GetValue(0, row), json);
+		out[row] = StringVector::AddString(result, json);
+	}
+	if (args.AllConstant()) {
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	}
+}
+
 } // namespace
 
 void CoreScalarFunctions::RegisterGraphTreeJsonScalarFunction(ExtensionLoader &loader) {
@@ -402,6 +479,10 @@ void CoreScalarFunctions::RegisterGraphTreeJsonScalarFunction(ExtensionLoader &l
 	ScalarFunction json_string("__pgq_json_string", {LogicalType::VARCHAR}, LogicalType::VARCHAR, JsonStringFunction);
 	json_string.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	loader.RegisterFunction(json_string);
+
+	ScalarFunction json_value("__pgq_json_value", {LogicalType::ANY}, LogicalType::VARCHAR, JsonValueFunction);
+	json_value.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	loader.RegisterFunction(json_value);
 }
 
 } // namespace duckdb
