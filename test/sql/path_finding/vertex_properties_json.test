@@ -1,0 +1,77 @@
+# name: test/sql/path_finding/vertex_properties_json.test
+# description: vertex_properties(p) and graph_tree_json give valid JSON whatever a property holds: quotes,
+#   backslashes and control characters are escaped, NULL is null; JSON text in a VARCHAR stays a string.
+#   The SQL replace() chain this replaced turned every quote into an escaped backslash and a bare quote.
+# group: [path_finding]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE tag(id INTEGER, name VARCHAR, attrs VARCHAR);
+
+statement ok
+INSERT INTO tag VALUES (1, 'Pump "A" at C:\plant' || chr(10) || 'line 2' || chr(9) || 'tab' || chr(1), '{"group":"atex \"II 2G\"","codes":[1,2]}'), (2, 'Parent', NULL);
+
+statement ok
+CREATE TABLE workorder(id INTEGER, title VARCHAR);
+
+statement ok
+INSERT INTO workorder VALUES (10, NULL);
+
+statement ok
+CREATE TABLE has_parent(src INTEGER, dst INTEGER);
+
+statement ok
+CREATE TABLE has_workorder(src INTEGER, dst INTEGER);
+
+statement ok
+CREATE SCHEMA graph;
+
+statement ok
+CREATE TABLE graph.__pg_test_graph__Tag__HasParent__Tag AS SELECT 1 AS v0, hash('parent') AS e1, 2 AS v1;
+
+statement ok
+CREATE TABLE graph.__pg_test_graph__Tag__HasWorkorder__Workorder AS SELECT 1 AS v0, hash('wo') AS e1, 10 AS v1;
+
+statement ok
+CREATE TABLE graph.__pgq_path_catalog AS
+SELECT 'test_graph' AS graph_name, '__pg_test_graph__Tag__HasParent__Tag' AS path_table_name, 'edge' AS path_kind,
+       1 AS hop_count, 'Tag' AS src_label, 'Tag' AS dst_label, 'Tag,Tag' AS vertex_label_sequence,
+       'HasParent' AS edge_label_sequence, true AS supports_one_row_per_step, true AS is_deduplicated,
+       1 AS estimated_rows, current_timestamp AS last_refreshed_at, true AS is_sorted_by_v0, 1 AS min_depth,
+       1 AS max_depth, 'has_parent' AS bridge_table_names, true AS preserves_multiplicity
+UNION ALL
+SELECT 'test_graph', '__pg_test_graph__Tag__HasWorkorder__Workorder', 'edge', 1, 'Tag', 'Workorder',
+       'Tag,Workorder', 'HasWorkorder', true, true, 1, current_timestamp, true, 1, 1, 'has_workorder', true;
+
+statement ok
+ALTER TABLE graph.__pgq_path_catalog ADD COLUMN built_by VARCHAR DEFAULT 'pgq_abi_build';
+
+statement ok
+CREATE PROPERTY GRAPH test_graph
+VERTEX TABLES (tag PROPERTIES (id, name, attrs) LABEL Tag, workorder PROPERTIES (id, title) LABEL Workorder)
+EDGE TABLES (
+    has_parent SOURCE KEY (src) REFERENCES tag(id) DESTINATION KEY (dst) REFERENCES tag(id) LABEL HasParent,
+    has_workorder SOURCE KEY (src) REFERENCES tag(id) DESTINATION KEY (dst) REFERENCES workorder(id) LABEL HasWorkorder);
+
+statement ok
+SET pgq_require_abi_paths = true;
+
+query T rowsort
+SELECT unnest(vp) FROM GRAPH_TABLE (test_graph MATCH p = (t:Tag)-[:!HasParent]->{1,2}(x) WHERE t.id = 1
+    COLUMNS (vertex_properties(p) AS vp));
+----
+{"id":"1","name":"Pump \"A\" at C:\\plant\nline 2\ttab\u0001","attrs":"{\"group\":\"atex \\\"II 2G\\\"\",\"codes\":[1,2]}"}
+{"id":"10","title":null}
+
+query T
+WITH graph_paths AS (FROM GRAPH_TABLE (test_graph MATCH p = (t:Tag)-[:!HasParent]->{1,2}(x) WHERE t.id = 1
+    COLUMNS (path_length(p) AS depth, label(x) AS dst_label, vertices(p) AS vertex_ids, vertex_labels(p) AS vertex_labels,
+             edge_labels(p) AS edge_labels, vertex_properties(p) AS vertex_properties)))
+SELECT graph_tree_json(list(vertex_ids ORDER BY depth, dst_label), list(vertex_labels ORDER BY depth, dst_label),
+    list(edge_labels ORDER BY depth, dst_label), list(vertex_properties ORDER BY depth, dst_label)) FROM graph_paths;
+----
+{"label":"Tag","key":"1","properties":{"id":"1","name":"Pump \"A\" at C:\\plant\nline 2\ttab\u0001","attrs":"{\"group\":\"atex \\\"II 2G\\\"\",\"codes\":[1,2]}"},"relationships":{"HasWorkorder":[{"label":"Workorder","key":"10","properties":{"id":"10","title":null}}]}}
