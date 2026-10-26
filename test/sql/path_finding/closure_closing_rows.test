@@ -1,0 +1,72 @@
+# name: test/sql/path_finding/closure_closing_rows.test
+# description: ANY / ALL SHORTEST answered from a transitive closure match walks, so a (v, v) row of the closure -- a
+#              closed walk -- is a match. Where the closure has no such row within the bounds (a hierarchy, measured
+#              once per lake state) the route keeps `v0 <> v1`: it removes nothing there, and it keeps the planner's
+#              estimate of the closure's side (without it the hash joins built on the vertex tables and scanned them
+#              whole: 28 -> 52 ms on the lake's TAG hierarchy). On a cycle the closed walk is returned.
+# group: [path_finding]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+# A tree: no closed walk
+statement ok
+CREATE TABLE T AS SELECT range AS id FROM range(1, 40);
+
+statement ok
+CREATE TABLE H AS SELECT range AS child, range // 2 AS parent FROM range(2, 40);
+
+statement ok
+CREATE PROPERTY GRAPH h VERTEX TABLES (T LABEL T) EDGE TABLES (H SOURCE KEY (child) REFERENCES T (id) DESTINATION KEY (parent) REFERENCES T (id) LABEL H);
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('h', closures := ['H']);
+
+query II rowsort
+FROM GRAPH_TABLE (h MATCH ANY SHORTEST (c:T)-[:H]->{1,5}(a:T) WHERE c.id = 13 COLUMNS (c.id AS c, a.id AS a));
+----
+13	1
+13	3
+13	6
+
+query TT
+SELECT rewrite_type, status FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+transitive_closure	selected
+
+query II
+EXPLAIN FROM GRAPH_TABLE (h MATCH ANY SHORTEST (c:T)-[:H]->{1,5}(a:T) WHERE c.id = 13 COLUMNS (c.id AS c, a.id AS a));
+----
+physical_plan	<REGEX>:.*v0 != v1.*
+
+# A cycle 1 -> 2 -> 3 -> 1 with a tail 3 -> 4: every vertex on the cycle has its closed walk
+statement ok
+CREATE TABLE C AS SELECT range AS id FROM range(1, 5);
+
+statement ok
+CREATE TABLE E(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO E VALUES (1, 2), (2, 3), (3, 1), (3, 4);
+
+statement ok
+CREATE PROPERTY GRAPH c VERTEX TABLES (C LABEL C) EDGE TABLES (E SOURCE KEY (src) REFERENCES C (id) DESTINATION KEY (dst) REFERENCES C (id) LABEL E);
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('c', closures := ['E']);
+
+statement ok
+CREATE TABLE closure_rows AS FROM GRAPH_TABLE (c MATCH ANY SHORTEST (x:C)-[:E]->{1,5}(y:C) COLUMNS (x.id AS x, y.id AS y));
+
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE TABLE traversed_rows AS FROM GRAPH_TABLE (c MATCH ANY SHORTEST (x:C)-[:E]->{1,5}(y:C) COLUMNS (x.id AS x, y.id AS y));
+
+query II
+SELECT (SELECT count(*) FROM closure_rows WHERE x = y), (SELECT count(*) FROM ((FROM closure_rows EXCEPT ALL FROM traversed_rows) UNION ALL (FROM traversed_rows EXCEPT ALL FROM closure_rows)));
+----
+3	0

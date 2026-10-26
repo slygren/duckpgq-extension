@@ -7226,6 +7226,48 @@ public:
 		                 end(*edge_table.destination_pg_table, edge_table.destination_pk[0], edge_table.destination_fk[0]));
 	}
 
+	// The closures of one self-referential edge describe a hierarchy: no edge stored twice, at most one out-edge per
+	// vertex, no cycle. Then every closure kind is exact -- each path from a vertex is a prefix of its one chain --
+	// as far as it reaches. Counted from metadata where the tables exist, from the bridge where they do not:
+	//   no duplicates    |bridge| = pairs        pairs: |1-hop artifact| (it is DISTINCT pairs), or
+	//                                             count(DISTINCT (src, dst)) of the bridge
+	//   out-degree <= 1  sources = pairs         sources: |tc_chain| (one chain per vertex with an
+	//                                             out-edge), or count(DISTINCT src) of the bridge
+	//   acyclic          |tc| = |tc_witness|     (with out-degree <= 1, a cycle of length L below the closures'
+	//                                             depth cap reaches a pair at two depths), or no witness / tc row
+	//                                             closing on its start
+	bool Hierarchy(const string &label, const string &edge_label) {
+		// Counts of the stored tables, whose shape this describes whatever their endpoints: no artifact gate (the
+		// artifact a route then reads is gated where it is chosen).
+		PGQArtifactGate ungated(nullptr);
+		const auto *tc = Closure("transitive_closure", "__tc__", label, edge_label);
+		const auto *witness = Closure("tc_witness", "__tc_witness__", label, edge_label);
+		const auto *chain = Closure("tc_chain", "__tc_chain__", label, edge_label);
+		const auto *edge = EdgeArtifact(label, edge_label, label);
+		const auto *any_closure = witness ? witness : (tc ? tc : chain);
+		string bridge;
+		string src_col;
+		string dst_col;
+		if (!any_closure || !Bridge(edge_label, bridge, src_col, dst_col)) {
+			return false;
+		}
+		const string pairs = edge ? StringUtil::Format("(SELECT count(*) FROM %s)", Table(*edge))
+		                          : StringUtil::Format("(SELECT count(DISTINCT (%s, %s)) FROM %s)", src_col,
+		                                               dst_col, bridge);
+		const string sources = chain ? StringUtil::Format("(SELECT count(*) FROM %s)", Table(*chain))
+		                             : StringUtil::Format("(SELECT count(DISTINCT %s) FROM %s)", src_col, bridge);
+		const string acyclic =
+		    (tc && witness)
+		        ? StringUtil::Format("(SELECT count(*) FROM %s) = (SELECT count(*) FROM %s)", Table(*tc),
+		                             Table(*witness))
+		        : StringUtil::Format("NOT EXISTS (SELECT 1 FROM %s WHERE v0 = v1)", Table(*any_closure));
+		const bool hierarchy = Probe(
+		    "hierarchy|" + Table(*any_closure),
+		    StringUtil::Format("SELECT (SELECT count(*) FROM %s) = %s AND %s = %s AND %s", bridge, pairs, sources,
+		                       pairs, acyclic));
+		return hierarchy;
+	}
+
 	// A closure (tc, tc_witness, tc_chain) of one self-referential edge holds exactly the traversal's paths up
 	// to `upper` hops.
 	bool ClosureExact(const PGQPathTableInfo &info, int64_t upper) {
@@ -7251,32 +7293,10 @@ public:
 		if (!Bridge(edge_label, bridge, src_col, dst_col)) {
 			return false;
 		}
-		// A hierarchy: no edge stored twice, at most one out-edge per vertex, no cycle. Then every closure
-		// kind is exact -- each path from a vertex is a prefix of its one chain -- as far as it reaches. Counted
-		// from metadata where the tables exist, from the bridge where they do not:
-		//   no duplicates    |bridge| = pairs        pairs: |1-hop artifact| (it is DISTINCT pairs), or
-		//                                             count(DISTINCT (src, dst)) of the bridge
-		//   out-degree <= 1  sources = pairs         sources: |tc_chain| (one chain per vertex with an
-		//                                             out-edge), or count(DISTINCT src) of the bridge
-		//   acyclic          |tc| = |tc_witness|     (with out-degree <= 1, a pair reached at two depths means
-		//                                             the walk came round again), or no witness / tc row
-		//                                             closing on its start
+		// A hierarchy (Hierarchy): every closure kind is exact as far as it reaches.
 		const auto *any_closure = witness ? witness : (tc ? tc : chain);
 		if (any_closure) {
-			const string pairs = edge ? StringUtil::Format("(SELECT count(*) FROM %s)", Table(*edge))
-			                          : StringUtil::Format("(SELECT count(DISTINCT (%s, %s)) FROM %s)", src_col,
-			                                               dst_col, bridge);
-			const string sources = chain ? StringUtil::Format("(SELECT count(*) FROM %s)", Table(*chain))
-			                             : StringUtil::Format("(SELECT count(DISTINCT %s) FROM %s)", src_col, bridge);
-			const string acyclic =
-			    (tc && witness)
-			        ? StringUtil::Format("(SELECT count(*) FROM %s) = (SELECT count(*) FROM %s)", Table(*tc),
-			                             Table(*witness))
-			        : StringUtil::Format("NOT EXISTS (SELECT 1 FROM %s WHERE v0 = v1)", Table(*any_closure));
-			const bool hierarchy = Probe(
-			    "hierarchy|" + Table(*any_closure),
-			    StringUtil::Format("SELECT (SELECT count(*) FROM %s) = %s AND %s = %s AND %s", bridge, pairs, sources,
-			                       pairs, acyclic));
+			const bool hierarchy = Hierarchy(label, edge_label);
 			if (hierarchy) {
 				// A closure stops at its builder's depth cap. Up to its deepest row nothing is missing; past it,
 				// it is complete exactly when no deepest path can be extended by another edge.
@@ -7312,6 +7332,23 @@ public:
 		return witness && Probe("witness|" + Table(*witness),
 		                        StringUtil::Format("SELECT (SELECT count(*) FROM %s) = (SELECT count(*) FROM %s)",
 		                                           Table(*witness), Table(*tc)));
+	}
+
+	// No row of the closure closes on its start within `upper` hops, so a search prefix's walks over it have no
+	// closed walk to return: keeping `v0 <> v1` then removes nothing (and keeps the planner's estimate of the
+	// closure's side). Measured once per lake state, like every probe.
+	bool NoClosingRow(const PGQPathTableInfo &info, int64_t upper) {
+		const bool bounded = upper < static_cast<int64_t>(1 << 30);
+		// A hierarchy (metadata counts, shared with ClosureExact) has no cycle shorter than the closures' depth cap.
+		const auto vertices = SplitCatalogSequence(info.vertex_label_sequence);
+		const auto edges = SplitCatalogSequence(info.edge_label_sequence);
+		if (bounded && info.max_depth > 0 && upper < info.max_depth && vertices.size() == 2 && edges.size() == 1 &&
+		    Hierarchy(vertices[0], edges[0])) {
+			return true;
+		}
+		return Probe("no_closing|" + Table(info) + (bounded ? "|" + std::to_string(upper) : string()),
+		             StringUtil::Format("SELECT NOT EXISTS (SELECT 1 FROM %s WHERE v0 = v1%s)", Table(info),
+		                                bounded ? " AND depth <= " + std::to_string(upper) : string()));
 	}
 
 	// Every walk of at most `upper` hops over the closure's directed edge visits no vertex twice, so a search
@@ -10868,7 +10905,9 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 						PushConstraintToSQLFilter(where_constraints, tc_dst->variable_binding, PGQStr(etbl->destination_pk[0]),
 						                          "w.v1", endpoint_filters);
 						AddTCWitnessORPCTE(select_node, *tc_witness_info, vtable, etbl, tc_sp->lower, tc_sp->upper,
-						                   endpoint_filters, selector != PGQPathSelector::WALK && ClosedWalks(*tc_sp));
+						                   endpoint_filters,
+						                   selector != PGQPathSelector::WALK && ClosedWalks(*tc_sp) &&
+						                       !exactness.NoClosingRow(*tc_witness_info, tc_sp->upper));
 						alias_map[tc_src->variable_binding] = vtable;
 						alias_map[tc_dst->variable_binding] = vtable;
 						auto diagnostic = MakeArtifactDiagnostic(
@@ -10939,7 +10978,8 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 								path_ref = BuildTCWitnessNamedPathRef(*tc_witness_info, path_alias, tc_sp->lower, tc_sp->upper,
 								                                      endpoint_filters, PGQStr(vtable->main_label),
 								                                      PGQStr(etbl->main_label),
-								                                      selector != PGQPathSelector::WALK && ClosedWalks(*tc_sp));
+								                                      selector != PGQPathSelector::WALK && ClosedWalks(*tc_sp) &&
+								                                          !exactness.NoClosingRow(*tc_witness_info, tc_sp->upper));
 							} else {
 								path_ref = BuildTCChainNamedPathRef(*tc_chain_info, path_alias, tc_sp->lower, tc_sp->upper,
 								                                    endpoint_filters, PGQStr(vtable->main_label),
@@ -11107,6 +11147,10 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 							bt->SetTable(Identifier(tc_info->table_name));
 							bt->alias        = Identifier(pt_alias);
 							unique_ptr<TableRef> pt_ref = std::move(bt);
+							// Whether a pair closing on its start is a match here: a closed walk under the selector,
+							// and only where the closure has one within the bounds.
+							const bool closes = selector != PGQPathSelector::WALK && ClosedWalks(*tc_sp) &&
+							                    !exactness.NoClosingRow(*tc_info, tc_sp->upper);
 							if (selector != PGQPathSelector::WALK && !exactness.OneDepthPerPair(*tc_info)) {
 								// A shortest path per endpoint pair, not one row per depth: the least depth within the
 								// bounds, never a pair that only closes a cycle. (ALL SHORTEST only reaches here with a
@@ -11123,14 +11167,14 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 								                          endpoint_filters);
 								// The closure is over walks: a (v, v) row is a closed walk, the shortest path from v to itself
 								// under walk semantics (ClosedWalks); kept there, dropped where the pattern forbids it.
-								const string self_filter = ClosedWalks(*tc_sp) ? "" : " AND v0 <> v1";
+								const string self_filter = closes ? "" : " AND v0 <> v1";
 								pt_ref = make_uniq<SubqueryRef>(
 								    ParseSelectStatement("SELECT v0, v1, min(depth) AS depth FROM " +
 								                         QualifiedTableName(tc_info->catalog_name, tc_info->schema_name, tc_info->table_name) +
 								                         " WHERE " + BuildSQLFilter(depth_filter + self_filter, endpoint_filters) +
 								                         " GROUP BY v0, v1"),
 								    PGQId(pt_alias));
-							} else if (selector != PGQPathSelector::WALK && !ClosedWalks(*tc_sp)) {
+							} else if (selector != PGQPathSelector::WALK && !closes) {
 								// Already one row per pair; a pair closing a cycle goes where the pattern forbids it.
 								conditions.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_NOTEQUAL,
 								                                                     PGQColRef("v0", pt_alias), PGQColRef("v1", pt_alias)));
