@@ -543,11 +543,10 @@ static void LoadPathTableCatalogMetadata(Connection &connection, const string &c
 
 	auto query_result = connection.Query(build_query(columns));
 	if (assume_latest_columns && (!query_result || query_result->HasError())) {
-		// A catalog written by the layout compiler or an older pgq_abi_build has no provenance columns.
-		columns.erase("source_snapshot");
-		columns.erase("source_tables");
-		columns.erase("built_by");
-		columns.erase("endpoints_complete");
+		// A catalog written by the layout compiler or an older pgq_abi_build lacks some of the newest columns (the
+		// compiler writes endpoints_complete but no provenance): read the ones it has, the others take their
+		// defaults. Dropping a fixed list instead lost a stored endpoints_complete along with the provenance.
+		columns = LoadCatalogTableColumns(connection, catalog_name, schema_name, "__pgq_path_catalog");
 		query_result = connection.Query(build_query(columns));
 	}
 	if (!query_result || query_result->HasError()) {

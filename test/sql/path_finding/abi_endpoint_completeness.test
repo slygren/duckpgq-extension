@@ -901,3 +901,56 @@ SELECT (SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE status = 'sele
        (SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE reason LIKE 'far_ends|%' AND status = 'exact');
 ----
 true	2
+
+# =====================================================================================================================
+# G. A catalog with the proof but no provenance columns -- what the dwh layout compiler writes: the proof is read
+# =====================================================================================================================
+
+statement ok
+CREATE TABLE GV(id VARCHAR PRIMARY KEY);
+
+statement ok
+CREATE TABLE GT(code VARCHAR PRIMARY KEY);
+
+statement ok
+CREATE TABLE GE(vid VARCHAR, tcode VARCHAR);
+
+statement ok
+INSERT INTO GV VALUES ('1'), ('2');
+
+statement ok
+INSERT INTO GT VALUES ('x'), ('y');
+
+statement ok
+INSERT INTO GE VALUES ('1', 'x'), ('2', 'y'), ('9', 'x'), ('1', 'z');
+
+statement ok
+CREATE PROPERTY GRAPH dg VERTEX TABLES (GV LABEL V, GT LABEL T)
+EDGE TABLES (GE SOURCE KEY (vid) REFERENCES GV (id) DESTINATION KEY (tcode) REFERENCES GT (code) LABEL E);
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('dg', schema := 'abi_dg');
+
+# The layout compiler's catalog: endpoints_complete, none of the provenance columns
+statement ok
+ALTER TABLE abi_dg.__pgq_path_catalog DROP COLUMN source_snapshot;
+
+statement ok
+ALTER TABLE abi_dg.__pgq_path_catalog DROP COLUMN source_tables;
+
+statement ok
+ALTER TABLE abi_dg.__pgq_path_catalog DROP COLUMN built_by;
+
+query II
+FROM GRAPH_TABLE (dg MATCH (v:V)-[:E]->(t:T) COLUMNS (v.id AS v, t.code AS t)) ORDER BY ALL;
+----
+1	x
+2	y
+
+# Answered from the artifact without measuring it (the loader used to drop endpoints_complete with the provenance
+# columns it did not find, and probed every artifact of such a catalog)
+query II
+SELECT (SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected') > 0,
+       (SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE rewrite_type = 'multiplicity_probe');
+----
+true	0
