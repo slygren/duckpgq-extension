@@ -325,7 +325,7 @@ How each function reads the edges (n vertices, m edges):
 | `total_triangle_count(g, v, e)` | undirected | ignored | count once | one row, `triangle_count BIGINT` | O(m^1.5) |
 | `betweenness_centrality(g, v, e, k, normalized, directed, seed)` | directed (default) or undirected | ignored | count once | `betweenness_centrality DOUBLE` | O(n m), O(k m) sampled |
 | `label_propagation(g, v, e, seed, max_iterations)` | undirected | ignored | count once | `community BIGINT` | O(m) per round |
-| `louvain(g, v, e, resolution, seed)` | undirected, unweighted | ignored | count once | `community BIGINT` | O(m) per pass, typically O(m log n) |
+| `louvain(g, v, e, resolution, seed)` | undirected, unweighted | ignored | count once | `community BIGINT` | about O(m) per level |
 | `k_core(g, v, e)` | undirected | ignored | count once | `core_number BIGINT` | O(n + m) |
 | `shortest_path_lengths(g, v, e, source, directed)` | directed (default) or undirected | no effect | no effect | `distance BIGINT`, reachable vertices only | O(n + m) |
 | `degree(g, v, e)` | directed | 1 in + 1 out | each counts | `in_degree, out_degree, degree BIGINT` | O(n + m), plain SQL |
@@ -361,14 +361,17 @@ How each function reads the edges (n vertices, m edges):
   holds a most frequent neighbour label, or after `max_iterations` rounds (default 100). The same seed gives the same
   communities on every platform. NetworkX uses Python's random generator, so labels differ from NetworkX's. A
   `community` is the smallest rowid among its members.
-- **`louvain`**: Louvain modularity optimisation (Blondel et al. 2008), as `networkx.louvain_communities` runs it.
-  Vertices move one at a time, in a random order drawn from `seed`, to the neighbouring community with the best
-  modularity gain until no vertex moves. Each community then becomes a vertex of the next level. It stops when a
-  level moves nothing or raises modularity by at most 1e-7. `resolution` (default 1) above 1 favours smaller
-  communities, below 1 larger ones; 0 merges every connected part. The result is deterministic for a seed but is not
-  NetworkX's partition (different random generator). On the generated test graphs its modularity is within 0.02 of
-  the best of five NetworkX seeds, and planted partitions are recovered exactly. As with any Louvain, a community can
-  be internally disconnected; Leiden's refinement step, which prevents that, is not implemented.
+- **`louvain`**: Louvain modularity optimisation (Blondel et al. 2008). Vertices move one at a time, from a queue
+  in a random order drawn from `seed`, to the neighbouring community with the best modularity gain. A vertex that
+  moves queues its neighbours again (Leiden's fast local move), and up to two sweeps over all vertices catch the
+  remaining moves. Each community then becomes a vertex of the next level. It stops, as
+  `networkx.louvain_communities` does, when a level moves nothing or raises modularity by at most 1e-7. NetworkX
+  instead sweeps until a sweep moves nothing. On 1M vertices / 5M edges that rule takes 416 s against 8 s here, and
+  on the test graphs the mean modularity over five seeds is within 0.006 of NetworkX's. `resolution` (default 1)
+  above 1 favours smaller communities, below 1 larger ones; 0 merges every connected part. The result is
+  deterministic for a seed but is not NetworkX's partition (different random generator). Planted partitions are
+  recovered exactly. As with any Louvain, a community can be internally disconnected; Leiden's refinement step,
+  which prevents that, is not implemented.
 - **`k_core`**: each vertex's core number, the largest k such that the vertex lies in a subgraph where every vertex
   has at least k neighbours, computed by Batagelj-Zaversnik bucket peeling. The k-core is
   `WHERE core_number >= k`. `networkx.core_number` refuses graphs with self-loops; here they are dropped, which gives

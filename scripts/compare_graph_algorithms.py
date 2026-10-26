@@ -17,7 +17,8 @@ through the duckdb CLI; every algorithm's output is read back and compared with 
   degree                         in/out/total degree of the MultiDiGraph
   shortest_path_lengths          nx.single_source_shortest_path_length, directed and undirected
   label_propagation              properties: a fixed point of asynchronous LPA, deterministic, planted partitions
-  louvain                        properties: modularity close to nx.louvain_communities, planted partitions
+  louvain                        properties: mean modularity over 5 seeds within 0.01 of nx.louvain_communities,
+                                 planted partitions
 
 Exit status 1 when anything disagrees.
 """
@@ -187,6 +188,10 @@ QUERIES = {
     "label_propagation_again": "FROM label_propagation('g', 'v', 'e', seed := 7)",
     "louvain": "FROM louvain('g', 'v', 'e', seed := 7)",
     "louvain_again": "FROM louvain('g', 'v', 'e', seed := 7)",
+    "louvain_seed_1": "FROM louvain('g', 'v', 'e', seed := 1)",
+    "louvain_seed_2": "FROM louvain('g', 'v', 'e', seed := 2)",
+    "louvain_seed_3": "FROM louvain('g', 'v', 'e', seed := 3)",
+    "louvain_seed_4": "FROM louvain('g', 'v', 'e', seed := 4)",
 }
 
 
@@ -227,7 +232,7 @@ def run_case(duckdb, case, only, workdir):
         "DESTINATION KEY (dst) REFERENCES v (id));",
     ]
     for name, q in QUERIES.items():
-        base = name.split("_raw")[0].split("_undirected")[0].split("_k_")[0].replace("_again", "")
+        base = name.split("_raw")[0].split("_undirected")[0].split("_k_")[0].split("_seed_")[0].replace("_again", "")
         if base not in only:
             continue
         if "{source}" in q and case.source is None:
@@ -493,17 +498,19 @@ def check_case(chk, case, workdir, only, log):
         else:
             rows = got[1]
             g = case.graph()
-            ours = modularity_of(g, groups_of(rows))
-            theirs = max(modularity_of(g, nx.community.louvain_communities(g, seed=s)) for s in range(5)) \
+            # Different random generators, so compare the mean modularity over five seeds on each side.
+            runs = [rows] + [res[f"louvain_seed_{s}"][1] for s in range(1, 5) if res[f"louvain_seed_{s}"]]
+            ours = sum(modularity_of(g, groups_of(r)) for r in runs) / len(runs)
+            theirs = sum(modularity_of(g, nx.community.louvain_communities(g, seed=s)) for s in range(5)) / 5 \
                 if g.number_of_edges() else 0.0
             okay = True
             if res["louvain_again"] is None or res["louvain_again"][1] != rows:
                 chk.fail(case, "louvain", "same seed gave different communities")
                 okay = False
-            if ours < theirs - 0.02:
-                chk.fail(case, "louvain", f"modularity {ours:.4f} vs NetworkX {theirs:.4f}")
+            if len(runs) < 5 or ours < theirs - 0.01:
+                chk.fail(case, "louvain", f"mean modularity {ours:.4f} vs NetworkX {theirs:.4f}")
                 okay = False
-            log.append(f"  [{case.name}] louvain modularity {ours:.4f} (NetworkX best of 5 seeds {theirs:.4f})")
+            log.append(f"  [{case.name}] louvain mean modularity over 5 seeds {ours:.4f} (NetworkX {theirs:.4f})")
             if hasattr(case, "planted"):
                 if sorted(map(sorted, groups_of(rows))) != sorted(map(sorted, case.planted)):
                     chk.fail(case, "louvain", "did not recover the planted partition")
