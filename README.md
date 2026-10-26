@@ -236,7 +236,7 @@ else by its text (`path_length(p)`, `(p.id + 1)`) -- on every route, ABI artifac
 | `v.link.prop`, `v.link.{a, b}` | a property of the vertex a single-valued link points to, when the graph's ABI catalog declares that link |
 | `element_id(x)`, `label(x)` | element id (the row id; for an undirected edge the edge's own row); label as declared in `CREATE PROPERTY GRAPH` (a table with sub-labels reports its main label). `label(x) = 'Person'` is case-sensitive; `IS LABELED` is not |
 | `x IS [NOT] LABELED L` | label test; for a discriminator sub-label (`LABEL Member IN kind (Student, Teacher)`) the row's own bit |
-| `ALL_DIFFERENT(a, b, …)` | the bound elements are pairwise distinct |
+| `SAME(a, b, …)`, `ALL_DIFFERENT(a, b, …)` | all arguments are the same element / no two are. An element is its table and its row, so elements of two tables (a vertex and an edge, a `Person` and a `Course` with the same row id) are never the same |
 | `a IS [NOT] SOURCE OF e`, `a IS [NOT] DESTINATION OF e` | whether vertex `a` is the vertex edge `e` leaves (its `SOURCE KEY`) / enters, whatever direction the pattern reads `e` in (`(a)-[e]-(b) WHERE a IS SOURCE OF e` is `(a)-[e]->(b)`); `a` need not be next to `e`. `e` is a single edge, not a quantified one |
 | `path_length(p)`, `vertices(p)`, `edges(p)` | hops; the path's vertices (row ids when traversed, keys when an ABI artifact answers) and edges (row ids; no artifact has them, so a pattern asking for `edges(p)` is traversed) |
 | `vertex_labels(p)`, `edge_labels(p)` | declared labels along the path, in path order, traversed or answered by an ABI artifact. They need each vertex and edge of the path to have one table, from its label or from the edge next to it |
@@ -246,8 +246,8 @@ else by its text (`path_length(p)`, `(p.id + 1)`) -- on every route, ABI artifac
 | `cost(p)` | total cost of an `ANY`/`ALL CHEAPEST` path, its steps' costs added in path order: BIGINT for integer costs, DOUBLE for any other number (DECIMAL included). For a constant `COST c` (the pattern is then `SHORTEST`), `c` added once per step |
 | `path_tree_json(…)`, `graph_tree_json(…)` | nest paths into a JSON tree |
 
-The element functions and predicates (`element_id`, `label`, `IS [NOT] LABELED`, `ALL_DIFFERENT`, `IS SOURCE OF`,
-`IS DESTINATION OF`) can stand anywhere an expression can: nested in other expressions (`NOT`, `CASE`, function
+The element functions and predicates (`element_id`, `label`, `IS [NOT] LABELED`, `SAME`, `ALL_DIFFERENT`, `IS SOURCE
+OF`, `IS DESTINATION OF`) can stand anywhere an expression can: nested in other expressions (`NOT`, `CASE`, function
 arguments), in `COLUMNS`, in an element `WHERE`, in the `WHERE` of an `EXISTS { }` pattern and of a `UNION` branch. Of an `OPTIONAL MATCH` element that
 matched nothing they are NULL, so `WHERE c IS LABELED Course` drops the rows where `c` is missing.
 

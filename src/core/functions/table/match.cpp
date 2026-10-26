@@ -2609,25 +2609,60 @@ static unique_ptr<ParsedExpression> RewriteElementFunction(FunctionExpression &f
 		}
 		return NullWhereElementNull(scope, vertex, NullWhereElementNull(scope, edge, std::move(result)));
 	}
-	if (name == "all_different") {
+	if (name == "all_different" || name == "same") {
+		// SAME: every element is the first one; ALL_DIFFERENT: no two are the same. An element is its table and row.
+		const bool same = name == "same";
 		vector<string> variables;
 		for (idx_t i = 0; i < argument_count; i++) {
 			variables.push_back(ElementArgument(function, i));
 			if (variables.back().empty()) {
-				throw BinderException("ALL_DIFFERENT arguments must be element variable references");
+				throw BinderException("%s arguments must be element variable references", same ? "SAME" : "ALL_DIFFERENT");
 			}
 		}
+		// Whether two variables are the same element: a constant when their tables decide it, else by row id. A
+		// placeholder table (stub) decides nothing.
+		// A term decided by the tables is not NULL by itself where an OPTIONAL element is missing; a row comparison is.
+		bool decided = false;
+		auto identical = [&](const string &left, const string &right, bool equal) -> unique_ptr<ParsedExpression> {
+			if (StringUtil::CIEquals(left, right)) {
+				decided = true;
+				return ConstantExpression::FromValue(Value::BOOLEAN(equal));
+			}
+			auto left_table = table_of(left);
+			auto right_table = table_of(right);
+			const bool stub = scope.stubs && (scope.stubs->count(left) || scope.stubs->count(right));
+			if (left_table && right_table && !stub && !left_table->SameTableIdentity(*right_table)) {
+				decided = true;
+				return ConstantExpression::FromValue(Value::BOOLEAN(!equal));
+			}
+			return make_uniq<ComparisonExpression>(equal ? ExpressionType::COMPARE_EQUAL
+			                                             : ExpressionType::COMPARE_NOTEQUAL,
+			                                       ElementRowid(scope, left), ElementRowid(scope, right));
+		};
 		unique_ptr<ParsedExpression> result;
-		for (idx_t i = 0; i < variables.size(); i++) {
-			for (idx_t j = i + 1; j < variables.size(); j++) {
-				unique_ptr<ParsedExpression> different = make_uniq<ComparisonExpression>(
-				    ExpressionType::COMPARE_NOTEQUAL, ElementRowid(scope, variables[i]), ElementRowid(scope, variables[j]));
-				result = result ? make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(result),
-				                                                   std::move(different))
-				                : std::move(different);
+		auto add = [&](unique_ptr<ParsedExpression> term) {
+			result = result ? make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(result),
+			                                                   std::move(term))
+			                : std::move(term);
+		};
+		if (same) {
+			for (idx_t i = 1; i < variables.size(); i++) {
+				add(identical(variables[0], variables[i], true));
+			}
+		} else {
+			for (idx_t i = 0; i < variables.size(); i++) {
+				for (idx_t j = i + 1; j < variables.size(); j++) {
+					add(identical(variables[i], variables[j], false));
+				}
 			}
 		}
-		return result ? std::move(result) : ConstantExpression::FromValue(Value::BOOLEAN(true));
+		if (!result) {
+			return ConstantExpression::FromValue(Value::BOOLEAN(true));
+		}
+		for (idx_t i = 0; decided && i < variables.size(); i++) {
+			result = NullWhereElementNull(scope, variables[i], std::move(result));
+		}
+		return result;
 	}
 	return nullptr;
 }

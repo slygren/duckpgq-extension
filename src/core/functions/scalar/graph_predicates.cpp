@@ -23,6 +23,16 @@ static void SourceDestinationFunction(DataChunk &, ExpressionState &, Vector &) 
 	throw InvalidInputException("IS [NOT] SOURCE OF cannot be executed outside a GRAPH_TABLE");
 }
 
+// SAME(a, b, ...) and ALL_DIFFERENT(a, b, ...) compare graph elements; the MATCH expansion rewrites them.
+static unique_ptr<FunctionData> ElementComparisonBind(BindScalarFunctionInput &) {
+	throw BinderException("SAME and ALL_DIFFERENT are only allowed inside a GRAPH_TABLE, on element variables of its "
+	                      "MATCH");
+}
+
+static void ElementComparisonFunction(DataChunk &, ExpressionState &, Vector &) {
+	throw InvalidInputException("SAME and ALL_DIFFERENT cannot be executed outside a GRAPH_TABLE");
+}
+
 //------------------------------------------------------------------------------
 // Register functions
 //------------------------------------------------------------------------------
@@ -30,6 +40,11 @@ void CoreScalarFunctions::RegisterGraphPredicateScalarFunctions(ExtensionLoader 
 	for (auto name : {"is_labeled", "not_labeled"}) {
 		loader.RegisterFunction(Fallible(ScalarFunction(name, {LogicalType::ANY, LogicalType::VARCHAR}, LogicalType::BOOLEAN,
 		                                       LabelPredicateFunction, LabelPredicateBind)));
+	}
+	for (auto name : {"same", "all_different"}) {
+		loader.RegisterFunction(Fallible(ScalarFunction(name, vector<LogicalType> {}, LogicalType::BOOLEAN,
+		                                                ElementComparisonFunction, ElementComparisonBind, nullptr,
+		                                                nullptr, LogicalType::ANY)));
 	}
 	for (auto name : {"is_source_of", "is_destination_of"}) {
 		loader.RegisterFunction(Fallible(ScalarFunction(name, {LogicalType::ANY, LogicalType::ANY}, LogicalType::BOOLEAN,

@@ -1,0 +1,149 @@
+# name: test/sql/pattern_matching/same_all_different.test
+# description: SAME(a, b, ...) holds when every argument is the same graph element, ALL_DIFFERENT(a, b, ...) when no
+#              two are. An element is its table and its row: a Person and a Course with the same row id are different
+#              elements (ALL_DIFFERENT compared row ids only and called them the same). Each is compared with the same
+#              question asked of element ids within one table, traversed and with ABI artifacts built.
+# group: [pattern_matching]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE P(id BIGINT PRIMARY KEY, name VARCHAR);
+
+statement ok
+INSERT INTO P VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e');
+
+statement ok
+CREATE TABLE C(cid BIGINT PRIMARY KEY, title VARCHAR);
+
+statement ok
+INSERT INTO C VALUES (1, 'x'), (2, 'y');
+
+statement ok
+CREATE TABLE K(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO K VALUES (1, 2), (1, 2), (2, 3), (1, 3), (3, 4), (2, 4), (4, 1), (2, 1), (3, 5), (5, 5);
+
+statement ok
+CREATE TABLE L(pid BIGINT, cid BIGINT);
+
+statement ok
+INSERT INTO L VALUES (1, 1), (2, 2), (3, 1);
+
+statement ok
+CREATE PROPERTY GRAPH g
+VERTEX TABLES (P LABEL Person, C LABEL Course)
+EDGE TABLES (K SOURCE KEY (src) REFERENCES P (id) DESTINATION KEY (dst) REFERENCES P (id) LABEL Knows,
+             L SOURCE KEY (pid) REFERENCES P (id) DESTINATION KEY (cid) REFERENCES C (cid) LABEL Takes);
+
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+loop pass 0 2
+
+# --- across tables: never the same element (Person 1 and Course 1 both have row id 0)
+
+query II
+FROM GRAPH_TABLE (g MATCH (a:Person)-[t:Takes]->(c:Course) WHERE ALL_DIFFERENT(a, c) COLUMNS (a.id, c.cid)) ORDER BY ALL;
+----
+1	1
+2	2
+3	1
+
+query II
+FROM GRAPH_TABLE (g MATCH (a:Person)-[t:Takes]->(c:Course) WHERE SAME(a, c) OR NOT ALL_DIFFERENT(a, c, t) COLUMNS (a.id, c.cid)) ORDER BY ALL;
+----
+
+# a vertex and an edge are never the same
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH (a:Person)-[e:Knows]->(b:Person) WHERE SAME(a, e) OR SAME(e, b) COLUMNS (a.id));
+----
+0
+
+# --- within a table: by element id
+
+statement ok
+CREATE OR REPLACE TABLE r AS FROM GRAPH_TABLE (g MATCH (a:Person)-[e:Knows]->(b:Person)-[f:Knows]->(c:Person)
+    COLUMNS (a.id AS a, b.id AS b, c.id AS c, element_id(e) AS e, element_id(f) AS f,
+             SAME(a, c) AS s_ac, SAME(a, b, c) AS s_abc, SAME(e, f) AS s_ef, ALL_DIFFERENT(a, b, c) AS d_abc,
+             ALL_DIFFERENT(e, f) AS d_ef, SAME(a, a) AS s_aa, ALL_DIFFERENT(a, a) AS d_aa));
+
+query I
+SELECT count(*) FROM r WHERE s_ac <> (a = c) OR s_abc <> (a = b AND b = c) OR s_ef <> (e = f)
+                          OR d_abc <> (a <> b AND b <> c AND a <> c) OR d_ef <> (e <> f) OR NOT s_aa OR d_aa;
+----
+0
+
+query III
+SELECT count(*), count(*) FILTER (WHERE s_ac), count(*) FILTER (WHERE s_ef) FROM r;
+----
+20	5	1
+
+# SAME(a, c) over a two-hop chain is the chain back to its start
+statement ok
+CREATE OR REPLACE TABLE r1 AS FROM GRAPH_TABLE (g MATCH (a:Person)-[e:Knows]->(b:Person)-[f:Knows]->(c:Person) WHERE SAME(a, c)
+                                                 COLUMNS (a.id AS a, b.id AS b, element_id(e) AS e, element_id(f) AS f));
+
+statement ok
+CREATE OR REPLACE TABLE r2 AS FROM GRAPH_TABLE (g MATCH (a:Person)-[e:Knows]->(b:Person)-[f:Knows]->(a)
+                                                 COLUMNS (a.id AS a, b.id AS b, element_id(e) AS e, element_id(f) AS f));
+
+query I
+SELECT count(*) FROM ((FROM r1 EXCEPT ALL FROM r2) UNION ALL (FROM r2 EXCEPT ALL FROM r1));
+----
+0
+
+# NOT ALL_DIFFERENT is the OR of SAME over the pairs
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH (a:Person)-[e:Knows]->(b:Person)-[f:Knows]->(c:Person)
+    WHERE (NOT ALL_DIFFERENT(a, b, c)) <> (SAME(a, b) OR SAME(b, c) OR SAME(a, c)) COLUMNS (a.id));
+----
+0
+
+# undirected edges: the edge itself, read either way
+query II
+FROM GRAPH_TABLE (g MATCH (a:Person)-[e:Knows]-(b:Person)-[f:Knows]-(c:Person)
+    COLUMNS (count(*) FILTER (WHERE SAME(e, f)), count(*) FILTER (WHERE ALL_DIFFERENT(e, f))));
+----
+19	60
+
+# --- OPTIONAL MATCH: NULL where an argument is missing
+
+query IIII
+FROM GRAPH_TABLE (g MATCH (a:Person) OPTIONAL MATCH (a)-[t:Takes]->(c:Course)
+    COLUMNS (a.id, SAME(a, c) AS s, ALL_DIFFERENT(a, c) AS d, SAME(c, c) AS cc)) ORDER BY ALL;
+----
+1	false	true	true
+2	false	true	true
+3	false	true	true
+4	NULL	NULL	NULL
+5	NULL	NULL	NULL
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('g', exclude_self_referential := false, max_hops := 2);
+
+endloop
+
+# --- refusals
+
+statement error
+FROM GRAPH_TABLE (g MATCH (a:Person)-[e:Knows]->(b:Person) WHERE SAME(a, b.id) COLUMNS (a.id));
+----
+SAME arguments must be element variable references
+
+statement error
+SELECT same(1, 2);
+----
+only allowed inside a GRAPH_TABLE
+
+statement error
+SELECT all_different(1, 2);
+----
+only allowed inside a GRAPH_TABLE
