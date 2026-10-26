@@ -403,32 +403,86 @@ unique_ptr<PathReference> TransformAbbreviatedEdge(PEGTransformer &transformer, 
 	return std::move(result);
 }
 
-[[noreturn]] void ThrowParenthesizedPath() {
-	throw ParserException(
-	    "Parenthesized path patterns are not supported: neither a quantified group such as "
-	    "((a)-[:R]->(b) | (a)-[:S]->(b)){1,3} nor a group inside a longer path. Write a path pattern union at the "
-	    "top level of a MATCH pattern instead, e.g. MATCH (a)-[:R]->(b) | (a)-[:S]->(b)");
+unique_ptr<PathPattern> TransformPathPattern(PEGTransformer &transformer, ParseResult &parse_result,
+                                             AnonymousNames &anon_names);
+
+// DuckPGQPathGroupBody DuckPGQQuantifier?, with DuckPGQPathGroupBody <- ('(' / '[') DuckPGQPathPattern WhereClause?
+// (')' / ']'). The body keeps its own elements; the quantifier, the WHERE and a path mode go on the group.
+unique_ptr<PathReference> TransformPathGroup(PEGTransformer &transformer, ParseResult &parse_result,
+                                             AnonymousNames &anon_names) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto &body = DuckPGQGetChoice(list.GetChild(0)).Cast<ListParseResult>();
+	auto pattern = TransformPathPattern(transformer, body.GetChild(1), anon_names);
+	if (!pattern->union_operands.empty()) {
+		throw ParserException("A path pattern union ('|' or '|+|') inside a parenthesized path pattern is not "
+		                      "supported; write the alternatives as a union at the top level of the MATCH pattern");
+	}
+	if (pattern->shortest || pattern->cheapest || pattern->topk) {
+		throw ParserException("A search prefix (ANY / ALL SHORTEST, SHORTEST k, CHEAPEST) cannot be written inside a "
+		                      "parenthesized path pattern; put it in front of the whole path pattern");
+	}
+	auto group = make_uniq<SubPath>(PGQPathReferenceType::SUBPATH);
+	group->quantified_group = true;
+	auto elements = std::move(pattern->path_elements);
+	if (elements.size() == 1) {
+		auto *wrapper = static_cast<SubPath *>(elements[0].get());
+		if (elements[0]->path_reference_type == PGQPathReferenceType::SUBPATH && !wrapper->quantified_group &&
+		    (!wrapper->path_variable.empty() || wrapper->path_mode != PGQPathMode::NONE) &&
+		    wrapper->path_list.size() > 1) {
+			if (!wrapper->path_variable.empty()) {
+				throw ParserException("A path variable inside a parenthesized path pattern ('%s = ...') is not "
+				                      "supported; name the whole path pattern instead",
+				                      wrapper->path_variable);
+			}
+			group->path_mode = wrapper->path_mode;
+			auto inner = std::move(wrapper->path_list);
+			elements = std::move(inner);
+		}
+	}
+	group->path_list = std::move(elements);
+	auto &where_clause = body.Child<OptionalParseResult>(2);
+	if (where_clause.HasResult()) {
+		group->where_clause = transformer.Transform<unique_ptr<ParsedExpression>>(where_clause.GetResult());
+	}
+	auto &quantifier = list.Child<OptionalParseResult>(1);
+	if (quantifier.HasResult()) {
+		ApplyQuantifier(transformer, &quantifier.GetResult(), string(), *group);
+	}
+	return std::move(group);
+}
+
+// DuckPGQGroupStep / DuckPGQVertex, with DuckPGQGroupStep <- DuckPGQParenthesizedPath DuckPGQVertex?
+void TransformPathStart(PEGTransformer &transformer, ParseResult &start, AnonymousNames &anon_names,
+                        vector<unique_ptr<PathReference>> &elements) {
+	if (start.Name() != "DuckPGQGroupStep") {
+		elements.push_back(TransformElement(transformer, start, PGQMatchType::MATCH_VERTEX, anon_names));
+		return;
+	}
+	auto &group_step = start.Cast<ListParseResult>();
+	elements.push_back(TransformPathGroup(transformer, group_step.GetChild(0), anon_names));
+	auto &vertex = group_step.Child<OptionalParseResult>(1);
+	if (vertex.HasResult()) {
+		elements.push_back(TransformElement(transformer, vertex.GetResult(), PGQMatchType::MATCH_VERTEX, anon_names));
+	}
 }
 
 // DuckPGQPathStart DuckPGQEdgeVertex*, with DuckPGQPathStart <- DuckPGQParenthesizedPath / DuckPGQVertex and
-// DuckPGQEdgeVertex <- (DuckPGQEdge DuckPGQPathStart) / DuckPGQParenthesizedPath
+// DuckPGQEdgeVertex <- (DuckPGQEdge DuckPGQPathStart) / (DuckPGQParenthesizedPath DuckPGQVertex?). A parenthesized path pattern is
+// one entry of the sequence (a SubPath with quantified_group set), so the sequence need not alternate.
 unique_ptr<PathPattern> TransformPathSequence(PEGTransformer &transformer, ParseResult &parse_result,
                                               AnonymousNames &anon_names) {
 	auto &list = parse_result.Cast<ListParseResult>();
 	auto pattern = make_uniq<PathPattern>();
-	auto &start = DuckPGQGetChoice(list.GetChild(0));
-	if (start.Name() == "DuckPGQParenthesizedPath") {
-		ThrowParenthesizedPath();
-	}
-	pattern->path_elements.push_back(TransformElement(transformer, start, PGQMatchType::MATCH_VERTEX, anon_names));
+	TransformPathStart(transformer, DuckPGQGetChoice(list.GetChild(0)), anon_names, pattern->path_elements);
 	auto &repeat = list.Child<OptionalParseResult>(1);
 	if (!repeat.HasResult()) {
 		return pattern;
 	}
 	for (auto &edge_vertex : repeat.GetResult().Cast<RepeatParseResult>().GetChildren()) {
 		auto &step = DuckPGQGetChoice(edge_vertex.get());
-		if (step.Name() == "DuckPGQParenthesizedPath") {
-			ThrowParenthesizedPath();
+		if (step.Name() == "DuckPGQGroupStep") {
+			TransformPathStart(transformer, step, anon_names, pattern->path_elements);
+			continue;
 		}
 		auto &pair = step.Cast<ListParseResult>();
 		auto &edge = DuckPGQGetChoice(pair.GetChild(0));
@@ -437,11 +491,7 @@ unique_ptr<PathPattern> TransformPathSequence(PEGTransformer &transformer, Parse
 		} else {
 			pattern->path_elements.push_back(TransformQuantifiedEdge(transformer, edge, anon_names));
 		}
-		auto &target = DuckPGQGetChoice(pair.GetChild(1));
-		if (target.Name() == "DuckPGQParenthesizedPath") {
-			ThrowParenthesizedPath();
-		}
-		pattern->path_elements.push_back(TransformElement(transformer, target, PGQMatchType::MATCH_VERTEX, anon_names));
+		TransformPathStart(transformer, DuckPGQGetChoice(pair.GetChild(1)), anon_names, pattern->path_elements);
 	}
 	return pattern;
 }
@@ -526,7 +576,11 @@ unique_ptr<PathPattern> TransformPathPattern(PEGTransformer &transformer, ParseR
 
 void CollectVertexStars(PathReference &path_reference, vector<unique_ptr<ParsedExpression>> &columns) {
 	if (path_reference.path_reference_type == PGQPathReferenceType::SUBPATH) {
-		for (auto &child : static_cast<SubPath &>(path_reference).path_list) {
+		auto &subpath = static_cast<SubPath &>(path_reference);
+		if (subpath.quantified_group && subpath.upper > 1) {
+			return; // group variables bind lists; v.* of one is not a row's columns
+		}
+		for (auto &child : subpath.path_list) {
 			CollectVertexStars(*child, columns);
 		}
 		return;

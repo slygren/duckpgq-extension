@@ -411,17 +411,14 @@ SELECT status, rewrite_fired, only_in_abi + only_in_fallback FROM pgq_verify_abi
 ----
 match	true	0
 
-# Declined: an undirected hop between P and Q (the traversal reads it backwards across tables)
+# Declined: an undirected hop between P and Q. The traversal reads it only in the direction its tables allow
+# (P -S-> Q), so the rows are those of (a:P)-[:S]->(b:Q)-[:T]->(c:Q)
 query III
 FROM GRAPH_TABLE (g MATCH (a:P)-[:S]-(b:Q)-[:T]->(c:Q) COLUMNS (a.id AS a, b.id AS b, c.id AS c)) ORDER BY ALL;
 ----
 1	1	2
-1	1	2
-1	2	3
 2	1	2
 2	2	3
-2	2	3
-3	3	3
 3	3	3
 
 query T

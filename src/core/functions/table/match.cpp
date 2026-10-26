@@ -21,6 +21,7 @@
 #include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/operator_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
+#include "duckdb/storage/table_storage_info.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 
@@ -1964,19 +1965,29 @@ static bool BindingSpansMultiplePatterns(const MatchExpression &ref, const strin
 	if (binding.empty()) {
 		return false;
 	}
+	// The element may sit inside the subpath a path variable or path mode wraps around the pattern, or inside the
+	// subpath that carries an element WHERE.
+	std::function<bool(const vector<unique_ptr<PathReference>> &)> contains =
+	    [&](const vector<unique_ptr<PathReference>> &elements) {
+		    for (const auto &element : elements) {
+			    if (auto *path_element = PGQMatchFunction::GetPathElement(element)) {
+				    if (StringUtil::CIEquals(path_element->variable_binding, binding)) {
+					    return true;
+				    }
+			    } else if (auto *subpath = PGQMatchFunction::GetSubPath(element)) {
+				    if (contains(subpath->path_list)) {
+					    return true;
+				    }
+			    }
+		    }
+		    return false;
+	    };
 	idx_t patterns_containing = 0;
 	for (const auto &pattern : ref.path_patterns) {
 		if (!pattern) {
 			continue;
 		}
-		bool found = false;
-		for (const auto &element : pattern->path_elements) {
-			auto *path_element = PGQMatchFunction::GetPathElement(element);
-			if (path_element && StringUtil::CIEquals(path_element->variable_binding, binding)) {
-				found = true;
-				break;
-			}
-		}
+		const bool found = contains(pattern->path_elements);
 		if (found && ++patterns_containing > 1) {
 			return true;
 		}
@@ -2801,11 +2812,55 @@ static unique_ptr<SubqueryRef> UndirectedEdgeUnion(const PropertyGraphTable &edg
 	return union_subquery;
 }
 
+//! Which stored orientations of an undirected edge join prev to next. Read forwards, prev must be in the edge's
+//! source table and next in its destination table; read backwards, the other way round. Over an edge between two
+//! different vertex tables only one reading fits; reading the other would compare one table's key with the other's.
+//! Unknown tables allow both.
+struct PGQUndirectedOrientations {
+	bool forward = true;
+	bool reverse = true;
+};
+
+static PGQUndirectedOrientations UndirectedOrientations(const PropertyGraphTable &edge_table,
+                                                        const shared_ptr<PropertyGraphTable> &prev_table,
+                                                        const shared_ptr<PropertyGraphTable> &next_table) {
+	PGQUndirectedOrientations result;
+	auto &source = edge_table.source_pg_table;
+	auto &destination = edge_table.destination_pg_table;
+	if (!source || !destination || !prev_table || !next_table) {
+		return result;
+	}
+	result.forward = prev_table->SameTableIdentity(*source) && next_table->SameTableIdentity(*destination);
+	result.reverse = prev_table->SameTableIdentity(*destination) && next_table->SameTableIdentity(*source);
+	if (!result.forward && !result.reverse) {
+		throw BinderException("Edge pattern of table %s connects %s and %s, so it cannot join %s to %s in either "
+		                      "direction",
+		                      PGQStr(edge_table.table_name), PGQStr(source->table_name),
+		                      PGQStr(destination->table_name), PGQStr(prev_table->table_name),
+		                      PGQStr(next_table->table_name));
+	}
+	return result;
+}
+
+//! The undirected reading of an edge, with the orientations that cannot join prev to next left out.
+static unique_ptr<SubqueryRef> UndirectedEdgeUnionBetween(const PropertyGraphTable &edge_table,
+                                                          const string &edge_binding,
+                                                          const shared_ptr<PropertyGraphTable> &prev_table,
+                                                          const shared_ptr<PropertyGraphTable> &next_table) {
+	auto orientations = UndirectedOrientations(edge_table, prev_table, next_table);
+	auto never = [](bool allowed) -> unique_ptr<ParsedExpression> {
+		return allowed ? nullptr : ConstantExpression::FromValue(Value::BOOLEAN(false));
+	};
+	return UndirectedEdgeUnion(edge_table, edge_binding, never(orientations.forward), never(orientations.reverse));
+}
+
 void PGQMatchFunction::EdgeTypeAny(const shared_ptr<PropertyGraphTable> &edge_table, const string &edge_binding,
                                    const string &prev_binding, const string &next_binding,
+                                   const shared_ptr<PropertyGraphTable> &prev_table,
+                                   const shared_ptr<PropertyGraphTable> &next_table,
                                    vector<unique_ptr<ParsedExpression>> &conditions,
                                    unique_ptr<TableRef> &from_clause) {
-	auto union_subquery = UndirectedEdgeUnion(*edge_table, edge_binding);
+	auto union_subquery = UndirectedEdgeUnionBetween(*edge_table, edge_binding, prev_table, next_table);
 	if (from_clause) {
 		auto from_join = make_uniq<JoinRef>(JoinRefType::CROSS);
 		from_join->left = std::move(from_clause);
@@ -3444,7 +3499,8 @@ void PGQMatchFunction::AddEdgeJoins(const shared_ptr<PropertyGraphTable> &edge_t
 	}
 	switch (edge_type) {
 	case PGQMatchType::MATCH_EDGE_ANY: {
-		EdgeTypeAny(edge_table, edge_binding, prev_binding, next_binding, conditions, from_clause);
+		EdgeTypeAny(edge_table, edge_binding, prev_binding, next_binding, previous_vertex_table, next_vertex_table,
+		            conditions, from_clause);
 		break;
 	}
 	case PGQMatchType::MATCH_EDGE_LEFT:
@@ -5087,7 +5143,7 @@ void PGQMatchFunction::CheckNamedSubpath(SubPath &subpath, MatchExpression &orig
 	}
 	for (idx_t idx_i = 0; idx_i < original_ref.column_list.size(); idx_i++) {
 		auto parsed_ref = dynamic_cast<FunctionExpression *>(original_ref.column_list[idx_i].get());
-		if (parsed_ref == nullptr) {
+		if (parsed_ref == nullptr || parsed_ref->GetArguments().empty()) {
 			continue;
 		}
 		auto column_ref = dynamic_cast<ColumnRefExpression *>(parsed_ref->GetArgumentsMutable()[0].GetExpressionMutable().get());
@@ -5825,7 +5881,7 @@ void PGQMatchFunction::ProcessOptionalPathList(
 				// LEFT JOIN ((edge read both ways) JOIN next ON next.pk = edge.dst [AND label]) ON prev.pk = edge.src:
 				// the edge and its far vertex match together or not at all. The union is the one a MATCH reads
 				// (a self-loop once, not once per direction).
-				auto un_sub = UndirectedEdgeUnion(*edge_table, edge_binding);
+				auto un_sub = UndirectedEdgeUnionBetween(*edge_table, edge_binding, prev_vertex_table, next_vertex_table);
 				unique_ptr<ParsedExpression> vertex_on = CreateMatchJoinExpression(
 				    PGQStrs(edge_table->destination_pk), PGQStrs(edge_table->destination_fk), next_binding, edge_binding);
 				bool far_end_cannot_fail = pg_table.verified;
@@ -11882,12 +11938,15 @@ static bool HasPathPatternUnion(const vector<unique_ptr<PathPattern>> &patterns)
 	return false;
 }
 
+static bool BlockHasQuantifiedGroup(const MatchExpression &block);
+
 static bool NeedsLoweredMatch(const MatchExpression &ref) {
-	if (HasPathPatternUnion(ref.path_patterns) || UsesPathPropertyCalls(ref)) {
+	if (HasPathPatternUnion(ref.path_patterns) || UsesPathPropertyCalls(ref) || BlockHasQuantifiedGroup(ref)) {
 		return true;
 	}
 	for (auto &branch : ref.union_matches) {
-		if (HasPathPatternUnion(branch->path_patterns) || ContainsPathPropertyCall(branch->where_clause.get())) {
+		if (HasPathPatternUnion(branch->path_patterns) || ContainsPathPropertyCall(branch->where_clause.get()) ||
+		    BlockHasQuantifiedGroup(*branch)) {
 			return true;
 		}
 	}
@@ -12728,6 +12787,1681 @@ static unique_ptr<QueryNode> BuildMatchLeafNode(ClientContext &context, MatchExp
 }
 
 //------------------------------------------------------------------------------
+// Quantified path groups: ( body [WHERE cond] ){n,m}, also written [ body ]{n,m}
+//------------------------------------------------------------------------------
+// A group is lowered onto MATCH blocks without groups, one per choice of iteration count of every group (a "leaf"),
+// combined with UNION ALL. Leaves with different counts bind different numbers of elements, so no binding is
+// produced twice. In a leaf the body is written out k times with its variables renamed per iteration, and adjacent
+// vertex patterns are one vertex (SQL/PGQ concatenation): the vertex before the group is the first iteration's
+// first vertex, each iteration's last vertex is the next one's first, and with no iteration the vertices around the
+// group are one vertex. Every route a fixed-length pattern has (joins, ABI artifacts, vertex elimination, path
+// functions) then answers the leaf.
+//
+// A variable of a group whose upper bound is above 1 is a group variable: outside the group it stands for the list
+// of its elements in iteration order (g.x is [g_1.x, ..., g_k.x], an aggregate over it runs along that list); inside
+// the group (its WHERE, element WHEREs) it is the element of that iteration. A group with an upper bound of 1 binds
+// its variables once, or not at all (NULL) when it matches zero times. Like a quantified edge, a group with an upper
+// bound above 1 visits no vertex twice across its iterations.
+
+//! Iterations unrolled per group at most, and leaves (choices of iteration counts) per MATCH block at most.
+static constexpr int64_t kGroupMaxUnrolledIterations = 8;
+static constexpr idx_t kGroupMaxLeaves = 64;
+static constexpr idx_t kGroupMaxUnrolledEdges = 48;
+static constexpr const char *kGroupAggregateFunction = "__pgq_group_agg";
+
+static bool IsQuantifiedGroup(const PathReference &reference) {
+	return reference.path_reference_type == PGQPathReferenceType::SUBPATH &&
+	       static_cast<const SubPath &>(reference).quantified_group;
+}
+
+//! The subpath a path variable or path mode wraps around a pattern's element sequence, or null.
+static SubPath *PatternSequenceWrapper(PathPattern &pattern) {
+	if (pattern.path_elements.size() != 1) {
+		return nullptr;
+	}
+	auto *subpath = PGQMatchFunction::GetSubPath(pattern.path_elements[0]);
+	if (!subpath || subpath->quantified_group || subpath->lower != 1 || subpath->upper != 1 ||
+	    (subpath->path_variable.empty() && subpath->path_mode == PGQPathMode::NONE)) {
+		return nullptr;
+	}
+	return subpath;
+}
+
+static vector<unique_ptr<PathReference>> &PatternSequence(PathPattern &pattern) {
+	auto *wrapper = PatternSequenceWrapper(pattern);
+	return wrapper ? wrapper->path_list : pattern.path_elements;
+}
+
+static bool SequenceHasGroup(const vector<unique_ptr<PathReference>> &sequence) {
+	for (auto &reference : sequence) {
+		if (IsQuantifiedGroup(*reference)) {
+			return true;
+		}
+		if (reference->path_reference_type == PGQPathReferenceType::SUBPATH &&
+		    SequenceHasGroup(static_cast<const SubPath &>(*reference).path_list)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool PatternsHaveGroup(const vector<unique_ptr<PathPattern>> &patterns) {
+	for (auto &pattern : patterns) {
+		if (SequenceHasGroup(pattern->path_elements)) {
+			return true;
+		}
+		for (auto &operand : pattern->union_operands) {
+			if (SequenceHasGroup(operand)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+static bool BlockHasQuantifiedGroup(const MatchExpression &block) {
+	if (PatternsHaveGroup(block.path_patterns)) {
+		return true;
+	}
+	for (auto &group : block.optional_match_patterns) {
+		if (PatternsHaveGroup(group)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//! The element of a sequence entry: a plain element, or the one element a WHERE / COST wrapper holds.
+static PathElement *EntryElement(const unique_ptr<PathReference> &reference) {
+	if (auto *element = PGQMatchFunction::GetPathElement(reference)) {
+		return element;
+	}
+	auto *subpath = PGQMatchFunction::GetSubPath(reference);
+	if (subpath && !subpath->quantified_group && subpath->path_list.size() == 1) {
+		return PGQMatchFunction::GetPathElement(subpath->path_list[0]);
+	}
+	return nullptr;
+}
+
+static bool EntryIsVertex(const unique_ptr<PathReference> &reference) {
+	auto *element = EntryElement(reference);
+	return element && element->match_type == PGQMatchType::MATCH_VERTEX;
+}
+
+static bool IsGeneratedVariable(const string &name) {
+	return StringUtil::StartsWith(name, "_anon_");
+}
+
+//! A group of a MATCH block, in pattern order.
+struct PGQGroupSpec {
+	idx_t pattern_index = 0;
+	int64_t lower = 1;
+	int64_t upper = 1;
+	//! upper > 1: its variables are group variables (lists).
+	bool lists = false;
+	//! Every element variable of the body, generated ones included, in body order (vertices and edges).
+	vector<string> variables;
+	case_insensitive_set_t variable_set;
+	//! Number of edges in the body.
+	idx_t body_edges = 0;
+};
+
+static void CollectBodyVariable(const string &name, PGQGroupSpec &spec) {
+	if (spec.variable_set.insert(name).second) {
+		spec.variables.push_back(name);
+	}
+}
+
+//! True when the expression reads one of `variables` (as v.x, or v as a function argument). Does not look into
+//! subqueries; EXISTS patterns are checked separately.
+static bool ReadsVariables(const ParsedExpression &expression, const case_insensitive_set_t &variables) {
+	if (expression.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+		auto &names = expression.Cast<ColumnRefExpression>().ColumnNames();
+		return !names.empty() && variables.count(PGQStr(names[0]));
+	}
+	if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		return false;
+	}
+	bool found = false;
+	ParsedExpressionIterator::EnumerateChildren(
+	    expression, [&](const ParsedExpression &child) { found = found || ReadsVariables(child, variables); });
+	return found;
+}
+
+static void CollectExistsVariables(const MatchExpression &match, case_insensitive_set_t &names) {
+	for (auto &pattern : match.path_patterns) {
+		case_insensitive_set_t path_names;
+		for (auto &reference : pattern->path_elements) {
+			CollectUnionNamedVariables(*reference, names, path_names);
+		}
+	}
+}
+
+//! Refuse an EXISTS { } that names a group variable, and an EXISTS { } that holds a group itself.
+static void CheckGroupExists(const ParsedExpression *expression, const case_insensitive_set_t &group_variables) {
+	if (!expression) {
+		return;
+	}
+	if (auto inner = DuckPGQGetExistsPattern(*expression)) {
+		if (PatternsHaveGroup(inner->path_patterns)) {
+			throw NotImplementedException("A parenthesized path pattern inside EXISTS { } is not supported");
+		}
+		case_insensitive_set_t names;
+		CollectExistsVariables(*inner, names);
+		for (auto &name : names) {
+			if (group_variables.count(name)) {
+				throw BinderException("EXISTS { } cannot refer to '%s': it is a group variable (declared in a "
+				                      "quantified path pattern), which stands for a list of elements",
+				                      name);
+			}
+		}
+		return;
+	}
+	ParsedExpressionIterator::EnumerateChildren(
+	    *expression, [&](const ParsedExpression &child) { CheckGroupExists(&child, group_variables); });
+}
+
+//! The groups of a block, checked. `group_of` maps each variable declared in a group to its group.
+static vector<PGQGroupSpec> CollectGroups(MatchExpression &block, case_insensitive_map_t<idx_t> &group_of) {
+	vector<PGQGroupSpec> specs;
+	for (auto &optional_group : block.optional_match_patterns) {
+		if (PatternsHaveGroup(optional_group)) {
+			throw NotImplementedException("A parenthesized path pattern in OPTIONAL MATCH is not supported; write it "
+			                              "in the MATCH, or left-join two GRAPH_TABLEs");
+		}
+	}
+	case_insensitive_set_t outer_variables;
+	for (idx_t p = 0; p < block.path_patterns.size(); p++) {
+		auto &pattern = *block.path_patterns[p];
+		auto &sequence = PatternSequence(pattern);
+		const bool has_group = SequenceHasGroup(sequence);
+		if (has_group && !pattern.union_operands.empty()) {
+			throw NotImplementedException("A parenthesized path pattern in a path pattern union ('|' or '|+|') is not "
+			                              "supported");
+		}
+		if (has_group && pattern.cheapest) {
+			throw NotImplementedException("ANY / ALL CHEAPEST over a parenthesized path pattern is not supported");
+		}
+		idx_t group_count = 0;
+		for (auto &entry : sequence) {
+			if (!IsQuantifiedGroup(*entry)) {
+				if (entry->path_reference_type == PGQPathReferenceType::SUBPATH &&
+				    SequenceHasGroup(static_cast<SubPath &>(*entry).path_list)) {
+					throw NotImplementedException("This parenthesized path pattern is nested in a way that is not "
+					                              "supported");
+				}
+				case_insensitive_set_t names;
+				case_insensitive_set_t path_names;
+				CollectUnionNamedVariables(*entry, names, path_names);
+				outer_variables.insert(names.begin(), names.end());
+				continue;
+			}
+			group_count++;
+			auto &group = static_cast<SubPath &>(*entry);
+			PGQGroupSpec spec;
+			spec.pattern_index = p;
+			spec.lower = group.lower;
+			spec.upper = group.upper;
+			spec.lists = group.upper > 1;
+			if (group.cost_expr) {
+				throw NotImplementedException("COST on a parenthesized path pattern is not supported");
+			}
+			bool previous_vertex = false;
+			for (idx_t i = 0; i < group.path_list.size(); i++) {
+				auto &item = group.path_list[i];
+				if (IsQuantifiedGroup(*item)) {
+					throw NotImplementedException("Nested quantified path patterns are not supported: a parenthesized "
+					                              "path pattern inside another one");
+				}
+				auto *element = EntryElement(item);
+				auto *wrapper = PGQMatchFunction::GetSubPath(item);
+				if (!element) {
+					throw NotImplementedException("This parenthesized path pattern body is not supported");
+				}
+				if (wrapper && (wrapper->lower != 1 || wrapper->upper != 1)) {
+					throw NotImplementedException("A quantified edge inside a quantified path pattern is not supported "
+					                              "(edge '%s'); write the repetition as a group of its own",
+					                              element->variable_binding);
+				}
+				if (wrapper && wrapper->cost_expr) {
+					throw NotImplementedException("COST inside a parenthesized path pattern is not supported");
+				}
+				const bool vertex = element->match_type == PGQMatchType::MATCH_VERTEX;
+				if (!vertex) {
+					spec.body_edges++;
+				}
+				if (vertex == previous_vertex && i > 0) {
+					throw NotImplementedException("A parenthesized path pattern body must alternate vertices and edges");
+				}
+				previous_vertex = vertex;
+				CollectBodyVariable(element->variable_binding, spec);
+			}
+			if (spec.body_edges == 0) {
+				throw NotImplementedException("A quantified path pattern needs at least one edge in its body");
+			}
+			for (auto &name : spec.variables) {
+				if (group_of.count(name)) {
+					throw BinderException("Variable '%s' is declared in two parenthesized path patterns", name);
+				}
+				group_of[name] = specs.size();
+			}
+			specs.push_back(std::move(spec));
+		}
+		if (group_count == 1 && sequence.size() == 1 && specs.back().lower == 0) {
+			throw BinderException("A quantified path pattern that can match zero times needs a vertex pattern before "
+			                      "or after it: on its own, zero iterations would be an empty path");
+		}
+	}
+	for (auto &name : outer_variables) {
+		auto entry = group_of.find(name);
+		if (entry != group_of.end()) {
+			throw BinderException("Variable '%s' is declared both inside a parenthesized path pattern and outside it",
+			                      name);
+		}
+	}
+	case_insensitive_set_t group_variables;
+	for (auto &spec : specs) {
+		if (spec.lists) {
+			for (auto &name : spec.variables) {
+				group_variables.insert(name);
+			}
+		}
+	}
+	CheckGroupExists(block.where_clause.get(), group_variables);
+	for (auto &column : block.column_list) {
+		CheckGroupExists(column.get(), group_variables);
+		if (column->GetExpressionClass() == ExpressionClass::STAR) {
+			auto relation = PGQStr(column->Cast<StarExpression>().RelationName());
+			auto entry = group_of.find(relation);
+			if (!relation.empty() && entry != group_of.end() &&
+			    (specs[entry->second].lists || specs[entry->second].lower == 0)) {
+				throw BinderException("%s.* cannot be returned: '%s' is declared in a quantified path pattern; list "
+				                      "its properties in COLUMNS",
+				                      relation, relation);
+			}
+		}
+	}
+	return specs;
+}
+
+static void RenameVariables(unique_ptr<ParsedExpression> &expression, const case_insensitive_map_t<string> &names);
+
+static void RenameReferenceVariables(PathReference &reference, const case_insensitive_map_t<string> &names) {
+	if (reference.path_reference_type == PGQPathReferenceType::SUBPATH) {
+		auto &subpath = static_cast<SubPath &>(reference);
+		for (auto &child : subpath.path_list) {
+			RenameReferenceVariables(*child, names);
+		}
+		if (subpath.where_clause) {
+			RenameVariables(subpath.where_clause, names);
+		}
+		if (subpath.cost_expr) {
+			RenameVariables(subpath.cost_expr, names);
+		}
+		return;
+	}
+	auto &element = static_cast<PathElement &>(reference);
+	auto entry = names.find(element.variable_binding);
+	if (entry != names.end()) {
+		element.variable_binding = entry->second;
+	}
+}
+
+static void RenameMatchVariables(MatchExpression &match, const case_insensitive_map_t<string> &names) {
+	for (auto &pattern : match.path_patterns) {
+		for (auto &reference : pattern->path_elements) {
+			RenameReferenceVariables(*reference, names);
+		}
+		for (auto &operand : pattern->union_operands) {
+			for (auto &reference : operand) {
+				RenameReferenceVariables(*reference, names);
+			}
+		}
+	}
+	for (auto &group : match.optional_match_patterns) {
+		for (auto &pattern : group) {
+			for (auto &reference : pattern->path_elements) {
+				RenameReferenceVariables(*reference, names);
+			}
+		}
+	}
+	if (match.where_clause) {
+		RenameVariables(match.where_clause, names);
+	}
+}
+
+//! Renames element variables in an expression: v.x and a bare v (a function argument), x.* and the correlated
+//! variables of an EXISTS { } pattern.
+static void RenameVariables(unique_ptr<ParsedExpression> &expression, const case_insensitive_map_t<string> &names) {
+	if (!expression || names.empty()) {
+		return;
+	}
+	switch (expression->GetExpressionClass()) {
+	case ExpressionClass::COLUMN_REF: {
+		auto &column_names = expression->Cast<ColumnRefExpression>().ColumnNamesMutable();
+		if (!column_names.empty()) {
+			auto entry = names.find(PGQStr(column_names[0]));
+			if (entry != names.end()) {
+				column_names[0] = Identifier(entry->second);
+			}
+		}
+		return;
+	}
+	case ExpressionClass::STAR: {
+		auto &relation = expression->Cast<StarExpression>().RelationNameMutable();
+		auto entry = names.find(PGQStr(relation));
+		if (!relation.empty() && entry != names.end()) {
+			relation = Identifier(entry->second);
+		}
+		return;
+	}
+	case ExpressionClass::SUBQUERY:
+		if (auto inner = DuckPGQGetExistsPattern(*expression)) {
+			RenameMatchVariables(*inner, names);
+		}
+		return;
+	default:
+		ParsedExpressionIterator::EnumerateChildren(
+		    *expression, [&](unique_ptr<ParsedExpression> &child) { RenameVariables(child, names); });
+	}
+}
+
+static unique_ptr<ParsedExpression> AndAll(vector<unique_ptr<ParsedExpression>> conditions) {
+	unique_ptr<ParsedExpression> result;
+	for (auto &condition : conditions) {
+		if (!condition) {
+			continue;
+		}
+		result = result ? make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(result),
+		                                                   std::move(condition))
+		                : std::move(condition);
+	}
+	return result;
+}
+
+static string CombineLabels(const string &left, const string &right) {
+	if (left.empty()) {
+		return right;
+	}
+	if (right.empty() || StringUtil::CIEquals(left, right)) {
+		return left;
+	}
+	auto operand = [](const string &label) {
+		return label.find_first_of("|&!") == string::npos ? label : "(" + label + ")";
+	};
+	return operand(left) + "&" + operand(right);
+}
+
+//! The leaf variable of an iteration's copy of a body variable.
+static string GroupCopyName(const string &variable, idx_t group, idx_t iteration) {
+	if (IsGeneratedVariable(variable)) {
+		return variable + "_qg" + std::to_string(group) + "_" + std::to_string(iteration + 1);
+	}
+	return "__pgq_qg" + std::to_string(group) + "_" + std::to_string(iteration + 1) + "_" + variable;
+}
+
+static bool IsGroupCopyName(const string &name) {
+	return StringUtil::StartsWith(name, "__pgq_qg") || name.find("_qg") != string::npos;
+}
+
+//! One MATCH block without groups, for one choice of iteration counts.
+struct PGQGroupLeaf {
+	unique_ptr<MatchExpression> match;
+	vector<int64_t> iterations;
+	//! Per group, per iteration: body variable -> leaf variable.
+	vector<vector<case_insensitive_map_t<string>>> names;
+	//! Variables of groups with an upper bound of 1 that matched zero times: NULL in this leaf.
+	case_insensitive_set_t missing;
+	//! Per pattern, the leaf's element variables in path order (vertex, edge, vertex, ...).
+	vector<vector<string>> sequences;
+	//! Per pattern, whether the entry at that position is an edge.
+	vector<vector<bool>> sequence_edges;
+	//! Candidate tables of each leaf element variable (qualified table names).
+	case_insensitive_map_t<case_insensitive_set_t> domains;
+	//! The direction of each leaf edge variable.
+	case_insensitive_map_t<PGQMatchType> edge_types;
+	//! The group WHEREs per iteration and the no-vertex-twice conditions: part of the path pattern itself.
+	vector<unique_ptr<ParsedExpression>> pattern_conditions;
+};
+
+static string TableKey(const PropertyGraphTable &table) {
+	return QualifiedTableName(PGQStr(table.catalog_name), PGQStr(table.schema_name), PGQStr(table.table_name));
+}
+
+//! The column vertices of `table` are identified by: the key edges reference. Empty when no edge references it.
+static string VertexKeyColumn(const string &table_key, CreatePropertyGraphInfo &pg_table) {
+	for (auto &edge : pg_table.edge_tables) {
+		if (edge->source_pg_table && TableKey(*edge->source_pg_table) == table_key && !edge->source_pk.empty()) {
+			return PGQStr(edge->source_pk[0]);
+		}
+		if (edge->destination_pg_table && TableKey(*edge->destination_pg_table) == table_key &&
+		    !edge->destination_pk.empty()) {
+			return PGQStr(edge->destination_pk[0]);
+		}
+	}
+	return string();
+}
+
+//! Narrows the candidate tables of every vertex and single edge from labels and edge ends. False when some element
+//! can bind no table, i.e. the leaf has no match. Sound: a candidate is only removed when no binding can use it.
+static bool PropagateGroupDomains(PGQGroupLeaf &leaf, CreatePropertyGraphInfo &pg_table) {
+	struct EdgeSlot {
+		string previous;
+		string next;
+		PathElement *edge;
+		case_insensitive_set_t candidates;
+	};
+	case_insensitive_map_t<shared_ptr<PropertyGraphTable>> edge_tables;
+	for (auto &table : pg_table.edge_tables) {
+		edge_tables[TableKey(*table)] = table;
+	}
+	vector<EdgeSlot> slots;
+	for (auto &pattern : leaf.match->path_patterns) {
+		auto &sequence = PatternSequence(*pattern);
+		for (idx_t i = 0; i < sequence.size(); i++) {
+			auto *element = EntryElement(sequence[i]);
+			if (!element) {
+				continue;
+			}
+			auto candidates = UnionCandidateTables(*element, pg_table);
+			auto &name = element->variable_binding;
+			auto existing = leaf.domains.find(name);
+			if (existing == leaf.domains.end()) {
+				leaf.domains[name] = candidates;
+			} else {
+				case_insensitive_set_t both;
+				for (auto &table : existing->second) {
+					if (candidates.count(table)) {
+						both.insert(table);
+					}
+				}
+				existing->second = both;
+			}
+			auto *wrapper = PGQMatchFunction::GetSubPath(sequence[i]);
+			const bool single_hop = !wrapper || (wrapper->lower == 1 && wrapper->upper == 1);
+			if (element->match_type != PGQMatchType::MATCH_VERTEX && single_hop && i > 0 && i + 1 < sequence.size()) {
+				auto *previous = EntryElement(sequence[i - 1]);
+				auto *next = EntryElement(sequence[i + 1]);
+				if (previous && next) {
+					slots.push_back({previous->variable_binding, next->variable_binding, element, candidates});
+				}
+			}
+		}
+	}
+	bool changed = true;
+	while (changed) {
+		changed = false;
+		for (auto &slot : slots) {
+			auto &previous = leaf.domains[slot.previous];
+			auto &next = leaf.domains[slot.next];
+			case_insensitive_set_t edges;
+			case_insensitive_set_t previous_allowed;
+			case_insensitive_set_t next_allowed;
+			for (auto &candidate : slot.candidates) {
+				auto table = edge_tables[candidate];
+				if (!table || !table->source_pg_table || !table->destination_pg_table) {
+					// Nothing known about its ends: it constrains nothing.
+					edges.insert(candidate);
+					previous_allowed.insert(previous.begin(), previous.end());
+					next_allowed.insert(next.begin(), next.end());
+					continue;
+				}
+				const auto source = TableKey(*table->source_pg_table);
+				const auto destination = TableKey(*table->destination_pg_table);
+				auto orientation = [&](const string &from, const string &to) {
+					if (previous.count(from) && next.count(to)) {
+						edges.insert(candidate);
+						previous_allowed.insert(from);
+						next_allowed.insert(to);
+					}
+				};
+				switch (slot.edge->match_type) {
+				case PGQMatchType::MATCH_EDGE_RIGHT:
+					orientation(source, destination);
+					break;
+				case PGQMatchType::MATCH_EDGE_LEFT:
+					orientation(destination, source);
+					break;
+				default:
+					orientation(source, destination);
+					orientation(destination, source);
+					break;
+				}
+			}
+			auto narrow = [&](case_insensitive_set_t &domain, const case_insensitive_set_t &allowed) {
+				for (auto it = domain.begin(); it != domain.end();) {
+					if (!allowed.count(*it)) {
+						it = domain.erase(it);
+						changed = true;
+					} else {
+						++it;
+					}
+				}
+			};
+			if (edges.size() != slot.candidates.size()) {
+				slot.candidates = edges;
+				changed = true;
+			}
+			narrow(previous, previous_allowed);
+			narrow(next, next_allowed);
+		}
+	}
+	for (auto &entry : leaf.domains) {
+		if (entry.second.empty()) {
+			return false;
+		}
+	}
+	for (auto &slot : slots) {
+		if (slot.candidates.empty()) {
+			return false;
+		}
+	}
+	return true;
+}
+
+//! The leaf for `iterations`, or null when it can have no match.
+static unique_ptr<PGQGroupLeaf> BuildGroupLeaf(const MatchExpression &block, const vector<PGQGroupSpec> &specs,
+                                               const vector<int64_t> &iterations, CreatePropertyGraphInfo &pg_table) {
+	auto leaf = make_uniq<PGQGroupLeaf>();
+	leaf->match = unique_ptr_cast<ParsedExpression, MatchExpression>(block.Copy());
+	leaf->iterations = iterations;
+	leaf->names.resize(specs.size());
+	case_insensitive_map_t<string> alias;
+	struct GroupRange {
+		idx_t group;
+		idx_t pattern;
+		idx_t first;
+		idx_t last;
+	};
+	vector<GroupRange> ranges;
+	idx_t group_index = 0;
+	idx_t anonymous = 0;
+	auto priority = [](const string &name) {
+		if (IsGeneratedVariable(name)) {
+			return 1;
+		}
+		return IsGroupCopyName(name) ? 2 : 3;
+	};
+	for (idx_t p = 0; p < leaf->match->path_patterns.size(); p++) {
+		auto &sequence = PatternSequence(*leaf->match->path_patterns[p]);
+		if (!SequenceHasGroup(sequence)) {
+			continue;
+		}
+		vector<unique_ptr<PathReference>> out;
+		auto merge = [&](unique_ptr<PathReference> &keep_reference, unique_ptr<PathReference> absorbed_reference) {
+			auto *keep = EntryElement(keep_reference);
+			auto *absorbed = EntryElement(absorbed_reference);
+			if (priority(absorbed->variable_binding) > priority(keep->variable_binding)) {
+				alias[keep->variable_binding] = absorbed->variable_binding;
+				keep->variable_binding = absorbed->variable_binding;
+			} else if (!StringUtil::CIEquals(absorbed->variable_binding, keep->variable_binding)) {
+				alias[absorbed->variable_binding] = keep->variable_binding;
+			}
+			keep->label = CombineLabels(keep->label, absorbed->label);
+			auto *absorbed_wrapper = PGQMatchFunction::GetSubPath(absorbed_reference);
+			if (absorbed_wrapper && absorbed_wrapper->where_clause) {
+				if (!PGQMatchFunction::GetSubPath(keep_reference)) {
+					auto wrapper = make_uniq<SubPath>(PGQPathReferenceType::SUBPATH);
+					wrapper->path_list.push_back(std::move(keep_reference));
+					keep_reference = std::move(wrapper);
+				}
+				auto *keep_wrapper = PGQMatchFunction::GetSubPath(keep_reference);
+				vector<unique_ptr<ParsedExpression>> both;
+				both.push_back(std::move(keep_wrapper->where_clause));
+				both.push_back(std::move(absorbed_wrapper->where_clause));
+				keep_wrapper->where_clause = AndAll(std::move(both));
+			}
+		};
+		auto anonymous_vertex = [&]() {
+			auto vertex = make_uniq<PathElement>(PGQPathReferenceType::PATH_ELEMENT);
+			vertex->match_type = PGQMatchType::MATCH_VERTEX;
+			vertex->variable_binding = "_anon_qgv" + std::to_string(anonymous++);
+			return vertex;
+		};
+		auto append = [&](unique_ptr<PathReference> entry) {
+			if (EntryIsVertex(entry)) {
+				if (!out.empty() && EntryIsVertex(out.back())) {
+					merge(out.back(), std::move(entry));
+				} else {
+					out.push_back(std::move(entry));
+				}
+				return;
+			}
+			if (out.empty() || !EntryIsVertex(out.back())) {
+				out.push_back(anonymous_vertex());
+			}
+			out.push_back(std::move(entry));
+		};
+		for (auto &entry : sequence) {
+			if (!IsQuantifiedGroup(*entry)) {
+				append(std::move(entry));
+				continue;
+			}
+			auto &group = static_cast<SubPath &>(*entry);
+			const idx_t g = group_index++;
+			auto &spec = specs[g];
+			const auto k = iterations[g];
+			const idx_t first = !out.empty() && EntryIsVertex(out.back()) ? out.size() - 1 : out.size();
+			for (int64_t i = 0; i < k; i++) {
+				case_insensitive_map_t<string> names;
+				for (auto &variable : spec.variables) {
+					names[variable] = spec.lists ? GroupCopyName(variable, g, idx_t(i)) : variable;
+				}
+				for (auto &item : group.path_list) {
+					auto copy = item->Copy();
+					RenameReferenceVariables(*copy, names);
+					append(std::move(copy));
+				}
+				if (group.where_clause) {
+					auto condition = group.where_clause->Copy();
+					RenameVariables(condition, names);
+					leaf->pattern_conditions.push_back(std::move(condition));
+				}
+				leaf->names[g].push_back(std::move(names));
+			}
+			if (k == 0 && !spec.lists) {
+				leaf->missing.insert(spec.variables.begin(), spec.variables.end());
+			}
+			if (k > 0 && spec.lists) {
+				ranges.push_back({g, p, first, out.size() - 1});
+			}
+		}
+		if (!out.empty() && !EntryIsVertex(out.back())) {
+			out.push_back(anonymous_vertex());
+		}
+		sequence = std::move(out);
+	}
+
+	// Variables merged into another one take its name everywhere (chains resolved).
+	case_insensitive_map_t<string> resolved;
+	for (auto &entry : alias) {
+		string target = entry.second;
+		for (idx_t guard = 0; guard < alias.size() && alias.count(target); guard++) {
+			target = alias[target];
+		}
+		resolved[entry.first] = target;
+	}
+	RenameMatchVariables(*leaf->match, resolved);
+	for (auto &column : leaf->match->column_list) {
+		RenameVariables(column, resolved);
+	}
+	for (auto &condition : leaf->pattern_conditions) {
+		RenameVariables(condition, resolved);
+	}
+	for (auto &group_names : leaf->names) {
+		for (auto &names : group_names) {
+			for (auto &entry : names) {
+				auto target = resolved.find(entry.second);
+				if (target != resolved.end()) {
+					entry.second = target->second;
+				}
+			}
+		}
+	}
+
+	if (!PropagateGroupDomains(*leaf, pg_table)) {
+		return nullptr;
+	}
+	// An unlabeled vertex that can only be one table gets that table's label, so the translation does not have to
+	// work it out from the edges next to it.
+	case_insensitive_map_t<shared_ptr<PropertyGraphTable>> vertex_tables;
+	for (auto &table : pg_table.vertex_tables) {
+		vertex_tables[TableKey(*table)] = table;
+	}
+	for (auto &pattern : leaf->match->path_patterns) {
+		vector<string> names;
+		vector<bool> edges;
+		for (auto &entry : PatternSequence(*pattern)) {
+			auto *element = EntryElement(entry);
+			if (!element) {
+				names.push_back(string());
+				edges.push_back(true);
+				continue;
+			}
+			names.push_back(element->variable_binding);
+			edges.push_back(element->match_type != PGQMatchType::MATCH_VERTEX);
+			if (element->match_type != PGQMatchType::MATCH_VERTEX) {
+				leaf->edge_types[element->variable_binding] = element->match_type;
+			}
+			if (element->match_type == PGQMatchType::MATCH_VERTEX && element->label.empty()) {
+				auto &domain = leaf->domains[element->variable_binding];
+				if (domain.size() == 1) {
+					auto table = vertex_tables[*domain.begin()];
+					if (table && !table->main_label.empty()) {
+						element->label = PGQStr(table->main_label);
+					}
+				}
+			}
+		}
+		leaf->sequences.push_back(std::move(names));
+		leaf->sequence_edges.push_back(std::move(edges));
+	}
+
+	// No vertex twice across a group's iterations, the vertex before and after it included, as a quantified edge.
+	// Vertices are identified by their key, as the variable-length traversal identifies them.
+	for (auto &range : ranges) {
+		auto &names = leaf->sequences[range.pattern];
+		auto &edges = leaf->sequence_edges[range.pattern];
+		vector<string> vertices;
+		for (idx_t i = range.first; i <= range.last && i < names.size(); i++) {
+			if (!edges[i]) {
+				vertices.push_back(names[i]);
+			}
+		}
+		for (idx_t i = 0; i < vertices.size(); i++) {
+			for (idx_t j = i + 1; j < vertices.size(); j++) {
+				if (StringUtil::CIEquals(vertices[i], vertices[j])) {
+					return nullptr; // the same vertex twice by construction
+				}
+				auto &left = leaf->domains[vertices[i]];
+				auto &right = leaf->domains[vertices[j]];
+				if (!TablesIntersect(left, right)) {
+					continue;
+				}
+				if (left.size() == 1 && right.size() == 1) {
+					auto key = VertexKeyColumn(*left.begin(), pg_table);
+					const string column = key.empty() ? "rowid" : key;
+					leaf->pattern_conditions.push_back(make_uniq<ComparisonExpression>(
+					    ExpressionType::COMPARE_DISTINCT_FROM, PGQColRef(column, vertices[i]),
+					    PGQColRef(column, vertices[j])));
+					continue;
+				}
+				// Not known to be one table: different tables, or different rows of one.
+				vector<unique_ptr<ParsedExpression>> label_args_i;
+				label_args_i.push_back(PGQColRef(vertices[i]));
+				vector<unique_ptr<ParsedExpression>> label_args_j;
+				label_args_j.push_back(PGQColRef(vertices[j]));
+				auto different_table = make_uniq<ComparisonExpression>(
+				    ExpressionType::COMPARE_DISTINCT_FROM, make_uniq<FunctionExpression>("label", std::move(label_args_i)),
+				    make_uniq<FunctionExpression>("label", std::move(label_args_j)));
+				auto different_row =
+				    make_uniq<ComparisonExpression>(ExpressionType::COMPARE_DISTINCT_FROM, PGQColRef("rowid", vertices[i]),
+				                                    PGQColRef("rowid", vertices[j]));
+				leaf->pattern_conditions.push_back(make_uniq<ConjunctionExpression>(
+				    ExpressionType::CONJUNCTION_OR, std::move(different_table), std::move(different_row)));
+			}
+		}
+	}
+	return leaf;
+}
+
+//! The graph functions of one element whose value, for a group variable, is the list of their per-iteration values.
+static bool IsElementFunction(const string &name) {
+	static const case_insensitive_set_t functions {"element_id", "label", "labels"};
+	return functions.count(name) > 0;
+}
+
+//! What a leaf needs to write group variable references as lists.
+struct PGQGroupRefContext {
+	ClientContext &context;
+	CreatePropertyGraphInfo &pg_table;
+	const vector<PGQGroupSpec> &specs;
+	const case_insensitive_map_t<idx_t> &group_of;
+	//! The one table a group variable binds in every iteration of every leaf, where there is one.
+	const case_insensitive_map_t<string> &variable_tables;
+	PGQGroupLeaf &leaf;
+
+	//! The group of a variable that stands for a list here, or false.
+	bool ListGroup(const string &variable, idx_t &group) const {
+		auto entry = group_of.find(variable);
+		if (entry == group_of.end() || !specs[entry->second].lists) {
+			return false;
+		}
+		group = entry->second;
+		return true;
+	}
+};
+
+//! A reference to one element's value: v.x, or element_id(v) / label(v) / labels(v). Sets the group and variable.
+static bool IsGroupAtom(const ParsedExpression &expression, const PGQGroupRefContext &ctx, idx_t &group,
+                        string &variable) {
+	if (expression.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+		auto &names = expression.Cast<ColumnRefExpression>().ColumnNames();
+		if (names.size() >= 2 && ctx.ListGroup(PGQStr(names[0]), group)) {
+			variable = PGQStr(names[0]);
+			return true;
+		}
+		return false;
+	}
+	if (expression.GetExpressionClass() != ExpressionClass::FUNCTION) {
+		return false;
+	}
+	auto &function = expression.Cast<FunctionExpression>();
+	if (!IsElementFunction(PGQStr(function.FunctionName())) || function.GetArguments().size() != 1) {
+		return false;
+	}
+	auto &argument = function.GetArguments()[0].GetExpression();
+	if (argument.GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+		return false;
+	}
+	auto &names = argument.Cast<ColumnRefExpression>().ColumnNames();
+	if (names.size() == 1 && ctx.ListGroup(PGQStr(names[0]), group)) {
+		variable = PGQStr(names[0]);
+		return true;
+	}
+	return false;
+}
+
+//! The type of an atom's value, for typing the empty list of zero iterations; INVALID when not known.
+static LogicalType GroupAtomType(const ParsedExpression &atom, const string &variable, const PGQGroupRefContext &ctx) {
+	if (atom.GetExpressionClass() == ExpressionClass::FUNCTION) {
+		auto name = StringUtil::Lower(PGQStr(atom.Cast<FunctionExpression>().FunctionName()));
+		if (name == "element_id") {
+			return LogicalType::BIGINT;
+		}
+		if (name == "label") {
+			return LogicalType::VARCHAR;
+		}
+		return LogicalType::LIST(LogicalType::VARCHAR);
+	}
+	auto entry = ctx.variable_tables.find(variable);
+	if (entry == ctx.variable_tables.end()) {
+		return LogicalType::INVALID;
+	}
+	auto &names = atom.Cast<ColumnRefExpression>().ColumnNames();
+	for (auto *tables : {&ctx.pg_table.vertex_tables, &ctx.pg_table.edge_tables}) {
+		for (auto &table : *tables) {
+			if (TableKey(*table) == entry->second) {
+				return PathPropertyColumnType(ctx.context, *table, PGQStr(names[1]));
+			}
+		}
+	}
+	return LogicalType::INVALID;
+}
+
+//! `expression` with the group's variables renamed to their copies in iteration `iteration`.
+static unique_ptr<ParsedExpression> GroupIterationCopy(const ParsedExpression &expression, idx_t group,
+                                                       idx_t iteration, const PGQGroupRefContext &ctx) {
+	auto copy = expression.Copy();
+	RenameVariables(copy, ctx.leaf.names[group][iteration]);
+	if (copy->GetExpressionClass() == ExpressionClass::FUNCTION) {
+		// element_id(v) and label(v) of the copy, resolved here: the translation resolves them only at the top of an
+		// expression, not inside the list built from them.
+		auto &function = copy->Cast<FunctionExpression>();
+		auto name = StringUtil::Lower(PGQStr(function.FunctionName()));
+		auto variable = PGQStr(function.GetArguments()[0].GetExpression().Cast<ColumnRefExpression>().ColumnNames()[0]);
+		if (name == "element_id") {
+			// An undirected edge is read both ways from a union that carries the edge's row id in its own column.
+			auto edge_type = ctx.leaf.edge_types.find(variable);
+			const bool undirected = edge_type != ctx.leaf.edge_types.end() &&
+			                        edge_type->second == PGQMatchType::MATCH_EDGE_ANY;
+			return PGQColRef(undirected ? "__pgq_erowid" : "rowid", variable);
+		}
+		auto domain = ctx.leaf.domains.find(variable);
+		if (name == "label" && domain != ctx.leaf.domains.end() && domain->second.size() == 1) {
+			for (auto *tables : {&ctx.pg_table.vertex_tables, &ctx.pg_table.edge_tables}) {
+				for (auto &table : *tables) {
+					if (TableKey(*table) == *domain->second.begin()) {
+						return ConstantExpression::FromValue(Value(PGQStr(table->main_label)));
+					}
+				}
+			}
+		}
+	}
+	return copy;
+}
+
+//! [e_1, ..., e_k] for the leaf's k iterations of the group; typed by `empty_type` when k is 0.
+static unique_ptr<ParsedExpression> GroupList(const ParsedExpression &expression, idx_t group,
+                                              const LogicalType &empty_type, const PGQGroupRefContext &ctx) {
+	if (ctx.leaf.iterations[group] == 0) {
+		auto type = empty_type.id() == LogicalTypeId::INVALID ? LogicalType::SQLNULL : empty_type;
+		return ConstantExpression::FromValue(Value::LIST(type, vector<Value>()));
+	}
+	vector<unique_ptr<ParsedExpression>> items;
+	for (idx_t i = 0; i < idx_t(ctx.leaf.iterations[group]); i++) {
+		items.push_back(GroupIterationCopy(expression, group, i, ctx));
+	}
+	return make_uniq<FunctionExpression>("list_value", std::move(items));
+}
+
+static void CollectListGroups(const ParsedExpression &expression, const PGQGroupRefContext &ctx,
+                              case_insensitive_set_t &variables, std::set<idx_t> &groups) {
+	if (expression.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+		auto &names = expression.Cast<ColumnRefExpression>().ColumnNames();
+		idx_t group;
+		if (!names.empty() && ctx.ListGroup(PGQStr(names[0]), group)) {
+			variables.insert(PGQStr(names[0]));
+			groups.insert(group);
+		}
+		return;
+	}
+	if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		return;
+	}
+	ParsedExpressionIterator::EnumerateChildren(
+	    expression, [&](const ParsedExpression &child) { CollectListGroups(child, ctx, variables, groups); });
+}
+
+//! An aggregate over a group variable (marked kGroupAggregateFunction before the lowering), evaluated along the list
+//! of the group's iterations: SUM(e.w) is the sum of the leaf's e_1.w .. e_k.w. Arguments of the marker: the
+//! aggregate's name, DISTINCT, then the aggregate's own arguments (the first one aggregated, the rest constants).
+static unique_ptr<ParsedExpression> RewriteGroupAggregate(FunctionExpression &marker, const PGQGroupRefContext &ctx) {
+	auto &arguments = marker.GetArgumentsMutable();
+	const auto name = arguments[0].GetExpression().Cast<ConstantExpression>().GetLiteral().ToValue().ToString();
+	const bool distinct =
+	    arguments[1].GetExpression().Cast<ConstantExpression>().GetLiteral().ToValue().GetValue<bool>();
+	if (arguments.size() < 3) {
+		throw BinderException("%s() over a group variable needs an argument", name);
+	}
+	auto &input = arguments[2].GetExpression();
+	case_insensitive_set_t variables;
+	std::set<idx_t> groups;
+	CollectListGroups(input, ctx, variables, groups);
+	if (groups.size() != 1) {
+		throw BinderException("%s() over group variables of different quantified path patterns is not supported",
+		                      name);
+	}
+	const idx_t group = *groups.begin();
+	const auto k = ctx.leaf.iterations[group];
+	const bool bare_variable = input.GetExpressionClass() == ExpressionClass::COLUMN_REF &&
+	                           input.Cast<ColumnRefExpression>().ColumnNames().size() == 1;
+	if (bare_variable) {
+		if (!StringUtil::CIEquals(name, "count")) {
+			throw BinderException("%s(%s) needs a property of the group variable, e.g. %s(%s.x)", name,
+			                      input.ToString(), name, input.ToString());
+		}
+		// COUNT(e): the number of iterations, each binds one element.
+		return ConstantExpression::FromValue(Value::BIGINT(distinct ? MinValue<int64_t>(k, 1) * k : k));
+	}
+	if (k == 0) {
+		// An aggregate over no elements.
+		return StringUtil::CIEquals(name, "count") ? ConstantExpression::FromValue(Value::BIGINT(0))
+		                                           : ConstantExpression::FromValue(Value());
+	}
+	idx_t atom_group;
+	string atom_variable;
+	auto empty_type = IsGroupAtom(input, ctx, atom_group, atom_variable) ? GroupAtomType(input, atom_variable, ctx)
+	                                                                       : LogicalType::INVALID;
+	auto list = GroupList(input, group, empty_type, ctx);
+	if (distinct) {
+		vector<unique_ptr<ParsedExpression>> distinct_args;
+		distinct_args.push_back(std::move(list));
+		list = make_uniq<FunctionExpression>("list_distinct", std::move(distinct_args));
+	}
+	vector<unique_ptr<ParsedExpression>> aggregate_args;
+	aggregate_args.push_back(std::move(list));
+	aggregate_args.push_back(ConstantExpression::FromValue(Value(name)));
+	for (idx_t i = 3; i < arguments.size(); i++) {
+		if (ReadsVariables(arguments[i].GetExpression(), ctx.leaf.missing) || !variables.empty()) {
+			// constants only; checked below
+		}
+		aggregate_args.push_back(arguments[i].GetExpression().Copy());
+	}
+	return make_uniq<FunctionExpression>("list_aggregate", std::move(aggregate_args));
+}
+
+//! Writes every reference to a group variable as the list of its iterations' values.
+static unique_ptr<ParsedExpression> RewriteGroupReferences(unique_ptr<ParsedExpression> expression,
+                                                           const PGQGroupRefContext &ctx) {
+	if (!expression) {
+		return expression;
+	}
+	if (expression->GetExpressionClass() == ExpressionClass::FUNCTION &&
+	    StringUtil::CIEquals(PGQStr(expression->Cast<FunctionExpression>().FunctionName()), kGroupAggregateFunction)) {
+		auto alias = expression->GetAlias();
+		auto result = RewriteGroupAggregate(expression->Cast<FunctionExpression>(), ctx);
+		result->SetAlias(alias);
+		return result;
+	}
+	idx_t group;
+	string variable;
+	if (IsGroupAtom(*expression, ctx, group, variable)) {
+		auto alias = expression->GetAlias();
+		auto result = GroupList(*expression, group, GroupAtomType(*expression, variable, ctx), ctx);
+		result->SetAlias(alias);
+		return result;
+	}
+	if (expression->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+		auto &names = expression->Cast<ColumnRefExpression>().ColumnNames();
+		if (names.size() == 1 && ctx.ListGroup(PGQStr(names[0]), group)) {
+			throw BinderException("'%s' is a group variable (declared in a quantified path pattern) and stands for a "
+			                      "list of elements: read a property (%s.x), element_id(%s) or an aggregate over it",
+			                      PGQStr(names[0]), PGQStr(names[0]), PGQStr(names[0]));
+		}
+		return expression;
+	}
+	if (expression->GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		return expression;
+	}
+	ParsedExpressionIterator::EnumerateChildren(*expression, [&](unique_ptr<ParsedExpression> &child) {
+		child = RewriteGroupReferences(std::move(child), ctx);
+	});
+	return expression;
+}
+
+static unique_ptr<QueryNode> BuildMatchBlockNode(ClientContext &context, MatchExpression &block);
+static void SplitZeroOrOneHopEdges(MatchExpression &block, CreatePropertyGraphInfo &pg_table);
+
+//! The iteration counts of every group, as the leaves of the lowering; refuses bounds it does not unroll.
+static vector<vector<int64_t>> GroupIterationChoices(const vector<PGQGroupSpec> &specs) {
+	vector<vector<int64_t>> choices {{}};
+	for (auto &spec : specs) {
+		if (spec.upper >= int64_t(1 << 30) || spec.upper > kGroupMaxUnrolledIterations) {
+			throw NotImplementedException(
+			    "A quantified path pattern with %s is not supported: parenthesized path patterns are unrolled, up to "
+			    "%lld iterations. Give it an upper bound of at most %lld",
+			    spec.upper >= int64_t(1 << 30) ? string("no upper bound") : "the upper bound " + std::to_string(spec.upper),
+			    static_cast<long long>(kGroupMaxUnrolledIterations), static_cast<long long>(kGroupMaxUnrolledIterations));
+		}
+		vector<vector<int64_t>> extended;
+		for (auto &choice : choices) {
+			for (int64_t k = spec.lower; k <= spec.upper; k++) {
+				auto next = choice;
+				next.push_back(k);
+				extended.push_back(std::move(next));
+				if (extended.size() > kGroupMaxLeaves) {
+					throw NotImplementedException("This MATCH has more than %llu combinations of iteration counts of its "
+					                              "quantified path patterns; narrow their bounds",
+					                              static_cast<unsigned long long>(kGroupMaxLeaves));
+				}
+			}
+		}
+		choices = std::move(extended);
+	}
+	for (auto &choice : choices) {
+		idx_t edges = 0;
+		for (idx_t g = 0; g < specs.size(); g++) {
+			edges += idx_t(choice[g]) * specs[g].body_edges;
+		}
+		if (edges > kGroupMaxUnrolledEdges) {
+			throw NotImplementedException("This MATCH unrolls its quantified path patterns into %llu edges, more than "
+			                              "the %llu supported; narrow their bounds",
+			                              static_cast<unsigned long long>(edges),
+			                              static_cast<unsigned long long>(kGroupMaxUnrolledEdges));
+		}
+	}
+	return choices;
+}
+
+//! A result with the COLUMNS' names and no rows, for a pattern no choice of iteration counts can match.
+static unique_ptr<QueryNode> EmptyGroupResult(const MatchExpression &block) {
+	vector<string> columns;
+	for (idx_t i = 0; i < block.column_list.size(); i++) {
+		auto &column = block.column_list[i];
+		if (column->GetExpressionClass() == ExpressionClass::STAR) {
+			throw BinderException("This pattern can never match (its vertex and edge tables do not connect), and %s "
+			                      "has no fixed columns to return; list the columns in COLUMNS",
+			                      column->ToString());
+		}
+		auto name = PGQStr(column->GetAlias().empty() ? column->GetName() : column->GetAlias());
+		columns.push_back("NULL AS " + KeywordHelper::WriteOptionallyQuoted(name));
+	}
+	return ParseGeneratedSelect("SELECT " + StringUtil::Join(columns, ", ") + " WHERE false");
+}
+
+//! Path functions of a named path that is a single vertex in this leaf (its groups matched zero times): the
+//! translation answers path functions from the edges of a path, and this one has none.
+static unique_ptr<ParsedExpression> RewriteZeroLengthPathFunctions(unique_ptr<ParsedExpression> expression,
+                                                                   const case_insensitive_map_t<string> &paths,
+                                                                   const PGQGroupLeaf &leaf,
+                                                                   CreatePropertyGraphInfo &pg_table) {
+	if (!expression || paths.empty()) {
+		return expression;
+	}
+	if (expression->GetExpressionClass() == ExpressionClass::FUNCTION) {
+		auto &function = expression->Cast<FunctionExpression>();
+		auto name = StringUtil::Lower(PGQStr(function.FunctionName()));
+		if (function.GetArguments().size() == 1 &&
+		    function.GetArguments()[0].GetExpression().GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			auto &names = function.GetArguments()[0].GetExpression().Cast<ColumnRefExpression>().ColumnNames();
+			auto path = names.size() == 1 ? paths.find(PGQStr(names[0])) : paths.end();
+			if (path != paths.end()) {
+				const auto &vertex = path->second;
+				unique_ptr<ParsedExpression> result;
+				auto list_of = [](unique_ptr<ParsedExpression> item) {
+					vector<unique_ptr<ParsedExpression>> items;
+					items.push_back(std::move(item));
+					return make_uniq<FunctionExpression>("list_value", std::move(items));
+				};
+				auto empty_list = [](const LogicalType &type) {
+					return ConstantExpression::FromValue(Value::LIST(type, vector<Value>()));
+				};
+				if (name == "vertices") {
+					result = list_of(PGQColRef("rowid", vertex));
+				} else if (name == "edges") {
+					result = empty_list(LogicalType::BIGINT);
+				} else if (name == "path_length") {
+					result = ConstantExpression::FromValue(Value::BIGINT(0));
+				} else if (name == "edge_labels") {
+					result = empty_list(LogicalType::VARCHAR);
+				} else if (name == "vertex_labels") {
+					auto domain = leaf.domains.find(vertex);
+					if (domain != leaf.domains.end() && domain->second.size() == 1) {
+						for (auto &table : pg_table.vertex_tables) {
+							if (TableKey(*table) == *domain->second.begin()) {
+								result = list_of(ConstantExpression::FromValue(Value(PGQStr(table->main_label))));
+							}
+						}
+					}
+				}
+				if (result) {
+					result->SetAlias(expression->GetAlias());
+					return result;
+				}
+			}
+		}
+	}
+	if (expression->GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		return expression;
+	}
+	ParsedExpressionIterator::EnumerateChildren(*expression, [&](unique_ptr<ParsedExpression> &child) {
+		child = RewriteZeroLengthPathFunctions(std::move(child), paths, leaf, pg_table);
+	});
+	return expression;
+}
+
+//! The variables an expression reads (v of v.x, and a bare v), and whether it holds a subquery.
+static void CollectReadVariables(const ParsedExpression &expression, case_insensitive_set_t &variables,
+                                 bool &subquery) {
+	if (expression.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+		auto &names = expression.Cast<ColumnRefExpression>().ColumnNames();
+		if (!names.empty()) {
+			variables.insert(PGQStr(names[0]));
+		}
+		return;
+	}
+	if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		subquery = true;
+		return;
+	}
+	ParsedExpressionIterator::EnumerateChildren(
+	    expression, [&](const ParsedExpression &child) { CollectReadVariables(child, variables, subquery); });
+}
+
+static void SplitConjuncts(unique_ptr<ParsedExpression> expression, vector<unique_ptr<ParsedExpression>> &out) {
+	if (!expression) {
+		return;
+	}
+	if (expression->GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+		for (auto &child : expression->Cast<ConjunctionExpression>().GetChildrenMutable()) {
+			SplitConjuncts(std::move(child), out);
+		}
+		return;
+	}
+	out.push_back(std::move(expression));
+}
+
+//! The table a leaf variable binds, when it is one table.
+static shared_ptr<PropertyGraphTable> LeafVariableTable(const PGQGroupLeaf &leaf, const string &variable,
+                                                        CreatePropertyGraphInfo &pg_table) {
+	auto domain = leaf.domains.find(variable);
+	if (domain == leaf.domains.end() || domain->second.size() != 1) {
+		return nullptr;
+	}
+	for (auto *tables : {&pg_table.vertex_tables, &pg_table.edge_tables}) {
+		for (auto &table : *tables) {
+			if (TableKey(*table) == *domain->second.begin()) {
+				return table;
+			}
+		}
+	}
+	return nullptr;
+}
+
+//! An element's identity for the selector: its table's position in the graph and its row.
+static unique_ptr<ParsedExpression> SelectorElementTable(const PGQGroupLeaf &leaf, const string &variable,
+                                                         CreatePropertyGraphInfo &pg_table) {
+	if (auto table = LeafVariableTable(leaf, variable, pg_table)) {
+		return ConstantExpression::FromValue(Value(PGQStr(table->main_label)));
+	}
+	vector<unique_ptr<ParsedExpression>> arguments;
+	arguments.push_back(PGQColRef(variable));
+	return make_uniq<FunctionExpression>("label", std::move(arguments));
+}
+
+static unique_ptr<ParsedExpression> SelectorEdgeRow(const PGQGroupLeaf &leaf, const string &variable) {
+	auto edge_type = leaf.edge_types.find(variable);
+	const bool undirected = edge_type != leaf.edge_types.end() && edge_type->second == PGQMatchType::MATCH_EDGE_ANY;
+	return PGQColRef(undirected ? "__pgq_erowid" : "rowid", variable);
+}
+
+//! v.x where v's table has no property x is NULL: ONE ROW PER over a path through several tables.
+static unique_ptr<ParsedExpression> NullAbsentProperties(unique_ptr<ParsedExpression> expression,
+                                                         const string &variable,
+                                                         const shared_ptr<PropertyGraphTable> &table) {
+	if (!expression || !table) {
+		return expression;
+	}
+	if (expression->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+		auto &names = expression->Cast<ColumnRefExpression>().ColumnNames();
+		if (names.size() == 2 && StringUtil::CIEquals(PGQStr(names[0]), variable) &&
+		    !TableHasProperty(*table, PGQStr(names[1])) && !table->all_columns) {
+			auto null_value = ConstantExpression::FromValue(Value());
+			null_value->SetAlias(expression->GetAlias());
+			return std::move(null_value);
+		}
+		return expression;
+	}
+	if (expression->GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		return expression;
+	}
+	ParsedExpressionIterator::EnumerateChildren(*expression, [&](unique_ptr<ParsedExpression> &child) {
+		child = NullAbsentProperties(std::move(child), variable, table);
+	});
+	return expression;
+}
+
+//! The rows of a graph table as the catalog estimates them, or -1 when it cannot say.
+static int64_t GraphTableRows(ClientContext &context, const PropertyGraphTable &table,
+                              case_insensitive_map_t<int64_t> &cache) {
+	const auto key = TableKey(table);
+	auto cached = cache.find(key);
+	if (cached != cache.end()) {
+		return cached->second;
+	}
+	int64_t rows = -1;
+	try {
+		const string catalog_name = table.catalog_name.empty() ? PGQStr(DatabaseManager::GetDefaultDatabase(context))
+		                                                       : PGQStr(table.catalog_name);
+		const string schema_name = table.schema_name.empty() ? string(DEFAULT_SCHEMA) : PGQStr(table.schema_name);
+		auto entry = Catalog::GetEntry<TableCatalogEntry>(
+		    context, QualifiedName(Identifier(catalog_name), Identifier(schema_name), table.table_name),
+		    OnEntryNotFound::RETURN_NULL);
+		if (entry) {
+			auto info = entry->GetStorageInfo(context);
+			if (info.cardinality.IsValid()) {
+				rows = NumericCast<int64_t>(info.cardinality.GetIndex());
+			}
+		}
+	} catch (...) {
+		rows = -1;
+	}
+	cache[key] = rows;
+	return rows;
+}
+
+//! A MATCH whose quantified path patterns no vertex condition seeds expands from every vertex. Its size is estimated
+//! (per leaf, the product of its edge tables' rows over the product of its inner vertices' rows) and refused over
+//! pgq_max_vl_fallback_rows, as an unanchored variable-length traversal is. A condition on one vertex outside the
+//! groups (in the MATCH WHERE, or the vertex's own WHERE) seeds it: the joins then start from the matching rows.
+static void CheckGroupBudget(ClientContext &context, const MatchExpression &block, const vector<PGQGroupSpec> &specs,
+                             const case_insensitive_map_t<idx_t> &group_of,
+                             const vector<unique_ptr<PGQGroupLeaf>> &leaves, CreatePropertyGraphInfo &pg_table) {
+	const auto budget = MaxVLFallbackRows(context);
+	bool lists = false;
+	for (auto &spec : specs) {
+		lists = lists || spec.lists;
+	}
+	if (budget <= 0 || !lists) {
+		return;
+	}
+	// Seeds: a vertex outside every group read alone by a WHERE conjunct, or carrying an element WHERE.
+	case_insensitive_set_t outer_vertices;
+	bool seeded = false;
+	for (auto &pattern : block.path_patterns) {
+		for (auto &entry : PatternSequence(*pattern)) {
+			auto *element = EntryElement(entry);
+			if (!element || element->match_type != PGQMatchType::MATCH_VERTEX || group_of.count(element->variable_binding)) {
+				continue;
+			}
+			outer_vertices.insert(element->variable_binding);
+			auto *wrapper = PGQMatchFunction::GetSubPath(entry);
+			seeded = seeded || (wrapper && wrapper->where_clause);
+		}
+	}
+	if (!seeded && block.where_clause) {
+		vector<unique_ptr<ParsedExpression>> conjuncts;
+		SplitConjuncts(block.where_clause->Copy(), conjuncts);
+		for (auto &conjunct : conjuncts) {
+			case_insensitive_set_t read;
+			bool subquery = false;
+			CollectReadVariables(*conjunct, read, subquery);
+			seeded = seeded || (!subquery && read.size() == 1 && outer_vertices.count(*read.begin()));
+		}
+	}
+	if (seeded) {
+		return;
+	}
+	case_insensitive_map_t<int64_t> rows_cache;
+	case_insensitive_map_t<shared_ptr<PropertyGraphTable>> tables;
+	for (auto *list : {&pg_table.vertex_tables, &pg_table.edge_tables}) {
+		for (auto &table : *list) {
+			tables[TableKey(*table)] = table;
+		}
+	}
+	auto domain_rows = [&](const PGQGroupLeaf &leaf, const string &variable) -> double {
+		auto domain = leaf.domains.find(variable);
+		if (domain == leaf.domains.end()) {
+			return -1;
+		}
+		double total = 0;
+		for (auto &key : domain->second) {
+			auto table = tables[key];
+			auto rows = table ? GraphTableRows(context, *table, rows_cache) : -1;
+			if (rows < 0) {
+				return -1;
+			}
+			total += double(rows);
+		}
+		return total;
+	};
+	double estimate = 0;
+	for (auto &leaf : leaves) {
+		double leaf_rows = 1;
+		for (idx_t p = 0; p < leaf->sequences.size(); p++) {
+			auto &sequence = leaf->sequences[p];
+			double pattern_rows = domain_rows(*leaf, sequence[0]);
+			for (idx_t i = 1; i + 1 < sequence.size() && pattern_rows >= 0; i += 2) {
+				const double edges = domain_rows(*leaf, sequence[i]);
+				const double sources = domain_rows(*leaf, sequence[i - 1]);
+				if (edges < 0 || sources < 0) {
+					pattern_rows = -1;
+					break;
+				}
+				pattern_rows = sources > 0 ? pattern_rows * edges / sources : 0;
+			}
+			if (pattern_rows < 0) {
+				return; // a table without an estimate: nothing to cost against
+			}
+			leaf_rows *= pattern_rows;
+		}
+		estimate += leaf_rows;
+	}
+	if (estimate > double(budget)) {
+		throw BinderException(
+		    "This MATCH with a quantified path pattern has no condition on a vertex outside the pattern, so it expands "
+		    "from every vertex, and is estimated to produce ~%.0f rows, exceeding pgq_max_vl_fallback_rows (%lld). "
+		    "Constrain a vertex before or after the quantified pattern (any condition on that vertex alone seeds the "
+		    "expansion), lower the upper bound, or raise or disable the budget with SET pgq_max_vl_fallback_rows",
+		    estimate, static_cast<long long>(budget));
+	}
+}
+
+//! element_id(v) and label(v) of a leaf variable, anywhere in an expression. The translation resolves them only at
+//! the top of a column or a WHERE conjunct, and the lowering nests them in lists.
+static unique_ptr<ParsedExpression> ResolveElementFunctions(unique_ptr<ParsedExpression> expression,
+                                                            const PGQGroupLeaf &leaf,
+                                                            CreatePropertyGraphInfo &pg_table) {
+	if (!expression) {
+		return expression;
+	}
+	if (expression->GetExpressionClass() == ExpressionClass::FUNCTION) {
+		auto &function = expression->Cast<FunctionExpression>();
+		auto name = StringUtil::Lower(PGQStr(function.FunctionName()));
+		if ((name == "element_id" || name == "label") && function.GetArguments().size() == 1 &&
+		    function.GetArguments()[0].GetExpression().GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			auto &names = function.GetArguments()[0].GetExpression().Cast<ColumnRefExpression>().ColumnNames();
+			if (names.size() == 1 && leaf.domains.count(PGQStr(names[0]))) {
+				auto variable = PGQStr(names[0]);
+				unique_ptr<ParsedExpression> result;
+				if (name == "element_id") {
+					result = SelectorEdgeRow(leaf, variable);
+				} else if (auto table = LeafVariableTable(leaf, variable, pg_table)) {
+					result = ConstantExpression::FromValue(Value(PGQStr(table->main_label)));
+				}
+				if (result) {
+					result->SetAlias(expression->GetAlias());
+					return result;
+				}
+			}
+		}
+	}
+	if (expression->GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		return expression;
+	}
+	ParsedExpressionIterator::EnumerateChildren(*expression, [&](unique_ptr<ParsedExpression> &child) {
+		child = ResolveElementFunctions(std::move(child), leaf, pg_table);
+	});
+	return expression;
+}
+
+static unique_ptr<QueryNode> BuildQuantifiedGroupNode(ClientContext &context, MatchExpression &block) {
+	auto duckpgq_state = GetDuckPGQState(context);
+	QualifiedName graph_name(Identifier(block.pg_catalog), Identifier(block.pg_schema), Identifier(block.pg_name));
+	auto &pg_table = *duckpgq_state->GetPropertyGraph(context, graph_name);
+
+	case_insensitive_map_t<idx_t> group_of;
+	auto specs = CollectGroups(block, group_of);
+
+	// A search prefix over a pattern with a group chooses among the paths of all its leaves; ONE ROW PER unnests the
+	// leaves' paths. Both are applied over the union of the leaves, so they need the group's pattern to be the only
+	// one of the MATCH.
+	const bool one_row_per = block.one_row_per != OneRowPerMode::NONE;
+	bool selector = false;
+	bool all_shortest = false;
+	for (auto &pattern : block.path_patterns) {
+		if (!SequenceHasGroup(PatternSequence(*pattern))) {
+			continue;
+		}
+		if (pattern->topk) {
+			throw NotImplementedException("SHORTEST k over a quantified path pattern is not supported; use ANY SHORTEST "
+			                              "or ALL SHORTEST");
+		}
+		if (pattern->shortest) {
+			selector = true;
+			all_shortest = pattern->all;
+		}
+	}
+	if ((selector || one_row_per) && (block.path_patterns.size() != 1 || !block.optional_match_patterns.empty())) {
+		throw NotImplementedException("%s over a quantified path pattern needs it to be the only path pattern of the "
+		                              "MATCH",
+		                              selector ? "A search prefix" : "ONE ROW PER");
+	}
+	case_insensitive_set_t orp_variables(block.one_row_per_vars.begin(), block.one_row_per_vars.end());
+	if (one_row_per) {
+		if (block.where_clause && ReadsVariables(*block.where_clause, orp_variables)) {
+			throw BinderException("The WHERE of a MATCH with ONE ROW PER cannot refer to its ONE ROW PER variables");
+		}
+		for (auto &column : block.column_list) {
+			if (column->GetExpressionClass() == ExpressionClass::STAR) {
+				throw BinderException("ONE ROW PER over a quantified path pattern needs COLUMNS without *; list the "
+				                      "properties");
+			}
+		}
+	}
+
+	vector<unique_ptr<PGQGroupLeaf>> leaves;
+	for (auto &choice : GroupIterationChoices(specs)) {
+		auto leaf = BuildGroupLeaf(block, specs, choice, pg_table);
+		if (leaf) {
+			leaves.push_back(std::move(leaf));
+		}
+	}
+	if (leaves.empty()) {
+		return EmptyGroupResult(block);
+	}
+	CheckGroupBudget(context, block, specs, group_of, leaves, pg_table);
+	// The table each group variable binds, where it is one table in every iteration of every leaf.
+	case_insensitive_map_t<string> variable_tables;
+	case_insensitive_set_t ambiguous;
+	for (auto &leaf : leaves) {
+		for (idx_t g = 0; g < specs.size(); g++) {
+			for (auto &names : leaf->names[g]) {
+				for (auto &entry : names) {
+					auto &domain = leaf->domains[entry.second];
+					if (domain.size() != 1) {
+						ambiguous.insert(entry.first);
+						continue;
+					}
+					auto existing = variable_tables.find(entry.first);
+					if (existing == variable_tables.end()) {
+						variable_tables[entry.first] = *domain.begin();
+					} else if (existing->second != *domain.begin()) {
+						ambiguous.insert(entry.first);
+					}
+				}
+			}
+		}
+	}
+	for (auto &name : ambiguous) {
+		variable_tables.erase(name);
+	}
+
+	vector<string> column_names;
+	for (auto &column : block.column_list) {
+		column_names.push_back(column->GetExpressionClass() == ExpressionClass::STAR
+		                           ? string()
+		                           : PGQStr(column->GetAlias().empty() ? column->GetName() : column->GetAlias()));
+	}
+	static const vector<string> kSelectorColumns {"__pgq_sel_st", "__pgq_sel_sr", "__pgq_sel_dt", "__pgq_sel_dr",
+	                                              "__pgq_sel_hops", "__pgq_sel_edges", "__pgq_sel_post"};
+
+	vector<unique_ptr<QueryNode>> nodes;
+	for (auto &leaf : leaves) {
+		PGQGroupRefContext ctx {context, pg_table, specs, group_of, variable_tables, *leaf};
+		auto &match = *leaf->match;
+		// Named paths that are one vertex in this leaf.
+		case_insensitive_map_t<string> zero_length_paths;
+		for (idx_t p = 0; p < match.path_patterns.size(); p++) {
+			auto *wrapper = PatternSequenceWrapper(*match.path_patterns[p]);
+			if (wrapper && !wrapper->path_variable.empty() && leaf->sequences[p].size() == 1) {
+				zero_length_paths[wrapper->path_variable] = leaf->sequences[p][0];
+			}
+		}
+		auto finish = [&](unique_ptr<ParsedExpression> expression) {
+			expression = RewriteGroupReferences(std::move(expression), ctx);
+			expression = NullMissingVariables(std::move(expression), leaf->missing);
+			expression = RewriteZeroLengthPathFunctions(std::move(expression), zero_length_paths, *leaf, pg_table);
+			return ResolveElementFunctions(std::move(expression), *leaf, pg_table);
+		};
+
+		if (one_row_per) {
+			// Each column becomes the list of its values at every position of the path, in path order; the lists
+			// are unnested together after the union.
+			auto &sequence = leaf->sequences[0];
+			auto &is_edge = leaf->sequence_edges[0];
+			vector<case_insensitive_map_t<string>> positions;
+			for (idx_t i = 0; i < sequence.size(); i++) {
+				auto &vars = block.one_row_per_vars;
+				if (block.one_row_per == OneRowPerMode::VERTEX && !is_edge[i]) {
+					positions.push_back({{vars[0], sequence[i]}});
+				} else if (block.one_row_per == OneRowPerMode::EDGE && is_edge[i]) {
+					positions.push_back({{vars[0], sequence[i]}});
+				} else if (block.one_row_per == OneRowPerMode::STEP && is_edge[i]) {
+					positions.push_back({{vars[0], sequence[i - 1]}, {vars[1], sequence[i]}, {vars[2], sequence[i + 1]}});
+				}
+			}
+			for (idx_t c = 0; c < match.column_list.size(); c++) {
+				auto &column = match.column_list[c];
+				vector<unique_ptr<ParsedExpression>> items;
+				for (auto &position : positions) {
+					auto item = column->Copy();
+					item->SetAlias(Identifier());
+					RenameVariables(item, position);
+					for (auto &entry : position) {
+						item = NullAbsentProperties(std::move(item), entry.second,
+						                            LeafVariableTable(*leaf, entry.second, pg_table));
+					}
+					items.push_back(finish(std::move(item)));
+				}
+				unique_ptr<ParsedExpression> list;
+				if (items.empty()) {
+					list = ConstantExpression::FromValue(Value::LIST(LogicalType::SQLNULL, vector<Value>()));
+				} else {
+					list = make_uniq<FunctionExpression>("list_value", std::move(items));
+				}
+				list->SetAlias(Identifier("__pgq_orp_" + std::to_string(c)));
+				column = std::move(list);
+			}
+			match.one_row_per = OneRowPerMode::NONE;
+			match.one_row_per_vars.clear();
+		} else {
+			for (idx_t c = 0; c < match.column_list.size(); c++) {
+				auto &column = match.column_list[c];
+				const bool star = column->GetExpressionClass() == ExpressionClass::STAR;
+				column = finish(std::move(column));
+				if (!star && column->GetAlias().empty()) {
+					column->SetAlias(Identifier(column_names[c]));
+				}
+			}
+		}
+
+		vector<unique_ptr<ParsedExpression>> conditions;
+		unique_ptr<ParsedExpression> post_selection;
+		if (selector) {
+			// Conjuncts of the MATCH WHERE on the path's endpoints alone commute with choosing a path per endpoint
+			// pair, so they stay with the match (and seed it). Every other conjunct applies to the chosen paths.
+			auto &sequence = leaf->sequences[0];
+			case_insensitive_set_t endpoints {sequence.front(), sequence.back()};
+			vector<unique_ptr<ParsedExpression>> conjuncts;
+			SplitConjuncts(std::move(match.where_clause), conjuncts);
+			vector<unique_ptr<ParsedExpression>> post;
+			for (auto &conjunct : conjuncts) {
+				case_insensitive_set_t read;
+				bool subquery = false;
+				CollectReadVariables(*conjunct, read, subquery);
+				bool endpoint_only = !subquery;
+				for (auto &name : read) {
+					endpoint_only = endpoint_only && endpoints.count(name);
+				}
+				(endpoint_only ? conditions : post).push_back(finish(std::move(conjunct)));
+			}
+			post_selection = AndAll(std::move(post));
+			if (!post_selection) {
+				post_selection = ConstantExpression::FromValue(Value::BOOLEAN(true));
+			}
+		} else {
+			conditions.push_back(finish(std::move(match.where_clause)));
+		}
+		for (auto &condition : leaf->pattern_conditions) {
+			conditions.push_back(std::move(condition));
+		}
+		match.where_clause = AndAll(std::move(conditions));
+
+		if (selector) {
+			auto &sequence = leaf->sequences[0];
+			auto &is_edge = leaf->sequence_edges[0];
+			vector<unique_ptr<ParsedExpression>> hidden;
+			hidden.push_back(SelectorElementTable(*leaf, sequence.front(), pg_table));
+			hidden.push_back(PGQColRef("rowid", sequence.front()));
+			hidden.push_back(SelectorElementTable(*leaf, sequence.back(), pg_table));
+			hidden.push_back(PGQColRef("rowid", sequence.back()));
+			int64_t hops = 0;
+			vector<unique_ptr<ParsedExpression>> edge_rows;
+			for (idx_t i = 0; i < sequence.size(); i++) {
+				if (is_edge[i]) {
+					hops++;
+					vector<FunctionArgument> pair;
+					pair.emplace_back(Identifier("t"), SelectorElementTable(*leaf, sequence[i], pg_table));
+					pair.emplace_back(Identifier("r"), SelectorEdgeRow(*leaf, sequence[i]));
+					edge_rows.push_back(make_uniq<FunctionExpression>(Identifier("struct_pack"), std::move(pair)));
+				}
+			}
+			hidden.push_back(ConstantExpression::FromValue(Value::BIGINT(hops)));
+			if (edge_rows.empty()) {
+				hidden.push_back(ConstantExpression::FromValue(Value::LIST(LogicalType::SQLNULL, vector<Value>())));
+			} else {
+				hidden.push_back(make_uniq<FunctionExpression>("list_value", std::move(edge_rows)));
+			}
+			hidden.push_back(std::move(post_selection));
+			for (idx_t i = 0; i < hidden.size(); i++) {
+				hidden[i]->SetAlias(Identifier(kSelectorColumns[i]));
+				match.column_list.push_back(std::move(hidden[i]));
+			}
+			match.path_patterns[0]->shortest = false;
+			match.path_patterns[0]->all = false;
+		}
+		SplitZeroOrOneHopEdges(match, pg_table);
+		nodes.push_back(BuildMatchBlockNode(context, match));
+	}
+	auto result = CombineUnionAll(std::move(nodes));
+
+	if (selector) {
+		const string partition = "PARTITION BY __pgq_sel_st, __pgq_sel_sr, __pgq_sel_dt, __pgq_sel_dr";
+		const string rank = all_shortest ? "rank() OVER (" + partition + " ORDER BY __pgq_sel_hops)"
+		                                 : "row_number() OVER (" + partition + " ORDER BY __pgq_sel_hops, "
+		                                   "__pgq_sel_edges)";
+		auto chosen = ParseGeneratedSelect(
+		    "SELECT * EXCLUDE (" + StringUtil::Join(kSelectorColumns, ", ") + ", __pgq_sel_rank) FROM (SELECT *, " + rank +
+		    " AS __pgq_sel_rank FROM __pgq_sel_source) WHERE __pgq_sel_rank = 1 AND __pgq_sel_post");
+		PrependCTE(*chosen, "__pgq_sel_source", std::move(result));
+		result = std::move(chosen);
+	}
+	if (one_row_per) {
+		vector<string> unnests;
+		for (idx_t c = 0; c < column_names.size(); c++) {
+			unnests.push_back("unnest(__pgq_orp_" + std::to_string(c) + ") AS " +
+			                  KeywordHelper::WriteOptionallyQuoted(column_names[c]));
+		}
+		auto unnested = ParseGeneratedSelect("SELECT " + StringUtil::Join(unnests, ", ") + " FROM __pgq_orp_source");
+		PrependCTE(*unnested, "__pgq_orp_source", std::move(result));
+		result = std::move(unnested);
+	}
+	return result;
+}
+
+//------------------------------------------------------------------------------
 // Path pattern unions
 //------------------------------------------------------------------------------
 struct PGQUnionLeaf {
@@ -12741,6 +14475,9 @@ struct PGQUnionLeaf {
 };
 
 static unique_ptr<QueryNode> BuildMatchBlockNode(ClientContext &context, MatchExpression &block) {
+	if (BlockHasQuantifiedGroup(block)) {
+		return BuildQuantifiedGroupNode(context, block);
+	}
 	if (!HasPathPatternUnion(block.path_patterns)) {
 		return BuildMatchLeafNode(context, block, true);
 	}
@@ -13012,12 +14749,13 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildLoweredMatchQueryNode(ClientContext
 	head->union_matches.clear();
 	head->union_all_flags.clear();
 	auto result = BuildMatchBlockNode(context, *head);
-	// UNION [ALL] MATCH branches share the head's COLUMNS.
+	// UNION [ALL] MATCH branches share the head's COLUMNS, unless each block has its own.
 	for (idx_t i = 0; i < ref.union_matches.size(); i++) {
 		auto branch = unique_ptr_cast<ParsedExpression, MatchExpression>(ref.union_matches[i]->Copy());
-		branch->column_list.clear();
-		for (auto &column : ref.column_list) {
-			branch->column_list.push_back(column->Copy());
+		if (branch->column_list.empty()) {
+			for (auto &column : ref.column_list) {
+				branch->column_list.push_back(column->Copy());
+			}
 		}
 		auto set_op = make_uniq<SetOperationNode>();
 		set_op->setop_type = SetOperationType::UNION;
@@ -13050,9 +14788,11 @@ static void SplitZeroOrOneHopEdges(MatchExpression &block, CreatePropertyGraphIn
 	if (block.one_row_per != OneRowPerMode::NONE) {
 		return;
 	}
-	for (auto &pattern : block.path_patterns) {
-		if (!pattern->union_operands.empty() || pattern->shortest || pattern->cheapest || pattern->topk) {
-			continue;
+	for (idx_t pattern_index = 0; pattern_index < block.path_patterns.size(); pattern_index++) {
+		auto &pattern = block.path_patterns[pattern_index];
+		if (!pattern->union_operands.empty() || pattern->shortest || pattern->cheapest || pattern->topk ||
+		    SequenceHasGroup(pattern->path_elements)) {
+			continue; // a pattern with a quantified group is split once its groups are unrolled
 		}
 		// The element list, or the one inside the subpath a path variable or path mode wraps around it.
 		auto *elements = &pattern->path_elements;
@@ -13117,6 +14857,52 @@ static void SplitZeroOrOneHopEdges(MatchExpression &block, CreatePropertyGraphIn
 				}
 			}
 			operands.push_back(std::move(operand->path_elements));
+		}
+		// An operand whose tables cannot connect (its one-hop edge leaves a vertex of another table) has no match.
+		// Leaving it out keeps the other operands' rows instead of failing on it.
+		vector<vector<unique_ptr<PathReference>>> feasible;
+		for (auto &operand : operands) {
+			PGQGroupLeaf probe;
+			probe.match = unique_ptr_cast<ParsedExpression, MatchExpression>(block.Copy());
+			auto &probe_pattern = *probe.match->path_patterns[pattern_index];
+			probe_pattern.path_elements.clear();
+			for (auto &reference : operand) {
+				probe_pattern.path_elements.push_back(reference->Copy());
+			}
+			if (PropagateGroupDomains(probe, pg_table)) {
+				feasible.push_back(std::move(operand));
+			}
+		}
+		if (!feasible.empty()) {
+			operands = std::move(feasible);
+		}
+		if (operands.size() == 1) {
+			// One operand is left: no union is built, so the variables it does not bind (the edge of a zero-hop
+			// operand) are NULL here.
+			case_insensitive_set_t before;
+			case_insensitive_set_t after;
+			case_insensitive_set_t path_names;
+			for (auto &reference : pattern->path_elements) {
+				CollectUnionNamedVariables(*reference, before, path_names);
+			}
+			for (auto &reference : operands[0]) {
+				CollectUnionNamedVariables(*reference, after, path_names);
+			}
+			case_insensitive_set_t missing;
+			for (auto &name : before) {
+				if (!after.count(name)) {
+					missing.insert(name);
+				}
+			}
+			for (auto &column : block.column_list) {
+				auto name = column->GetAlias().empty() ? column->GetName() : column->GetAlias();
+				const bool star = column->GetExpressionClass() == ExpressionClass::STAR;
+				column = NullMissingVariables(std::move(column), missing);
+				if (!star && column->GetAlias().empty()) {
+					column->SetAlias(name);
+				}
+			}
+			block.where_clause = NullMissingVariables(std::move(block.where_clause), missing);
 		}
 		pattern->path_elements = std::move(operands[0]);
 		for (idx_t i = 1; i < operands.size(); i++) {
@@ -13202,7 +14988,302 @@ static bool BlockHasPatternUnion(const MatchExpression &block) {
 			return true;
 		}
 	}
-	return false;
+	// A quantified path pattern is built as one query per iteration count, like a union.
+	return BlockHasQuantifiedGroup(block);
+}
+
+//! An aggregate over a group variable is horizontal (SQL/PGQ): it runs along the variable's list of elements, per
+//! match, not over the matches. It is marked here, before the aggregates over rows are split off, and evaluated in
+//! each leaf of the group lowering (RewriteGroupAggregate).
+static unique_ptr<ParsedExpression> MarkGroupAggregates(ClientContext &context, unique_ptr<ParsedExpression> expression,
+                                                        const case_insensitive_set_t &group_variables) {
+	if (!expression || group_variables.empty()) {
+		return expression;
+	}
+	if (IsAggregateCall(context, *expression)) {
+		auto &function = expression->Cast<FunctionExpression>();
+		bool reads_group = false;
+		for (auto &argument : function.GetArguments()) {
+			reads_group = reads_group || ReadsVariables(argument.GetExpression(), group_variables);
+		}
+		if (reads_group) {
+			if (function.Filter() || (function.OrderBy() && !function.OrderBy()->orders.empty())) {
+				throw NotImplementedException("FILTER and ORDER BY in an aggregate over a group variable are not "
+				                              "supported: it runs along the group's iterations in their order");
+			}
+			vector<unique_ptr<ParsedExpression>> arguments;
+			arguments.push_back(ConstantExpression::FromValue(Value(StringUtil::Lower(PGQStr(function.FunctionName())))));
+			arguments.push_back(ConstantExpression::FromValue(Value::BOOLEAN(function.Distinct())));
+			for (auto &argument : function.GetArgumentsMutable()) {
+				arguments.push_back(std::move(argument.GetExpressionMutable()));
+			}
+			auto marker = make_uniq<FunctionExpression>(kGroupAggregateFunction, std::move(arguments));
+			marker->SetAlias(expression->GetAlias().empty() ? expression->GetName() : expression->GetAlias());
+			return std::move(marker);
+		}
+	}
+	if (expression->GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		return expression;
+	}
+	ParsedExpressionIterator::EnumerateChildren(*expression, [&](unique_ptr<ParsedExpression> &child) {
+		child = MarkGroupAggregates(context, std::move(child), group_variables);
+	});
+	return expression;
+}
+
+//------------------------------------------------------------------------------
+// Variables of quantified edges
+//------------------------------------------------------------------------------
+// The variable of a quantified edge -[e]->{n,m} (upper bound above 1) is a group variable too (SQL/PGQ: the edge is
+// the group (()-[e]->()){n,m}): e.x is the list of the path's edges' x values in path order. A pattern that reads e
+// is rewritten here; one that does not keeps its route unchanged. label(e) alone keeps the meaning it always had
+// (the edge's label, one value), so such a query is not touched either.
+//
+// - One quantified edge between two vertices, under a search prefix or with a bound the lowering does not unroll:
+//   the pattern keeps its path search and e's values are read along the path (edge_property, edges, edge_labels).
+// - Otherwise, with a bound it unrolls: the edge becomes that group.
+
+static bool IsLabelOfVariable(const ParsedExpression &expression, const string &variable) {
+	if (expression.GetExpressionClass() != ExpressionClass::FUNCTION) {
+		return false;
+	}
+	auto &function = expression.Cast<FunctionExpression>();
+	if (!StringUtil::CIEquals(PGQStr(function.FunctionName()), "label") || function.GetArguments().size() != 1 ||
+	    function.GetArguments()[0].GetExpression().GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+		return false;
+	}
+	auto &names = function.GetArguments()[0].GetExpression().Cast<ColumnRefExpression>().ColumnNames();
+	return names.size() == 1 && StringUtil::CIEquals(PGQStr(names[0]), variable);
+}
+
+//! True when the expression reads `variable` other than through label(variable).
+static bool ReadsEdgeVariable(const ParsedExpression &expression, const string &variable) {
+	if (IsLabelOfVariable(expression, variable)) {
+		return false;
+	}
+	if (expression.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+		auto &names = expression.Cast<ColumnRefExpression>().ColumnNames();
+		return !names.empty() && StringUtil::CIEquals(PGQStr(names[0]), variable);
+	}
+	if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		return false;
+	}
+	bool found = false;
+	ParsedExpressionIterator::EnumerateChildren(
+	    expression, [&](const ParsedExpression &child) { found = found || ReadsEdgeVariable(child, variable); });
+	return found;
+}
+
+static unique_ptr<ParsedExpression> PathCall(const char *name, const string &path) {
+	vector<unique_ptr<ParsedExpression>> arguments;
+	arguments.push_back(PGQColRef(path));
+	return make_uniq<FunctionExpression>(name, std::move(arguments));
+}
+
+static unique_ptr<ParsedExpression> EdgePropertyCall(const string &path, const string &property) {
+	vector<unique_ptr<ParsedExpression>> arguments;
+	arguments.push_back(PGQColRef(path));
+	arguments.push_back(ConstantExpression::FromValue(Value(property)));
+	return make_uniq<FunctionExpression>("edge_property", std::move(arguments));
+}
+
+//! e's references written as the values along path `path`, whose edges are exactly e's.
+static unique_ptr<ParsedExpression> RewriteEdgeVariableAlongPath(ClientContext &context,
+                                                                 unique_ptr<ParsedExpression> expression,
+                                                                 const string &variable, const string &path) {
+	if (!expression) {
+		return expression;
+	}
+	auto alias = expression->GetAlias();
+	auto keep_alias = [&](unique_ptr<ParsedExpression> result) {
+		result->SetAlias(alias.empty() ? expression->GetName() : alias);
+		return result;
+	};
+	if (IsAggregateCall(context, *expression) && ReadsEdgeVariable(*expression, variable)) {
+		auto &function = expression->Cast<FunctionExpression>();
+		const auto name = StringUtil::Lower(PGQStr(function.FunctionName()));
+		if (function.GetArguments().size() != 1 || function.Filter() ||
+		    (function.OrderBy() && !function.OrderBy()->orders.empty())) {
+			throw NotImplementedException("%s() over the variable of a quantified edge supports one argument, without "
+			                              "FILTER or ORDER BY",
+			                              name);
+		}
+		auto &argument = function.GetArguments()[0].GetExpression();
+		if (argument.GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+			throw NotImplementedException("%s() over an expression of the variable of a quantified edge with this bound "
+			                              "is not supported; aggregate one property, e.g. %s(%s.x)",
+			                              name, name, variable);
+		}
+		auto &names = argument.Cast<ColumnRefExpression>().ColumnNames();
+		if (names.size() == 1) {
+			if (name != "count") {
+				throw BinderException("%s(%s) needs a property of the edge, e.g. %s(%s.x)", name, variable, name, variable);
+			}
+			return keep_alias(PathCall("path_length", path));
+		}
+		unique_ptr<ParsedExpression> list = EdgePropertyCall(path, PGQStr(names[1]));
+		if (function.Distinct()) {
+			vector<unique_ptr<ParsedExpression>> distinct_args;
+			distinct_args.push_back(std::move(list));
+			list = make_uniq<FunctionExpression>("list_distinct", std::move(distinct_args));
+		}
+		vector<unique_ptr<ParsedExpression>> aggregate_args;
+		aggregate_args.push_back(std::move(list));
+		aggregate_args.push_back(ConstantExpression::FromValue(Value(name)));
+		return keep_alias(make_uniq<FunctionExpression>("list_aggregate", std::move(aggregate_args)));
+	}
+	if (expression->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+		auto &names = expression->Cast<ColumnRefExpression>().ColumnNames();
+		if (names.empty() || !StringUtil::CIEquals(PGQStr(names[0]), variable)) {
+			return expression;
+		}
+		if (names.size() == 1) {
+			throw BinderException("'%s' is the variable of a quantified edge and stands for a list of edges: read a "
+			                      "property (%s.x), element_id(%s) or an aggregate over it",
+			                      variable, variable, variable);
+		}
+		return keep_alias(EdgePropertyCall(path, PGQStr(names[1])));
+	}
+	if (expression->GetExpressionClass() == ExpressionClass::FUNCTION) {
+		auto &function = expression->Cast<FunctionExpression>();
+		auto name = StringUtil::Lower(PGQStr(function.FunctionName()));
+		if ((name == "element_id" || name == "label") && function.GetArguments().size() == 1 &&
+		    function.GetArguments()[0].GetExpression().GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+			auto &names = function.GetArguments()[0].GetExpression().Cast<ColumnRefExpression>().ColumnNames();
+			if (names.size() == 1 && StringUtil::CIEquals(PGQStr(names[0]), variable)) {
+				return keep_alias(PathCall(name == "element_id" ? "edges" : "edge_labels", path));
+			}
+		}
+	}
+	if (expression->GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		return expression;
+	}
+	ParsedExpressionIterator::EnumerateChildren(*expression, [&](unique_ptr<ParsedExpression> &child) {
+		child = RewriteEdgeVariableAlongPath(context, std::move(child), variable, path);
+	});
+	return expression;
+}
+
+//! Rewrites the patterns of `block` whose quantified edges have a variable the query reads. `columns` are the
+//! COLUMNS that apply to the block; `owns_columns` is false when they are shared with other blocks.
+static void PromoteQuantifiedEdgeVariables(ClientContext &context, MatchExpression &block,
+                                           vector<unique_ptr<ParsedExpression>> &columns, bool owns_columns) {
+	case_insensitive_set_t orp_variables(block.one_row_per_vars.begin(), block.one_row_per_vars.end());
+	idx_t generated = 0;
+	for (auto &pattern : block.path_patterns) {
+		if (!pattern->union_operands.empty() || pattern->cheapest || pattern->topk) {
+			continue;
+		}
+		auto &sequence = PatternSequence(*pattern);
+		for (idx_t i = 0; i < sequence.size(); i++) {
+			auto *quantified = PGQMatchFunction::GetSubPath(sequence[i]);
+			if (!quantified || quantified->quantified_group || quantified->path_list.size() != 1 ||
+			    quantified->upper <= 1 || quantified->cost_expr) {
+				continue;
+			}
+			auto *edge = PGQMatchFunction::GetPathElement(quantified->path_list[0]);
+			if (!edge || edge->match_type == PGQMatchType::MATCH_VERTEX) {
+				continue;
+			}
+			const auto &variable = edge->variable_binding;
+			bool read = false;
+			if (!IsGeneratedVariable(variable) && !orp_variables.count(variable)) {
+				for (auto &column : columns) {
+					read = read || ReadsEdgeVariable(*column, variable);
+				}
+				read = read || (block.where_clause && ReadsEdgeVariable(*block.where_clause, variable));
+			}
+			const bool element_where = quantified->where_clause != nullptr;
+			if (!read && !element_where) {
+				continue;
+			}
+			const bool unrollable =
+			    quantified->upper < int64_t(1 << 30) && quantified->upper <= kGroupMaxUnrolledIterations;
+			const bool single_segment = sequence.size() == 3 && i == 1;
+			if (read && single_segment && !element_where && block.one_row_per == OneRowPerMode::NONE &&
+			    (pattern->shortest || !unrollable) && owns_columns) {
+				// Keep the path search; read e along the path.
+				auto *wrapper = PatternSequenceWrapper(*pattern);
+				string path;
+				if (wrapper && !wrapper->path_variable.empty()) {
+					path = wrapper->path_variable;
+				} else {
+					path = "__pgq_qe_path" + std::to_string(generated++);
+					if (wrapper) {
+						wrapper->path_variable = path;
+					} else {
+						auto named = make_uniq<SubPath>(PGQPathReferenceType::SUBPATH);
+						named->path_variable = path;
+						named->path_list = std::move(pattern->path_elements);
+						pattern->path_elements.clear();
+						pattern->path_elements.push_back(std::move(named));
+					}
+				}
+				for (auto &column : columns) {
+					column = RewriteEdgeVariableAlongPath(context, std::move(column), variable, path);
+				}
+				block.where_clause = RewriteEdgeVariableAlongPath(context, std::move(block.where_clause), variable, path);
+				break; // the pattern's element list was rewrapped
+			}
+			if (!unrollable) {
+				continue; // as before: e cannot be read here
+			}
+			// The edge is the group (()-[e]->()){n,m}.
+			auto group = make_uniq<SubPath>(PGQPathReferenceType::SUBPATH);
+			group->quantified_group = true;
+			group->lower = quantified->lower;
+			group->upper = quantified->upper;
+			group->path_mode = quantified->path_mode;
+			auto vertex = [&](const char *end) {
+				auto element = make_uniq<PathElement>(PGQPathReferenceType::PATH_ELEMENT);
+				element->match_type = PGQMatchType::MATCH_VERTEX;
+				element->variable_binding = "_anon_qe" + std::to_string(generated) + end;
+				return element;
+			};
+			group->path_list.push_back(vertex("s"));
+			if (quantified->where_clause) {
+				auto element_wrapper = make_uniq<SubPath>(PGQPathReferenceType::SUBPATH);
+				element_wrapper->where_clause = std::move(quantified->where_clause);
+				element_wrapper->path_list.push_back(std::move(quantified->path_list[0]));
+				group->path_list.push_back(std::move(element_wrapper));
+			} else {
+				group->path_list.push_back(std::move(quantified->path_list[0]));
+			}
+			group->path_list.push_back(vertex("d"));
+			generated++;
+			sequence[i] = std::move(group);
+		}
+	}
+}
+
+static void PromoteQuantifiedEdgeVariables(ClientContext &context, MatchExpression &ref) {
+	const bool shared = !ref.union_matches.empty() && ref.union_matches[0]->column_list.empty();
+	PromoteQuantifiedEdgeVariables(context, ref, ref.column_list, !shared);
+	for (auto &branch : ref.union_matches) {
+		if (branch->column_list.empty()) {
+			PromoteQuantifiedEdgeVariables(context, *branch, ref.column_list, false);
+		} else {
+			PromoteQuantifiedEdgeVariables(context, *branch, branch->column_list, true);
+		}
+	}
+}
+
+static void MarkGroupAggregates(ClientContext &context, MatchExpression &block) {
+	if (!BlockHasQuantifiedGroup(block)) {
+		return;
+	}
+	case_insensitive_map_t<idx_t> group_of;
+	auto specs = CollectGroups(block, group_of);
+	case_insensitive_set_t group_variables;
+	for (auto &entry : group_of) {
+		if (specs[entry.second].lists) {
+			group_variables.insert(entry.first);
+		}
+	}
+	for (auto &column : block.column_list) {
+		column = MarkGroupAggregates(context, std::move(column), group_variables);
+	}
+	block.where_clause = MarkGroupAggregates(context, std::move(block.where_clause), group_variables);
 }
 
 unique_ptr<TableRef> PGQMatchFunction::AggregateOverUnion(ClientContext &context, MatchExpression &ref) {
@@ -13272,6 +15353,7 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	auto match_copy = unique_ptr_cast<ParsedExpression, MatchExpression>(match_info->match->Copy());
 	auto *ref = match_copy.get();
 	NormalizeMatchExpression(*ref);
+	PromoteQuantifiedEdgeVariables(context, *ref);
 	{
 		QualifiedName graph_name(Identifier(ref->pg_catalog), Identifier(ref->pg_schema), Identifier(ref->pg_name));
 		auto &pg_table = *duckpgq_state->GetPropertyGraph(context, graph_name);
@@ -13281,6 +15363,10 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 		}
 	}
 	duckpgq_state->BeginRewriteDiagnostics(context);
+	MarkGroupAggregates(context, *ref);
+	for (auto &branch : ref->union_matches) {
+		MarkGroupAggregates(context, *branch);
+	}
 	if (auto aggregated = AggregateOverUnion(context, *ref)) {
 		return aggregated;
 	}

@@ -125,6 +125,7 @@ put over DuckLake catalogs. A graph is stored in the database it is created in a
 | `->`, `<-`, `-`, `<->` | anonymous edge of any label |
 | `-[:R]->{1,5}`, `{,3}`, `{2,}`, `{2}`, `*`, `+`, `?` | quantified (variable-length) edge, quantifier after the arrow |
 | `-[:R*1..5]->`, `-[:R*]->`, `-[:R*2]->`, `-[:R*..3]->`, `-[:R*0..]->` | Cypher's quantifier inside the edge, with Cypher's meaning (see below) |
+| `(t) ((a)-[e:R]->(b) WHERE e.w > 1){1,3} (z)`, `[(a)-[e:R]->(b)]{1,3}`, `{n}`, `{,m}`, `?` | quantified path pattern: the parenthesized (or bracketed) body repeated, its optional `WHERE` per repetition; its variables are lists outside it (see [Quantified path patterns](#quantified-path-patterns)) |
 | `MATCH (t)-[:A]->(a), (t)-[:B]->(b)` | several patterns sharing a variable |
 | `MATCH p = …` | path variable |
 | `ANY SHORTEST`, `ALL SHORTEST`, `ANY CHEAPEST`, `ALL CHEAPEST` | path search; `COST expr [DEFAULT n]` on an edge gives its weight, a number (`DEFAULT` where `expr` is NULL). A NULL cost without `DEFAULT`, and a negative or non-finite one, is an error. CHEAPEST returns the path(s) of the least total cost within the quantifier's bounds (`ALL`: every tied path), and the path functions, `ONE ROW PER` and `cost(p)` all describe them |
@@ -164,6 +165,46 @@ walks that return to their start vertex are left out, and an edge stored twice i
 zero-hop walk, which binds the end vertex to the start; `-[e]->?` (`{0,1}`) is the plain edge's matches, self-loops
 included, plus those, with `e` NULL in them.
 
+### Quantified path patterns
+
+A parenthesized path pattern with a quantifier repeats its body: `MATCH (t:TAG) ((a)-[:HAS_WORKORDER]->(w:WORK_ORDER)
+-[:HAS_OPERATION]->(o)){1,3}` matches one to three repetitions of tag, work order and operation. Square brackets
+work the same: `[(a)-[:R]->(b)]{1,3}`. The quantifiers are those of edges. An optional `WHERE` before the closing
+parenthesis holds in each repetition, and element `WHERE`s inside the body do too.
+
+- **Concatenation.** Adjacent vertex patterns are one vertex, as in SQL/PGQ. The vertex before the group is the
+  first repetition's first vertex, each repetition's last vertex is the next one's first, and the vertex after the
+  group is the last one's last. With zero repetitions the vertices around the group are one vertex. A group may start
+  the pattern, follow an edge or vertex, be followed by one, and several groups may appear in one pattern.
+- **Group variables.** A variable declared in a group whose upper bound is above 1 stands, outside the group, for the
+  list of its elements in repetition order. So `w.name` is `[w1.name, w2.name, …]`, `element_id(e)` and `label(w)`
+  are lists, and zero repetitions give `[]`. Read them with DuckDB's list functions, as in
+  `list_contains(w.status, 'open')` or `len(e.w)`. An aggregate whose argument reads a group variable runs along
+  its list (SQL/PGQ horizontal aggregation): `SUM(e.weight)`, `COUNT(e)` (the number of repetitions), `AVG`, `MIN`,
+  `MAX`, `LIST`. Inside the group (its `WHERE` and element `WHERE`s) the variable is the element of that
+  repetition. A group with an upper bound of 1 (`?`, `{0,1}`, no quantifier) binds its variables once, or NULL when
+  it matches zero times.
+- **Quantified edges.** The variable of a quantified edge is a group variable too: `-[e:R]->{1,3}` is the group
+  `(()-[e:R]->()){1,3}`, so `e.w` is the list of the path's edge weights in path order. An element `WHERE` on a
+  quantified edge holds for each of its edges. A query that does not read the variable is answered exactly as
+  before, and so is one that reads only `label(e)`, which keeps its single value.
+- **No vertex twice.** A group with an upper bound above 1 visits no vertex twice across its repetitions, the
+  vertices before and after it included. This is the rule of a quantified edge: `(()-[e:R]->()){1,3}` and
+  `-[e:R]->{1,3}` return the same rows. SQL/PGQ's default would be WALK. Path modes add nothing, as for quantified
+  edges.
+- **Paths.** A path variable, `ONE ROW PER VERTEX / EDGE / STEP` and `ANY` / `ALL SHORTEST` describe the whole
+  path pattern: the fixed parts and every repetition. A property that a table on the path does not have is NULL in
+  `ONE ROW PER`. A shortest path is chosen per pair of endpoints by hop count; `ANY` breaks ties by the smallest
+  edge sequence. A `MATCH WHERE` condition on the endpoints alone seeds the match. Any other condition applies to
+  the chosen paths, so it removes rows and does not pick longer paths (SQL/PGQ applies the graph pattern's `WHERE`
+  after selection).
+- **How it runs.** The group is written out once per repetition count. Each count is an ordinary fixed-length
+  MATCH: joins seeded by the MATCH's conditions, ABI fixed-path artifacts, vertex elimination. The counts are
+  combined with UNION ALL. Counts that cannot match because the tables at a junction do not connect are left out.
+  Without a condition on a vertex outside the group, the MATCH is costed against `pgq_max_vl_fallback_rows` and
+  refused over it. A pattern that is one quantified edge under `ANY` / `ALL SHORTEST`, or one with an unbounded or
+  large quantifier, keeps its path search and reads `e` along the path found.
+
 `SHORTEST k` follows SQL/PGQ: the k shortest paths per endpoint pair, as walks (a vertex or edge may repeat, and a
 path may return to its start) unless a path mode restricts them: `TRAIL` (no edge twice), `ACYCLIC` (no vertex twice),
 `SIMPLE` (no vertex twice except a return to the start). SQL/PGQ leaves the choice among paths tied at the k-th
@@ -184,6 +225,8 @@ runs on. No artifact holds k paths per pair: `SHORTEST k` always traverses.
 | `ALL_DIFFERENT(a, b, …)` | the bound elements are pairwise distinct |
 | `path_length(p)`, `vertices(p)`, `edges(p)` | hops; the path's vertices (row ids when traversed, keys when an ABI artifact answers) and edges (row ids; no artifact has them, so a pattern asking for `edges(p)` is traversed) |
 | `vertex_labels(p)`, `edge_labels(p)` | declared labels along the path, in path order, traversed or answered by an ABI artifact. They need each vertex and edge of the path to have one table, from its label or from the edge next to it |
+| `g.x`, `element_id(g)`, `label(g)` of a group variable `g` (declared in a quantified path pattern, or on a quantified edge) | the list of its elements' values in repetition (path) order; `[]` for zero repetitions |
+| `SUM(g.x)`, `COUNT(g)`, `AVG`, `MIN`, `MAX`, `LIST(g.x)` over a group variable | the aggregate along the list, per match (horizontal aggregation); an aggregate over anything else in `COLUMNS` is over the rows |
 | `vertex_property(p, 'x')`, `edge_property(p, 'x')` | property `x` of every vertex / edge of path `p`, in path order (NULL where an element's table has no `x`), for aggregating along the path: `list_sum(edge_property(p, 'weight'))`, `list_avg`, `list_min`, `list_max`, `len`. In COLUMNS and WHERE, on every route that answers `vertices(p)` / `edges(p)`, ABI artifacts included; `edge_property` is traversed, like `edges(p)` |
 | `cost(p)` | total cost of an `ANY`/`ALL CHEAPEST` path: BIGINT for integer costs, DOUBLE for any other number (DECIMAL included) |
 | `path_tree_json(…)`, `graph_tree_json(…)` | nest paths into a JSON tree |
@@ -454,9 +497,17 @@ building in [abi_build.cpp](src/core/functions/table/abi_build.cpp); vertex-join
 ## Limitations
 
 - **One DuckDB version per binary**, and unsigned (see [Deployment](#deployment)).
-- **Patterns not supported:** bracketed sub-path groups `[ … ]{n,m}` and parenthesized path patterns (a quantified
-  or nested union such as `((a)-[:R]->(b) | (a)-[:S]->(b)){1,3}`), `LATERAL` inside `MATCH`, graph updates
-  (`INSERT`/`DELETE` of vertices or edges; the graph is a view over tables).
+- **Patterns not supported:** `LATERAL` inside `MATCH`, graph updates (`INSERT`/`DELETE` of vertices or edges; the
+  graph is a view over tables).
+- **Quantified path patterns** are written out per repetition count. A group allows at most 8 repetitions, and a
+  MATCH at most 64 combinations of counts and 48 edges in one written-out pattern. A group without an upper bound
+  (`+`, `*`, `{2,}`) or with a larger one is refused. The same holds for the variable of such a quantified edge in a
+  longer pattern; alone between two vertices the path search answers it. Refused with an explanation:
+  - nested groups, and a quantified edge or a union inside a group;
+  - a group in `OPTIONAL MATCH` or `EXISTS { }`, and a group variable named in `EXISTS { }` or as `g.*`;
+  - `SHORTEST k` and `CHEAPEST` over a group;
+  - `ONE ROW PER` or a search prefix over a group whose pattern is not the MATCH's only one;
+  - a path variable or search prefix inside the group.
 - **Path pattern unions** (`|`, `|+|`) stand at the top level of a MATCH pattern, and take no search prefix
   (`ANY SHORTEST … | …`), OPTIONAL MATCH or ONE ROW PER. `|` removes duplicates only between fixed-length, directed
   operands; operands that may match the same variable-length walk need `|+|` or disjoint labels.

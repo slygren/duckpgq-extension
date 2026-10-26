@@ -457,12 +457,12 @@ SET pgq_require_abi_paths = false;
 statement error
 FROM GRAPH_TABLE (g MATCH ((a:P)-[:R]->(b:P) | (a:P)-[:S]->(b:P)){1,3} COLUMNS (a.id));
 ----
-Parenthesized path patterns are not supported
+A path pattern union ('|' or '|+|') inside a parenthesized path pattern is not supported
 
 statement error
 FROM GRAPH_TABLE (g MATCH (x:P)-[:R]->((a:P)-[:R]->(b:P) | (a:P)-[:S]->(b:P)) COLUMNS (x.id));
 ----
-Parenthesized path patterns are not supported
+A path pattern union ('|' or '|+|') inside a parenthesized path pattern is not supported
 
 statement error
 FROM GRAPH_TABLE (g MATCH (a:P)-[:R]->(b:P) | (a:P)-[:S]->(b:P) |+| (a:P)-[:S]->(b:P) COLUMNS (a.id));

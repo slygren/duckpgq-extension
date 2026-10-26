@@ -111,6 +111,61 @@ FROM GRAPH_TABLE (social MATCH p = (a:Person WHERE a.name = 'Ann')-[:Knows]->{1,
 | Dan | 3 |
 | Eve | 3 |
 
+### Repeated sub-patterns (quantified path patterns)
+
+A parenthesized, or bracketed, path pattern with a quantifier repeats its body. Its `WHERE` holds in each
+repetition. Adjacent vertex patterns are one vertex, so the group continues from the vertex before it. Its
+variables are lists outside the group, in repetition order, and an aggregate over one runs along that list.
+These examples were run on branch round2-subpatterns.
+```sql
+FROM GRAPH_TABLE (social MATCH (a:Person WHERE a.name = 'Ann') ((x)-[k:Knows]->(y) WHERE k.since >= 2020){1,3} (b)
+  COLUMNS (b.name AS reached, y.name AS via, k.since AS years, sum(k.w) AS total_w)) ORDER BY ALL;
+```
+| reached | via | years | total_w |
+|---|---|---|---|
+| Cid | [Cid] | [2020] | 5.0 |
+| Dan | [Cid, Dan] | [2020, 2024] | 5.5 |
+| Eve | [Cid, Dan, Eve] | [2020, 2024, 2022] | 7.5 |
+
+Zero repetitions make the vertices around the group one vertex, with empty lists:
+```sql
+FROM GRAPH_TABLE (social MATCH (a:Person WHERE a.name = 'Bob') [(x)-[:Knows]->(y)]{0,2} (b)-[:LivesIn]->(c:City)
+  COLUMNS (b.name AS person, x.name AS walked, c.name AS city)) ORDER BY ALL;
+```
+| person | walked | city |
+|---|---|---|
+| Bob | [] | Oslo |
+| Cid | [Bob] | Bergen |
+| Dan | [Bob, Cid] | Bergen |
+
+The variable of a quantified edge is such a list too (`-[k]->{1,3}` is the group `(()-[k]->()){1,3}`):
+```sql
+FROM GRAPH_TABLE (social MATCH (a:Person WHERE a.name = 'Ann')-[k:Knows]->{1,3}(b:Person)
+  COLUMNS (b.name AS reached, k.since AS years, list_sum(k.w) AS total_w, count(k) AS hops)) ORDER BY hops, reached;
+```
+| reached | years | total_w | hops |
+|---|---|---|---|
+| Bob | [2019] | 1.0 | 1 |
+| Cid | [2020] | 5.0 | 1 |
+| Cid | [2019, 2021] | 2.0 | 2 |
+| Dan | [2020, 2024] | 5.5 | 2 |
+| Dan | [2019, 2021, 2024] | 2.5 | 3 |
+| Eve | [2020, 2024, 2022] | 7.5 | 3 |
+
+Path variables, `ONE ROW PER` and `ANY` / `ALL SHORTEST` cover the whole path:
+```sql
+FROM GRAPH_TABLE (social MATCH p = ANY SHORTEST (a:Person WHERE a.name = 'Ann') ((x)-[k:Knows]->(y)){1,4} (b:Person WHERE b.name = 'Eve')
+  ONE ROW PER STEP (v1, e, v2) COLUMNS (v1.name AS from_, e.since AS since, v2.name AS to_));
+```
+| from_ | since | to_ |
+|---|---|---|
+| Ann | 2020 | Cid |
+| Cid | 2024 | Dan |
+| Dan | 2022 | Eve |
+
+A group visits no vertex twice, as a quantified edge does. It allows at most 8 repetitions; `+`, `*` and larger
+bounds are refused.
+
 ### Cypher-style quantifiers
 
 These mean what they mean in Neo4j: a bare `*` is one or more hops here, but zero or more in the arrow form `->*`.
@@ -363,7 +418,8 @@ Being worked on now:
   - `ALTER PROPERTY GRAPH`.
 - **Predicates:** `IS SOURCE OF`, `IS DESTINATION OF`, `SAME`, `PROPERTY_EXISTS`, `labels()`.
 - **Selectors:** `ANY k` and `SHORTEST k GROUP`.
-- **Repeated sub-patterns** (`((a)-[:R]->(b)){1,3}`) and **edge variables under a quantifier** (`-[e]->{1,2}` then `e.w`).
+- **Repeated sub-patterns without an upper bound, or above 8 repetitions** (`((a)-[:R]->(b)-[:S]->(c))+`), nested
+  ones, and ones in OPTIONAL MATCH or EXISTS.
 - **CHEAPEST refusals:**
   - `COST(p)` in the MATCH WHERE;
   - CHEAPEST inside OPTIONAL MATCH;
