@@ -34,11 +34,26 @@ public:
 		CreatePropertyGraphGlobalData() = default;
 	};
 
+	//! The columns of an element table, which is a table or a view.
+	struct ElementColumns {
+		vector<Identifier> names;
+		vector<LogicalType> types;
+		//! The table's catalog entry; null for a view.
+		optional_ptr<TableCatalogEntry> table;
+		bool is_view = false;
+
+		bool Exists(const Identifier &name) const;
+		LogicalType Type(const Identifier &name) const;
+	};
+
+	//! The columns of the table or view the element table names; throws when there is neither.
+	static ElementColumns ResolveElementColumns(ClientContext &context, const PropertyGraphTable &pg_table);
+
 	static void CheckPropertyGraphTableLabels(const shared_ptr<PropertyGraphTable> &pg_table,
-	                                          optional_ptr<TableCatalogEntry> &table);
+	                                          const ElementColumns &table);
 
 	static void CheckPropertyGraphTableColumns(const shared_ptr<PropertyGraphTable> &pg_table,
-	                                           optional_ptr<TableCatalogEntry> &table);
+	                                           const ElementColumns &table);
 
 	static reference<TableCatalogEntry> GetTableCatalogEntry(ClientContext &context,
 	                                                         shared_ptr<PropertyGraphTable> &pg_table);
@@ -58,7 +73,7 @@ public:
 	                         const vector<unique_ptr<Constraint>> &table_constraints);
 
 	static void ValidateForeignKeyColumns(shared_ptr<PropertyGraphTable> &edge_table,
-	                                      const vector<Identifier> &fk_columns, optional_ptr<TableCatalogEntry> &table);
+	                                      const vector<Identifier> &fk_columns, const ElementColumns &table);
 
 	static unique_ptr<GlobalTableFunctionState> CreatePropertyGraphInit(ClientContext &context,
 	                                                                    TableFunctionInitInput &input);

@@ -45,11 +45,20 @@ static optional_ptr<TableCatalogEntry> GetPropertyGraphTable(ClientContext &cont
 	return GetPropertyGraphTableEntry(context, *table);
 }
 
-static optional_ptr<CatalogEntry> GetPropertyGraphView(ClientContext &context,
-                                                       const shared_ptr<PropertyGraphTable> &table) {
-	auto &catalog = Catalog::GetCatalog(context, PGQIdentifier(table->catalog_name));
-	return catalog.GetEntry(context, CatalogType::VIEW_ENTRY, PGQIdentifier(table->schema_name),
-	                        PGQIdentifier(table->table_name), OnEntryNotFound::RETURN_NULL);
+//! The columns that number a view's rows (see PGQElementRelations): the key first, then every other column, so that
+//! only identical rows tie even where the key is not unique.
+static vector<Identifier> IdentityColumns(const vector<Identifier> &key, const vector<Identifier> &columns) {
+	vector<Identifier> result = key;
+	for (auto &column : columns) {
+		bool in_key = false;
+		for (auto &key_column : key) {
+			in_key = in_key || StringUtil::CIEquals(key_column.GetIdentifierName(), column.GetIdentifierName());
+		}
+		if (!in_key) {
+			result.push_back(column);
+		}
+	}
+	return result;
 }
 
 static void ThrowMissingVertexReference(CreatePropertyGraphInfo &info, const Identifier &catalog_name,
@@ -71,15 +80,64 @@ static vector<Identifier> ExpandAllColumnsExcept(vector<string> column_names,
 	return StringsToIdentifiers(selected_columns);
 }
 
+bool CreatePropertyGraphFunction::ElementColumns::Exists(const Identifier &name) const {
+	return Type(name).id() != LogicalTypeId::INVALID;
+}
+
+LogicalType CreatePropertyGraphFunction::ElementColumns::Type(const Identifier &name) const {
+	for (idx_t i = 0; i < names.size(); i++) {
+		if (StringUtil::CIEquals(names[i].GetIdentifierName(), name.GetIdentifierName())) {
+			return types[i];
+		}
+	}
+	return LogicalType::INVALID;
+}
+
+CreatePropertyGraphFunction::ElementColumns
+CreatePropertyGraphFunction::ResolveElementColumns(ClientContext &context, const PropertyGraphTable &pg_table) {
+	ElementColumns result;
+	auto entry = GetPropertyGraphCatalogEntry(context, pg_table);
+	if (entry && entry->type == CatalogType::TABLE_ENTRY) {
+		auto &table = entry->Cast<TableCatalogEntry>();
+		result.table = &table;
+		for (auto &column : table.GetColumns().Logical()) {
+			result.names.push_back(column.Name());
+			result.types.push_back(column.Type());
+		}
+		return result;
+	}
+	if (entry && entry->type == CatalogType::VIEW_ENTRY) {
+		auto &view = entry->Cast<ViewCatalogEntry>();
+		view.BindView(context);
+		auto columns = view.GetColumnInfo();
+		if (!columns) {
+			throw Exception(ExceptionType::INVALID, "Could not determine the columns of view " + pg_table.table_name);
+		}
+		result.is_view = true;
+		result.names = columns->names;
+		result.types = columns->types;
+		for (auto &name : result.names) {
+			// The view's element id is exposed as rowid (see PGQElementRelations).
+			if (StringUtil::CIEquals(name.GetIdentifierName(), "rowid")) {
+				throw Exception(ExceptionType::INVALID, "View " + pg_table.table_name +
+				                                            " has a column named rowid, which a property graph "
+				                                            "element table over a view cannot have");
+			}
+		}
+		return result;
+	}
+	throw Exception(ExceptionType::INVALID, "Table with name " + pg_table.table_name + " does not exist");
+}
+
 void CreatePropertyGraphFunction::CheckPropertyGraphTableLabels(const shared_ptr<PropertyGraphTable> &pg_table,
-                                                                optional_ptr<TableCatalogEntry> &table) {
+                                                                const ElementColumns &table) {
 	if (!pg_table->discriminator.empty()) {
-		if (!table->ColumnExists(PGQIdentifier(pg_table->discriminator))) {
+		if (!table.Exists(PGQIdentifier(pg_table->discriminator))) {
 			throw Exception(ExceptionType::INVALID,
 			                "Column " + pg_table->discriminator + " not found in table " + pg_table->table_name);
 		}
-		auto &column = table->GetColumn(PGQIdentifier(pg_table->discriminator));
-		if (!(column.GetType() == LogicalType::BIGINT || column.GetType() == LogicalType::INTEGER)) {
+		auto type = table.Type(PGQIdentifier(pg_table->discriminator));
+		if (!(type == LogicalType::BIGINT || type == LogicalType::INTEGER)) {
 			throw Exception(ExceptionType::INVALID, "The discriminator column " + pg_table->discriminator +
 			                                            " of table " + pg_table->table_name +
 			                                            " should be of type BIGINT or INTEGER");
@@ -88,26 +146,26 @@ void CreatePropertyGraphFunction::CheckPropertyGraphTableLabels(const shared_ptr
 }
 
 void CreatePropertyGraphFunction::CheckPropertyGraphTableColumns(const shared_ptr<PropertyGraphTable> &pg_table,
-                                                                 optional_ptr<TableCatalogEntry> &table) {
+                                                                 const ElementColumns &table) {
 	if (pg_table->no_columns) {
 		return;
 	}
 
 	if (pg_table->all_columns) {
 		for (auto &except_column : pg_table->except_columns) {
-			if (!table->ColumnExists(PGQIdentifier(except_column))) {
+			if (!table.Exists(PGQIdentifier(except_column))) {
 				throw Exception(ExceptionType::INVALID,
 				                "EXCEPT column " + except_column + " not found in table " + pg_table->table_name);
 			}
 		}
 
-		pg_table->column_names = ExpandAllColumnsExcept(table->GetColumns().GetColumnNames(), pg_table->except_columns);
+		pg_table->column_names = ExpandAllColumnsExcept(IdentifiersToStrings(table.names), pg_table->except_columns);
 		pg_table->column_aliases = pg_table->column_names;
 		return;
 	}
 
 	for (auto &column : pg_table->column_names) {
-		if (!table->ColumnExists(PGQIdentifier(column))) {
+		if (!table.Exists(PGQIdentifier(column))) {
 			throw Exception(ExceptionType::INVALID, "Column " + column + " not found in table " + pg_table->table_name);
 		}
 	}
@@ -166,9 +224,9 @@ void CreatePropertyGraphFunction::ValidateKeys(shared_ptr<PropertyGraphTable> &e
 
 void CreatePropertyGraphFunction::ValidateForeignKeyColumns(shared_ptr<PropertyGraphTable> &edge_table,
                                                             const vector<Identifier> &fk_columns,
-                                                            optional_ptr<TableCatalogEntry> &table) {
+                                                            const ElementColumns &table) {
 	for (const auto &fk : fk_columns) {
-		if (!table->ColumnExists(PGQIdentifier(fk))) {
+		if (!table.Exists(PGQIdentifier(fk))) {
 			throw Exception(ExceptionType::INVALID,
 			                "Foreign key " + fk + " does not exist in table " + edge_table->table_name);
 		}
@@ -188,13 +246,9 @@ void CreatePropertyGraphFunction::ValidateVertexTableRegistration(shared_ptr<Pro
 void CreatePropertyGraphFunction::ValidatePrimaryKeyInTable(ClientContext &context,
                                                             shared_ptr<PropertyGraphTable> &pg_table,
                                                             const vector<Identifier> &pk_columns) {
-	auto table = GetPropertyGraphTable(context, pg_table);
-	if (!table) {
-		throw Exception(ExceptionType::INVALID, "Table with name " + pg_table->table_name + " does not exist");
-	}
-
+	auto table = ResolveElementColumns(context, *pg_table);
 	for (const auto &pk : pk_columns) {
-		if (!table->ColumnExists(PGQIdentifier(pk))) {
+		if (!table.Exists(PGQIdentifier(pk))) {
 			throw Exception(ExceptionType::INVALID,
 			                "Primary key " + pk + " does not exist in table " + pg_table->table_name);
 		}
@@ -229,28 +283,21 @@ unique_ptr<FunctionData> CreatePropertyGraphFunction::CreatePropertyGraphBind(Cl
 	}
 
 	case_insensitive_set_t v_table_names;
+	case_insensitive_map_t<ElementColumns> vertex_columns;
 	for (auto &vertex_table : info->vertex_tables) {
+		ElementColumns table;
 		try {
 			BindPropertyGraphTable(context, vertex_table);
-
-			auto table = GetPropertyGraphTable(context, vertex_table);
-			if (!table) {
-				throw Exception(ExceptionType::INVALID,
-				                "Table with name " + vertex_table->table_name + " does not exist");
-			}
+			table = ResolveElementColumns(context, *vertex_table);
 			CheckPropertyGraphTableColumns(vertex_table, table);
 			CheckPropertyGraphTableLabels(vertex_table, table);
 		} catch (CatalogException &e) {
-			auto table = GetPropertyGraphView(context, vertex_table);
-			if (table) {
-				throw Exception(ExceptionType::INVALID, "Found a view with name " + vertex_table->table_name +
-				                                            ". Creating property graph tables over views is "
-				                                            "currently not supported.");
-			}
 			throw Exception(ExceptionType::INVALID, e.what());
 		} catch (BinderException &e) {
 			throw Exception(ExceptionType::INVALID, "Catalog '" + vertex_table->catalog_name + "' does not exist!");
 		}
+		vertex_table->is_view = table.is_view;
+		vertex_columns[vertex_table->FullTableName()] = table;
 		v_table_names.insert(vertex_table->FullTableName());
 		if (vertex_table->hasTableNameAlias()) {
 			v_table_names.insert(vertex_table->table_name_alias.GetIdentifierName());
@@ -260,17 +307,24 @@ unique_ptr<FunctionData> CreatePropertyGraphFunction::CreatePropertyGraphBind(Cl
 	for (auto &edge_table : info->edge_tables) {
 		try {
 			BindPropertyGraphTable(context, edge_table);
-			auto table = GetPropertyGraphTable(context, edge_table);
-			if (!table) {
-				throw Exception(ExceptionType::INVALID,
-				                "Table with name " + edge_table->table_name + " does not exist");
-			}
+			auto table = ResolveElementColumns(context, *edge_table);
+			edge_table->is_view = table.is_view;
 			CheckPropertyGraphTableColumns(edge_table, table);
 			CheckPropertyGraphTableLabels(edge_table, table);
 			BindPropertyGraphReference(context, edge_table->source_catalog, edge_table->source_schema);
 			BindPropertyGraphReference(context, edge_table->destination_catalog, edge_table->destination_schema);
 
-			auto &table_constraints = table->GetConstraints();
+			// A view has no constraints to infer the keys from.
+			const vector<unique_ptr<Constraint>> no_constraints;
+			auto &table_constraints = table.table ? table.table->GetConstraints() : no_constraints;
+			if (table.is_view && ((edge_table->source_fk.empty() && edge_table->source_pk.empty()) ||
+			                      (edge_table->destination_fk.empty() && edge_table->destination_pk.empty()))) {
+				throw Exception(ExceptionType::INVALID,
+				                "Edge table " + edge_table->table_name +
+				                    " is a view, which has no foreign keys to take the endpoint keys from: declare "
+				                    "them with SOURCE KEY (...) REFERENCES ... (...) and DESTINATION KEY (...) "
+				                    "REFERENCES ... (...)");
+			}
 
 			ValidateKeys(edge_table, edge_table->source_reference, "source", edge_table->source_pk,
 			             edge_table->source_fk, table_constraints);
@@ -304,17 +358,39 @@ unique_ptr<FunctionData> CreatePropertyGraphFunction::CreatePropertyGraphBind(Cl
 
 			// Validate primary keys in the destination table
 			ValidatePrimaryKeyInTable(context, edge_table->destination_pg_table, edge_table->destination_pk);
-		} catch (CatalogException &e) {
-			auto table = GetPropertyGraphView(context, edge_table);
-			if (table) {
-				throw Exception(ExceptionType::INVALID, "Found a view with name " + edge_table->table_name +
-				                                            ". Creating property graph tables over views is "
-				                                            "currently not supported.");
+			if (table.is_view) {
+				edge_table->identity_columns = IdentityColumns(vector<Identifier>(), table.names);
 			}
+		} catch (CatalogException &e) {
 			throw Exception(ExceptionType::INVALID, e.what());
 		} catch (BinderException &e) {
 			throw Exception(ExceptionType::INVALID, "Catalog '" + edge_table->catalog_name + "' does not exist!");
 		}
+	}
+	for (auto &vertex_table : info->vertex_tables) {
+		if (!vertex_table->is_view) {
+			continue;
+		}
+		// The vertex key of a view: the columns every edge references it by, when they agree; otherwise every
+		// column (rows are then numbered in the order of their whole contents).
+		vector<Identifier> referenced;
+		bool agree = true;
+		for (auto &edge_table : info->edge_tables) {
+			for (int side = 0; side < 2; side++) {
+				auto &vertex = side == 0 ? edge_table->source_pg_table : edge_table->destination_pg_table;
+				auto &keys = side == 0 ? edge_table->source_pk : edge_table->destination_pk;
+				if (vertex.get() != vertex_table.get()) {
+					continue;
+				}
+				if (referenced.empty()) {
+					referenced = keys;
+				} else if (referenced != keys) {
+					agree = false;
+				}
+			}
+		}
+		vertex_table->identity_columns = IdentityColumns(agree ? referenced : vector<Identifier>(),
+		                                                 vertex_columns[vertex_table->FullTableName()].names);
 	}
 	return make_uniq<CreatePropertyGraphBindData>(info);
 }
@@ -323,7 +399,7 @@ unique_ptr<FunctionData> CreatePropertyGraphFunction::CreatePropertyGraphBind(Cl
 //! context (the property graph itself keeps an unqualified name when the search path resolved it).
 static string ResolvedTableRef(ClientContext &context, const shared_ptr<PropertyGraphTable> &table,
                                const string &alias) {
-	auto entry = GetPropertyGraphTable(context, table);
+	auto entry = GetPropertyGraphCatalogEntry(context, *table);
 	if (!entry) {
 		return DuckPGQSQL::TableRef(*table, alias);
 	}
@@ -420,6 +496,22 @@ static bool CheckEdgeKeysReferenceVertices(ClientContext &context, Connection &c
 	                          edge_table.table_name.GetIdentifierName(), side, StringUtil::Join(edge_keys, ", "),
 	                          StringUtil::Join(values, ", "), vertex_table.table_name.GetIdentifierName(),
 	                          StringUtil::Join(vertex_keys, ", "));
+}
+
+static string StringListSQL(const vector<Identifier> &values) {
+	if (values.empty()) {
+		return "NULL";
+	}
+	vector<string> literals;
+	for (auto &value : values) {
+		literals.push_back(KeywordHelper::WriteQuoted(value.GetIdentifierName(), '\''));
+	}
+	return "[" + StringUtil::Join(literals, ", ") + "]::VARCHAR[]";
+}
+
+//! The values of the __duckpgq_internal columns after abi_options, for one element table.
+static string ElementColumnsSQL(const PropertyGraphTable &table) {
+	return string(table.is_view ? "true" : "NULL") + ", " + StringListSQL(table.identity_columns);
 }
 
 unique_ptr<GlobalTableFunctionState>
@@ -527,6 +619,7 @@ void CreatePropertyGraphFunction::CreatePropertyGraphFunc(ClientContext &context
 		insert_info += "'" + graph_catalog + "', '" + graph_schema + "', ";
 		insert_info += pg_info->verified ? "true" : "false";
 		insert_info += ", " + abi_options_sql;
+		insert_info += ", " + ElementColumnsSQL(*v_table);
 		insert_info += "), ";
 	}
 
@@ -590,6 +683,7 @@ void CreatePropertyGraphFunction::CreatePropertyGraphFunc(ClientContext &context
 		insert_info += "'" + graph_catalog + "', '" + graph_schema + "', ";
 		insert_info += pg_info->verified ? "true" : "false";
 		insert_info += ", " + abi_options_sql;
+		insert_info += ", " + ElementColumnsSQL(*e_table);
 		insert_info += "), ";
 	}
 	auto insert_query = new_conn->Query(insert_info);

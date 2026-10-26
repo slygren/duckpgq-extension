@@ -2,6 +2,7 @@
 
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckpgq/core/utils/duckpgq_sql.hpp"
+#include "duckpgq/core/utils/element_relation.hpp"
 
 namespace duckdb {
 
@@ -37,9 +38,10 @@ static unique_ptr<TableRef> DegreeBindReplace(ClientContext &context, TableFunct
 	    << DuckPGQSQL::Column(rowid, string("__pgq_v")) << " = __pgq_o.r"
 	    << (vertex_condition.empty() ? "" : " WHERE " + vertex_condition);
 	auto select = DuckPGQSQL::ParseSelect(sql.str(), "degree");
-	auto result = make_uniq<SubqueryRef>(std::move(select));
+	unique_ptr<TableRef> result = make_uniq<SubqueryRef>(std::move(select));
 	result->alias = Identifier("degree");
-	return std::move(result);
+	PGQElementRelations::Apply(context, *binding.graph, result);
+	return result;
 }
 
 void CoreGraphAlgorithms::RegisterDegree(ExtensionLoader &loader) {

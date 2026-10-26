@@ -73,6 +73,12 @@ public:
 
 	shared_ptr<PropertyGraphTable> destination_pg_table;
 
+	//! The element table is a view. A view has no rowid, so the MATCH translation reads it through an element
+	//! relation that numbers its rows by identity_columns (see PGQElementRelations).
+	bool is_view = false;
+	//! The columns that order a view's rows for its element ids: its element key, else every column.
+	vector<Identifier> identity_columns;
+
 public:
 	string ToString() const;
 	bool Equals(const PropertyGraphTable *other_p) const;

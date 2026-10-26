@@ -84,14 +84,18 @@ void DuckPGQState::CreateInternalTable(Connection &connection) {
 	                              "graph_catalog varchar, "
 	                              "graph_schema varchar, "
 	                              "verified boolean, "
-	                              "abi_options varchar"
+	                              "abi_options varchar, "
+	                              "is_view boolean, "
+	                              "identity_columns varchar[]"
 	                              ")");
 	if (query->HasError()) {
 		throw TransactionException(query->GetError());
 	}
 	// Databases written before graphs recorded their qualification only have the first 20 columns, and databases
 	// written before the incomplete-edge check have no verified column (NULL: not verified).
-	for (auto column : {"graph_catalog VARCHAR", "graph_schema VARCHAR", "verified BOOLEAN", "abi_options VARCHAR"}) {
+	// Later columns are NULL in rows written before they existed, which reads as what those graphs meant.
+	for (auto column : {"graph_catalog VARCHAR", "graph_schema VARCHAR", "verified BOOLEAN", "abi_options VARCHAR",
+	                    "is_view BOOLEAN", "identity_columns VARCHAR[]"}) {
 		auto alter =
 		    connection.Query(StringUtil::Format("ALTER TABLE __duckpgq_internal ADD COLUMN IF NOT EXISTS %s", column));
 		if (alter->HasError()) {
@@ -194,6 +198,14 @@ void DuckPGQState::ProcessPropertyGraphs(ClientContext &context, unique_ptr<Quer
 			QualifiedName graph_name(graph_catalog, graph_schema, Identifier(chunk->GetValue(0, i).GetValue<string>()));
 			auto resolved_name = ResolvePropertyGraphName(context, graph_name);
 			RegisterPropertyGraph(table, resolved_name, is_vertex, verified);
+			if (chunk->ColumnCount() > 25) {
+				auto is_view = chunk->GetValue(24, i);
+				table->is_view = !is_view.IsNull() && is_view.GetValue<bool>();
+				auto identity = chunk->GetValue(25, i);
+				if (!identity.IsNull()) {
+					ExtractListValues(identity, table->identity_columns);
+				}
+			}
 			if (chunk->ColumnCount() > 23 && !chunk->GetValue(23, i).IsNull()) {
 				auto &info = registered_property_graphs[resolved_name.Name().GetIdentifierName()]
 				                 ->Cast<CreatePropertyGraphInfo>();

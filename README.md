@@ -114,6 +114,13 @@ put over DuckLake catalogs. A graph is stored in the database it is created in a
 `CREATE PROPERTY GRAPH` does not check that edges reference existing vertices unless
 `pgq_verify_edges_on_create = true` (that check scans every edge table).
 
+A vertex or edge table may be a **view**, also a view in an attached database or DuckLake catalog. A view has no
+foreign keys, so an edge view needs `SOURCE KEY (…) REFERENCES … (…)` and `DESTINATION KEY (…)`. A view has no
+`rowid` either: its element ids are its rows numbered by the vertex key (the columns the edges reference, else all
+columns) and then its other columns, the same in every read. Fixed-length patterns read the view as is; paths and
+graph algorithms, which address vertices by id, pay a sort of the view. Vertex-join elimination never applies to a
+view, and ABI artifacts of a view graph are built like any other (their freshness is not tracked through the view).
+
 ### Patterns
 
 | Pattern | Meaning |

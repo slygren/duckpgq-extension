@@ -5,6 +5,7 @@
 #include "duckpgq/core/functions/table/describe_property_graph.hpp"
 #include "duckpgq/core/functions/table/drop_property_graph.hpp"
 #include "duckpgq/core/utils/duckpgq_sql.hpp"
+#include "duckpgq/core/utils/duckpgq_identifier.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
@@ -12,13 +13,67 @@
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 
 namespace duckdb {
 
+optional_ptr<CatalogEntry> GetPropertyGraphCatalogEntry(ClientContext &context, const PropertyGraphTable &table) {
+	// Tables and views share one namespace; the lookup returns whichever the name denotes.
+	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY,
+	                       QualifiedName(table.catalog_name, table.schema_name, table.table_name));
+	return Catalog::GetEntry(context, lookup, OnEntryNotFound::RETURN_NULL);
+}
+
 optional_ptr<TableCatalogEntry> GetPropertyGraphTableEntry(ClientContext &context, const PropertyGraphTable &table) {
-	return Catalog::GetEntry<TableCatalogEntry>(
-	    context, QualifiedName(table.catalog_name, table.schema_name, table.table_name), OnEntryNotFound::RETURN_NULL);
+	auto entry = GetPropertyGraphCatalogEntry(context, table);
+	if (!entry || entry->type != CatalogType::TABLE_ENTRY) {
+		return nullptr;
+	}
+	return &entry->Cast<TableCatalogEntry>();
+}
+
+optional_ptr<ViewCatalogEntry> GetPropertyGraphViewEntry(ClientContext &context, const PropertyGraphTable &table) {
+	auto entry = GetPropertyGraphCatalogEntry(context, table);
+	if (!entry || entry->type != CatalogType::VIEW_ENTRY) {
+		return nullptr;
+	}
+	return &entry->Cast<ViewCatalogEntry>();
+}
+
+LogicalType PGQRelationColumnType(ClientContext &context, const string &catalog, const string &schema,
+                                  const string &table, const string &column) {
+	try {
+		const string catalog_name = catalog.empty() ? PGQStr(DatabaseManager::GetDefaultDatabase(context)) : catalog;
+		const string schema_name = schema.empty() ? string(DEFAULT_SCHEMA) : schema;
+		EntryLookupInfo lookup(CatalogType::TABLE_ENTRY,
+		                       QualifiedName(Identifier(catalog_name), Identifier(schema_name), Identifier(table)));
+		auto entry = Catalog::GetEntry(context, lookup, OnEntryNotFound::RETURN_NULL);
+		if (!entry) {
+			return LogicalType::INVALID;
+		}
+		if (entry->type == CatalogType::TABLE_ENTRY) {
+			auto &table_entry = entry->Cast<TableCatalogEntry>();
+			if (!table_entry.ColumnExists(Identifier(column))) {
+				return LogicalType::INVALID;
+			}
+			return table_entry.GetColumn(Identifier(column)).Type();
+		}
+		if (entry->type == CatalogType::VIEW_ENTRY) {
+			auto &view = entry->Cast<ViewCatalogEntry>();
+			view.BindView(context);
+			auto columns = view.GetColumnInfo();
+			for (idx_t i = 0; columns && i < columns->names.size(); i++) {
+				if (StringUtil::CIEquals(columns->names[i].GetIdentifierName(), column)) {
+					return columns->types[i];
+				}
+			}
+		}
+		return LogicalType::INVALID;
+	} catch (...) {
+		return LogicalType::INVALID;
+	}
 }
 
 // Function to get DuckPGQState from ClientContext

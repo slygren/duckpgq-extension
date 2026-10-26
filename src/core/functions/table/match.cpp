@@ -39,6 +39,7 @@
 #include <duckdb/common/enums/set_operation_type.hpp>
 #include <duckpgq/core/functions/table.hpp>
 #include <duckpgq/core/utils/duckpgq_utils.hpp>
+#include "duckpgq/core/utils/element_relation.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -5839,19 +5840,7 @@ void PGQMatchFunction::ProcessPathList(ClientContext &context, vector<unique_ptr
 //! The type of a column of a catalog table, or INVALID when it cannot be looked up.
 static LogicalType QualifiedColumnType(ClientContext &context, const string &catalog, const string &schema,
                                        const string &table, const string &column) {
-	try {
-		const string catalog_name = catalog.empty() ? PGQStr(DatabaseManager::GetDefaultDatabase(context)) : catalog;
-		const string schema_name = schema.empty() ? string(DEFAULT_SCHEMA) : schema;
-		auto entry = Catalog::GetEntry<TableCatalogEntry>(
-		    context, QualifiedName(Identifier(catalog_name), Identifier(schema_name), Identifier(table)),
-		    OnEntryNotFound::RETURN_NULL);
-		if (!entry || !entry->ColumnExists(Identifier(column))) {
-			return LogicalType::INVALID;
-		}
-		return entry->GetColumn(Identifier(column)).Type();
-	} catch (...) {
-		return LogicalType::INVALID;
-	}
+	return PGQRelationColumnType(context, catalog, schema, table, column);
 }
 
 static LogicalType GraphTableColumnType(ClientContext &context, const PropertyGraphTable &table, const string &column) {
@@ -7550,19 +7539,7 @@ public:
 	// The type of a table's column, or INVALID when it cannot be looked up. (Here because this is the one object
 	// the expansion builder gets that carries the ClientContext.)
 	LogicalType ColumnType(const string &catalog, const string &schema, const string &table, const string &column) {
-		try {
-			const string catalog_name = catalog.empty() ? PGQStr(DatabaseManager::GetDefaultDatabase(context)) : catalog;
-			const string schema_name = schema.empty() ? string(DEFAULT_SCHEMA) : schema;
-			auto entry = Catalog::GetEntry<TableCatalogEntry>(
-			    context, QualifiedName(Identifier(catalog_name), Identifier(schema_name), Identifier(table)),
-			    OnEntryNotFound::RETURN_NULL);
-			if (!entry || !entry->ColumnExists(Identifier(column))) {
-				return LogicalType::INVALID;
-			}
-			return entry->GetColumn(Identifier(column)).Type();
-		} catch (...) {
-			return LogicalType::INVALID;
-		}
+		return PGQRelationColumnType(context, catalog, schema, table, column);
 	}
 
 	// The type a UNION ALL gives a column whose branches have these two types.
@@ -13404,20 +13381,8 @@ static vector<shared_ptr<PropertyGraphTable>> PathElementTables(const MatchExpre
 //! The type of a table's column, or INVALID when it cannot be looked up.
 static LogicalType PathPropertyColumnType(ClientContext &context, const PropertyGraphTable &table,
                                           const string &column) {
-	try {
-		const string catalog_name = table.catalog_name.empty() ? PGQStr(DatabaseManager::GetDefaultDatabase(context))
-		                                                       : PGQStr(table.catalog_name);
-		const string schema_name = table.schema_name.empty() ? string(DEFAULT_SCHEMA) : PGQStr(table.schema_name);
-		auto entry = Catalog::GetEntry<TableCatalogEntry>(
-		    context, QualifiedName(Identifier(catalog_name), Identifier(schema_name), table.table_name),
-		    OnEntryNotFound::RETURN_NULL);
-		if (!entry || !entry->ColumnExists(Identifier(column))) {
-			return LogicalType::INVALID;
-		}
-		return entry->GetColumn(Identifier(column)).Type();
-	} catch (...) {
-		return LogicalType::INVALID;
-	}
+	return PGQRelationColumnType(context, PGQStr(table.catalog_name), PGQStr(table.schema_name),
+	                             PGQStr(table.table_name), column);
 }
 
 static bool TableHasProperty(const PropertyGraphTable &table, const string &property) {
@@ -16745,10 +16710,13 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	for (auto &branch : ref->union_matches) {
 		MarkGroupAggregates(context, *branch);
 	}
-	if (auto aggregated = AggregateOverUnion(context, *ref)) {
-		return aggregated;
+	auto result = AggregateOverUnion(context, *ref);
+	if (!result) {
+		result = BuildMatchRef(context, *ref);
 	}
-	return BuildMatchRef(context, *ref);
+	QualifiedName graph_name(Identifier(ref->pg_catalog), Identifier(ref->pg_schema), Identifier(ref->pg_name));
+	PGQElementRelations::Apply(context, *duckpgq_state->GetPropertyGraph(context, graph_name), result);
+	return result;
 }
 
 //! A search prefix over a pattern that mixes fixed hops with one variable-length edge, (a)-[e]->(b)-[f]->{1,3}(c):

@@ -4,5 +4,6 @@ set(EXTENSION_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/duckpgq_sql.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/duckpgq_bitmap.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/duckpgq_utils.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/element_relation.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/source_search.cpp
     PARENT_SCOPE)

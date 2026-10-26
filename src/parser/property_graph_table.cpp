@@ -233,6 +233,9 @@ bool PropertyGraphTable::Equals(const PropertyGraphTable *other_p) const {
 	if (destination_pg_table != other->destination_pg_table) {
 		return false;
 	}
+	if (is_view != other->is_view || identity_columns != other->identity_columns) {
+		return false;
+	}
 
 	return true;
 }
@@ -274,6 +277,8 @@ void PropertyGraphTable::Serialize(Serializer &serializer) const {
 		serializer.WriteProperty(122, "source_pg_table", source_pg_table);
 		serializer.WriteProperty(123, "destination_pg_table", destination_pg_table);
 	}
+	serializer.WritePropertyWithDefault(124, "is_view", is_view, false);
+	serializer.WritePropertyWithDefault(125, "identity_columns", identity_columns);
 }
 
 shared_ptr<PropertyGraphTable> PropertyGraphTable::Deserialize(Deserializer &deserializer) {
@@ -309,6 +314,8 @@ shared_ptr<PropertyGraphTable> PropertyGraphTable::Deserialize(Deserializer &des
 		deserializer.ReadProperty(122, "source_pg_table", pg_table->source_pg_table);
 		deserializer.ReadProperty(123, "destination_pg_table", pg_table->destination_pg_table);
 	}
+	deserializer.ReadPropertyWithExplicitDefault(124, "is_view", pg_table->is_view, false);
+	deserializer.ReadPropertyWithDefault(125, "identity_columns", pg_table->identity_columns);
 	return pg_table;
 }
 
@@ -364,6 +371,8 @@ shared_ptr<PropertyGraphTable> PropertyGraphTable::Copy() const {
 	for (auto &key : destination_pk) {
 		result->destination_pk.push_back(key);
 	}
+	result->is_view = is_view;
+	result->identity_columns = identity_columns;
 	return result;
 }
 
