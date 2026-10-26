@@ -5,7 +5,7 @@
 
 require duckpgq
 
-load __TEST_DIR__/create_pg_on_view.db
+load {TEST_DIR}/create_pg_on_view.db
 
 # The SQL/PGQ grammar is connection-local and must be activated explicitly.
 statement ok

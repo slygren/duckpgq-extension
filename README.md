@@ -100,12 +100,13 @@ DuckDB SQL. Inside `MATCH`, the pattern features follow PGQL 2.1. Everything aro
 ```sql
 CREATE [OR REPLACE] PROPERTY GRAPH [IF NOT EXISTS] g
   {VERTEX | NODE} TABLES (
-    person [AS p]
+    person [AS p] [KEY (id)]
       { LABEL Person | DEFAULT LABEL } [IN kind (Student, Teacher)] [properties]   -- one or more labels
       [ LABEL Human [properties] ] …, …)
   {EDGE | RELATIONSHIP} TABLES (
-    knows SOURCE KEY (src) REFERENCES person (id)
-          DESTINATION KEY (dst) REFERENCES person (id) LABEL Knows [properties], …)
+    knows [KEY (src, dst)]
+          SOURCE KEY (src) REFERENCES person [(id)]       -- or SOURCE person: from its FOREIGN KEY
+          DESTINATION KEY (dst) REFERENCES person [(id)] LABEL Knows [properties], …)
   [WITH ABI (max_hops := 2, closures := ['Knows'])];      -- see ABI path tables
 
 -- properties: PROPERTIES (col [AS name], …) | PROPERTIES [ARE] ALL COLUMNS [EXCEPT (…)] | NO PROPERTIES
@@ -126,10 +127,16 @@ matches, on every route and with the same ABI artifacts. `label(x)` is the first
 accepts any of them. Each label may have its own `PROPERTIES` clause, and the table has the properties of all its
 labels; a label without one has all columns, as SQL/PGQ says. A label still names one table (see Limitations).
 
+`KEY (…)` declares the columns that identify a table's vertices or edges, for tables (and views) without a PRIMARY
+KEY. It wins over the PRIMARY KEY: `REFERENCES person` without a column list references person's `KEY`, else its
+PRIMARY KEY. A key that a PRIMARY KEY or UNIQUE constraint enforces needs no check; any other key is trusted, and
+checked (unique, no NULLs) when `pgq_verify_edges_on_create = true`. A trusted key never enables vertex-join
+elimination. Element ids stay row ids for tables; for a view the key orders them.
+
 A vertex or edge table may be a **view**, also a view in an attached database or DuckLake catalog. A view has no
-foreign keys, so an edge view needs `SOURCE KEY (…) REFERENCES … (…)` and `DESTINATION KEY (…)`. A view has no
-`rowid` either: its element ids are its rows numbered by the vertex key (the columns the edges reference, else all
-columns) and then its other columns, the same in every read. Fixed-length patterns read the view as is; paths and
+foreign keys, so an edge view needs `SOURCE KEY (…) REFERENCES …` and `DESTINATION KEY (…)`. A view has no `rowid`
+either: its element ids are its rows numbered by its key (its `KEY`, else for a vertex view the columns the edges
+reference it by, else all columns) and then its other columns, the same in every read. Fixed-length patterns read the view as is; paths and
 graph algorithms, which address vertices by id, pay a sort of the view. Vertex-join elimination never applies to a
 view, and ABI artifacts of a view graph are built like any other (their freshness is not tracked through the view).
 

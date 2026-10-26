@@ -4,6 +4,7 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/parser/constraints/foreign_key_constraint.hpp"
+#include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckpgq/common.hpp"
 #include <duckpgq/core/functions/table.hpp>
@@ -59,6 +60,99 @@ static vector<Identifier> IdentityColumns(const vector<Identifier> &key, const v
 		}
 	}
 	return result;
+}
+
+//! The columns of a UNIQUE or PRIMARY KEY constraint.
+static vector<Identifier> UniqueColumns(const TableCatalogEntry &table, const UniqueConstraint &unique) {
+	if (unique.HasIndex()) {
+		return {table.GetColumn(unique.GetIndex()).Name()};
+	}
+	return unique.GetColumnNames();
+}
+
+static bool SameColumnSet(const vector<Identifier> &left, const vector<Identifier> &right) {
+	if (left.size() != right.size()) {
+		return false;
+	}
+	for (auto &column : left) {
+		bool found = false;
+		for (auto &other : right) {
+			found = found || StringUtil::CIEquals(column.GetIdentifierName(), other.GetIdentifierName());
+		}
+		if (!found) {
+			return false;
+		}
+	}
+	return true;
+}
+
+//! Whether the table's constraints guarantee that these columns identify its rows (a PRIMARY KEY or UNIQUE
+//! constraint on exactly them), so a KEY over them needs no check.
+static bool KeyIsEnforced(const CreatePropertyGraphFunction::ElementColumns &table, const vector<Identifier> &key) {
+	if (!table.table) {
+		return false;
+	}
+	for (auto &constraint : table.table->GetConstraints()) {
+		if (constraint->type == ConstraintType::UNIQUE &&
+		    SameColumnSet(UniqueColumns(*table.table, constraint->Cast<UniqueConstraint>()), key)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//! The key a vertex table is referenced by when an edge names no columns (REFERENCES v): its KEY, else its PRIMARY
+//! KEY; empty when it has neither.
+static vector<Identifier> ReferencedKey(const PropertyGraphTable &vertex,
+                                        const CreatePropertyGraphFunction::ElementColumns &columns) {
+	if (!vertex.element_key.empty()) {
+		return vertex.element_key;
+	}
+	if (columns.table) {
+		for (auto &constraint : columns.table->GetConstraints()) {
+			if (constraint->type == ConstraintType::UNIQUE && constraint->Cast<UniqueConstraint>().IsPrimaryKey()) {
+				return UniqueColumns(*columns.table, constraint->Cast<UniqueConstraint>());
+			}
+		}
+	}
+	return {};
+}
+
+//! REFERENCES v without a column list references v's key (its KEY, else its PRIMARY KEY).
+static void ResolveReferencedKey(const PropertyGraphTable &edge, const string &side, const PropertyGraphTable &vertex,
+                                 const vector<Identifier> &edge_columns, vector<Identifier> &vertex_columns,
+                                 case_insensitive_map_t<CreatePropertyGraphFunction::ElementColumns> &columns) {
+	if (!vertex_columns.empty() || edge_columns.empty()) {
+		return;
+	}
+	vertex_columns = ReferencedKey(vertex, columns[vertex.FullTableName()]);
+	if (vertex_columns.empty()) {
+		throw Exception(ExceptionType::INVALID, side + " KEY of edge table " + edge.table_name + " references " +
+		                                            vertex.table_name +
+		                                            " without a column list, but that table has neither a KEY nor a "
+		                                            "PRIMARY KEY: name the referenced columns");
+	}
+	if (vertex_columns.size() != edge_columns.size()) {
+		throw Exception(ExceptionType::INVALID, side + " KEY of edge table " + edge.table_name + " has " +
+		                                            to_string(edge_columns.size()) + " columns, but the key of " +
+		                                            vertex.table_name + " has " + to_string(vertex_columns.size()));
+	}
+}
+
+static void CheckElementKey(const PropertyGraphTable &table, const CreatePropertyGraphFunction::ElementColumns &columns) {
+	for (idx_t i = 0; i < table.element_key.size(); i++) {
+		auto &column = table.element_key[i];
+		if (!columns.Exists(column)) {
+			throw Exception(ExceptionType::INVALID,
+			                "KEY column " + column + " not found in table " + table.table_name);
+		}
+		for (idx_t j = 0; j < i; j++) {
+			if (StringUtil::CIEquals(table.element_key[j].GetIdentifierName(), column.GetIdentifierName())) {
+				throw Exception(ExceptionType::INVALID,
+				                "KEY column " + column + " is given twice for table " + table.table_name);
+			}
+		}
+	}
 }
 
 static void ThrowMissingVertexReference(CreatePropertyGraphInfo &info, const Identifier &catalog_name,
@@ -315,6 +409,7 @@ unique_ptr<FunctionData> CreatePropertyGraphFunction::CreatePropertyGraphBind(Cl
 		try {
 			BindPropertyGraphTable(context, vertex_table);
 			table = ResolveElementColumns(context, *vertex_table);
+			CheckElementKey(*vertex_table, table);
 			CheckPropertyGraphTableColumns(vertex_table, table);
 			CheckPropertyGraphTableLabels(vertex_table, table);
 		} catch (CatalogException &e) {
@@ -334,6 +429,7 @@ unique_ptr<FunctionData> CreatePropertyGraphFunction::CreatePropertyGraphBind(Cl
 		try {
 			BindPropertyGraphTable(context, edge_table);
 			auto table = ResolveElementColumns(context, *edge_table);
+			CheckElementKey(*edge_table, table);
 			edge_table->is_view = table.is_view;
 			CheckPropertyGraphTableColumns(edge_table, table);
 			CheckPropertyGraphTableLabels(edge_table, table);
@@ -371,6 +467,8 @@ unique_ptr<FunctionData> CreatePropertyGraphFunction::CreatePropertyGraphBind(Cl
 				                            edge_table->source_reference);
 			}
 			ValidateVertexTableRegistration(edge_table->source_pg_table, v_table_names);
+			ResolveReferencedKey(*edge_table, "SOURCE", *edge_table->source_pg_table, edge_table->source_fk,
+			                     edge_table->source_pk, vertex_columns);
 
 			// Validate primary keys in the source table
 			ValidatePrimaryKeyInTable(context, edge_table->source_pg_table, edge_table->source_pk);
@@ -381,11 +479,13 @@ unique_ptr<FunctionData> CreatePropertyGraphFunction::CreatePropertyGraphBind(Cl
 				                            edge_table->destination_reference);
 			}
 			ValidateVertexTableRegistration(edge_table->destination_pg_table, v_table_names);
+			ResolveReferencedKey(*edge_table, "DESTINATION", *edge_table->destination_pg_table,
+			                     edge_table->destination_fk, edge_table->destination_pk, vertex_columns);
 
 			// Validate primary keys in the destination table
 			ValidatePrimaryKeyInTable(context, edge_table->destination_pg_table, edge_table->destination_pk);
 			if (table.is_view) {
-				edge_table->identity_columns = IdentityColumns(vector<Identifier>(), table.names);
+				edge_table->identity_columns = IdentityColumns(edge_table->element_key, table.names);
 			}
 		} catch (CatalogException &e) {
 			throw Exception(ExceptionType::INVALID, e.what());
@@ -397,8 +497,13 @@ unique_ptr<FunctionData> CreatePropertyGraphFunction::CreatePropertyGraphBind(Cl
 		if (!vertex_table->is_view) {
 			continue;
 		}
-		// The vertex key of a view: the columns every edge references it by, when they agree; otherwise every
-		// column (rows are then numbered in the order of their whole contents).
+		// The vertex key of a view: its KEY, else the columns every edge references it by when they agree; otherwise
+		// every column (rows are then numbered in the order of their whole contents).
+		if (!vertex_table->element_key.empty()) {
+			vertex_table->identity_columns =
+			    IdentityColumns(vertex_table->element_key, vertex_columns[vertex_table->FullTableName()].names);
+			continue;
+		}
 		vector<Identifier> referenced;
 		bool agree = true;
 		for (auto &edge_table : info->edge_tables) {
@@ -538,7 +643,50 @@ static string StringListSQL(const vector<Identifier> &values) {
 //! The values of the __duckpgq_internal columns after abi_options, for one element table.
 static string ElementColumnsSQL(const PropertyGraphTable &table) {
 	return string(table.is_view ? "true" : "NULL") + ", " + StringListSQL(table.identity_columns) + ", " +
-	       StringListSQL(table.extra_labels);
+	       StringListSQL(table.extra_labels) + ", " + StringListSQL(table.element_key);
+}
+
+//! A KEY must identify the table's rows (SQL/PGQ element key). A PRIMARY KEY or UNIQUE constraint on the same columns
+//! guarantees it; otherwise it is trusted, and checked here when pgq_verify_edges_on_create asks for the data checks:
+//! no key value may occur twice or contain NULL. Returns false when the data could not be read.
+static bool CheckElementKeyIdentifies(ClientContext &context, Connection &connection,
+                                      const shared_ptr<PropertyGraphTable> &table) {
+	if (table->element_key.empty()) {
+		return true;
+	}
+	auto columns = CreatePropertyGraphFunction::ResolveElementColumns(context, *table);
+	if (KeyIsEnforced(columns, table->element_key)) {
+		return true;
+	}
+	vector<string> keys;
+	vector<string> nulls;
+	for (auto &column : table->element_key) {
+		keys.push_back(DuckPGQSQL::Column(column, string("t")));
+		nulls.push_back(DuckPGQSQL::Column(column, string("t")) + " IS NULL");
+	}
+	auto result = connection.Query("SELECT " + StringUtil::Join(keys, ", ") + ", count(*) FROM " +
+	                               ResolvedTableRef(context, table, "t") + " GROUP BY ALL HAVING count(*) > 1 OR " +
+	                               StringUtil::Join(nulls, " OR ") + " LIMIT 1");
+	if (result->HasError()) {
+		if (result->GetErrorObject().Type() == ExceptionType::CATALOG) {
+			return false;
+		}
+		throw Exception(ExceptionType::INVALID,
+		                "Could not verify the KEY of element table " + table->table_name + ": " + result->GetError());
+	}
+	auto chunk = result->Fetch();
+	if (!chunk || chunk->size() == 0) {
+		return true;
+	}
+	vector<string> values;
+	for (idx_t i = 0; i < table->element_key.size(); i++) {
+		values.push_back(chunk->GetValue(i, 0).ToString());
+	}
+	throw ConstraintException("KEY (%s) of element table %s does not identify its rows: (%s) occurs %s times. A key "
+	                          "must be unique and not NULL.",
+	                          StringUtil::Join(IdentifiersToStrings(table->element_key), ", "),
+	                          table->table_name.GetIdentifierName(), StringUtil::Join(values, ", "),
+	                          chunk->GetValue(table->element_key.size(), 0).ToString());
 }
 
 unique_ptr<GlobalTableFunctionState>
@@ -578,6 +726,16 @@ void CreatePropertyGraphFunction::CreatePropertyGraphFunc(ClientContext &context
 	const bool verify = context.TryGetCurrentSetting("pgq_verify_edges_on_create", verify_edges) &&
 	                    !verify_edges.IsNull() && verify_edges.GetValue<bool>();
 	pg_info->verified = verify;
+	for (auto &table : pg_info->vertex_tables) {
+		if (verify) {
+			pg_info->verified &= CheckElementKeyIdentifies(context, *new_conn, table);
+		}
+	}
+	for (auto &edge_table : pg_info->edge_tables) {
+		if (verify) {
+			pg_info->verified &= CheckElementKeyIdentifies(context, *new_conn, edge_table);
+		}
+	}
 	for (auto &edge_table : pg_info->edge_tables) {
 		if (!verify) {
 			break;

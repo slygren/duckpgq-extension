@@ -76,6 +76,10 @@ public:
 
 	shared_ptr<PropertyGraphTable> destination_pg_table;
 
+	//! The element key declared with KEY (...): the columns that identify the table's elements. Empty when the table
+	//! declares none (its key is then its PRIMARY KEY, or for a vertex table the columns its edges reference).
+	vector<Identifier> element_key;
+
 	//! The element table is a view. A view has no rowid, so the MATCH translation reads it through an element
 	//! relation that numbers its rows by identity_columns (see PGQElementRelations).
 	bool is_view = false;

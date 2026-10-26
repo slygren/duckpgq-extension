@@ -13,8 +13,11 @@ DuckPGQVertexTables <- DuckPGQVertexKeyword 'TABLES' Parens(List(DuckPGQVertexTa
 DuckPGQEdgeTables <- DuckPGQEdgeKeyword 'TABLES' Parens(List(DuckPGQEdgeTable))
 DuckPGQVertexKeyword <- 'VERTEX' / 'NODE'
 DuckPGQEdgeKeyword <- 'EDGE' / 'RELATIONSHIP'
-DuckPGQVertexTable <- BaseTableName TableAliasAs? DuckPGQLabelsAndProperties
-DuckPGQEdgeTable <- BaseTableName TableAliasAs? DuckPGQSourceReference DuckPGQDestinationReference DuckPGQLabelsAndProperties
+DuckPGQVertexTable <- BaseTableName TableAliasAs? DuckPGQElementKey? DuckPGQLabelsAndProperties
+DuckPGQEdgeTable <- BaseTableName TableAliasAs? DuckPGQElementKey? DuckPGQSourceReference DuckPGQDestinationReference DuckPGQLabelsAndProperties
+
+# The element key: the columns that identify the table's vertices or edges (SQL/PGQ element table key clause).
+DuckPGQElementKey <- 'KEY' Parens(List(ColId))
 
 # Labels with their properties, in the standard's order (LABEL l PROPERTIES (...), repeated), after an optional
 # PROPERTIES clause of the first label in this extension's original order (PROPERTIES (...) LABEL l).
@@ -37,8 +40,8 @@ DuckPGQPropertyAlias <- 'AS' ColId
 # Discriminator sub-labels: rows whose discriminator has bit i set also carry the i-th of these labels.
 DuckPGQSubLabels <- 'IN' Identifier Parens(List(ColId))
 
-# Edge endpoint references, with explicit or inferred keys.
+# Edge endpoint references, with explicit or inferred keys. Without a column list REFERENCES v means v's key.
 DuckPGQSourceReference <- 'SOURCE' DuckPGQReference
 DuckPGQDestinationReference <- 'DESTINATION' DuckPGQReference
 DuckPGQReference <- DuckPGQKeyReference / BaseTableName
-DuckPGQKeyReference <- 'KEY' Parens(List(ColId)) 'REFERENCES' BaseTableName Parens(List(ColId))
+DuckPGQKeyReference <- 'KEY' Parens(List(ColId)) 'REFERENCES' BaseTableName Parens(List(ColId))?

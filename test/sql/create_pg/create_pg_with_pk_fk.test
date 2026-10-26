@@ -172,7 +172,21 @@ CREATE PROPERTY GRAPH g4
 VERTEX TABLES (m)
 EDGE TABLES (n SOURCE KEY (src) REFERENCES m DESTINATION m);
 ----
-Parser Error: syntax error at or near "DESTINATION"
+Invalid Error: The primary key for the DESTINATION table m is not defined in the edge table n
+
+# REFERENCES m without a column list references m's PRIMARY KEY.
+statement ok
+CREATE PROPERTY GRAPH g4
+VERTEX TABLES (m)
+EDGE TABLES (n SOURCE KEY (src) REFERENCES m DESTINATION KEY (dst) REFERENCES m);
+
+query TT
+SELECT source_pk, destination_pk FROM __duckpgq_internal WHERE property_graph = 'g4' AND NOT is_vertex_table;
+----
+[id]	[id]
+
+statement ok
+DROP PROPERTY GRAPH g4;
 
 statement ok
 CREATE TABLE p (

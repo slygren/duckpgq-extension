@@ -87,7 +87,8 @@ void DuckPGQState::CreateInternalTable(Connection &connection) {
 	                              "abi_options varchar, "
 	                              "is_view boolean, "
 	                              "identity_columns varchar[], "
-	                              "extra_labels varchar[]"
+	                              "extra_labels varchar[], "
+	                              "element_key varchar[]"
 	                              ")");
 	if (query->HasError()) {
 		throw TransactionException(query->GetError());
@@ -96,7 +97,8 @@ void DuckPGQState::CreateInternalTable(Connection &connection) {
 	// written before the incomplete-edge check have no verified column (NULL: not verified).
 	// Later columns are NULL in rows written before they existed, which reads as what those graphs meant.
 	for (auto column : {"graph_catalog VARCHAR", "graph_schema VARCHAR", "verified BOOLEAN", "abi_options VARCHAR",
-	                    "is_view BOOLEAN", "identity_columns VARCHAR[]", "extra_labels VARCHAR[]"}) {
+	                    "is_view BOOLEAN", "identity_columns VARCHAR[]", "extra_labels VARCHAR[]",
+	                    "element_key VARCHAR[]"}) {
 		auto alter =
 		    connection.Query(StringUtil::Format("ALTER TABLE __duckpgq_internal ADD COLUMN IF NOT EXISTS %s", column));
 		if (alter->HasError()) {
@@ -206,6 +208,9 @@ void DuckPGQState::ProcessPropertyGraphs(ClientContext &context, unique_ptr<Quer
 			}
 			if (chunk->ColumnCount() > 26 && !chunk->GetValue(26, i).IsNull()) {
 				ExtractListValues(chunk->GetValue(26, i), table->extra_labels);
+			}
+			if (chunk->ColumnCount() > 27 && !chunk->GetValue(27, i).IsNull()) {
+				ExtractListValues(chunk->GetValue(27, i), table->element_key);
 			}
 			QualifiedName graph_name(graph_catalog, graph_schema, Identifier(chunk->GetValue(0, i).GetValue<string>()));
 			auto resolved_name = ResolvePropertyGraphName(context, graph_name);

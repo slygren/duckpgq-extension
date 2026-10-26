@@ -203,7 +203,11 @@ static void ApplyReference(PEGTransformer &transformer, ParseResult &parse_resul
 		auto &list = reference.Cast<ListParseResult>();
 		foreign_keys = TransformParensList<Identifier>(transformer, list.GetChild(1));
 		base_table = transformer.Transform<unique_ptr<BaseTableRef>>(list.GetChild(3));
-		primary_keys = TransformParensList<Identifier>(transformer, list.GetChild(4));
+		// Without a column list the vertex table's key is referenced; CREATE PROPERTY GRAPH resolves it.
+		auto &referenced = list.Child<OptionalParseResult>(4);
+		if (referenced.HasResult()) {
+			primary_keys = TransformParensList<Identifier>(transformer, referenced.GetResult());
+		}
 	} else {
 		base_table = transformer.Transform<unique_ptr<BaseTableRef>>(reference);
 	}
@@ -228,11 +232,16 @@ static shared_ptr<PropertyGraphTable> TransformGraphTable(PEGTransformer &transf
 	if (alias.HasResult()) {
 		table->table_name_alias = transformer.Transform<TableAlias>(alias.GetResult()).name;
 	}
-	idx_t labels_index = 2;
+	auto &element_key = list.Child<OptionalParseResult>(2);
+	if (element_key.HasResult()) {
+		table->element_key =
+		    TransformParensList<Identifier>(transformer, element_key.GetResult().Cast<ListParseResult>().GetChild(1));
+	}
+	idx_t labels_index = 3;
 	if (!table->is_vertex_table) {
-		ApplyReference(transformer, list.GetChild(2), *table, true);
-		ApplyReference(transformer, list.GetChild(3), *table, false);
-		labels_index = 4;
+		ApplyReference(transformer, list.GetChild(3), *table, true);
+		ApplyReference(transformer, list.GetChild(4), *table, false);
+		labels_index = 5;
 	}
 	ApplyLabelsAndProperties(transformer, list.GetChild(labels_index), *table);
 	return table;

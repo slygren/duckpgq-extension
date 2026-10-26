@@ -44,6 +44,9 @@ PropertyGraphTable::PropertyGraphTable(string table_name_p, string table_name_al
 string PropertyGraphTable::ToString() const {
 	string result = (catalog_name.empty() ? "" : catalog_name + ".") + (schema_name.empty() ? "" : schema_name + ".") +
 	                table_name + " " + (table_name_alias.empty() ? "" : "AS " + table_name_alias);
+	if (!element_key.empty()) {
+		result += " KEY (" + StringUtil::Join(IdentifiersToStrings(element_key), ", ") + ")";
+	}
 	if (!is_vertex_table) {
 		result += " SOURCE KEY (";
 		for (idx_t i = 0; i < source_fk.size(); i++) {
@@ -237,7 +240,7 @@ bool PropertyGraphTable::Equals(const PropertyGraphTable *other_p) const {
 		return false;
 	}
 	if (is_view != other->is_view || identity_columns != other->identity_columns ||
-	    extra_labels != other->extra_labels) {
+	    extra_labels != other->extra_labels || element_key != other->element_key) {
 		return false;
 	}
 
@@ -284,6 +287,7 @@ void PropertyGraphTable::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault(124, "is_view", is_view, false);
 	serializer.WritePropertyWithDefault(125, "identity_columns", identity_columns);
 	serializer.WritePropertyWithDefault(126, "extra_labels", extra_labels);
+	serializer.WritePropertyWithDefault(127, "element_key", element_key);
 }
 
 shared_ptr<PropertyGraphTable> PropertyGraphTable::Deserialize(Deserializer &deserializer) {
@@ -322,6 +326,7 @@ shared_ptr<PropertyGraphTable> PropertyGraphTable::Deserialize(Deserializer &des
 	deserializer.ReadPropertyWithExplicitDefault(124, "is_view", pg_table->is_view, false);
 	deserializer.ReadPropertyWithDefault(125, "identity_columns", pg_table->identity_columns);
 	deserializer.ReadPropertyWithDefault(126, "extra_labels", pg_table->extra_labels);
+	deserializer.ReadPropertyWithDefault(127, "element_key", pg_table->element_key);
 	return pg_table;
 }
 
@@ -397,6 +402,7 @@ shared_ptr<PropertyGraphTable> PropertyGraphTable::Copy() const {
 	}
 	result->is_view = is_view;
 	result->extra_labels = extra_labels;
+	result->element_key = element_key;
 	result->identity_columns = identity_columns;
 	return result;
 }
