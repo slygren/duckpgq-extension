@@ -479,10 +479,13 @@ FROM GRAPH_TABLE (g MATCH (a:P) -[e:K]->{1,2} (b) ONE ROW PER EDGE (z) WHERE a.i
 4	61	[11, 61]
 4	61	[21, 61]
 
-# unbounded under ALL SHORTEST: the path search answers, e is read along each path
+# unbounded under ALL SHORTEST: the path search answers, e is read along each path (walks: 1 is on the cycle
+# 1 -> 2 -> 3 -> 1, so b = 1 has its two shortest closed walks)
 query TTT rowsort
 FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P) -[e:K]->+ (b:P) WHERE a.id = 1 COLUMNS (b.id AS b, e.w AS ws, sum(e.w) AS total));
 ----
+1	[11, 31, 41]	83
+1	[21, 31, 41]	93
 2	[11]	11
 2	[21]	21
 3	[11, 31]	42

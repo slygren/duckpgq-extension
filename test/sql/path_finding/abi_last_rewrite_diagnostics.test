@@ -100,7 +100,7 @@ SELECT
     table_alias,
     endpoint_filter_count,
     estimated_rows
-FROM pgq_last_rewrite_diagnostics();
+FROM pgq_last_rewrite_diagnostics() WHERE rewrite_type <> 'multiplicity_probe'; -- the binder measures this hand-made catalog too
 ----
 edge	selected	selected exact edge artifact	__pg_test_graph__custom_edge	edge	identity	snapshot	distinct_edges	late_vertex_property_fetch	dbt_build	_pgq_pt_0	1	42
 

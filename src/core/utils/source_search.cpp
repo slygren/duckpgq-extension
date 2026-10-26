@@ -151,6 +151,47 @@ vector<vector<int64_t>> PGQSourceSearch::AllPaths(int64_t target) const {
 	return paths;
 }
 
+const vector<PGQSourceSearch::ClosingStep> &PGQSourceSearch::ClosingSteps(int64_t v_size, const atomic<int64_t> *v,
+                                                                          const vector<int64_t> &e,
+                                                                          const vector<int64_t> &edge_ids) const {
+	if (closing_known) {
+		return closing_steps;
+	}
+	closing_known = true;
+	vector<int64_t> reached;
+	if (dense) {
+		for (int64_t vertex = 0; vertex < static_cast<int64_t>(dense_entries.size()); vertex++) {
+			if (dense_entries[vertex].distance >= 0) {
+				reached.push_back(vertex);
+			}
+		}
+	} else {
+		for (auto &entry : sparse_entries) {
+			reached.push_back(entry.first);
+		}
+		std::sort(reached.begin(), reached.end());
+	}
+	for (auto from : reached) {
+		if (from < 0 || from >= v_size) {
+			continue;
+		}
+		const int64_t length = Lookup(from).distance + 1;
+		if (!closing_steps.empty() && length > closing_steps[0].length) {
+			continue;
+		}
+		for (auto offset = v[from].load(); offset < v[from + 1].load(); offset++) {
+			if (e[offset] != source) {
+				continue;
+			}
+			if (!closing_steps.empty() && length < closing_steps[0].length) {
+				closing_steps.clear();
+			}
+			closing_steps.push_back(ClosingStep {length, from, edge_ids[offset]});
+		}
+	}
+	return closing_steps;
+}
+
 idx_t PGQSourceSearch::Cells() const {
 	idx_t cells = dense ? dense_entries.size() : sparse_entries.size();
 	for (auto &entry : parents) {

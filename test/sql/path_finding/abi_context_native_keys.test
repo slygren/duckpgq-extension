@@ -141,6 +141,7 @@ query TIT rowsort
 FROM GRAPH_TABLE (m MATCH p = ANY SHORTEST (s:A)-[]->{1,3}(x) WHERE s.id = 1 COLUMNS (label(x) AS lbl, path_length(p) AS len, vertices(p) AS vs));
 ----
 A	2	[1, 007, 2]
+A	2	[1, 8, 1]
 A	2	[1, 8, 7]
 B	1	[1, 007]
 B	1	[1, 8]

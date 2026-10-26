@@ -109,6 +109,14 @@ EDGE TABLES (HD SOURCE KEY (tag) REFERENCES T (tagname) DESTINATION KEY (wo) REF
 statement ok
 SELECT count(*) FROM pgq_abi_build('gd');
 
+# pgq_abi_build leaves t2 -> w9 out (its work order is no vertex) and records it; an artifact from a builder that
+# copies the edge table holds it, and says nothing: planted here
+statement ok
+INSERT INTO graph.__pg_gd__TAG__HAS_WO__WO SELECT 't2', hash('HAS_WO|t2|w9'), 'w9';
+
+statement ok
+UPDATE graph.__pgq_path_catalog SET built_by = NULL, endpoints_complete = NULL WHERE graph_name = 'gd';
+
 query II
 FROM GRAPH_TABLE (gd MATCH (t:TAG) OPTIONAL MATCH (t)-[:HAS_WO]->(w:WO) COLUMNS (t.tagname AS t, w.wo AS w)) ORDER BY ALL;
 ----
@@ -119,7 +127,7 @@ t2	w3
 t3	NULL
 
 query T
-SELECT status FROM pgq_last_rewrite_diagnostics() WHERE reason LIKE 'far_ends|%';
+SELECT status FROM pgq_last_rewrite_diagnostics() WHERE reason LIKE 'far_ends|%|v1 %';
 ----
 not_exact
 
@@ -150,10 +158,11 @@ t1	w1
 t1	w2
 t3	NULL
 
-query T
-SELECT status FROM pgq_last_rewrite_diagnostics() WHERE reason LIKE 'far_ends|%';
+# pgq_abi_build records that every artifact row reaches a vertex (endpoints_complete): nothing is measured
+query I
+SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE reason LIKE 'far_ends|%';
 ----
-exact
+0
 
 # (the hop-by-hop OPTIONAL route records no rewrite diagnostic, so the verifier cannot tell the two runs apart)
 query T

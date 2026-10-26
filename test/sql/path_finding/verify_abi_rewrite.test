@@ -174,13 +174,14 @@ FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (lonely_graph MATCH (a:Person)-[:L
 ----
 true
 
-# The other direction: the artifact has no v1, so the REWRITE emits a query that
-# will not bind. That IS a verdict on the thing under test, and keeps its own status.
+# The other direction: the artifact has no v1. The binder measures whether its rows reach a vertex at both ends
+# before it uses it (no builder recorded that), the probe fails, and a failed probe is "no": the rewrite does not
+# fire, and the traversal, the only plan left, cannot run either.
 query TT
 SELECT status, rewrite_fired
 FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (broken_graph MATCH (a:Person)-[:Lonely]->(b:Person) COLUMNS (a.id AS aid, b.id AS bid))');
 ----
-abi_error	true
+abi_error	false
 
 # ── REGRESSION: a graph with NO catalogue row at all ──────────────────────────
 # This is the shape that was reported from the field: a property graph over data

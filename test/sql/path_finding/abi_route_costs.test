@@ -163,7 +163,7 @@ FROM GRAPH_TABLE (g MATCH (a:V)-[:K]->{2,2}(b:V) WHERE a.id = 1 COLUMNS (b.id AS
 query TR
 SELECT rewrite_type, estimated_cost FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
 ----
-fixed_path_exact_length	0.15625
+fixed_path_exact_length	0.140625
 
 # A hierarchy, whose closure is exact: both answer {2,2}, and the closure is preferred (measured faster: the fixed_path
 # needs its vertex checks)

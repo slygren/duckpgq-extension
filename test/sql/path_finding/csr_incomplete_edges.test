@@ -1,0 +1,121 @@
+# name: test/sql/path_finding/csr_incomplete_edges.test
+# description: An edge whose endpoint is no vertex is no edge of the graph (a traversal joins both endpoints), so the
+#              CSR routes skip it. The directed CSR counted it into its source's degree but did not insert it, and
+#              raised "Non-existent/non-unique vertices detected" instead. Checked against shortest walks computed by
+#              a recursive query over the complete edges, for ANY / ALL SHORTEST and CHEAPEST, endpoints and paths.
+# group: [path_finding]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE P(id BIGINT, name VARCHAR);
+
+statement ok
+INSERT INTO P VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e'), (6, 'f');
+
+# Dangling: 2 -> 9 and 9 -> 4 (9 is no vertex), 8 -> 1, a NULL destination and a NULL source
+statement ok
+CREATE TABLE K(src BIGINT, dst BIGINT, w BIGINT);
+
+statement ok
+INSERT INTO K VALUES (1, 2, 1), (2, 3, 1), (3, 1, 1), (2, 9, 1), (9, 4, 1), (3, 4, 5), (8, 1, 1), (4, 5, 1),
+                     (5, NULL, 1), (NULL, 6, 1), (2, 4, 9), (4, 9, 1);
+
+statement ok
+CREATE PROPERTY GRAPH g VERTEX TABLES (P LABEL P)
+EDGE TABLES (K SOURCE KEY (src) REFERENCES P (id) DESTINATION KEY (dst) REFERENCES P (id) LABEL K);
+
+statement ok
+CREATE TABLE complete AS SELECT k.* FROM K k WHERE k.src IN (SELECT id FROM P) AND k.dst IN (SELECT id FROM P);
+
+# Shortest walk lengths and least costs between distinct vertices over the complete edges
+statement ok
+CREATE TABLE reference AS
+WITH RECURSIVE walks(s, d, hops, cost) AS (
+    SELECT src, dst, 1, w FROM complete
+    UNION ALL
+    SELECT walks.s, c.dst, walks.hops + 1, walks.cost + c.w FROM walks JOIN complete c ON c.src = walks.d
+    WHERE walks.hops < 6)
+SELECT s, d, min(hops) AS hops, min(cost) AS cost FROM walks WHERE s <> d GROUP BY s, d;
+
+query I
+SELECT count(*) FROM reference;
+----
+13
+
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+# ANY SHORTEST, unbounded
+query I
+SELECT count(*) FROM (
+  (SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (x:P)-[e:K]->+(y:P) COLUMNS (x.id AS a, y.id AS b, path_length(p) AS l)) WHERE a <> b
+   EXCEPT ALL SELECT s, d, hops FROM reference)
+  UNION ALL
+  (SELECT s, d, hops FROM reference
+   EXCEPT ALL SELECT a, b, l FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (x:P)-[e:K]->+(y:P) COLUMNS (x.id AS a, y.id AS b, path_length(p) AS l)) WHERE a <> b));
+----
+0
+
+# Every vertex of each path is a vertex and every hop an edge of the complete set
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (x:P)-[e:K]->+(y:P) COLUMNS (vertices(p) AS v, edges(p) AS es)) t,
+     LATERAL (SELECT unnest(range(len(t.es))) AS i) steps
+WHERE NOT EXISTS (SELECT 1 FROM P a, K k, P b WHERE a.rowid = t.v[i + 1] AND k.rowid = t.es[i + 1] AND b.rowid = t.v[i + 2]
+                  AND k.src = a.id AND k.dst = b.id);
+----
+0
+
+# Unnamed, seeded from one vertex
+# (2 -> 3 -> 1 -> 2 closes a walk on 2)
+query II
+SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (x:P)-[:K]->+(y:P) WHERE x.id = 2 COLUMNS (x.id, y.id)) ORDER BY ALL;
+----
+2	1
+2	2
+2	3
+2	4
+2	5
+
+# ALL SHORTEST: as many paths per pair as shortest walks over the complete edges
+statement ok
+CREATE TABLE all_reference AS
+WITH RECURSIVE walks(s, d, hops) AS (
+    SELECT src, dst, 1 FROM complete
+    UNION ALL
+    SELECT walks.s, c.dst, walks.hops + 1 FROM walks JOIN complete c ON c.src = walks.d WHERE walks.hops < 6)
+SELECT walks.s, walks.d, count(*) AS paths FROM walks JOIN reference r ON r.s = walks.s AND r.d = walks.d AND r.hops = walks.hops
+GROUP BY ALL;
+
+query I
+SELECT count(*) FROM (
+  (SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (x:P)-[e:K]->+(y:P) COLUMNS (x.id AS a, y.id AS b)) WHERE a <> b GROUP BY ALL
+   EXCEPT ALL SELECT s, d, paths FROM all_reference)
+  UNION ALL
+  (SELECT s, d, paths FROM all_reference
+   EXCEPT ALL SELECT a, b, count(*) FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (x:P)-[e:K]->+(y:P) COLUMNS (x.id AS a, y.id AS b)) WHERE a <> b GROUP BY ALL));
+----
+0
+
+# CHEAPEST, unbounded (the weighted directed CSR)
+query I
+SELECT count(*) FROM (
+  (SELECT a, b, c FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (x:P)-[e:K COST e.w]->+(y:P) COLUMNS (x.id AS a, y.id AS b, cost(p) AS c)) WHERE a <> b
+   EXCEPT ALL SELECT s, d, cost FROM reference)
+  UNION ALL
+  (SELECT s, d, cost FROM reference
+   EXCEPT ALL SELECT a, b, c FROM GRAPH_TABLE (g MATCH p = ANY CHEAPEST (x:P)-[e:K COST e.w]->+(y:P) COLUMNS (x.id AS a, y.id AS b, cost(p) AS c)) WHERE a <> b));
+----
+0
+
+# A destination key held by two vertices is still refused
+statement ok
+INSERT INTO P VALUES (4, 'd2');
+
+statement error
+SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (x:P)-[:K]->+(y:P) COLUMNS (x.id, y.id));
+----
+Non-existent/non-unique vertices detected

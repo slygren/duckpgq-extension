@@ -61,6 +61,30 @@ In every such case the old rows were wrong.
     `b`.
   - **`-[e]->?` where the one-hop edge cannot leave the vertex's table** returns its zero-hop rows instead of an
     error.
+  - **ABI artifacts no longer hold edges whose endpoint is no vertex.** `pgq_abi_build` copied such edges, so an
+    artifact answered them where the traversal does not (`(p)-[:L]->(t)`: 2 rows from the artifact, 1 traversed).
+    It now builds from the complete edges and records `endpoints_complete`; a catalog without that column is
+    measured once and its incomplete artifacts are not used.
+  - **Zero hops over an edge between two tables:** `(a:Tag)-[:HasWorkorder]->{0,k}(b)` has a zero-hop row per tag
+    (b = a); an unlabeled end vertex took the edge's other table, so there was none. `{0,k}` / `{1,k}` over such an
+    edge are one hop at most (an unbounded or named one was refused).
+  - **ANY SHORTEST over a fixed-length pattern** (`-[e]->{1,1}`, a plain edge, several fixed hops) returns one path
+    per pair of endpoints, in every direction; it returned one row per parallel edge. Over a pattern that mixes fixed
+    hops with a variable-length one, ANY / ALL SHORTEST compare the whole paths: they returned the shortest
+    variable-length part per pair of its own ends, so longer paths and extra ties per endpoint pair.
+  - **ANY / ALL SHORTEST match walks, as in SQL/PGQ and as `SHORTEST k` already did.** A walk may return to its
+    start and repeat a vertex: `ANY SHORTEST (a)-[:K]->{1,3}(b)` has a row with `b = a` for every `a` on a cycle (the
+    shortest closed walk), `ALL SHORTEST` every shortest closed walk, and from a lower bound above 1 the shortest walk
+    within the bounds may pass a vertex twice (`{2,4}` from `a` to a neighbour `b` can be `a -> b -> a -> b`). They
+    left those out, so `SHORTEST 1` and `ANY SHORTEST` disagreed. `ACYCLIC` keeps the old answers, `TRAIL` and
+    `SIMPLE` restrict the walks as they define (an undirected `TRAIL` cannot go back over the edge it came by). The
+    CSR path functions take a fifth argument for it (`iterativelength`, `shortestpath`, `allshortestpaths`: the
+    shortest closed walk from a vertex to itself).
+  - **Column names do not depend on the route.** `COLUMNS (p.id)` was named `id` traversed and `v0` when an ABI
+    artifact answered; it is `id` on every route (an expression without `AS` is named by its text).
+  - **Several `GRAPH_TABLE`s in one statement** (a join, `EXCEPT`, two scalar subqueries over the same graph) give
+    the rows each gives alone. DuckDB 2.0.0's `common_subplan` optimizer merged their subplans and could read one
+    vertex scan's column in place of another's; it is kept off the scans of statements with a `GRAPH_TABLE`.
 
 **Errors where there used to be silent wrong output**
 - **A path function on a name that isn't a path** (`path_length(o)` with no `o = …`) is an error. The column used to
@@ -155,12 +179,23 @@ with identical answers.
   with "Cannot compare VARCHAR and BIGINT".
 - **`edges(p)`** on an ABI route used to fail. It now traverses.
 - **Bounded CHEAPEST** used to fail with "CSR not found".
+- **`ONE ROW PER` over a quantifier whose endpoint has an element WHERE** (`(a:Person WHERE a.name = 'Ann')`) used
+  to fail with "could not locate quantified path element". It gives the rows of the same condition in the MATCH
+  WHERE.
+- **The path variable of an OPTIONAL MATCH pattern** can be used in COLUMNS and WHERE: `path_length(p)`, `vertices(p)`,
+  `vertex_property(p, 'x')`, ... are NULL where the optional pattern did not match. It was refused.
+- **Unbounded ANY / ALL SHORTEST and CHEAPEST over an edge table with edges to missing vertices** (lake data has
+  them) failed with "Non-existent/non-unique vertices detected". Such an edge is no edge of the graph, as everywhere
+  else, and is skipped.
+- **Errors raised by the extension's functions** (a CSR that is not built, an invalid argument to
+  `graph_tree_json`, a vertex id outside the CSR) are reported as themselves. They used to surface as INTERNAL
+  errors, which invalidate the database, and `TRY()` could not catch them. Out-of-range vertex ids given to the
+  path functions directly used to be read as memory offsets; they are refused.
 
 ### Known limitations
 
 See README "Limitations". Work in progress for the next release:
 - **Patterns:** cross-table label disjunction and unlabeled vertices over several vertex tables.
-- **`ONE ROW PER` with element-level WHERE.**
 - **Graph definition:** graphs over views, several labels per table, a `KEY` clause, computed properties,
   `ALTER PROPERTY GRAPH`.
 - **Predicates:** `IS SOURCE/DESTINATION OF`, `SAME`, `PROPERTY_EXISTS`, `labels()`.
@@ -171,5 +206,3 @@ See README "Limitations". Work in progress for the next release:
 - **DuckLake version coupling:** DuckDB 2.0 writes DuckLake format 1.1 and a newer file storage version, which 1.5
   tools can't read. A 2.0 write into a Postgres-backed 1.0 catalog once removed column statistics 1.5 then failed on
   (repaired by hand). See README "DuckLake versions": build lakes with the version their other writers use.
-- **Wrong rows from DuckDB's `common_subplan` optimizer** with several `GRAPH_TABLE`s in one statement. Being fixed;
-  until then avoid putting several `GRAPH_TABLE`s that share a subquery in one statement.

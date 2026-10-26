@@ -1742,16 +1742,23 @@ FROM GRAPH_TABLE (sg MATCH (a:V)-[:E]->?(m:V)-[:E]->?(b:V) WHERE a.id = 1 COLUMN
 1	2	2
 1	2	3
 
-# Over an edge between two tables the end vertex has the edge's destination table, so no zero-hop match, as with {0,k}
+# Over an edge between two tables zero hops bind the unlabeled end vertex to the start (a V): one zero-hop match per
+# V, beside the one-hop match into O. {0,2} is {0,1} there (the edge cannot be taken twice in a row).
 query II rowsort
 FROM GRAPH_TABLE (sg MATCH (a:V)-[:F]->?(b) COLUMNS (a.id AS a, b.id AS b));
 ----
+1	1
+2	2
 2	7
+3	3
 
 query II rowsort
 FROM GRAPH_TABLE (sg MATCH (a:V)-[:F]->{0,2}(b) COLUMNS (a.id AS a, b.id AS b));
 ----
+1	1
+2	2
 2	7
+3	3
 
 # A named path of zero hops
 query IITI rowsort

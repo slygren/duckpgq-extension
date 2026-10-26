@@ -60,6 +60,7 @@ static void IterativeLengthBidirectionalFunction(DataChunk &args, ExpressionStat
 	UnifiedVectorFormat vdata_dst;
 	src.ToUnifiedFormat(vdata_src);
 	dst.ToUnifiedFormat(vdata_dst);
+	CheckCSRVertices(*csr_found, v_size, vdata_src, vdata_dst, args.size(), "iterativelengthbidirectional");
 	// The unified format exposes raw bytes; the BIGINT columns must be read as int64_t (indexing the byte pointer
 	// read one byte per element and made every comparison depend on neighbouring bytes).
 	auto src_data = reinterpret_cast<const int64_t *>(vdata_src.data);
@@ -163,10 +164,10 @@ static void IterativeLengthBidirectionalFunction(DataChunk &args, ExpressionStat
 // Register functions
 //------------------------------------------------------------------------------
 void CoreScalarFunctions::RegisterIterativeLengthBidirectionalScalarFunction(ExtensionLoader &loader) {
-	loader.RegisterFunction(ScalarFunction(
+	loader.RegisterFunction(Fallible(ScalarFunction(
 	    "iterativelengthbidirectional",
 	    {LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT}, LogicalType::BIGINT,
-	    IterativeLengthBidirectionalFunction, IterativeLengthFunctionData::IterativeLengthBind));
+	    IterativeLengthBidirectionalFunction, IterativeLengthFunctionData::IterativeLengthBind)));
 }
 
 } // namespace duckdb

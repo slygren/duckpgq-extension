@@ -30,10 +30,12 @@ CREATE TABLE H AS SELECT i AS child, (i - 1) // 4 AS parent FROM range(1, 5000) 
 statement ok
 CREATE PROPERTY GRAPH h VERTEX TABLES (T LABEL T) EDGE TABLES (H SOURCE KEY (child) REFERENCES T (id) DESTINATION KEY (parent) REFERENCES T (id) LABEL H);
 
-# One seed: every destination's shortest path, the same one among ties as before
+# One seed: every destination's shortest path, the same one among ties as before (ANY SHORTEST matches walks: the
+# seed's own row is its shortest closed walk, through the edge 20 -> 1)
 query IITT
 FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[:K]->+(b:P) WHERE a.id = 1 COLUMNS (b.id AS b, path_length(p) AS l, vertices(p) AS vs, edges(p) AS es)) ORDER BY ALL;
 ----
+1	8	[0, 3, 6, 9, 12, 15, 17, 19, 0]	[37, 38, 39, 40, 41, 34, 36, 44]
 2	1	[0, 1]	[0]
 3	1	[0, 2]	[19]
 4	1	[0, 3]	[37]
@@ -55,6 +57,7 @@ FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[:K]->+(b:P) WHERE a.id = 1 COL
 20	7	[0, 3, 6, 9, 12, 15, 17, 19]	[37, 38, 39, 40, 41, 34, 36]
 
 # Backwards from one seed
+# ANY SHORTEST matches walks (round2-correctness): a vertex on a cycle has its shortest closed walk
 query IT
 FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)<-[:K]-+(b:P) WHERE a.id = 17 COLUMNS (b.id AS b, vertices(p) AS vs)) ORDER BY ALL;
 ----
@@ -74,15 +77,18 @@ FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)<-[:K]-+(b:P) WHERE a.id = 17 CO
 14	[16, 14, 13]
 15	[16, 14]
 16	[16, 15]
+17	[16, 14, 12, 9, 6, 3, 0, 19, 17, 16]
 18	[16, 14, 12, 9, 6, 3, 0, 19, 17]
 19	[16, 14, 12, 9, 6, 3, 0, 19, 18]
 20	[16, 14, 12, 9, 6, 3, 0, 19]
 
 # A few seeds (each searched once)
+# ANY SHORTEST matches walks (round2-correctness): a vertex on a cycle has its shortest closed walk
 query IIT
 FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[:K]->+(b:P) WHERE a.id IN (2, 7, 11) COLUMNS (a.id AS a, b.id AS b, edges(p) AS es)) ORDER BY ALL;
 ----
 2	1	[20, 38, 39, 40, 41, 34, 36, 44]
+2	2	[20, 38, 39, 40, 41, 34, 36, 44, 0]
 2	3	[1]
 2	4	[20]
 2	5	[1, 21]
@@ -107,6 +113,7 @@ FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[:K]->+(b:P) WHERE a.id IN (2, 
 7	4	[39, 40, 41, 34, 36, 44, 37]
 7	5	[39, 40, 41, 34, 36, 44, 19, 21]
 7	6	[39, 40, 41, 34, 36, 44, 37, 22]
+7	7	[39, 40, 41, 34, 36, 44, 37, 38]
 7	8	[6]
 7	9	[25]
 7	10	[39]
@@ -130,6 +137,7 @@ FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[:K]->+(b:P) WHERE a.id IN (2, 
 11	8	[29, 41, 34, 36, 44, 37, 22, 24]
 11	9	[29, 41, 34, 36, 44, 37, 38, 25]
 11	10	[29, 41, 34, 36, 44, 37, 38, 39]
+11	11	[29, 41, 34, 36, 44, 37, 38, 25, 27]
 11	12	[10]
 11	13	[29]
 11	14	[10, 30]
@@ -141,20 +149,23 @@ FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[:K]->+(b:P) WHERE a.id IN (2, 
 11	20	[29, 41, 34, 36]
 
 # Every source: more distinct sources per chunk than are searched one by one
+# ANY SHORTEST matches walks (round2-correctness): a vertex on a cycle has its shortest closed walk
 query III
 SELECT count(*), sum(l), sum(hash(vs)) FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[:K]->+(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS vs));
 ----
-380	1725	3474189566818772286650
+400	1896	3675484002222913580813
 
 # Lower bound above 1
+# ANY SHORTEST matches walks (round2-correctness): a vertex on a cycle has its shortest closed walk
 query II
 FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[:K]->{3,}(b:P) WHERE a.id = 4 COLUMNS (b.id AS b, path_length(p) AS l)) ORDER BY ALL;
 ----
 1	7
 2	8
 3	8
+4	8
 5	9
-6	10
+6	9
 7	3
 8	3
 9	3

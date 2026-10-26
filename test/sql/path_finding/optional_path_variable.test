@@ -1,0 +1,387 @@
+# name: test/sql/path_finding/optional_path_variable.test
+# description: The path variable of an OPTIONAL MATCH pattern in COLUMNS and WHERE: path_length(p), vertices(p),
+#              edges(p), vertex_labels(p), vertex_property(p, 'x'), element_id(p) and expressions over them, NULL where
+#              the optional pattern did not match. It was refused. Each shape equals the LEFT JOIN of the mandatory
+#              pattern's GRAPH_TABLE onto the vertices, in every direction, bounded, unbounded and fixed, traversed and
+#              with ABI artifacts.
+# group: [path_finding]
+
+require duckpgq
+
+load __TEST_DIR__/optional_path_variable.db
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE P(id BIGINT, w BIGINT);
+
+statement ok
+INSERT INTO P VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);
+
+statement ok
+CREATE TABLE K(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO K VALUES (1, 2), (2, 3), (1, 3), (3, 4), (1, 2);
+
+statement ok
+CREATE PROPERTY GRAPH g VERTEX TABLES (P LABEL P)
+EDGE TABLES (K SOURCE KEY (src) REFERENCES P (id) DESTINATION KEY (dst) REFERENCES P (id) LABEL K);
+
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+# traversed: right {1,2}
+statement ok
+CREATE OR REPLACE TABLE t_opt AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = (a)-[e:K]->{1,2}(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws, path_length(p) * 100 + a.id AS mix));
+
+statement ok
+CREATE OR REPLACE TABLE t_ref AS SELECT v.id AS a, m.b, m.l, m.v, m.es, m.vl, m.ws, m.l * 100 + v.id AS mix FROM P v LEFT JOIN
+    (FROM GRAPH_TABLE (g MATCH p = (a:P)-[e:K]->{1,2}(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws))) m ON m.a = v.id;
+
+query III
+SELECT (SELECT count(*) FROM t_opt WHERE l IS NULL) > 0, (SELECT count(*) FROM t_opt WHERE l IS NOT NULL) > 0,
+       (SELECT count(*) FROM ((FROM t_opt EXCEPT ALL FROM t_ref) UNION ALL (FROM t_ref EXCEPT ALL FROM t_opt)));
+----
+true	true	0
+
+# traversed: right ANY SHORTEST +
+statement ok
+CREATE OR REPLACE TABLE t_opt AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = ANY SHORTEST (a)-[e:K]->+(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws, path_length(p) * 100 + a.id AS mix));
+
+statement ok
+CREATE OR REPLACE TABLE t_ref AS SELECT v.id AS a, m.b, m.l, m.v, m.es, m.vl, m.ws, m.l * 100 + v.id AS mix FROM P v LEFT JOIN
+    (FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[e:K]->+(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws))) m ON m.a = v.id;
+
+query III
+SELECT (SELECT count(*) FROM t_opt WHERE l IS NULL) > 0, (SELECT count(*) FROM t_opt WHERE l IS NOT NULL) > 0,
+       (SELECT count(*) FROM ((FROM t_opt EXCEPT ALL FROM t_ref) UNION ALL (FROM t_ref EXCEPT ALL FROM t_opt)));
+----
+true	true	0
+
+# traversed: right ALL SHORTEST {1,3}
+statement ok
+CREATE OR REPLACE TABLE t_opt AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = ALL SHORTEST (a)-[e:K]->{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws, path_length(p) * 100 + a.id AS mix));
+
+statement ok
+CREATE OR REPLACE TABLE t_ref AS SELECT v.id AS a, m.b, m.l, m.v, m.es, m.vl, m.ws, m.l * 100 + v.id AS mix FROM P v LEFT JOIN
+    (FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[e:K]->{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws))) m ON m.a = v.id;
+
+query III
+SELECT (SELECT count(*) FROM t_opt WHERE l IS NULL) > 0, (SELECT count(*) FROM t_opt WHERE l IS NOT NULL) > 0,
+       (SELECT count(*) FROM ((FROM t_opt EXCEPT ALL FROM t_ref) UNION ALL (FROM t_ref EXCEPT ALL FROM t_opt)));
+----
+true	true	0
+
+# traversed: left {1,2}
+statement ok
+CREATE OR REPLACE TABLE t_opt AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = (a)<-[e:K]-{1,2}(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws, path_length(p) * 100 + a.id AS mix));
+
+statement ok
+CREATE OR REPLACE TABLE t_ref AS SELECT v.id AS a, m.b, m.l, m.v, m.es, m.vl, m.ws, m.l * 100 + v.id AS mix FROM P v LEFT JOIN
+    (FROM GRAPH_TABLE (g MATCH p = (a:P)<-[e:K]-{1,2}(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws))) m ON m.a = v.id;
+
+query III
+SELECT (SELECT count(*) FROM t_opt WHERE l IS NULL) > 0, (SELECT count(*) FROM t_opt WHERE l IS NOT NULL) > 0,
+       (SELECT count(*) FROM ((FROM t_opt EXCEPT ALL FROM t_ref) UNION ALL (FROM t_ref EXCEPT ALL FROM t_opt)));
+----
+true	true	0
+
+# traversed: left ANY SHORTEST +
+statement ok
+CREATE OR REPLACE TABLE t_opt AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = ANY SHORTEST (a)<-[e:K]-+(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws, path_length(p) * 100 + a.id AS mix));
+
+statement ok
+CREATE OR REPLACE TABLE t_ref AS SELECT v.id AS a, m.b, m.l, m.v, m.es, m.vl, m.ws, m.l * 100 + v.id AS mix FROM P v LEFT JOIN
+    (FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)<-[e:K]-+(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws))) m ON m.a = v.id;
+
+query III
+SELECT (SELECT count(*) FROM t_opt WHERE l IS NULL) > 0, (SELECT count(*) FROM t_opt WHERE l IS NOT NULL) > 0,
+       (SELECT count(*) FROM ((FROM t_opt EXCEPT ALL FROM t_ref) UNION ALL (FROM t_ref EXCEPT ALL FROM t_opt)));
+----
+true	true	0
+
+# traversed: left ALL SHORTEST {1,3}
+statement ok
+CREATE OR REPLACE TABLE t_opt AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = ALL SHORTEST (a)<-[e:K]-{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws, path_length(p) * 100 + a.id AS mix));
+
+statement ok
+CREATE OR REPLACE TABLE t_ref AS SELECT v.id AS a, m.b, m.l, m.v, m.es, m.vl, m.ws, m.l * 100 + v.id AS mix FROM P v LEFT JOIN
+    (FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)<-[e:K]-{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws))) m ON m.a = v.id;
+
+query III
+SELECT (SELECT count(*) FROM t_opt WHERE l IS NULL) > 0, (SELECT count(*) FROM t_opt WHERE l IS NOT NULL) > 0,
+       (SELECT count(*) FROM ((FROM t_opt EXCEPT ALL FROM t_ref) UNION ALL (FROM t_ref EXCEPT ALL FROM t_opt)));
+----
+true	true	0
+
+# traversed: undirected {1,2}
+statement ok
+CREATE OR REPLACE TABLE t_opt AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = (a)-[e:K]-{1,2}(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws, path_length(p) * 100 + a.id AS mix));
+
+statement ok
+CREATE OR REPLACE TABLE t_ref AS SELECT v.id AS a, m.b, m.l, m.v, m.es, m.vl, m.ws, m.l * 100 + v.id AS mix FROM P v LEFT JOIN
+    (FROM GRAPH_TABLE (g MATCH p = (a:P)-[e:K]-{1,2}(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws))) m ON m.a = v.id;
+
+query III
+SELECT (SELECT count(*) FROM t_opt WHERE l IS NULL) > 0, (SELECT count(*) FROM t_opt WHERE l IS NOT NULL) > 0,
+       (SELECT count(*) FROM ((FROM t_opt EXCEPT ALL FROM t_ref) UNION ALL (FROM t_ref EXCEPT ALL FROM t_opt)));
+----
+true	true	0
+
+# traversed: undirected ANY SHORTEST +
+statement ok
+CREATE OR REPLACE TABLE t_opt AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = ANY SHORTEST (a)-[e:K]-+(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws, path_length(p) * 100 + a.id AS mix));
+
+statement ok
+CREATE OR REPLACE TABLE t_ref AS SELECT v.id AS a, m.b, m.l, m.v, m.es, m.vl, m.ws, m.l * 100 + v.id AS mix FROM P v LEFT JOIN
+    (FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[e:K]-+(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws))) m ON m.a = v.id;
+
+query III
+SELECT (SELECT count(*) FROM t_opt WHERE l IS NULL) > 0, (SELECT count(*) FROM t_opt WHERE l IS NOT NULL) > 0,
+       (SELECT count(*) FROM ((FROM t_opt EXCEPT ALL FROM t_ref) UNION ALL (FROM t_ref EXCEPT ALL FROM t_opt)));
+----
+true	true	0
+
+# traversed: undirected ALL SHORTEST {1,3}
+statement ok
+CREATE OR REPLACE TABLE t_opt AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = ALL SHORTEST (a)-[e:K]-{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws, path_length(p) * 100 + a.id AS mix));
+
+statement ok
+CREATE OR REPLACE TABLE t_ref AS SELECT v.id AS a, m.b, m.l, m.v, m.es, m.vl, m.ws, m.l * 100 + v.id AS mix FROM P v LEFT JOIN
+    (FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[e:K]-{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws))) m ON m.a = v.id;
+
+query III
+SELECT (SELECT count(*) FROM t_opt WHERE l IS NULL) > 0, (SELECT count(*) FROM t_opt WHERE l IS NOT NULL) > 0,
+       (SELECT count(*) FROM ((FROM t_opt EXCEPT ALL FROM t_ref) UNION ALL (FROM t_ref EXCEPT ALL FROM t_opt)));
+----
+true	true	0
+
+# traversed: fixed one hop
+statement ok
+CREATE OR REPLACE TABLE t_opt AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = (a)-[e:K]->(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws, path_length(p) * 100 + a.id AS mix));
+
+statement ok
+CREATE OR REPLACE TABLE t_ref AS SELECT v.id AS a, m.b, m.l, m.v, m.vl, m.ws, m.l * 100 + v.id AS mix FROM P v LEFT JOIN
+    (FROM GRAPH_TABLE (g MATCH p = (a:P)-[e:K]->(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws))) m ON m.a = v.id;
+
+query III
+SELECT (SELECT count(*) FROM t_opt WHERE l IS NULL) > 0, (SELECT count(*) FROM t_opt WHERE l IS NOT NULL) > 0,
+       (SELECT count(*) FROM ((FROM t_opt EXCEPT ALL FROM t_ref) UNION ALL (FROM t_ref EXCEPT ALL FROM t_opt)));
+----
+true	true	0
+
+# traversed: fixed two hops
+statement ok
+CREATE OR REPLACE TABLE t_opt AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = (a)-[e:K]->(m:P)-[f:K]->(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws, path_length(p) * 100 + a.id AS mix));
+
+statement ok
+CREATE OR REPLACE TABLE t_ref AS SELECT v.id AS a, m.b, m.l, m.v, m.vl, m.ws, m.l * 100 + v.id AS mix FROM P v LEFT JOIN
+    (FROM GRAPH_TABLE (g MATCH p = (a:P)-[e:K]->(m:P)-[f:K]->(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws))) m ON m.a = v.id;
+
+query III
+SELECT (SELECT count(*) FROM t_opt WHERE l IS NULL) > 0, (SELECT count(*) FROM t_opt WHERE l IS NOT NULL) > 0,
+       (SELECT count(*) FROM ((FROM t_opt EXCEPT ALL FROM t_ref) UNION ALL (FROM t_ref EXCEPT ALL FROM t_opt)));
+----
+true	true	0
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('g', exclude_self_referential := false, closures := ['K'], max_hops := 2);
+
+# artifacts: right {1,2}
+statement ok
+CREATE OR REPLACE TABLE t_opt AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = (a)-[e:K]->{1,2}(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws, path_length(p) * 100 + a.id AS mix));
+
+statement ok
+CREATE OR REPLACE TABLE t_ref AS SELECT v.id AS a, m.b, m.l, m.v, m.es, m.vl, m.ws, m.l * 100 + v.id AS mix FROM P v LEFT JOIN
+    (FROM GRAPH_TABLE (g MATCH p = (a:P)-[e:K]->{1,2}(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws))) m ON m.a = v.id;
+
+query III
+SELECT (SELECT count(*) FROM t_opt WHERE l IS NULL) > 0, (SELECT count(*) FROM t_opt WHERE l IS NOT NULL) > 0,
+       (SELECT count(*) FROM ((FROM t_opt EXCEPT ALL FROM t_ref) UNION ALL (FROM t_ref EXCEPT ALL FROM t_opt)));
+----
+true	true	0
+
+# artifacts: right ANY SHORTEST +
+statement ok
+CREATE OR REPLACE TABLE t_opt AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = ANY SHORTEST (a)-[e:K]->+(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws, path_length(p) * 100 + a.id AS mix));
+
+statement ok
+CREATE OR REPLACE TABLE t_ref AS SELECT v.id AS a, m.b, m.l, m.v, m.es, m.vl, m.ws, m.l * 100 + v.id AS mix FROM P v LEFT JOIN
+    (FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[e:K]->+(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws))) m ON m.a = v.id;
+
+query III
+SELECT (SELECT count(*) FROM t_opt WHERE l IS NULL) > 0, (SELECT count(*) FROM t_opt WHERE l IS NOT NULL) > 0,
+       (SELECT count(*) FROM ((FROM t_opt EXCEPT ALL FROM t_ref) UNION ALL (FROM t_ref EXCEPT ALL FROM t_opt)));
+----
+true	true	0
+
+# artifacts: right ALL SHORTEST {1,3}
+statement ok
+CREATE OR REPLACE TABLE t_opt AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = ALL SHORTEST (a)-[e:K]->{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws, path_length(p) * 100 + a.id AS mix));
+
+statement ok
+CREATE OR REPLACE TABLE t_ref AS SELECT v.id AS a, m.b, m.l, m.v, m.es, m.vl, m.ws, m.l * 100 + v.id AS mix FROM P v LEFT JOIN
+    (FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[e:K]->{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws))) m ON m.a = v.id;
+
+query III
+SELECT (SELECT count(*) FROM t_opt WHERE l IS NULL) > 0, (SELECT count(*) FROM t_opt WHERE l IS NOT NULL) > 0,
+       (SELECT count(*) FROM ((FROM t_opt EXCEPT ALL FROM t_ref) UNION ALL (FROM t_ref EXCEPT ALL FROM t_opt)));
+----
+true	true	0
+
+# artifacts: left {1,2}
+statement ok
+CREATE OR REPLACE TABLE t_opt AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = (a)<-[e:K]-{1,2}(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws, path_length(p) * 100 + a.id AS mix));
+
+statement ok
+CREATE OR REPLACE TABLE t_ref AS SELECT v.id AS a, m.b, m.l, m.v, m.es, m.vl, m.ws, m.l * 100 + v.id AS mix FROM P v LEFT JOIN
+    (FROM GRAPH_TABLE (g MATCH p = (a:P)<-[e:K]-{1,2}(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws))) m ON m.a = v.id;
+
+query III
+SELECT (SELECT count(*) FROM t_opt WHERE l IS NULL) > 0, (SELECT count(*) FROM t_opt WHERE l IS NOT NULL) > 0,
+       (SELECT count(*) FROM ((FROM t_opt EXCEPT ALL FROM t_ref) UNION ALL (FROM t_ref EXCEPT ALL FROM t_opt)));
+----
+true	true	0
+
+# artifacts: left ANY SHORTEST +
+statement ok
+CREATE OR REPLACE TABLE t_opt AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = ANY SHORTEST (a)<-[e:K]-+(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws, path_length(p) * 100 + a.id AS mix));
+
+statement ok
+CREATE OR REPLACE TABLE t_ref AS SELECT v.id AS a, m.b, m.l, m.v, m.es, m.vl, m.ws, m.l * 100 + v.id AS mix FROM P v LEFT JOIN
+    (FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)<-[e:K]-+(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws))) m ON m.a = v.id;
+
+query III
+SELECT (SELECT count(*) FROM t_opt WHERE l IS NULL) > 0, (SELECT count(*) FROM t_opt WHERE l IS NOT NULL) > 0,
+       (SELECT count(*) FROM ((FROM t_opt EXCEPT ALL FROM t_ref) UNION ALL (FROM t_ref EXCEPT ALL FROM t_opt)));
+----
+true	true	0
+
+# artifacts: left ALL SHORTEST {1,3}
+statement ok
+CREATE OR REPLACE TABLE t_opt AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = ALL SHORTEST (a)<-[e:K]-{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws, path_length(p) * 100 + a.id AS mix));
+
+statement ok
+CREATE OR REPLACE TABLE t_ref AS SELECT v.id AS a, m.b, m.l, m.v, m.es, m.vl, m.ws, m.l * 100 + v.id AS mix FROM P v LEFT JOIN
+    (FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)<-[e:K]-{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws))) m ON m.a = v.id;
+
+query III
+SELECT (SELECT count(*) FROM t_opt WHERE l IS NULL) > 0, (SELECT count(*) FROM t_opt WHERE l IS NOT NULL) > 0,
+       (SELECT count(*) FROM ((FROM t_opt EXCEPT ALL FROM t_ref) UNION ALL (FROM t_ref EXCEPT ALL FROM t_opt)));
+----
+true	true	0
+
+# artifacts: undirected {1,2}
+statement ok
+CREATE OR REPLACE TABLE t_opt AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = (a)-[e:K]-{1,2}(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws, path_length(p) * 100 + a.id AS mix));
+
+statement ok
+CREATE OR REPLACE TABLE t_ref AS SELECT v.id AS a, m.b, m.l, m.v, m.es, m.vl, m.ws, m.l * 100 + v.id AS mix FROM P v LEFT JOIN
+    (FROM GRAPH_TABLE (g MATCH p = (a:P)-[e:K]-{1,2}(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws))) m ON m.a = v.id;
+
+query III
+SELECT (SELECT count(*) FROM t_opt WHERE l IS NULL) > 0, (SELECT count(*) FROM t_opt WHERE l IS NOT NULL) > 0,
+       (SELECT count(*) FROM ((FROM t_opt EXCEPT ALL FROM t_ref) UNION ALL (FROM t_ref EXCEPT ALL FROM t_opt)));
+----
+true	true	0
+
+# artifacts: undirected ANY SHORTEST +
+statement ok
+CREATE OR REPLACE TABLE t_opt AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = ANY SHORTEST (a)-[e:K]-+(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws, path_length(p) * 100 + a.id AS mix));
+
+statement ok
+CREATE OR REPLACE TABLE t_ref AS SELECT v.id AS a, m.b, m.l, m.v, m.es, m.vl, m.ws, m.l * 100 + v.id AS mix FROM P v LEFT JOIN
+    (FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[e:K]-+(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws))) m ON m.a = v.id;
+
+query III
+SELECT (SELECT count(*) FROM t_opt WHERE l IS NULL) > 0, (SELECT count(*) FROM t_opt WHERE l IS NOT NULL) > 0,
+       (SELECT count(*) FROM ((FROM t_opt EXCEPT ALL FROM t_ref) UNION ALL (FROM t_ref EXCEPT ALL FROM t_opt)));
+----
+true	true	0
+
+# artifacts: undirected ALL SHORTEST {1,3}
+statement ok
+CREATE OR REPLACE TABLE t_opt AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = ALL SHORTEST (a)-[e:K]-{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws, path_length(p) * 100 + a.id AS mix));
+
+statement ok
+CREATE OR REPLACE TABLE t_ref AS SELECT v.id AS a, m.b, m.l, m.v, m.es, m.vl, m.ws, m.l * 100 + v.id AS mix FROM P v LEFT JOIN
+    (FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[e:K]-{1,3}(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, edges(p) AS es, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws))) m ON m.a = v.id;
+
+query III
+SELECT (SELECT count(*) FROM t_opt WHERE l IS NULL) > 0, (SELECT count(*) FROM t_opt WHERE l IS NOT NULL) > 0,
+       (SELECT count(*) FROM ((FROM t_opt EXCEPT ALL FROM t_ref) UNION ALL (FROM t_ref EXCEPT ALL FROM t_opt)));
+----
+true	true	0
+
+# artifacts: fixed one hop
+statement ok
+CREATE OR REPLACE TABLE t_opt AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = (a)-[e:K]->(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws, path_length(p) * 100 + a.id AS mix));
+
+statement ok
+CREATE OR REPLACE TABLE t_ref AS SELECT v.id AS a, m.b, m.l, m.v, m.vl, m.ws, m.l * 100 + v.id AS mix FROM P v LEFT JOIN
+    (FROM GRAPH_TABLE (g MATCH p = (a:P)-[e:K]->(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws))) m ON m.a = v.id;
+
+query III
+SELECT (SELECT count(*) FROM t_opt WHERE l IS NULL) > 0, (SELECT count(*) FROM t_opt WHERE l IS NOT NULL) > 0,
+       (SELECT count(*) FROM ((FROM t_opt EXCEPT ALL FROM t_ref) UNION ALL (FROM t_ref EXCEPT ALL FROM t_opt)));
+----
+true	true	0
+
+# artifacts: fixed two hops
+statement ok
+CREATE OR REPLACE TABLE t_opt AS FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = (a)-[e:K]->(m:P)-[f:K]->(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws, path_length(p) * 100 + a.id AS mix));
+
+statement ok
+CREATE OR REPLACE TABLE t_ref AS SELECT v.id AS a, m.b, m.l, m.v, m.vl, m.ws, m.l * 100 + v.id AS mix FROM P v LEFT JOIN
+    (FROM GRAPH_TABLE (g MATCH p = (a:P)-[e:K]->(m:P)-[f:K]->(b:P) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, vertices(p) AS v, vertex_labels(p) AS vl, list_sum(vertex_property(p, 'w')) AS ws))) m ON m.a = v.id;
+
+query III
+SELECT (SELECT count(*) FROM t_opt WHERE l IS NULL) > 0, (SELECT count(*) FROM t_opt WHERE l IS NOT NULL) > 0,
+       (SELECT count(*) FROM ((FROM t_opt EXCEPT ALL FROM t_ref) UNION ALL (FROM t_ref EXCEPT ALL FROM t_opt)));
+----
+true	true	0
+
+# In the MATCH WHERE: rows filter as for any optional variable (a NULL comparison drops the row)
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+query III
+SELECT * FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = (a)-[e:K]->{1,2}(b:P) WHERE path_length(p) = 2
+                           COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)) ORDER BY ALL;
+----
+1	3	2
+1	3	2
+1	4	2
+2	4	2
+
+query II
+SELECT * FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = (a)-[e:K]->{1,2}(b:P)
+                           WHERE path_length(p) IS NULL OR list_sum(vertex_property(p, 'w')) > 60
+                           COLUMNS (a.id AS a, path_length(p) AS l)) ORDER BY ALL;
+----
+1	2
+2	2
+3	1
+4	NULL
+5	NULL
+
+# element_id(p) of an optional path
+query II
+SELECT a, len(ids) FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = ANY SHORTEST (a)-[e:K]->+(b:P) WHERE a.id = 3
+                                     COLUMNS (a.id AS a, element_id(p) AS ids)) ORDER BY ALL;
+----
+3	3
+
+# UNION branches with their own COLUMNS
+query II
+SELECT * FROM GRAPH_TABLE (g MATCH (a:P) OPTIONAL MATCH p = (a)-[e:K]->{1,3}(b:P) WHERE a.id = 4 COLUMNS (a.id AS a, path_length(p) AS l)
+                           UNION ALL MATCH (a:P) OPTIONAL MATCH q = ANY SHORTEST (a)-[e:K]->+(b:P) WHERE a.id = 3 COLUMNS (a.id AS a, path_length(q) AS l))
+ORDER BY ALL;
+----
+3	1
+4	NULL

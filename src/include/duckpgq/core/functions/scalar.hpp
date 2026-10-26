@@ -3,6 +3,16 @@
 
 namespace duckdb {
 
+//! Marks a function that can throw while it executes (an invalid argument, a CSR that is not there, a cost it refuses).
+//! DuckDB treats an unmarked function as one that never throws: it may evaluate it on rows the query never produces
+//! (moved past a filter, on dictionary entries), and it reports an error thrown from one as an INTERNAL error, which
+//! invalidates the database.
+template <class FUNCTION>
+FUNCTION Fallible(FUNCTION function) {
+	function.SetFallible();
+	return function;
+}
+
 struct CoreScalarFunctions {
 	static void Register(ExtensionLoader &loader) {
 		RegisterAllShortestPathsScalarFunction(loader);

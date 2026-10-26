@@ -52,6 +52,18 @@ public:
 	//! Cells held, for the cache budget
 	idx_t Cells() const;
 
+	//! A step back into the source that closes one of its shortest closed walks (the path functions' closed = true).
+	struct ClosingStep {
+		int64_t length;
+		int64_t vertex;
+		int64_t edge;
+	};
+	//! The steps into the source from the reached vertices nearest to it, all closing walks of the same (shortest)
+	//! length, in vertex order and each vertex's edges in CSR order: the first is the lane search's closing step.
+	//! Empty when no walk returns. Computed on first use and kept with the search.
+	const vector<ClosingStep> &ClosingSteps(int64_t v_size, const atomic<int64_t> *v, const vector<int64_t> &e,
+	                                        const vector<int64_t> &edge_ids) const;
+
 	//! Run the search. scratch_distance is v_size long, all -1, and is all -1 again on return.
 	void Run(ClientContext &context, int64_t v_size, const atomic<int64_t> *v, const vector<int64_t> &e,
 	         const vector<int64_t> &edge_ids, vector<int64_t> &scratch_distance);
@@ -67,6 +79,8 @@ private:
 	unordered_map<int64_t, Entry> sparse_entries;
 	//! allshortestpaths: vertex -> (parent vertex, edge) for every parent one level up
 	unordered_map<int64_t, vector<pair<int64_t, int64_t>>> parents;
+	mutable bool closing_known = false;
+	mutable vector<ClosingStep> closing_steps;
 };
 
 //! Thread-local cache of source searches over one CSR, the function local state of the path functions.

@@ -141,7 +141,8 @@ struct SearchRows {
 			src[row] = src_values[src_index];
 			dst[row] = dst_values[dst_index];
 			if (src[row] < 0 || src[row] >= v_size || dst[row] < 0 || dst[row] >= v_size) {
-				throw InternalException("Cheapest-path search: vertex outside the CSR");
+				throw InvalidInputException("cheapest path search: vertex %lld or %lld is not a row of the CSR",
+				                            static_cast<long long>(src[row]), static_cast<long long>(dst[row]));
 			}
 			auto entry = source_lane.find(src[row]);
 			if (entry == source_lane.end()) {
@@ -481,18 +482,18 @@ void CoreScalarFunctions::RegisterCheapestPathLengthScalarFunction(ExtensionLoad
 	                     CheapestPathLengthFunctionData::CheapestPathLengthBind);
 	typed.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	set.AddFunction(typed);
-	loader.RegisterFunction(set);
+	loader.RegisterFunction(Fallible(set));
 
 	//! cheapestpath(csr, v_size, src, dst): one cheapest path, encoded as shortestpath() encodes one.
-	loader.RegisterFunction(ScalarFunction(
+	loader.RegisterFunction(Fallible(ScalarFunction(
 	    "cheapestpath", {LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT},
 	    LogicalType::LIST(LogicalType::BIGINT), CheapestPathFunction,
-	    CheapestPathLengthFunctionData::CheapestPathLengthBind));
+	    CheapestPathLengthFunctionData::CheapestPathLengthBind)));
 	//! allcheapestpaths(csr, v_size, src, dst): every path of the least cost.
-	loader.RegisterFunction(ScalarFunction(
+	loader.RegisterFunction(Fallible(ScalarFunction(
 	    "allcheapestpaths", {LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT},
 	    LogicalType::LIST(LogicalType::LIST(LogicalType::BIGINT)), AllCheapestPathsFunction,
-	    CheapestPathLengthFunctionData::CheapestPathLengthBind));
+	    CheapestPathLengthFunctionData::CheapestPathLengthBind)));
 
 	ScalarFunction cost("pgq_cost", {LogicalType::ANY}, LogicalType::BIGINT, CostFunction);
 	cost.SetResolveTypesCallback(CostResolveTypes);

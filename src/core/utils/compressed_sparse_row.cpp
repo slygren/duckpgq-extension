@@ -59,6 +59,30 @@ string CSR::ToString() const {
 	return result.str();
 }
 
+void CheckCSRVertices(const CSR &csr, int64_t v_size, const UnifiedVectorFormat &src, const UnifiedVectorFormat &dst,
+                      idx_t count, const char *function_name) {
+	if (v_size < 0 || static_cast<idx_t>(v_size) + 2 > csr.vsize) {
+		throw InvalidInputException("%s: the vertex count %lld does not match the CSR (%llu vertices)", function_name,
+		                            static_cast<long long>(v_size),
+		                            static_cast<unsigned long long>(csr.vsize < 2 ? 0 : csr.vsize - 2));
+	}
+	auto src_data = UnifiedVectorFormat::GetData<int64_t>(src);
+	auto dst_data = UnifiedVectorFormat::GetData<int64_t>(dst);
+	for (idx_t row = 0; row < count; row++) {
+		const auto src_index = src.sel->get_index(row);
+		const auto dst_index = dst.sel->get_index(row);
+		// A NULL endpoint has no path; the functions answer it without reading the CSR
+		const bool src_valid = src.validity.RowIsValid(src_index);
+		const bool dst_valid = dst.validity.RowIsValid(dst_index);
+		for (auto vertex : {src_valid ? src_data[src_index] : 0, dst_valid ? dst_data[dst_index] : 0}) {
+			if (src_valid && dst_valid && (vertex < 0 || vertex >= v_size)) {
+				throw InvalidInputException("%s: vertex %lld is not a row of the CSR (0 .. %lld)", function_name,
+				                            static_cast<long long>(vertex), static_cast<long long>(v_size - 1));
+			}
+		}
+	}
+}
+
 CSRFunctionData::CSRFunctionData(ClientContext &context, int32_t id, const LogicalType &weight_type)
     : context(context), id(id), weight_type(weight_type) {
 }
@@ -232,6 +256,41 @@ unique_ptr<JoinRef> GetJoinRef(const shared_ptr<PropertyGraphTable> &edge_table,
 		}
 	}
 	return first_join_ref;
+}
+
+// Closes the gaps an edge to a missing vertex leaves: the degrees are counted over the edges whose source is a
+// vertex, the CSR is filled from those whose two endpoints are, so such a vertex's slice ends early. Each slice moves
+// down to where the previous one now ends. O(V + E), and only when an edge was missing an endpoint.
+void CSR::Compact() {
+	const int64_t vertices = static_cast<int64_t>(vsize) - 2;
+	int64_t write = 0;
+	for (int64_t x = 0; x < vertices; x++) {
+		const int64_t start = slice_start[x + 1];
+		const int64_t end = v[x + 1];
+		for (int64_t i = start; i < end; i++, write++) {
+			e[write] = e[i];
+			edge_ids[write] = edge_ids[i];
+			if (!w.empty()) {
+				w[write] = w[i];
+			}
+			if (!w_double.empty()) {
+				w_double[write] = w_double[i];
+			}
+		}
+		v[x + 1] = write;
+	}
+	v[vertices + 1] = write;
+	e.resize(write);
+	edge_ids.resize(write);
+	if (!w.empty()) {
+		w.resize(write);
+	}
+	if (!w_double.empty()) {
+		w_double.resize(write);
+	}
+	slice_start.clear();
+	slice_start.shrink_to_fit();
+	compact_pending = false;
 }
 
 unique_ptr<SubqueryExpression> CreateDirectedCSRVertexSubquery(const shared_ptr<PropertyGraphTable> &edge_table,

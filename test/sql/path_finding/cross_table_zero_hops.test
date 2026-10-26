@@ -1,0 +1,230 @@
+# name: test/sql/path_finding/cross_table_zero_hops.test
+# description: A quantifier from 0 over an edge between two vertex tables, (a:Tag)-[:HasWorkorder]->{0,k}(b): zero hops
+#              bind b to a (a Tag), one hop to a workorder. The unlabeled end vertex took its table from the edge, so
+#              the zero-hop rows were missing; and since such an edge cannot be taken twice in a row, {0,k} / {1,k} are
+#              {0,1} / {1,1} there (an unbounded one was refused). A property only the other table has is NULL in the
+#              zero-hop rows. Brute force, traversed and with ABI artifacts.
+# group: [path_finding]
+
+require duckpgq
+
+load __TEST_DIR__/cross_table_zero_hops.db
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE Tag(id BIGINT, name VARCHAR);
+
+statement ok
+INSERT INTO Tag VALUES (1, 't1'), (2, 't2'), (3, 't3');
+
+statement ok
+CREATE TABLE Workorder(id BIGINT, name VARCHAR, prio INTEGER);
+
+statement ok
+INSERT INTO Workorder VALUES (10, 'w10', 1), (11, 'w11', 2), (12, 'w12', 3);
+
+# Tag 1 has two workorders (one twice), tag 2 one, tag 3 none; an edge to a missing workorder
+statement ok
+CREATE TABLE has_wo(tag BIGINT, wo BIGINT, since INTEGER);
+
+statement ok
+INSERT INTO has_wo VALUES (1, 10, 2020), (1, 11, 2021), (2, 11, 2022), (1, 10, 2023), (2, 99, 2024);
+
+statement ok
+CREATE PROPERTY GRAPH g VERTEX TABLES (Tag LABEL Tag, Workorder LABEL Workorder)
+EDGE TABLES (has_wo SOURCE KEY (tag) REFERENCES Tag (id) DESTINATION KEY (wo) REFERENCES Workorder (id) LABEL HasWorkorder);
+
+# Every walk of 0 or 1 hop from a tag: (a, b, b's name, b's prio, hops, the edge's since)
+statement ok
+CREATE TABLE walks AS
+SELECT t.id AS a, t.id AS b, t.name AS bn, NULL::INTEGER AS prio, 0 AS l, NULL::INTEGER AS since FROM Tag t
+UNION ALL
+SELECT h.tag, w.id, w.name, w.prio, 1, h.since FROM has_wo h JOIN Tag t ON t.id = h.tag JOIN Workorder w ON w.id = h.wo;
+
+# Over {0,3} the edge variable is a group variable (its upper bound is above 1): e.since lists the walk's edges'
+# values, [] for zero hops
+statement ok
+ALTER TABLE walks ADD COLUMN sinces INTEGER[];
+
+statement ok
+UPDATE walks SET sinces = CASE WHEN l = 0 THEN []::INTEGER[] ELSE [since] END;
+
+statement ok
+CREATE TABLE shortest AS SELECT DISTINCT a, b, bn, prio, l FROM walks;
+
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+# traversed: {0,1}
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH (a:Tag)-[e:HasWorkorder]->{0,1}(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, e.since AS since))) WHERE a = b),
+       (SELECT count(*) FROM ((FROM GRAPH_TABLE (g MATCH (a:Tag)-[e:HasWorkorder]->{0,1}(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, e.since AS since)) EXCEPT ALL SELECT a, b, bn, prio, since FROM walks) UNION ALL (SELECT a, b, bn, prio, since FROM walks EXCEPT ALL FROM GRAPH_TABLE (g MATCH (a:Tag)-[e:HasWorkorder]->{0,1}(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, e.since AS since)))));
+----
+3	0
+
+# traversed: ?
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH (a:Tag)-[e:HasWorkorder]->?(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, e.since AS since))) WHERE a = b),
+       (SELECT count(*) FROM ((FROM GRAPH_TABLE (g MATCH (a:Tag)-[e:HasWorkorder]->?(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, e.since AS since)) EXCEPT ALL SELECT a, b, bn, prio, since FROM walks) UNION ALL (SELECT a, b, bn, prio, since FROM walks EXCEPT ALL FROM GRAPH_TABLE (g MATCH (a:Tag)-[e:HasWorkorder]->?(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, e.since AS since)))));
+----
+3	0
+
+# traversed: {0,3}
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH (a:Tag)-[e:HasWorkorder]->{0,3}(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, e.since AS since))) WHERE a = b),
+       (SELECT count(*) FROM ((FROM GRAPH_TABLE (g MATCH (a:Tag)-[e:HasWorkorder]->{0,3}(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, e.since AS since)) EXCEPT ALL SELECT a, b, bn, prio, sinces FROM walks) UNION ALL (SELECT a, b, bn, prio, sinces FROM walks EXCEPT ALL FROM GRAPH_TABLE (g MATCH (a:Tag)-[e:HasWorkorder]->{0,3}(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, e.since AS since)))));
+----
+3	0
+
+# traversed: named {0,2}
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[e:HasWorkorder]->{0,2}(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, path_length(p) AS l))) WHERE a = b),
+       (SELECT count(*) FROM ((FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[e:HasWorkorder]->{0,2}(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, path_length(p) AS l)) EXCEPT ALL SELECT a, b, bn, prio, l FROM walks) UNION ALL (SELECT a, b, bn, prio, l FROM walks EXCEPT ALL FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[e:HasWorkorder]->{0,2}(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, path_length(p) AS l)))));
+----
+3	0
+
+# traversed: reverse
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH (b)<-[e:HasWorkorder]-{0,1}(a:Tag) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, e.since AS since))) WHERE a = b),
+       (SELECT count(*) FROM ((FROM GRAPH_TABLE (g MATCH (b)<-[e:HasWorkorder]-{0,1}(a:Tag) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, e.since AS since)) EXCEPT ALL SELECT a, b, bn, prio, since FROM walks) UNION ALL (SELECT a, b, bn, prio, since FROM walks EXCEPT ALL FROM GRAPH_TABLE (g MATCH (b)<-[e:HasWorkorder]-{0,1}(a:Tag) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, e.since AS since)))));
+----
+3	0
+
+# traversed: ANY SHORTEST *
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Tag)-[e:HasWorkorder]->*(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, path_length(p) AS l))) WHERE a = b),
+       (SELECT count(*) FROM ((FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Tag)-[e:HasWorkorder]->*(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, path_length(p) AS l)) EXCEPT ALL SELECT a, b, bn, prio, l FROM shortest) UNION ALL (SELECT a, b, bn, prio, l FROM shortest EXCEPT ALL FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Tag)-[e:HasWorkorder]->*(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, path_length(p) AS l)))));
+----
+3	0
+
+# traversed: ANY SHORTEST {0,4}
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:Tag)-[e:HasWorkorder]->{0,4}(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio))) WHERE a = b),
+       (SELECT count(*) FROM ((FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:Tag)-[e:HasWorkorder]->{0,4}(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio)) EXCEPT ALL SELECT a, b, bn, prio FROM shortest) UNION ALL (SELECT a, b, bn, prio FROM shortest EXCEPT ALL FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:Tag)-[e:HasWorkorder]->{0,4}(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio)))));
+----
+3	0
+
+# traversed: ALL SHORTEST *
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:Tag)-[e:HasWorkorder]->*(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, path_length(p) AS l))) WHERE a = b),
+       (SELECT count(*) FROM ((FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:Tag)-[e:HasWorkorder]->*(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, path_length(p) AS l)) EXCEPT ALL SELECT a, b, bn, prio, l FROM walks) UNION ALL (SELECT a, b, bn, prio, l FROM walks EXCEPT ALL FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:Tag)-[e:HasWorkorder]->*(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, path_length(p) AS l)))));
+----
+3	0
+
+# traversed: one hop from 1 and over to the other table: no zero-hop rows when b is a workorder ...
+query II
+FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HasWorkorder]->{0,1}(b:Workorder) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)) ORDER BY ALL;
+----
+1	10
+1	10
+1	11
+
+# traversed: ... and only those when b is a tag
+query II
+FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HasWorkorder]->{0,1}(b:Tag) COLUMNS (a.id AS a, b.id AS b)) ORDER BY ALL;
+----
+1	1
+2	2
+3	3
+
+# traversed: {1,k} and + over it are one hop
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HasWorkorder]->{1,3}(b) COLUMNS (a.id));
+----
+4
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:Tag)-[:HasWorkorder]->+(b) COLUMNS (a.id));
+----
+3
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('g');
+
+# artifacts: {0,1}
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH (a:Tag)-[e:HasWorkorder]->{0,1}(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, e.since AS since))) WHERE a = b),
+       (SELECT count(*) FROM ((FROM GRAPH_TABLE (g MATCH (a:Tag)-[e:HasWorkorder]->{0,1}(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, e.since AS since)) EXCEPT ALL SELECT a, b, bn, prio, since FROM walks) UNION ALL (SELECT a, b, bn, prio, since FROM walks EXCEPT ALL FROM GRAPH_TABLE (g MATCH (a:Tag)-[e:HasWorkorder]->{0,1}(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, e.since AS since)))));
+----
+3	0
+
+# artifacts: ?
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH (a:Tag)-[e:HasWorkorder]->?(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, e.since AS since))) WHERE a = b),
+       (SELECT count(*) FROM ((FROM GRAPH_TABLE (g MATCH (a:Tag)-[e:HasWorkorder]->?(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, e.since AS since)) EXCEPT ALL SELECT a, b, bn, prio, since FROM walks) UNION ALL (SELECT a, b, bn, prio, since FROM walks EXCEPT ALL FROM GRAPH_TABLE (g MATCH (a:Tag)-[e:HasWorkorder]->?(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, e.since AS since)))));
+----
+3	0
+
+# artifacts: {0,3}
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH (a:Tag)-[e:HasWorkorder]->{0,3}(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, e.since AS since))) WHERE a = b),
+       (SELECT count(*) FROM ((FROM GRAPH_TABLE (g MATCH (a:Tag)-[e:HasWorkorder]->{0,3}(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, e.since AS since)) EXCEPT ALL SELECT a, b, bn, prio, sinces FROM walks) UNION ALL (SELECT a, b, bn, prio, sinces FROM walks EXCEPT ALL FROM GRAPH_TABLE (g MATCH (a:Tag)-[e:HasWorkorder]->{0,3}(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, e.since AS since)))));
+----
+3	0
+
+# artifacts: named {0,2}
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[e:HasWorkorder]->{0,2}(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, path_length(p) AS l))) WHERE a = b),
+       (SELECT count(*) FROM ((FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[e:HasWorkorder]->{0,2}(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, path_length(p) AS l)) EXCEPT ALL SELECT a, b, bn, prio, l FROM walks) UNION ALL (SELECT a, b, bn, prio, l FROM walks EXCEPT ALL FROM GRAPH_TABLE (g MATCH p = (a:Tag)-[e:HasWorkorder]->{0,2}(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, path_length(p) AS l)))));
+----
+3	0
+
+# artifacts: reverse
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH (b)<-[e:HasWorkorder]-{0,1}(a:Tag) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, e.since AS since))) WHERE a = b),
+       (SELECT count(*) FROM ((FROM GRAPH_TABLE (g MATCH (b)<-[e:HasWorkorder]-{0,1}(a:Tag) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, e.since AS since)) EXCEPT ALL SELECT a, b, bn, prio, since FROM walks) UNION ALL (SELECT a, b, bn, prio, since FROM walks EXCEPT ALL FROM GRAPH_TABLE (g MATCH (b)<-[e:HasWorkorder]-{0,1}(a:Tag) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, e.since AS since)))));
+----
+3	0
+
+# artifacts: ANY SHORTEST *
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Tag)-[e:HasWorkorder]->*(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, path_length(p) AS l))) WHERE a = b),
+       (SELECT count(*) FROM ((FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Tag)-[e:HasWorkorder]->*(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, path_length(p) AS l)) EXCEPT ALL SELECT a, b, bn, prio, l FROM shortest) UNION ALL (SELECT a, b, bn, prio, l FROM shortest EXCEPT ALL FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Tag)-[e:HasWorkorder]->*(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, path_length(p) AS l)))));
+----
+3	0
+
+# artifacts: ANY SHORTEST {0,4}
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:Tag)-[e:HasWorkorder]->{0,4}(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio))) WHERE a = b),
+       (SELECT count(*) FROM ((FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:Tag)-[e:HasWorkorder]->{0,4}(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio)) EXCEPT ALL SELECT a, b, bn, prio FROM shortest) UNION ALL (SELECT a, b, bn, prio FROM shortest EXCEPT ALL FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:Tag)-[e:HasWorkorder]->{0,4}(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio)))));
+----
+3	0
+
+# artifacts: ALL SHORTEST *
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:Tag)-[e:HasWorkorder]->*(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, path_length(p) AS l))) WHERE a = b),
+       (SELECT count(*) FROM ((FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:Tag)-[e:HasWorkorder]->*(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, path_length(p) AS l)) EXCEPT ALL SELECT a, b, bn, prio, l FROM walks) UNION ALL (SELECT a, b, bn, prio, l FROM walks EXCEPT ALL FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:Tag)-[e:HasWorkorder]->*(b) COLUMNS (a.id AS a, b.id AS b, b.name AS bn, b.prio AS prio, path_length(p) AS l)))));
+----
+3	0
+
+# artifacts: one hop from 1 and over to the other table: no zero-hop rows when b is a workorder ...
+query II
+FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HasWorkorder]->{0,1}(b:Workorder) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)) ORDER BY ALL;
+----
+1	10
+1	10
+1	11
+
+# artifacts: ... and only those when b is a tag
+query II
+FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HasWorkorder]->{0,1}(b:Tag) COLUMNS (a.id AS a, b.id AS b)) ORDER BY ALL;
+----
+1	1
+2	2
+3	3
+
+# artifacts: {1,k} and + over it are one hop
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH (a:Tag)-[:HasWorkorder]->{1,3}(b) COLUMNS (a.id));
+----
+4
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a:Tag)-[:HasWorkorder]->+(b) COLUMNS (a.id));
+----
+3

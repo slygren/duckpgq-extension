@@ -56,6 +56,10 @@ static void IterativeLengthFunction(DataChunk &args, ExpressionState &state, Vec
 	UnifiedVectorFormat vdata_dst;
 	src.ToUnifiedFormat(vdata_src);
 	dst.ToUnifiedFormat(vdata_dst);
+	CheckCSRVertices(*csr_found, v_size, vdata_src, vdata_dst, args.size(), "iterativelength");
+	// The optional fifth argument: a path from a vertex to itself takes at least one step (a closed walk, under
+	// a lower bound of 1) instead of being the zero-length path.
+	const bool closed = args.ColumnCount() > 4 && args.data[4].GetValue(0).GetValue<bool>();
 	auto src_data = reinterpret_cast<const int64_t *>(vdata_src.data);
 	auto dst_data = reinterpret_cast<const int64_t *>(vdata_dst.data);
 
@@ -77,7 +81,12 @@ static void IterativeLengthFunction(DataChunk &args, ExpressionState &state, Vec
 		for (auto &group : by_source.groups) {
 			auto &search = cache->Get(info.context, *csr_found, v_size, group.first, false);
 			for (auto row : group.second) {
-				const auto distance = search.Distance(dst_data[vdata_dst.sel->get_index(row)]);
+				const auto target = dst_data[vdata_dst.sel->get_index(row)];
+				auto distance = search.Distance(target);
+				if (closed && target == group.first) {
+					auto &steps = search.ClosingSteps(v_size, csr_found->v, e, csr_found->edge_ids);
+					distance = steps.empty() ? -1 : steps[0].length;
+				}
 				result_data[row] = distance;
 				if (distance < 0) {
 					result_validity.SetInvalid(row);
@@ -119,9 +128,10 @@ static void IterativeLengthFunction(DataChunk &args, ExpressionState &state, Vec
 					// a NULL source or destination has no path (the destination used to be read as its raw value)
 					result_validity.SetInvalid(search_num);
 					result_data[search_num] = -1; /* no path */
-				} else if (src_data[src_pos] == dst_data[dst_pos]) {
+				} else if (src_data[src_pos] == dst_data[dst_pos] && !closed) {
 					result_data[search_num] = 0; // path of length 0 does not require a search
 				} else {
+					// The source is not marked seen: a closed search finds it again at its shortest return.
 					visit1[src_data[src_pos]][lane] = true;
 					lane_to_num[lane] = search_num; // active lane
 					active++;
@@ -168,11 +178,18 @@ static void IterativeLengthFunction(DataChunk &args, ExpressionState &state, Vec
 // Register functions
 //------------------------------------------------------------------------------
 void CoreScalarFunctions::RegisterIterativeLengthScalarFunction(ExtensionLoader &loader) {
-	ScalarFunction function(
-	    "iterativelength", {LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT},
-	    LogicalType::BIGINT, IterativeLengthFunction, IterativeLengthFunctionData::IterativeLengthBind);
-	function.SetInitStateCallback(PGQSourceSearchCacheInit);
-	loader.RegisterFunction(function);
+	ScalarFunctionSet set("iterativelength");
+	for (bool closed : {false, true}) {
+		//! iterativelength(csr, v_size, src, dst, closed): closed = true takes a vertex to itself by a closed walk
+		vector<LogicalType> arguments {LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT};
+		if (closed) {
+			arguments.push_back(LogicalType::BOOLEAN);
+		}
+		ScalarFunction function(std::move(arguments), LogicalType::BIGINT, IterativeLengthFunction, IterativeLengthFunctionData::IterativeLengthBind);
+		function.SetInitStateCallback(PGQSourceSearchCacheInit);
+		set.AddFunction(function);
+	}
+	loader.RegisterFunction(Fallible(set));
 }
 
 } // namespace duckdb

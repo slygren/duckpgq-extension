@@ -110,16 +110,18 @@ SELECT list_sort(list(title)) AS got FROM GRAPH_TABLE ( g MATCH (t:Tag)-[:HasWo]
 ----
 [WO-13]
 
-# ── the CSR route is contained, not fixed ───────────────────────────────────────
-# A named path with a path function routes to GenerateShortestPathCTE, which is still
-# rowid-addressed. This shape used to take the database down with an out-of-bounds read
-# ("Attempted to access index 2 within vector of size 2"); it must refuse instead.
+# ── a named path over the cross-table edge ──────────────────────────────────────
+# This shape used to take the database down with an out-of-bounds read ("Attempted to access
+# index 2 within vector of size 2"), then was refused. The edge cannot be taken twice in a row
+# (Tag -> Wo), so {1,2} is one hop: answered by the join, never by the rowid-addressed CSR.
 
-statement error
+query TI rowsort
 FROM GRAPH_TABLE ( g MATCH p = (t:Tag)-[:HasWo]->{1,2}(x:Wo) WHERE t.id = 'T1'
     COLUMNS (x.title AS title, path_length(p) AS d) );
 ----
-connects two different vertex tables
+WO-10	1
+WO-11	1
+WO-12	1
 
 # ── a same-table edge is sound and must NOT be blocked ──────────────────────────
 # One vertex table means one id space, so the generic routes are correct here. This is

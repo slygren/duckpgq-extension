@@ -159,11 +159,30 @@ fixed-length, directed operands and the traversal. The path variable and path mo
 every operand, and `EXISTS { A | B }` holds when either operand matches.
 
 A quantified pattern without a search prefix returns **every walk** (SQL/PGQ semantics), not one row per endpoint;
-use `ANY SHORTEST` for one per endpoint, `ALL SHORTEST` for every shortest path. A walk visits no vertex twice, so
-walks that return to their start vertex are left out, and an edge stored twice is two walks. The path variable
+use `ANY SHORTEST` for one per endpoint, `ALL SHORTEST` for every shortest path. A search prefix applies to the whole path
+pattern: over a fixed-length one (`ANY SHORTEST (a)-[e]->(b)`) it keeps one path per pair of endpoints, and over one
+that mixes fixed hops with a variable-length edge it compares the whole paths' lengths (supported when it is the
+only pattern of its MATCH, without OPTIONAL MATCH, UNION or ONE ROW PER). Without a search prefix a walk visits no
+vertex twice, so walks that return to their start vertex are left out, and an edge stored twice is two walks. Under
+`ANY SHORTEST`, `ALL SHORTEST` and `SHORTEST k` the walks are SQL/PGQ's: a vertex may repeat and a walk may return to
+its start (`ANY SHORTEST (a)-[:K]->{1,3}(b)` has a row with `b = a` where `a` is on a cycle; `{2,4}` from a vertex to
+its neighbour may go there and back), unless a path mode restricts them: `TRAIL` (no edge twice), `ACYCLIC` (no vertex
+twice), `SIMPLE` (no vertex twice except a return to the start). The path variable
 (`vertices(p)`, `path_length(p)`, `ONE ROW PER`) describes the row's own walk. A quantifier from 0 also matches the
 zero-hop walk, which binds the end vertex to the start; `-[e]->?` (`{0,1}`) is the plain edge's matches, self-loops
-included, plus those, with `e` NULL in them.
+included, plus those, with `e` NULL in them. Over an edge between two vertex tables (`(a:Tag)-[:HasWorkorder]->{0,k}(b)`) the
+zero-hop match binds an unlabeled end vertex to the start, a `Tag` (its properties that only the other table has are
+NULL there), and since such an edge cannot be taken twice in a row, `{0,k}` and `{1,k}` are `{0,1}` and `{1,1}` over
+it, unbounded included. With both ends unlabeled, or the unlabeled end used by another pattern, zero hops are not
+matched over such an edge.
+
+`SHORTEST k` is the k shortest of those walks per endpoint pair, so `SHORTEST 1` and `ANY SHORTEST` give paths of
+the same length for every pair, closed walks included. SQL/PGQ leaves the choice among paths tied at the k-th
+length to the implementation; here the paths of one length are taken in the order of their edge row ids along the
+path, compared position by position, so the answer is deterministic. The search runs from each source the `MATCH
+WHERE` admits (a filter on the source alone seeds it, one on the destination alone ends it early) and counts every
+partial path it builds against `pgq_max_vl_fallback_rows`, so an unseeded search on a large graph fails rather than
+runs on. No artifact holds k paths per pair: `SHORTEST k` always traverses.
 
 ### Quantified path patterns
 
@@ -205,16 +224,10 @@ parenthesis holds in each repetition, and element `WHERE`s inside the body do to
   refused over it. A pattern that is one quantified edge under `ANY` / `ALL SHORTEST`, or one with an unbounded or
   large quantifier, keeps its path search and reads `e` along the path found.
 
-`SHORTEST k` follows SQL/PGQ: the k shortest paths per endpoint pair, as walks (a vertex or edge may repeat, and a
-path may return to its start) unless a path mode restricts them: `TRAIL` (no edge twice), `ACYCLIC` (no vertex twice),
-`SIMPLE` (no vertex twice except a return to the start). SQL/PGQ leaves the choice among paths tied at the k-th
-length to the implementation; here the paths of one length are taken in the order of their edge row ids along the
-path, compared position by position, so the answer is deterministic. The search runs from each source the `MATCH
-WHERE` admits (a filter on the source alone seeds it, one on the destination alone ends it early) and counts every
-partial path it builds against `pgq_max_vl_fallback_rows`, so an unseeded search on a large graph fails rather than
-runs on. No artifact holds k paths per pair: `SHORTEST k` always traverses.
-
 ### In WHERE and COLUMNS
+
+A `COLUMNS` expression without `AS` is named as SQL names it -- a property by the property (`p.id` is `id`), anything
+else by its text (`path_length(p)`, `(p.id + 1)`) -- on every route, ABI artifacts included.
 
 | Expression | Gives |
 | --- | --- |
@@ -308,8 +321,21 @@ So a closure answers:
   paths (`preserves_multiplicity`): the edge is acyclic, the depth cap was never reached, and every row is exactly
   one path (for `tc_chain` also no vertex with two out-edges, the usual hierarchy).
 - Never `CHEAPEST` with a per-edge `COST`, or a lower bound of 0. A `COST` that is one positive constant makes
-  `CHEAPEST` the same as `SHORTEST`, and path modes (`TRAIL`, `ACYCLIC`, `SIMPLE`) restrict nothing here: every
-  match already visits no vertex twice.
+  `CHEAPEST` the same as `SHORTEST`.
+- A search prefix's walks (a vertex twice, a return to the start) from an artifact only where no walk within the
+  bound can repeat a vertex: over a directed edge whose `transitive_closure` has no row closing on its start up to
+  the bound (measured once per process; past the closure's deepest row also no deepest row extending), so the walks
+  are the simple paths the artifacts hold. Otherwise they are traversed. Undirected walks can always step back, so
+  only an exact closure answers them.
+
+An artifact holds only edges whose endpoints are vertices, as the traversal sees them (it joins both endpoints):
+`pgq_abi_build` reads every edge table through its vertex keys, so an edge with a key no vertex has (or NULL) is in no
+artifact, and records that as `endpoints_complete = true` in `__pgq_path_catalog` (the vertex tables count among the
+artifact's sources for freshness). A row without that proof (another builder, an older catalog) answers only once the
+binder has measured that its rows reach a vertex at every end -- the `v0 .. vk` of an edge or fixed_path artifact, the
+edge tables of a closure or branch summary -- once per process and lake state (`multiplicity_probe` rows `far_ends|…`
+and `complete|…`; an anti-join each). Where they do not, the pattern is traversed (refused under
+`pgq_require_abi_paths`), and a context expansion with such a family declines as a whole.
 
 A fixed-length chain of two or three hops that no single artifact holds -- hops in both directions
 (`(a)<-[:R]-(b)-[:S]->(c)`), an undirected hop (`(a)-[:R]-(b)-[:S]->(c)`), or a one-way chain without its fixed_path
@@ -483,6 +509,7 @@ distinct sources at once share the lane search, 512 sources per pass.
 | `duckpgq_factorized_joins` | `true` | Pre-aggregate join sides that are only counted or summed, so path counts become degree products. |
 | `duckpgq_factorized_join_operator` | `true` | Use the `FACTORIZED_GROUP_JOIN` operator when both sides are only counted or summed. |
 | `duckpgq_factorized_join_directory` | `true` | Let that operator count into a dense array when key bounds are known. |
+| `duckpgq_common_subplan_guard` | `true` | Keep DuckDB's `common_subplan` optimizer off the table scans of a statement with a `GRAPH_TABLE`. DuckDB 2.0.0's optimizer can merge two occurrences of a subplan and read one table scan's column for another's, which gave wrong rows when several `GRAPH_TABLE`s shared one statement; statements without `GRAPH_TABLE` keep it. |
 
 All but `duckpgq_default_grammar` are per session.
 
@@ -601,8 +628,8 @@ building in [abi_build.cpp](src/core/functions/table/abi_build.cpp); vertex-join
   operands; operands that may match the same variable-length walk need `|+|` or disjoint labels.
 - **`vertex_property(p, 'x')` / `edge_property(p, 'x')`** take a literal property name. The lists are looked up
   after the match (one join per element table), so they cost about what the equivalent hand-written join does.
-- **`OPTIONAL MATCH`** cannot use the path variable of its own pattern in `COLUMNS` or `WHERE`, and its pattern cannot
-  be `ANY CHEAPEST` / `ALL CHEAPEST` yet (refused).
+- **`OPTIONAL MATCH`**: its pattern cannot be `ANY CHEAPEST` / `ALL CHEAPEST` yet (refused). Its path variable can be
+  read in `COLUMNS` and `WHERE` (NULL where it did not match), but not in `COLUMNS` shared by `UNION` branches.
 - **`SHORTEST k`** takes one quantified edge between two vertices over one edge table (no element `WHERE` on the
   edge); longer patterns are refused. Inside a longer pattern, an unbounded quantifier with only a path mode or with a
   lower bound above 1 is answered from the CSR, which finds one shortest path per pair (refused for `<-`).

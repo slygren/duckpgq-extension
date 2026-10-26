@@ -3,8 +3,9 @@
 # group: [path_finding]
 
 # A bidirectional edge (a)<-[e]->(b) is an edge in either direction (SQL/PGQ "left or right"), the same as -[e]-.
-# Reference semantics as in traversal_selectors.test: simple paths (no vertex twice, never back to the start), one per edge taken; ANY
-# SHORTEST one shortest per endpoint pair, ALL SHORTEST every shortest. The named paths are compared both ways
+# Reference semantics as in traversal_selectors.test: simple paths (no vertex twice, never back to the start), one per edge taken;
+# under ANY / ALL SHORTEST walks (ref_walks: a vertex may repeat, a walk may return to its start), ANY SHORTEST one
+# shortest per endpoint pair, ALL SHORTEST every shortest. The named paths are compared both ways
 # (EXCEPT ALL) with a brute-force enumeration (ref_paths); ONE ROW PER and the unnamed pattern with the named path
 # of the same query, unnested. Each side is materialised in its own statement.
 
@@ -48,6 +49,25 @@ w(dir, src, cur, depth, vs, es) AS (
     WHERE w.depth < 5 AND NOT list_contains(w.vs, steps.t))
 SELECT * FROM w;
 
+# Walks of every direction up to length 5: a search prefix (ANY / ALL SHORTEST) matches walks, which may repeat a
+# vertex or return to the start
+statement ok
+CREATE TABLE ref_walks AS
+WITH RECURSIVE steps(dir, s, t, e) AS (
+    SELECT '->', src, dst, rowid FROM K
+    UNION ALL SELECT '<-', dst, src, rowid FROM K
+    UNION ALL SELECT '-', src, dst, rowid FROM K
+    UNION ALL SELECT '-', dst, src, rowid FROM K WHERE src <> dst
+    UNION ALL SELECT '<->', src, dst, rowid FROM K
+    UNION ALL SELECT '<->', dst, src, rowid FROM K WHERE src <> dst),
+w(dir, src, cur, depth, vs, es) AS (
+    SELECT d, id, id, 0, [id], []::BIGINT[] FROM P, (VALUES ('->'), ('<-'), ('-'), ('<->')) t(d)
+    UNION ALL
+    SELECT w.dir, w.src, steps.t, w.depth + 1, list_append(w.vs, steps.t), list_append(w.es, steps.e)
+    FROM w JOIN steps ON steps.dir = w.dir AND steps.s = w.cur
+    WHERE w.depth < 5)
+SELECT * FROM w;
+
 statement ok
 SET pgq_disable_abi_rewrite = true;
 
@@ -57,7 +77,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ANY SHORTEST (a:P)<-[e:K]-+(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 5 AND src = 1;
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<-' AND depth BETWEEN 1 AND 5 AND src = 1;
 
 # one path per pair, a shortest one of the reference's
 query III
@@ -106,7 +126,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ANY SHORTEST (a:P)<-[e:K]-+(b:P) WHERE a.id = 5 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 5 AND src = 5;
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<-' AND depth BETWEEN 1 AND 5 AND src = 5;
 
 # one path per pair, a shortest one of the reference's
 query III
@@ -155,7 +175,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ANY SHORTEST (a:P)<-[e:K]-+(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 5 ;
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<-' AND depth BETWEEN 1 AND 5 ;
 
 # one path per pair, a shortest one of the reference's
 query III
@@ -204,7 +224,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ANY SHORTEST (a:P)<-[e:K]-*(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 0 AND 5 AND src = 1;
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<-' AND depth BETWEEN 0 AND 5 AND src = 1;
 
 # one path per pair, a shortest one of the reference's
 query III
@@ -253,7 +273,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ANY SHORTEST (a:P)<-[e:K]-*(b:P) WHERE a.id = 5 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 0 AND 5 AND src = 5;
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<-' AND depth BETWEEN 0 AND 5 AND src = 5;
 
 # one path per pair, a shortest one of the reference's
 query III
@@ -302,7 +322,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ANY SHORTEST (a:P)<-[e:K]-*(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 0 AND 5 ;
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<-' AND depth BETWEEN 0 AND 5 ;
 
 # one path per pair, a shortest one of the reference's
 query III
@@ -351,7 +371,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ANY SHORTEST (a:P)<-[e:K]-{1,}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 5 AND src = 1;
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<-' AND depth BETWEEN 1 AND 5 AND src = 1;
 
 # one path per pair, a shortest one of the reference's
 query III
@@ -400,7 +420,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ANY SHORTEST (a:P)<-[e:K]-{1,}(b:P) WHERE a.id = 5 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 5 AND src = 5;
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<-' AND depth BETWEEN 1 AND 5 AND src = 5;
 
 # one path per pair, a shortest one of the reference's
 query III
@@ -449,7 +469,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ANY SHORTEST (a:P)<-[e:K]-{1,}(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 5 ;
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<-' AND depth BETWEEN 1 AND 5 ;
 
 # one path per pair, a shortest one of the reference's
 query III
@@ -498,7 +518,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ALL SHORTEST (a:P)<-[e:K]-+(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 5 AND src = 1) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<-' AND depth BETWEEN 1 AND 5 AND src = 1) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
 
 query III
 SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
@@ -552,7 +572,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ALL SHORTEST (a:P)<-[e:K]-+(b:P) WHERE a.id = 5 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 5 AND src = 5) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<-' AND depth BETWEEN 1 AND 5 AND src = 5) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
 
 query III
 SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
@@ -606,7 +626,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ALL SHORTEST (a:P)<-[e:K]-+(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 5 ) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<-' AND depth BETWEEN 1 AND 5 ) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
 
 query III
 SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
@@ -660,7 +680,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ALL SHORTEST (a:P)<-[e:K]-*(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 0 AND 5 AND src = 1) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<-' AND depth BETWEEN 0 AND 5 AND src = 1) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
 
 query III
 SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
@@ -714,7 +734,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ALL SHORTEST (a:P)<-[e:K]-*(b:P) WHERE a.id = 5 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 0 AND 5 AND src = 5) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<-' AND depth BETWEEN 0 AND 5 AND src = 5) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
 
 query III
 SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
@@ -768,7 +788,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ALL SHORTEST (a:P)<-[e:K]-*(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 0 AND 5 ) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<-' AND depth BETWEEN 0 AND 5 ) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
 
 query III
 SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
@@ -822,7 +842,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ALL SHORTEST (a:P)<-[e:K]-{1,}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 5 AND src = 1) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<-' AND depth BETWEEN 1 AND 5 AND src = 1) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
 
 query III
 SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
@@ -876,7 +896,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ALL SHORTEST (a:P)<-[e:K]-{1,}(b:P) WHERE a.id = 5 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 5 AND src = 5) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<-' AND depth BETWEEN 1 AND 5 AND src = 5) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
 
 query III
 SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
@@ -930,7 +950,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ALL SHORTEST (a:P)<-[e:K]-{1,}(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 1 AND 5 ) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<-' AND depth BETWEEN 1 AND 5 ) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
 
 query III
 SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
@@ -1092,7 +1112,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ALL SHORTEST (a:P)<-[e:K]->{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<->' AND depth BETWEEN 1 AND 3 AND src = 1) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
 
 query III
 SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
@@ -1146,7 +1166,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ALL SHORTEST (a:P)<-[e:K]->{1,3}(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 1 AND 3 ) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<->' AND depth BETWEEN 1 AND 3 ) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
 
 query III
 SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
@@ -1200,7 +1220,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ANY SHORTEST (a:P)<-[e:K]->{1,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 1 AND 3 AND src = 1;
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<->' AND depth BETWEEN 1 AND 3 AND src = 1;
 
 # one path per pair, a shortest one of the reference's
 query III
@@ -1249,7 +1269,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ANY SHORTEST (a:P)<-[e:K]->{1,3}(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 1 AND 3 ;
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<->' AND depth BETWEEN 1 AND 3 ;
 
 # one path per pair, a shortest one of the reference's
 query III
@@ -1514,7 +1534,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ALL SHORTEST (a:P)<-[e:K]->{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<->' AND depth BETWEEN 2 AND 3 AND src = 1) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
 
 query III
 SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
@@ -1568,7 +1588,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ALL SHORTEST (a:P)<-[e:K]->{2,3}(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 2 AND 3 ) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<->' AND depth BETWEEN 2 AND 3 ) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
 
 query III
 SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
@@ -1622,7 +1642,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ANY SHORTEST (a:P)<-[e:K]->{2,3}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 2 AND 3 AND src = 1;
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<->' AND depth BETWEEN 2 AND 3 AND src = 1;
 
 # one path per pair, a shortest one of the reference's
 query III
@@ -1671,7 +1691,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ANY SHORTEST (a:P)<-[e:K]->{2,3}(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 2 AND 3 ;
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<->' AND depth BETWEEN 2 AND 3 ;
 
 # one path per pair, a shortest one of the reference's
 query III
@@ -1936,7 +1956,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ALL SHORTEST (a:P)<-[e:K]->{0,2}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 0 AND 2 AND src = 1) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<->' AND depth BETWEEN 0 AND 2 AND src = 1) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
 
 query III
 SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
@@ -1990,7 +2010,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ALL SHORTEST (a:P)<-[e:K]->{0,2}(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 0 AND 2 ) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<->' AND depth BETWEEN 0 AND 2 ) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
 
 query III
 SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
@@ -2044,7 +2064,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ANY SHORTEST (a:P)<-[e:K]->{0,2}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 0 AND 2 AND src = 1;
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<->' AND depth BETWEEN 0 AND 2 AND src = 1;
 
 # one path per pair, a shortest one of the reference's
 query III
@@ -2093,7 +2113,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ANY SHORTEST (a:P)<-[e:K]->{0,2}(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 0 AND 2 ;
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<->' AND depth BETWEEN 0 AND 2 ;
 
 # one path per pair, a shortest one of the reference's
 query III
@@ -2292,7 +2312,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ALL SHORTEST (a:P)<-[e:K]->{1,1}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 1 AND 1 AND src = 1) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<->' AND depth BETWEEN 1 AND 1 AND src = 1) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
 
 query III
 SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
@@ -2313,7 +2333,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ALL SHORTEST (a:P)<-[e:K]->{1,1}(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 1 AND 1 ) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<->' AND depth BETWEEN 1 AND 1 ) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
 
 query III
 SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
@@ -2376,7 +2396,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ANY SHORTEST (a:P)<-[e:K]->+(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 1 AND 5 AND src = 1;
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<->' AND depth BETWEEN 1 AND 5 AND src = 1;
 
 # one path per pair, a shortest one of the reference's
 query III
@@ -2425,7 +2445,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ANY SHORTEST (a:P)<-[e:K]->+(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 1 AND 5 ;
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<->' AND depth BETWEEN 1 AND 5 ;
 
 # one path per pair, a shortest one of the reference's
 query III
@@ -2474,7 +2494,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ANY SHORTEST (a:P)<-[e:K]->*(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 0 AND 5 AND src = 1;
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<->' AND depth BETWEEN 0 AND 5 AND src = 1;
 
 # one path per pair, a shortest one of the reference's
 query III
@@ -2523,7 +2543,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ANY SHORTEST (a:P)<-[e:K]->*(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 0 AND 5 ;
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<->' AND depth BETWEEN 0 AND 5 ;
 
 # one path per pair, a shortest one of the reference's
 query III
@@ -2572,7 +2592,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ALL SHORTEST (a:P)<-[e:K]->+(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 1 AND 5 AND src = 1) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<->' AND depth BETWEEN 1 AND 5 AND src = 1) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
 
 query III
 SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
@@ -2626,7 +2646,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ALL SHORTEST (a:P)<-[e:K]->+(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 1 AND 5 ) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<->' AND depth BETWEEN 1 AND 5 ) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
 
 query III
 SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
@@ -2680,7 +2700,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ALL SHORTEST (a:P)<-[e:K]->*(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 0 AND 5 AND src = 1) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<->' AND depth BETWEEN 0 AND 5 AND src = 1) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
 
 query III
 SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
@@ -2734,7 +2754,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ALL SHORTEST (a:P)<-[e:K]->*(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 0 AND 5 ) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<->' AND depth BETWEEN 0 AND 5 ) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
 
 query III
 SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
@@ -2788,7 +2808,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ALL SHORTEST (a:P)-[e:K]-+(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 5 AND src = 1) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '-' AND depth BETWEEN 1 AND 5 AND src = 1) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
 
 query III
 SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
@@ -2842,7 +2862,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ALL SHORTEST (a:P)-[e:K]-+(b:P) WHERE a.id = 5 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 5 AND src = 5) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '-' AND depth BETWEEN 1 AND 5 AND src = 5) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
 
 query III
 SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
@@ -2896,7 +2916,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ALL SHORTEST (a:P)-[e:K]-+(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '-' AND depth BETWEEN 1 AND 5 ) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '-' AND depth BETWEEN 1 AND 5 ) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
 
 query III
 SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
@@ -3058,7 +3078,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ANY SHORTEST (a:P)-[e:K]->{2,}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 5 AND src = 1;
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '->' AND depth BETWEEN 2 AND 5 AND src = 1;
 
 # one path per pair, a shortest one of the reference's
 query III
@@ -3107,7 +3127,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ALL SHORTEST (a:P)-[e:K]->{2,}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 5 AND src = 1) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '->' AND depth BETWEEN 2 AND 5 AND src = 1) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
 
 query III
 SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
@@ -3269,7 +3289,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ANY SHORTEST (a:P)-[e:K]->{2,}(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 5 ;
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '->' AND depth BETWEEN 2 AND 5 ;
 
 # one path per pair, a shortest one of the reference's
 query III
@@ -3318,7 +3338,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ALL SHORTEST (a:P)-[e:K]->{2,}(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '->' AND depth BETWEEN 2 AND 5 ) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '->' AND depth BETWEEN 2 AND 5 ) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
 
 query III
 SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
@@ -3480,7 +3500,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ANY SHORTEST (a:P)<-[e:K]-{2,}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 5 AND src = 1;
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<-' AND depth BETWEEN 2 AND 5 AND src = 1;
 
 # one path per pair, a shortest one of the reference's
 query III
@@ -3529,7 +3549,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ALL SHORTEST (a:P)<-[e:K]-{2,}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 5 AND src = 1) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<-' AND depth BETWEEN 2 AND 5 AND src = 1) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
 
 query III
 SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
@@ -3691,7 +3711,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ANY SHORTEST (a:P)<-[e:K]-{2,}(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 5 ;
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<-' AND depth BETWEEN 2 AND 5 ;
 
 # one path per pair, a shortest one of the reference's
 query III
@@ -3740,7 +3760,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ALL SHORTEST (a:P)<-[e:K]-{2,}(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<-' AND depth BETWEEN 2 AND 5 ) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<-' AND depth BETWEEN 2 AND 5 ) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
 
 query III
 SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
@@ -3902,7 +3922,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ANY SHORTEST (a:P)-[e:K]-{2,}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 5 AND src = 1;
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '-' AND depth BETWEEN 2 AND 5 AND src = 1;
 
 # one path per pair, a shortest one of the reference's
 query III
@@ -3951,7 +3971,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ALL SHORTEST (a:P)-[e:K]-{2,}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 5 AND src = 1) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '-' AND depth BETWEEN 2 AND 5 AND src = 1) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
 
 query III
 SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
@@ -4113,7 +4133,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ANY SHORTEST (a:P)-[e:K]-{2,}(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 5 ;
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '-' AND depth BETWEEN 2 AND 5 ;
 
 # one path per pair, a shortest one of the reference's
 query III
@@ -4162,7 +4182,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ALL SHORTEST (a:P)-[e:K]-{2,}(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '-' AND depth BETWEEN 2 AND 5 ) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '-' AND depth BETWEEN 2 AND 5 ) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
 
 query III
 SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
@@ -4324,7 +4344,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ANY SHORTEST (a:P)<-[e:K]->{2,}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 2 AND 5 AND src = 1;
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<->' AND depth BETWEEN 2 AND 5 AND src = 1;
 
 # one path per pair, a shortest one of the reference's
 query III
@@ -4373,7 +4393,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ALL SHORTEST (a:P)<-[e:K]->{2,}(b:P) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 2 AND 5 AND src = 1) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<->' AND depth BETWEEN 2 AND 5 AND src = 1) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
 
 query III
 SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));
@@ -4535,7 +4555,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ANY SHORTEST (a:P)<-[e:K]->{2,}(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 2 AND 5 ;
+CREATE OR REPLACE TABLE ref AS SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<->' AND depth BETWEEN 2 AND 5 ;
 
 # one path per pair, a shortest one of the reference's
 query III
@@ -4584,7 +4604,7 @@ CREATE OR REPLACE TABLE named AS SELECT a, b, list_transform(vs0, lambda x: x + 
     MATCH p = ALL SHORTEST (a:P)<-[e:K]->{2,}(b:P)  COLUMNS (a.id AS a, b.id AS b, vertices(p) AS vs0, edges(p) AS es));
 
 statement ok
-CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_paths WHERE dir = '<->' AND depth BETWEEN 2 AND 5 ) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
+CREATE OR REPLACE TABLE ref AS SELECT a, b, vs, es FROM (SELECT src AS a, cur AS b, vs, es FROM ref_walks WHERE dir = '<->' AND depth BETWEEN 2 AND 5 ) QUALIFY len(es) = min(len(es)) OVER (PARTITION BY a, b);
 
 query III
 SELECT (SELECT count(*) FROM ref) > 0, (SELECT count(*) FROM (FROM named EXCEPT ALL FROM ref)), (SELECT count(*) FROM (FROM ref EXCEPT ALL FROM named));

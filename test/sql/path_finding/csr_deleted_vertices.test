@@ -67,6 +67,7 @@ FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:v WHERE a.id = 4)-[x:e]-+(b:v) COL
 ----
 0	6
 1	7
+4	2
 5	1
 6	2
 7	3

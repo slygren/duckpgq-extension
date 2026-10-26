@@ -1,0 +1,1305 @@
+# name: test/sql/path_finding/one_row_per_element_where.test
+# description: ONE ROW PER over a quantified edge whose endpoint has an element WHERE, (a:Person WHERE a.name = 'Ann'),
+#              failed with "could not locate quantified path element". It gives the rows of the same predicate in the
+#              MATCH WHERE, and of the unfiltered ONE ROW PER filtered outside GRAPH_TABLE: STEP, VERTEX and EDGE,
+#              {1,2} and {2}, named and unnamed, on the source, the destination and both, on a graph with one and
+#              with two vertex tables.
+# group: [path_finding]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE Person(id BIGINT, name VARCHAR);
+
+statement ok
+INSERT INTO Person VALUES (1, 'Ann'), (2, 'Bob'), (3, 'Cy'), (4, 'Di'), (5, 'Ann');
+
+statement ok
+CREATE TABLE Company(id BIGINT, name VARCHAR);
+
+statement ok
+INSERT INTO Company VALUES (10, 'Acme');
+
+statement ok
+CREATE TABLE knows(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO knows VALUES (1, 2), (2, 3), (3, 1), (2, 4), (1, 3), (5, 1), (4, 5), (1, 2);
+
+statement ok
+CREATE TABLE worksAt(p BIGINT, c BIGINT);
+
+statement ok
+INSERT INTO worksAt VALUES (1, 10), (3, 10);
+
+statement ok
+CREATE PROPERTY GRAPH g1 VERTEX TABLES (Person LABEL Person)
+EDGE TABLES (knows SOURCE KEY (src) REFERENCES Person (id) DESTINATION KEY (dst) REFERENCES Person (id) LABEL Knows);
+
+statement ok
+CREATE PROPERTY GRAPH g2 VERTEX TABLES (Person LABEL Person, Company LABEL Company)
+EDGE TABLES (knows SOURCE KEY (src) REFERENCES Person (id) DESTINATION KEY (dst) REFERENCES Person (id) LABEL Knows,
+             worksAt SOURCE KEY (p) REFERENCES Person (id) DESTINATION KEY (c) REFERENCES Company (id) LABEL WorksAt);
+
+# g1 {1,2} unnamed STEP src
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH (a:Person WHERE a.name = 'Ann')-[:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) WHERE a.name = 'Ann' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2)) WHERE an = 'Ann';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {1,2} unnamed STEP dst
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{1,2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) WHERE b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2)) WHERE bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {1,2} unnamed STEP both
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH (a:Person WHERE a.name = 'Ann')-[:Knows]->{1,2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) WHERE a.name = 'Ann' AND b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2)) WHERE an = 'Ann' AND bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {1,2} unnamed VERTEX src
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH (a:Person WHERE a.name = 'Ann')-[:Knows]->{1,2}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER VERTEX (v) WHERE a.name = 'Ann' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v)) WHERE an = 'Ann';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {1,2} unnamed VERTEX dst
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{1,2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER VERTEX (v) WHERE b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v)) WHERE bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {1,2} unnamed VERTEX both
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH (a:Person WHERE a.name = 'Ann')-[:Knows]->{1,2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER VERTEX (v) WHERE a.name = 'Ann' AND b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v)) WHERE an = 'Ann' AND bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {1,2} unnamed EDGE src
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH (a:Person WHERE a.name = 'Ann')-[:Knows]->{1,2}(b:Person) ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER EDGE (e) WHERE a.name = 'Ann' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e)) WHERE an = 'Ann';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {1,2} unnamed EDGE dst
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{1,2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER EDGE (e) WHERE b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e)) WHERE bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {1,2} unnamed EDGE both
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH (a:Person WHERE a.name = 'Ann')-[:Knows]->{1,2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER EDGE (e) WHERE a.name = 'Ann' AND b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e)) WHERE an = 'Ann' AND bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {1,2} named STEP src
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person WHERE a.name = 'Ann')-[:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) WHERE a.name = 'Ann' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2)) WHERE an = 'Ann';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {1,2} named STEP dst
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) WHERE b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2)) WHERE bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {1,2} named STEP both
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person WHERE a.name = 'Ann')-[:Knows]->{1,2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) WHERE a.name = 'Ann' AND b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2)) WHERE an = 'Ann' AND bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {1,2} named VERTEX src
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person WHERE a.name = 'Ann')-[:Knows]->{1,2}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER VERTEX (v) WHERE a.name = 'Ann' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v)) WHERE an = 'Ann';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {1,2} named VERTEX dst
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER VERTEX (v) WHERE b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v)) WHERE bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {1,2} named VERTEX both
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person WHERE a.name = 'Ann')-[:Knows]->{1,2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER VERTEX (v) WHERE a.name = 'Ann' AND b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v)) WHERE an = 'Ann' AND bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {1,2} named EDGE src
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person WHERE a.name = 'Ann')-[:Knows]->{1,2}(b:Person) ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER EDGE (e) WHERE a.name = 'Ann' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e)) WHERE an = 'Ann';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {1,2} named EDGE dst
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER EDGE (e) WHERE b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e)) WHERE bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {1,2} named EDGE both
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person WHERE a.name = 'Ann')-[:Knows]->{1,2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER EDGE (e) WHERE a.name = 'Ann' AND b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e)) WHERE an = 'Ann' AND bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {2} unnamed STEP src
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH (a:Person WHERE a.name = 'Ann')-[:Knows]->{2}(b:Person) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER STEP (v1, e, v2) WHERE a.name = 'Ann' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2)) WHERE an = 'Ann';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {2} unnamed STEP dst
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER STEP (v1, e, v2) WHERE b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2)) WHERE bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {2} unnamed STEP both
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH (a:Person WHERE a.name = 'Ann')-[:Knows]->{2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER STEP (v1, e, v2) WHERE a.name = 'Ann' AND b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2)) WHERE an = 'Ann' AND bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {2} unnamed VERTEX src
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH (a:Person WHERE a.name = 'Ann')-[:Knows]->{2}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER VERTEX (v) WHERE a.name = 'Ann' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v)) WHERE an = 'Ann';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {2} unnamed VERTEX dst
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER VERTEX (v) WHERE b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v)) WHERE bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {2} unnamed VERTEX both
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH (a:Person WHERE a.name = 'Ann')-[:Knows]->{2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER VERTEX (v) WHERE a.name = 'Ann' AND b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v)) WHERE an = 'Ann' AND bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {2} unnamed EDGE src
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH (a:Person WHERE a.name = 'Ann')-[:Knows]->{2}(b:Person) ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER EDGE (e) WHERE a.name = 'Ann' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e)) WHERE an = 'Ann';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {2} unnamed EDGE dst
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER EDGE (e) WHERE b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e)) WHERE bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {2} unnamed EDGE both
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH (a:Person WHERE a.name = 'Ann')-[:Knows]->{2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER EDGE (e) WHERE a.name = 'Ann' AND b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e)) WHERE an = 'Ann' AND bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {2} named STEP src
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person WHERE a.name = 'Ann')-[:Knows]->{2}(b:Person) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER STEP (v1, e, v2) WHERE a.name = 'Ann' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2)) WHERE an = 'Ann';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {2} named STEP dst
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER STEP (v1, e, v2) WHERE b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2)) WHERE bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {2} named STEP both
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person WHERE a.name = 'Ann')-[:Knows]->{2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER STEP (v1, e, v2) WHERE a.name = 'Ann' AND b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2)) WHERE an = 'Ann' AND bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {2} named VERTEX src
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person WHERE a.name = 'Ann')-[:Knows]->{2}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER VERTEX (v) WHERE a.name = 'Ann' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v)) WHERE an = 'Ann';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {2} named VERTEX dst
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER VERTEX (v) WHERE b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v)) WHERE bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {2} named VERTEX both
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person WHERE a.name = 'Ann')-[:Knows]->{2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER VERTEX (v) WHERE a.name = 'Ann' AND b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v)) WHERE an = 'Ann' AND bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {2} named EDGE src
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person WHERE a.name = 'Ann')-[:Knows]->{2}(b:Person) ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER EDGE (e) WHERE a.name = 'Ann' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e)) WHERE an = 'Ann';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {2} named EDGE dst
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER EDGE (e) WHERE b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e)) WHERE bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g1 {2} named EDGE both
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person WHERE a.name = 'Ann')-[:Knows]->{2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER EDGE (e) WHERE a.name = 'Ann' AND b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g1 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e)) WHERE an = 'Ann' AND bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {1,2} unnamed STEP src
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH (a:Person WHERE a.name = 'Ann')-[:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) WHERE a.name = 'Ann' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2)) WHERE an = 'Ann';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {1,2} unnamed STEP dst
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{1,2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) WHERE b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2)) WHERE bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {1,2} unnamed STEP both
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH (a:Person WHERE a.name = 'Ann')-[:Knows]->{1,2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) WHERE a.name = 'Ann' AND b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2)) WHERE an = 'Ann' AND bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {1,2} unnamed VERTEX src
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH (a:Person WHERE a.name = 'Ann')-[:Knows]->{1,2}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER VERTEX (v) WHERE a.name = 'Ann' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v)) WHERE an = 'Ann';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {1,2} unnamed VERTEX dst
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{1,2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER VERTEX (v) WHERE b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v)) WHERE bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {1,2} unnamed VERTEX both
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH (a:Person WHERE a.name = 'Ann')-[:Knows]->{1,2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER VERTEX (v) WHERE a.name = 'Ann' AND b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v)) WHERE an = 'Ann' AND bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {1,2} unnamed EDGE src
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH (a:Person WHERE a.name = 'Ann')-[:Knows]->{1,2}(b:Person) ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER EDGE (e) WHERE a.name = 'Ann' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e)) WHERE an = 'Ann';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {1,2} unnamed EDGE dst
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{1,2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER EDGE (e) WHERE b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e)) WHERE bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {1,2} unnamed EDGE both
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH (a:Person WHERE a.name = 'Ann')-[:Knows]->{1,2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER EDGE (e) WHERE a.name = 'Ann' AND b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e)) WHERE an = 'Ann' AND bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {1,2} named STEP src
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person WHERE a.name = 'Ann')-[:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) WHERE a.name = 'Ann' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2)) WHERE an = 'Ann';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {1,2} named STEP dst
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) WHERE b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2)) WHERE bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {1,2} named STEP both
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person WHERE a.name = 'Ann')-[:Knows]->{1,2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) WHERE a.name = 'Ann' AND b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2)) WHERE an = 'Ann' AND bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {1,2} named VERTEX src
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person WHERE a.name = 'Ann')-[:Knows]->{1,2}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER VERTEX (v) WHERE a.name = 'Ann' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v)) WHERE an = 'Ann';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {1,2} named VERTEX dst
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER VERTEX (v) WHERE b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v)) WHERE bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {1,2} named VERTEX both
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person WHERE a.name = 'Ann')-[:Knows]->{1,2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER VERTEX (v) WHERE a.name = 'Ann' AND b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v)) WHERE an = 'Ann' AND bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {1,2} named EDGE src
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person WHERE a.name = 'Ann')-[:Knows]->{1,2}(b:Person) ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER EDGE (e) WHERE a.name = 'Ann' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e)) WHERE an = 'Ann';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {1,2} named EDGE dst
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER EDGE (e) WHERE b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e)) WHERE bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {1,2} named EDGE both
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person WHERE a.name = 'Ann')-[:Knows]->{1,2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER EDGE (e) WHERE a.name = 'Ann' AND b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{1,2}(b:Person) ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e)) WHERE an = 'Ann' AND bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {2} unnamed STEP src
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH (a:Person WHERE a.name = 'Ann')-[:Knows]->{2}(b:Person) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER STEP (v1, e, v2) WHERE a.name = 'Ann' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2)) WHERE an = 'Ann';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {2} unnamed STEP dst
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER STEP (v1, e, v2) WHERE b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2)) WHERE bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {2} unnamed STEP both
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH (a:Person WHERE a.name = 'Ann')-[:Knows]->{2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER STEP (v1, e, v2) WHERE a.name = 'Ann' AND b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2)) WHERE an = 'Ann' AND bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {2} unnamed VERTEX src
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH (a:Person WHERE a.name = 'Ann')-[:Knows]->{2}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER VERTEX (v) WHERE a.name = 'Ann' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v)) WHERE an = 'Ann';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {2} unnamed VERTEX dst
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER VERTEX (v) WHERE b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v)) WHERE bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {2} unnamed VERTEX both
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH (a:Person WHERE a.name = 'Ann')-[:Knows]->{2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER VERTEX (v) WHERE a.name = 'Ann' AND b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v)) WHERE an = 'Ann' AND bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {2} unnamed EDGE src
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH (a:Person WHERE a.name = 'Ann')-[:Knows]->{2}(b:Person) ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER EDGE (e) WHERE a.name = 'Ann' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e)) WHERE an = 'Ann';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {2} unnamed EDGE dst
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER EDGE (e) WHERE b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e)) WHERE bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {2} unnamed EDGE both
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH (a:Person WHERE a.name = 'Ann')-[:Knows]->{2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER EDGE (e) WHERE a.name = 'Ann' AND b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e)) WHERE an = 'Ann' AND bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {2} named STEP src
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person WHERE a.name = 'Ann')-[:Knows]->{2}(b:Person) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER STEP (v1, e, v2) WHERE a.name = 'Ann' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2)) WHERE an = 'Ann';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {2} named STEP dst
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER STEP (v1, e, v2) WHERE b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2)) WHERE bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {2} named STEP both
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person WHERE a.name = 'Ann')-[:Knows]->{2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER STEP (v1, e, v2) WHERE a.name = 'Ann' AND b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v1.id AS v1, element_id(e) AS e, v2.id AS v2)) WHERE an = 'Ann' AND bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {2} named VERTEX src
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person WHERE a.name = 'Ann')-[:Knows]->{2}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER VERTEX (v) WHERE a.name = 'Ann' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v)) WHERE an = 'Ann';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {2} named VERTEX dst
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER VERTEX (v) WHERE b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v)) WHERE bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {2} named VERTEX both
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person WHERE a.name = 'Ann')-[:Knows]->{2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER VERTEX (v) WHERE a.name = 'Ann' AND b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER VERTEX (v) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, v.id AS v)) WHERE an = 'Ann' AND bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {2} named EDGE src
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person WHERE a.name = 'Ann')-[:Knows]->{2}(b:Person) ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER EDGE (e) WHERE a.name = 'Ann' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e)) WHERE an = 'Ann';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {2} named EDGE dst
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER EDGE (e) WHERE b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e)) WHERE bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# g2 {2} named EDGE both
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person WHERE a.name = 'Ann')-[:Knows]->{2}(b:Person WHERE b.name <> 'Bob') ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_mw AS FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER EDGE (e) WHERE a.name = 'Ann' AND b.name <> 'Bob' COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT * FROM GRAPH_TABLE (g2 MATCH p = (a:Person)-[:Knows]->{2}(b:Person) ONE ROW PER EDGE (e) COLUMNS (a.id AS a, b.id AS b, a.name AS an, b.name AS bn, element_id(e) AS e)) WHERE an = 'Ann' AND bn <> 'Bob';
+
+query III
+SELECT (SELECT count(*) FROM t_elem) > 0,
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_mw) UNION ALL (FROM t_mw EXCEPT ALL FROM t_elem))),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+true	0	0
+
+# With ABI artifacts: a hierarchy whose closures answer ONE ROW PER STEP (the tc_chain key-step route)
+statement ok
+CREATE TABLE parent(child BIGINT, par BIGINT);
+
+statement ok
+INSERT INTO parent VALUES (1, 2), (2, 3), (3, 4), (5, 4);
+
+statement ok
+CREATE PROPERTY GRAPH h VERTEX TABLES (Person LABEL Person)
+EDGE TABLES (parent SOURCE KEY (child) REFERENCES Person (id) DESTINATION KEY (par) REFERENCES Person (id) LABEL HasParent);
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('h', exclude_self_referential := false, closures := ['HasParent']);
+
+statement ok
+CREATE OR REPLACE TABLE t_elem AS FROM GRAPH_TABLE (h MATCH (a:Person WHERE a.name = 'Ann')-[:HasParent]->{1,3}(b:Person)
+    ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, v1.id AS v1, v2.id AS v2));
+
+query I
+SELECT count(*) > 0 FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+true
+
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE t_out AS SELECT a, b, v1, v2 FROM GRAPH_TABLE (h MATCH (a:Person)-[:HasParent]->{1,3}(b:Person)
+    ONE ROW PER STEP (v1, e, v2) COLUMNS (a.id AS a, b.id AS b, a.name AS an, v1.id AS v1, v2.id AS v2)) WHERE an = 'Ann';
+
+query II
+SELECT (SELECT count(*) FROM t_elem),
+       (SELECT count(*) FROM ((FROM t_elem EXCEPT ALL FROM t_out) UNION ALL (FROM t_out EXCEPT ALL FROM t_elem)));
+----
+7	0

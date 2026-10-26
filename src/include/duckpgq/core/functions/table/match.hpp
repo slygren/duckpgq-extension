@@ -59,6 +59,10 @@ struct PGQPathTableInfo {
 	//! and can stand in for the bridge in multiplicity-sensitive walk traversal. Defaults
 	//! false for artifacts predating the probe, which keeps walk mode on the bridge.
 	bool preserves_multiplicity = false;
+	//! Recorded by the builder: the artifact holds only edges whose endpoints are vertices (pgq_abi_build reads the
+	//! edge tables through their vertex keys). Without it the binder measures the edge tables the artifact rests on
+	//! before it lets the artifact answer (PGQExactness::EndpointsComplete).
+	bool endpoints_complete = false;
 	bool from_metadata = false;
 	//! Provenance recorded by pgq_abi_build for artifacts computed from DuckLake tables (see abi_build.hpp)
 	string source_snapshot;
@@ -286,7 +290,7 @@ public:
 	                                 case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &opt_alias_map,
 	                                 CreatePropertyGraphInfo &pg_table, int32_t &extra_alias_counter,
 	                                 const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &mandatory_alias_map,
-	                                 const ParsedExpression *where_hint);
+	                                 vector<unique_ptr<ParsedExpression>> &columns, unique_ptr<ParsedExpression> &where);
 	//! The query for one MATCH block and its UNION [ALL] MATCH branches. allow_abi = false keeps every pattern on the
 	//! traversal routes, which bind each element to a table row.
 	static unique_ptr<QueryNode> BuildMatchQueryNode(ClientContext &context, MatchExpression *ref, bool allow_abi);
@@ -319,7 +323,8 @@ public:
 	                                    const shared_ptr<PropertyGraphTable> &prev_vertex_table,
 	                                    const shared_ptr<PropertyGraphTable> &next_vertex_table,
 	                                    const vector<shared_ptr<PropertyGraphTable>> &edge_tables, bool undirected,
-	                                    idx_t lower, idx_t upper);
+	                                    idx_t lower, idx_t upper, bool any_shortest = false, bool all_shortest = false,
+	                                    bool closed_walks = false);
 
 	// csr_id_counter hands out a distinct registry slot per CSR built in this query. It is
 	// a reference to DuckPGQState::csr_id_counter, threaded because this call chain carries

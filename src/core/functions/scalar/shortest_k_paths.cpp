@@ -109,8 +109,8 @@ static unique_ptr<FunctionData> ShortestKPathsBind(BindScalarFunctionInput &inpu
 		throw InvalidInputException("pgq_shortest_k_paths: bounds %lld..%lld", static_cast<long long>(lower),
 		                            static_cast<long long>(upper));
 	}
-	if (mode == PathSearchMode::WALK && (all_shortest || k < 0)) {
-		// Neither keeps a finite number of walks per vertex, so neither search would end on a cycle.
+	if (mode == PathSearchMode::WALK && !all_shortest && k < 0) {
+		// Every walk: no finite number of walks per vertex, so the search would not end on a cycle.
 		throw InvalidInputException("pgq_shortest_k_paths: under walk semantics only a finite k is supported");
 	}
 	if (!all_shortest && k == 0) {
@@ -147,6 +147,7 @@ public:
 		result_count.clear();
 		first_depth.clear();
 		kept.clear();
+		walk_depth.clear();
 		const bool all_targets = targets.empty();
 		target_set.clear();
 		for (auto t : targets) {
@@ -243,7 +244,20 @@ public:
 				if (c == 0 || candidates[c - 1] < candidate) {
 					current_rank++;
 				}
-				if (info.mode == PathSearchMode::WALK) {
+				if (info.mode == PathSearchMode::WALK && info.all_shortest) {
+					// Every shortest walk from `lower` on: a walk that reaches a vertex at depth d >= lower can only
+					// lead to a shortest walk if d is the first such depth of that vertex (a shorter one would make
+					// every continuation shorter too), so a vertex is kept at that depth only, with all its walks
+					// there -- and the search ends on cycles. Below `lower` every walk is kept (lower is small).
+					if (depth + 1 >= info.lower) {
+						auto entry = walk_depth.find(candidate.vertex);
+						if (entry == walk_depth.end()) {
+							walk_depth[candidate.vertex] = depth + 1;
+						} else if (entry->second != depth + 1) {
+							continue;
+						}
+					}
+				} else if (info.mode == PathSearchMode::WALK) {
 					// Keep a vertex's first k walks of each length below `lower`, and its first k from `lower` on.
 					auto &count = depth + 1 < info.lower ? level_count[candidate.vertex] : kept[candidate.vertex];
 					if (count >= info.k) {
@@ -292,10 +306,11 @@ private:
 		return static_cast<int64_t>(nodes.size()) - 1;
 	}
 
-	//! The source's own count towards its first k walks from `lower` on.
+	//! The source's own count towards its first k walks from `lower` on (or, for all shortest walks, its depth).
 	void Admit(int64_t index, int64_t lower) {
 		if (info.mode == PathSearchMode::WALK && nodes[index].depth >= lower) {
 			kept[nodes[index].vertex]++;
+			walk_depth[nodes[index].vertex] = nodes[index].depth;
 		}
 	}
 
@@ -331,6 +346,8 @@ private:
 	std::unordered_map<int64_t, int64_t> result_count;
 	std::unordered_map<int64_t, int64_t> first_depth;
 	std::unordered_map<int64_t, int64_t> kept;
+	//! all shortest walks: the depth (from `lower` on) at which each vertex is kept
+	std::unordered_map<int64_t, int64_t> walk_depth;
 	std::unordered_set<int64_t> target_set;
 };
 
