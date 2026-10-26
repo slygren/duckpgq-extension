@@ -1,4 +1,5 @@
 #include "duckpgq/core/functions/algorithms/graph_algorithm.hpp"
+#include "duckpgq/core/utils/element_relation.hpp"
 
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/vector/list_vector.hpp"
@@ -149,10 +150,10 @@ void CanonicalizeLabels(vector<int64_t> &labels) {
 	}
 }
 
-//! The condition a single label puts on a table's rows (as MATCH's label filter builds it): none for the main label,
-//! the discriminator bit for a sub-label.
+//! The condition a single label puts on a table's rows (as MATCH's label filter builds it): none for a label every
+//! row has, the discriminator bit for a sub-label.
 static string LabelCondition(const PropertyGraphTable &table, const string &label, const string &alias) {
-	if (StringUtil::CIEquals(PGQStr(table.main_label), label)) {
+	if (table.HasStaticLabel(label)) {
 		return "";
 	}
 	for (idx_t i = 0; i < table.sub_labels.size(); i++) {
@@ -217,6 +218,7 @@ GraphAlgorithmBinding BindGraphAlgorithmEdges(ClientContext &context, TableFunct
 		                                : string("?"));
 	}
 	GraphAlgorithmBinding binding;
+	binding.graph = pg_info;
 	binding.edge = edge_pg_entry;
 	binding.vertex_label = vertex_label;
 	binding.edge_label = edge_label;
@@ -496,10 +498,11 @@ unique_ptr<TableRef> GraphAlgorithmBindReplace(ClientContext &context, TableFunc
 	}
 	auto select_statement = DuckPGQSQL::ParseSelect(sql, spec.name);
 	auto select_node = unique_ptr_cast<QueryNode, SelectNode>(std::move(select_statement->node));
-	return CreateTableFunctionSubquery(std::move(select_node),
-	                                   CreateDirectedCSRCTE(edge_pg_entry, "src", "edge", "dst", csr_id, binding.EdgeFilter()),
-	                                   "csr_cte",
-	                                   spec.alias.empty() ? spec.name : spec.alias);
+	auto result = CreateTableFunctionSubquery(
+	    std::move(select_node), CreateDirectedCSRCTE(edge_pg_entry, "src", "edge", "dst", csr_id, binding.EdgeFilter()),
+	    "csr_cte", spec.alias.empty() ? spec.name : spec.alias);
+	PGQElementRelations::Apply(context, *binding.graph, result);
+	return result;
 }
 
 } // namespace

@@ -1,14 +1,21 @@
 # name: test/sql/create_pg/create_pg_on_view.test
+# description: views as vertex and edge tables, persisted across a restart, and graphs written before views were
+#              supported (the internal table without its is_view and identity_columns columns)
 # group: [create_pg]
 
 require duckpgq
+
+load {TEST_DIR}/create_pg_on_view.db
 
 # The SQL/PGQ grammar is connection-local and must be activated explicitly.
 statement ok
 SET active_grammar_extensions = ['duckpgq'];
 
 statement ok
-CREATE TABLE vdata(id TEXT PRIMARY KEY);
+CREATE TABLE vdata(id TEXT PRIMARY KEY, n INTEGER);
+
+statement ok
+INSERT INTO vdata VALUES ('a', 1), ('b', 2), ('c', 3);
 
 statement ok
 CREATE VIEW v AS SELECT * FROM vdata;
@@ -17,12 +24,19 @@ statement ok
 CREATE TABLE w(id TEXT PRIMARY KEY);
 
 statement ok
+INSERT INTO w VALUES ('x'), ('y');
+
+statement ok
 CREATE TABLE v_w(v_id TEXT, w_id TEXT);
+
+statement ok
+INSERT INTO v_w VALUES ('a', 'x'), ('b', 'x'), ('c', 'y'), ('c', 'z');
 
 statement ok
 create view v_w_view as select * from v_w;
 
-statement error
+# A view as a vertex table.
+statement ok
 CREATE PROPERTY GRAPH g1
   VERTEX TABLES (v, w)
   EDGE TABLES (
@@ -30,16 +44,144 @@ CREATE PROPERTY GRAPH g1
         DESTINATION KEY (w_id) REFERENCES w (id)
     LABEL hasW
   );
-----
-Invalid Error: Found a view with name v. Creating property graph tables over views is currently not supported.
 
-statement error
-CREATE PROPERTY GRAPH g1
+# A view as an edge table.
+statement ok
+CREATE PROPERTY GRAPH g2
   VERTEX TABLES (vdata, w)
   EDGE TABLES (
     v_w_view SOURCE KEY (v_id) REFERENCES vdata (id)
         DESTINATION KEY (w_id) REFERENCES w (id)
     LABEL hasW
   );
+
+# Only the endpoints that exist: c -> z has no vertex z.
+query II
+FROM GRAPH_TABLE (g1 MATCH (a:v)-[e:hasW]->(b:w) COLUMNS (a.id, b.id)) ORDER BY ALL;
 ----
-Invalid Error: Found a view with name v_w_view. Creating property graph tables over views is currently not supported.
+a	x
+b	x
+c	y
+
+query II
+FROM GRAPH_TABLE (g2 MATCH (a:vdata)-[e:hasW]->(b:w) COLUMNS (a.id, b.id)) ORDER BY ALL;
+----
+a	x
+b	x
+c	y
+
+# The vertex view is numbered by the key the edges reference it by, then by its other columns.
+query TTT
+SELECT table_name, is_view, identity_columns FROM __duckpgq_internal WHERE property_graph IN ('g1', 'g2')
+ORDER BY property_graph, table_name;
+----
+v	true	[id, n]
+v_w	NULL	NULL
+w	NULL	NULL
+v_w_view	true	[v_id, w_id]
+vdata	NULL	NULL
+w	NULL	NULL
+
+query III
+FROM GRAPH_TABLE (g1 MATCH p = ANY SHORTEST (a:v)-[e:hasW]->+(b:w) COLUMNS (a.n, element_id(a), path_length(p)))
+ORDER BY ALL;
+----
+1	0	1
+2	1	1
+3	2	1
+
+# A view no edge references, without a key: numbered by all of its columns.
+statement ok
+CREATE VIEW lonely AS SELECT n, id FROM vdata;
+
+statement ok
+CREATE PROPERTY GRAPH g3 VERTEX TABLES (lonely);
+
+query T
+SELECT identity_columns FROM __duckpgq_internal WHERE property_graph = 'g3';
+----
+[n, id]
+
+query II
+FROM GRAPH_TABLE (g3 MATCH (x:lonely) COLUMNS (x.id, element_id(x))) ORDER BY ALL;
+----
+a	0
+b	1
+c	2
+
+# The graphs survive a restart.
+restart
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+query II
+FROM GRAPH_TABLE (g1 MATCH p = ANY SHORTEST (a:v)-[e:hasW]->+(b:w) COLUMNS (a.id, b.id)) ORDER BY ALL;
+----
+a	x
+b	x
+c	y
+
+query II
+FROM GRAPH_TABLE (g2 MATCH (a:vdata)-[e:hasW]->(b:w) COLUMNS (a.id, element_id(e))) ORDER BY ALL;
+----
+a	0
+b	1
+c	2
+
+# A view changes with its rows; the graph reads it at query time.
+statement ok
+INSERT INTO vdata VALUES ('d', 4);
+
+statement ok
+INSERT INTO v_w VALUES ('d', 'y');
+
+query II
+FROM GRAPH_TABLE (g1 MATCH p = ANY SHORTEST (a:v)-[e:hasW]->+(b:w) COLUMNS (a.id, b.id)) ORDER BY ALL;
+----
+a	x
+b	x
+c	y
+d	y
+
+# Graphs written before views were supported: the internal table as those builds created it, with 24 columns. They
+# load as the tables they always were, and the newer columns are added on the next read-write start.
+statement ok
+DROP TABLE __duckpgq_internal;
+
+statement ok
+CREATE TABLE __duckpgq_internal (property_graph varchar, table_name varchar, label varchar, is_vertex_table boolean,
+  source_table varchar, source_pk varchar[], source_fk varchar[], destination_table varchar, destination_pk varchar[],
+  destination_fk varchar[], discriminator varchar, sub_labels varchar[], catalog varchar, schema varchar,
+  source_catalog varchar, source_schema varchar, destination_catalog varchar, destination_schema varchar,
+  properties varchar[], column_aliases varchar[], graph_catalog varchar, graph_schema varchar, verified boolean,
+  abi_options varchar);
+
+statement ok
+INSERT INTO __duckpgq_internal VALUES
+  ('old', 'vdata', 'vdata', true, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, '', '', NULL, NULL, NULL, NULL,
+   ['id', 'n'], ['id', 'n'], 'create_pg_on_view', 'main', false, NULL),
+  ('old', 'w', 'w', true, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, '', '', NULL, NULL, NULL, NULL,
+   ['id'], ['id'], 'create_pg_on_view', 'main', false, NULL),
+  ('old', 'v_w', 'hasW', false, 'vdata', ['id'], ['v_id'], 'w', ['id'], ['w_id'], NULL, NULL, '', '', '', '', '', '',
+   ['v_id', 'w_id'], ['v_id', 'w_id'], 'create_pg_on_view', 'main', false, NULL);
+
+restart
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+query II
+FROM GRAPH_TABLE (old MATCH p = ANY SHORTEST (a:vdata)-[e:hasW]->+(b:w) COLUMNS (a.id, element_id(a))) ORDER BY ALL;
+----
+a	0
+b	1
+c	2
+d	3
+
+query TT
+SELECT table_name, is_view FROM __duckpgq_internal WHERE property_graph = 'old' ORDER BY table_name;
+----
+v_w	NULL
+vdata	NULL
+w	NULL

@@ -31,14 +31,20 @@ public:
 	Identifier table_name;
 	Identifier table_name_alias;
 
-	//! The stack of names in order of which they appear (column_names[0], column_names[1], column_names[2], ...)
+	//! The properties: the column each reads (column_names), its name (column_aliases). A computed property
+	//! (PROPERTIES (age + 1 AS age_next)) has its name in both and its expression in property_expressions, which is
+	//! empty for a column and may be shorter than column_names (graphs persisted before computed properties).
 	vector<Identifier> column_names;
 	vector<Identifier> column_aliases;
+	vector<string> property_expressions;
 
 	vector<Identifier> except_columns;
 
 	vector<Identifier> sub_labels;
+	//! The first label declared for the table; label(x) returns it.
 	Identifier main_label;
+	//! The table's other labels, in declaration order (LABEL A LABEL B ...). Like main_label, every row has them.
+	vector<Identifier> extra_labels;
 
 	Identifier catalog_name;
 	Identifier schema_name;
@@ -73,6 +79,16 @@ public:
 
 	shared_ptr<PropertyGraphTable> destination_pg_table;
 
+	//! The element key declared with KEY (...): the columns that identify the table's elements. Empty when the table
+	//! declares none (its key is then its PRIMARY KEY, or for a vertex table the columns its edges reference).
+	vector<Identifier> element_key;
+
+	//! The element table is a view. A view has no rowid, so the MATCH translation reads it through an element
+	//! relation that numbers its rows by identity_columns (see PGQElementRelations).
+	bool is_view = false;
+	//! The columns that order a view's rows for its element ids: its element key, else every column.
+	vector<Identifier> identity_columns;
+
 public:
 	string ToString() const;
 	bool Equals(const PropertyGraphTable *other_p) const;
@@ -103,5 +119,21 @@ public:
 	}
 
 	bool IsSourceTable(const Identifier &table_name);
+
+	//! The name of property i (its alias, else its column).
+	const Identifier &PropertyName(idx_t i) const {
+		return i < column_aliases.size() && !column_aliases[i].empty() ? column_aliases[i] : column_names[i];
+	}
+	//! The SQL expression of computed property i; empty for a property that is a column.
+	string PropertyExpression(idx_t i) const {
+		return i < property_expressions.size() ? property_expressions[i] : string();
+	}
+	//! Whether the table has a property of this name (case-insensitive), or a property that renames a column of it.
+	bool HasProperty(const string &name) const;
+
+	//! Whether every row of the table has this label: its main label or one of its extra labels.
+	bool HasStaticLabel(const string &label) const;
+	//! main_label followed by extra_labels.
+	vector<Identifier> StaticLabels() const;
 };
 } // namespace duckdb

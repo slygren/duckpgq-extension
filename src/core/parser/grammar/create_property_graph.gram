@@ -4,15 +4,43 @@
 
 DuckPGQCreatePropertyGraph <- 'CREATE' OrReplace? 'PROPERTY' 'GRAPH' IfNotExists? QualifiedName DuckPGQVertexTables DuckPGQEdgeTables? DuckPGQAbiClause?
 
+# ALTER PROPERTY GRAPH: add or drop element tables, add or drop a label of one. Element tables are named by their
+# alias (the table name when they have none).
+DuckPGQAlterPropertyGraph <- 'ALTER' 'PROPERTY' 'GRAPH' QualifiedName DuckPGQAlterGraphAction
+DuckPGQAlterGraphAction <- DuckPGQAddVertexTables / DuckPGQAddEdgeTables / DuckPGQDropVertexTables / DuckPGQDropEdgeTables / DuckPGQAlterElementTable
+DuckPGQAddVertexTables <- 'ADD' DuckPGQVertexTables
+DuckPGQAddEdgeTables <- 'ADD' DuckPGQEdgeTables
+DuckPGQDropVertexTables <- 'DROP' DuckPGQVertexKeyword 'TABLES' Parens(List(ColId)) DuckPGQDropBehavior?
+DuckPGQDropEdgeTables <- 'DROP' DuckPGQEdgeKeyword 'TABLES' Parens(List(ColId)) DuckPGQDropBehavior?
+DuckPGQDropBehavior <- 'CASCADE' / 'RESTRICT'
+DuckPGQAlterElementTable <- 'ALTER' DuckPGQElementKind 'TABLE' ColId DuckPGQAlterElementAction
+DuckPGQElementKind <- DuckPGQVertexKeyword / DuckPGQEdgeKeyword
+DuckPGQAlterElementAction <- DuckPGQAddLabel / DuckPGQDropLabel
+DuckPGQAddLabel <- 'ADD' DuckPGQNamedLabel DuckPGQProperties?
+DuckPGQDropLabel <- 'DROP' DuckPGQNamedLabel DuckPGQDropBehavior?
+
 # What pgq_abi_build builds for the graph, with the option names of pgq_abi_build. Declaring it builds nothing.
 DuckPGQAbiClause <- 'WITH' 'ABI' Parens(List(DuckPGQAbiOption))
 DuckPGQAbiOption <- ColId NamedParameterAssignment Expression
 
-# Vertex and edge tables.
-DuckPGQVertexTables <- 'VERTEX' 'TABLES' Parens(List(DuckPGQVertexTable))
-DuckPGQEdgeTables <- 'EDGE' 'TABLES' Parens(List(DuckPGQEdgeTable))
-DuckPGQVertexTable <- BaseTableName TableAliasAs? DuckPGQProperties? DuckPGQLabel?
-DuckPGQEdgeTable <- BaseTableName TableAliasAs? DuckPGQSourceReference DuckPGQDestinationReference DuckPGQProperties? DuckPGQLabel?
+# Vertex and edge tables. NODE and RELATIONSHIP are the standard's synonyms.
+DuckPGQVertexTables <- DuckPGQVertexKeyword 'TABLES' Parens(List(DuckPGQVertexTable))
+DuckPGQEdgeTables <- DuckPGQEdgeKeyword 'TABLES' Parens(List(DuckPGQEdgeTable))
+DuckPGQVertexKeyword <- 'VERTEX' / 'NODE'
+DuckPGQEdgeKeyword <- 'EDGE' / 'RELATIONSHIP'
+DuckPGQVertexTable <- BaseTableName TableAliasAs? DuckPGQElementKey? DuckPGQLabelsAndProperties
+DuckPGQEdgeTable <- BaseTableName TableAliasAs? DuckPGQElementKey? DuckPGQSourceReference DuckPGQDestinationReference DuckPGQLabelsAndProperties
+
+# The element key: the columns that identify the table's vertices or edges (SQL/PGQ element table key clause).
+DuckPGQElementKey <- 'KEY' Parens(List(ColId))
+
+# Labels with their properties, in the standard's order (LABEL l PROPERTIES (...), repeated), after an optional
+# PROPERTIES clause of the first label in this extension's original order (PROPERTIES (...) LABEL l).
+DuckPGQLabelsAndProperties <- DuckPGQProperties? DuckPGQLabelEntry* DuckPGQSubLabels?
+DuckPGQLabelEntry <- DuckPGQLabelName DuckPGQSubLabels? DuckPGQProperties?
+DuckPGQLabelName <- DuckPGQDefaultLabel / DuckPGQNamedLabel
+DuckPGQDefaultLabel <- 'DEFAULT' 'LABEL'
+DuckPGQNamedLabel <- 'LABEL' ColId
 
 # Property selection and aliases. Try EXCEPT before its ALL COLUMNS prefix.
 DuckPGQProperties <- DuckPGQAllColumnsExcept / DuckPGQAllColumns / DuckPGQAllProperties / DuckPGQNoProperties / DuckPGQPropertyList
@@ -21,17 +49,15 @@ DuckPGQAllColumnsExcept <- 'PROPERTIES' 'ARE'? 'ALL' 'COLUMNS' 'EXCEPT' Parens(L
 DuckPGQAllProperties <- 'ALL' 'PROPERTIES'
 DuckPGQNoProperties <- 'NO' 'PROPERTIES'
 DuckPGQPropertyList <- 'PROPERTIES' Parens(List(DuckPGQProperty))
-DuckPGQProperty <- ColId DuckPGQPropertyAlias?
+# A property is a column, or any expression over the table's columns with a name (age + 1 AS age_next).
+DuckPGQProperty <- Expression DuckPGQPropertyAlias?
 DuckPGQPropertyAlias <- 'AS' ColId
 
-# Labels and discriminator sublabels.
-DuckPGQLabel <- DuckPGQExplicitLabel / DuckPGQImplicitLabel
-DuckPGQExplicitLabel <- 'LABEL' ColId DuckPGQSubLabels?
-DuckPGQImplicitLabel <- DuckPGQSubLabels
+# Discriminator sub-labels: rows whose discriminator has bit i set also carry the i-th of these labels.
 DuckPGQSubLabels <- 'IN' Identifier Parens(List(ColId))
 
-# Edge endpoint references, with explicit or inferred keys.
+# Edge endpoint references, with explicit or inferred keys. Without a column list REFERENCES v means v's key.
 DuckPGQSourceReference <- 'SOURCE' DuckPGQReference
 DuckPGQDestinationReference <- 'DESTINATION' DuckPGQReference
 DuckPGQReference <- DuckPGQKeyReference / BaseTableName
-DuckPGQKeyReference <- 'KEY' Parens(List(ColId)) 'REFERENCES' BaseTableName Parens(List(ColId))
+DuckPGQKeyReference <- 'KEY' Parens(List(ColId)) 'REFERENCES' BaseTableName Parens(List(ColId))?

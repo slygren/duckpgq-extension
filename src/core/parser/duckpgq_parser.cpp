@@ -16,6 +16,13 @@ namespace duckdb {
 static ParserExtensionPlanResult duckpgq_plan_statement(SQLStatement &statement) {
 	if (statement.type == StatementType::CREATE_STATEMENT) {
 		auto &create_statement = statement.Cast<CreateStatement>();
+		if (dynamic_cast<AlterPropertyGraphInfo *>(create_statement.info.get())) {
+			ParserExtensionPlanResult result;
+			result.function = AlterPropertyGraphFunction();
+			result.requires_valid_transaction = true;
+			result.return_type = StatementReturnType::QUERY_RESULT;
+			return result;
+		}
 		if (dynamic_cast<CreatePropertyGraphInfo *>(create_statement.info.get())) {
 			ParserExtensionPlanResult result;
 			result.function = CreatePropertyGraphFunction();

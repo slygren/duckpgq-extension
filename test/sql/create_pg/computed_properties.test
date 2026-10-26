@@ -1,0 +1,312 @@
+# name: test/sql/create_pg/computed_properties.test
+# description: properties that are expressions (PROPERTIES (age + 1 AS age_next)) or renamed columns (name AS
+#              fullname). Every query over such a graph equals the same query over tables holding those values as
+#              columns, traversed and from ABI artifacts; the properties survive a restart.
+# group: [create_pg]
+
+require duckpgq
+
+load {TEST_DIR}/computed_properties.db
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE person (id BIGINT, name VARCHAR, age INTEGER);
+
+statement ok
+INSERT INTO person VALUES (1, 'P1', 23), (2, 'P2', 28), (3, 'P3', 33), (4, 'P4', 38), (5, 'P5', 43), (6, 'P6', 48), (7, 'P7', 53), (8, 'P8', 18), (9, 'P9', 23), (10, 'P10', 28), (11, 'P11', 33), (12, 'P12', 38), (13, 'P13', 43), (14, 'P14', 48), (15, 'P15', 53), (16, 'P16', 18), (17, 'P17', 23), (18, 'P18', 28), (19, 'P19', 33), (20, 'P20', 38);
+
+statement ok
+CREATE TABLE knows (src BIGINT, dst BIGINT, w INTEGER);
+
+statement ok
+INSERT INTO knows VALUES (15, 18, 27), (15, 15, 16), (19, 7, 5), (17, 16, 20), (20, 6, 3), (15, 10, 4), (3, 18, 25), (2, 20, 12), (15, 20, 20), (6, 20, 0), (17, 3, 1), (2, 7, 28), (8, 20, 0), (15, 11, 14), (19, 7, 16), (8, 10, 15), (1, 3, 14), (9, 14, 17), (3, 9, 10), (8, 17, 9), (1, 3, 18), (4, 13, 3), (10, 13, 2), (1, 1, 6), (7, 2, 15), (13, 13, 13), (3, 19, 20), (7, 9, 10), (3, 10, 10), (1, 14, 24), (4, 5, 7), (4, 1, 1), (15, 16, 5), (18, 7, 14), (17, 7, 23), (5, 14, 20), (13, 4, 12), (14, 7, 0), (9, 19, 9), (1, 7, 5), (13, 20, 20), (19, 4, 1), (5, 7, 14), (9, 1, 24), (20, 11, 26), (10, 13, 2), (3, 3, 6), (19, 8, 0), (20, 12, 11), (20, 15, 4), (19, 16, 26), (19, 5, 27), (13, 6, 20), (5, 10, 29), (8, 20, 7), (1, 2, 3), (2, 2, 4), (5, 6, 7), (5, 6, 7);
+
+# The computed graph, and the same values as columns.
+statement ok
+CREATE PROPERTY GRAPH gc VERTEX TABLES (person KEY (id) PROPERTIES (id, name AS fullname, age + 1 AS age_next, lower(name) AS lname, age % 3 = 0 AS third) LABEL Person) EDGE TABLES (knows SOURCE KEY (src) REFERENCES person DESTINATION KEY (dst) REFERENCES person PROPERTIES (w, w * 2 + 1 AS cost, src || '>' || dst AS arrow) LABEL Knows);
+
+statement ok
+CREATE TABLE person_m AS SELECT id, name AS fullname, age + 1 AS age_next, lower(name) AS lname, age % 3 = 0 AS third FROM person;
+
+statement ok
+CREATE TABLE knows_m AS SELECT src, dst, w, w * 2 + 1 AS cost, src || '>' || dst AS arrow FROM knows;
+
+statement ok
+CREATE PROPERTY GRAPH gm VERTEX TABLES (person_m PROPERTIES (id, fullname, age_next, lname, third) LABEL Person) EDGE TABLES (knows_m SOURCE KEY (src) REFERENCES person_m (id) DESTINATION KEY (dst) REFERENCES person_m (id) PROPERTIES (w, cost, arrow) LABEL Knows);
+
+query TTT
+SELECT table_name, column_aliases, property_expressions FROM __duckpgq_internal WHERE property_graph = 'gc' ORDER BY table_name;
+----
+knows	[w, cost, arrow]	[NULL, '((w * 2) + 1)', '((src || \'>\') || dst)']
+person	[id, fullname, age_next, lname, third]	[NULL, NULL, '(age + 1)', 'lower("name")', '((age % 3) = 0)']
+
+# Every query: the symmetric difference of the two graphs' answers is empty, and the answer is not.
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (gc MATCH (a:Person)-[k:Knows]->(b:Person) COLUMNS (a.fullname, a.age_next, b.lname, k.cost, k.arrow)) EXCEPT ALL FROM GRAPH_TABLE (gm MATCH (a:Person)-[k:Knows]->(b:Person) COLUMNS (a.fullname, a.age_next, b.lname, k.cost, k.arrow)))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (gm MATCH (a:Person)-[k:Knows]->(b:Person) COLUMNS (a.fullname, a.age_next, b.lname, k.cost, k.arrow)) EXCEPT ALL FROM GRAPH_TABLE (gc MATCH (a:Person)-[k:Knows]->(b:Person) COLUMNS (a.fullname, a.age_next, b.lname, k.cost, k.arrow)))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (gc MATCH (a:Person)-[k:Knows]->(b:Person) COLUMNS (a.fullname, a.age_next, b.lname, k.cost, k.arrow))));
+----
+0	true
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (gc MATCH (a:Person)-[k:Knows]->(b:Person) WHERE a.age_next > 30 AND b.third AND k.cost < 40 COLUMNS (a.id, b.id)) EXCEPT ALL FROM GRAPH_TABLE (gm MATCH (a:Person)-[k:Knows]->(b:Person) WHERE a.age_next > 30 AND b.third AND k.cost < 40 COLUMNS (a.id, b.id)))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (gm MATCH (a:Person)-[k:Knows]->(b:Person) WHERE a.age_next > 30 AND b.third AND k.cost < 40 COLUMNS (a.id, b.id)) EXCEPT ALL FROM GRAPH_TABLE (gc MATCH (a:Person)-[k:Knows]->(b:Person) WHERE a.age_next > 30 AND b.third AND k.cost < 40 COLUMNS (a.id, b.id)))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (gc MATCH (a:Person)-[k:Knows]->(b:Person) WHERE a.age_next > 30 AND b.third AND k.cost < 40 COLUMNS (a.id, b.id))));
+----
+0	true
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (gc MATCH (a:Person WHERE a.lname LIKE 'p1%')-[k:Knows WHERE k.cost > 10]->(b:Person) COLUMNS (a.id, b.fullname)) EXCEPT ALL FROM GRAPH_TABLE (gm MATCH (a:Person WHERE a.lname LIKE 'p1%')-[k:Knows WHERE k.cost > 10]->(b:Person) COLUMNS (a.id, b.fullname)))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (gm MATCH (a:Person WHERE a.lname LIKE 'p1%')-[k:Knows WHERE k.cost > 10]->(b:Person) COLUMNS (a.id, b.fullname)) EXCEPT ALL FROM GRAPH_TABLE (gc MATCH (a:Person WHERE a.lname LIKE 'p1%')-[k:Knows WHERE k.cost > 10]->(b:Person) COLUMNS (a.id, b.fullname)))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (gc MATCH (a:Person WHERE a.lname LIKE 'p1%')-[k:Knows WHERE k.cost > 10]->(b:Person) COLUMNS (a.id, b.fullname))));
+----
+0	true
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (gc MATCH (a:Person)-[k:Knows]-(b:Person) WHERE a.third COLUMNS (a.id, b.age_next)) EXCEPT ALL FROM GRAPH_TABLE (gm MATCH (a:Person)-[k:Knows]-(b:Person) WHERE a.third COLUMNS (a.id, b.age_next)))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (gm MATCH (a:Person)-[k:Knows]-(b:Person) WHERE a.third COLUMNS (a.id, b.age_next)) EXCEPT ALL FROM GRAPH_TABLE (gc MATCH (a:Person)-[k:Knows]-(b:Person) WHERE a.third COLUMNS (a.id, b.age_next)))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (gc MATCH (a:Person)-[k:Knows]-(b:Person) WHERE a.third COLUMNS (a.id, b.age_next))));
+----
+0	true
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (gc MATCH (a:Person) COLUMNS (a.*)) EXCEPT ALL FROM GRAPH_TABLE (gm MATCH (a:Person) COLUMNS (a.*)))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (gm MATCH (a:Person) COLUMNS (a.*)) EXCEPT ALL FROM GRAPH_TABLE (gc MATCH (a:Person) COLUMNS (a.*)))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (gc MATCH (a:Person) COLUMNS (a.*))));
+----
+0	true
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (gc MATCH (a:Person)-[k:Knows]->(b:Person) COLUMNS (k.*, b.*)) EXCEPT ALL FROM GRAPH_TABLE (gm MATCH (a:Person)-[k:Knows]->(b:Person) COLUMNS (k.*, b.*)))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (gm MATCH (a:Person)-[k:Knows]->(b:Person) COLUMNS (k.*, b.*)) EXCEPT ALL FROM GRAPH_TABLE (gc MATCH (a:Person)-[k:Knows]->(b:Person) COLUMNS (k.*, b.*)))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (gc MATCH (a:Person)-[k:Knows]->(b:Person) COLUMNS (k.*, b.*))));
+----
+0	true
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (gc MATCH (a:Person)-[k:Knows]->{1,3}(b:Person) WHERE a.age_next < 30 COLUMNS (a.id, b.lname)) EXCEPT ALL FROM GRAPH_TABLE (gm MATCH (a:Person)-[k:Knows]->{1,3}(b:Person) WHERE a.age_next < 30 COLUMNS (a.id, b.lname)))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (gm MATCH (a:Person)-[k:Knows]->{1,3}(b:Person) WHERE a.age_next < 30 COLUMNS (a.id, b.lname)) EXCEPT ALL FROM GRAPH_TABLE (gc MATCH (a:Person)-[k:Knows]->{1,3}(b:Person) WHERE a.age_next < 30 COLUMNS (a.id, b.lname)))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (gc MATCH (a:Person)-[k:Knows]->{1,3}(b:Person) WHERE a.age_next < 30 COLUMNS (a.id, b.lname))));
+----
+0	true
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (gc MATCH p = ANY SHORTEST (a:Person)-[k:Knows]->+(b:Person) WHERE a.lname = 'p1' COLUMNS (b.id, path_length(p), vertex_property(p, 'age_next') AS ages, edge_property(p, 'arrow') AS arrows)) EXCEPT ALL FROM GRAPH_TABLE (gm MATCH p = ANY SHORTEST (a:Person)-[k:Knows]->+(b:Person) WHERE a.lname = 'p1' COLUMNS (b.id, path_length(p), vertex_property(p, 'age_next') AS ages, edge_property(p, 'arrow') AS arrows)))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (gm MATCH p = ANY SHORTEST (a:Person)-[k:Knows]->+(b:Person) WHERE a.lname = 'p1' COLUMNS (b.id, path_length(p), vertex_property(p, 'age_next') AS ages, edge_property(p, 'arrow') AS arrows)) EXCEPT ALL FROM GRAPH_TABLE (gc MATCH p = ANY SHORTEST (a:Person)-[k:Knows]->+(b:Person) WHERE a.lname = 'p1' COLUMNS (b.id, path_length(p), vertex_property(p, 'age_next') AS ages, edge_property(p, 'arrow') AS arrows)))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (gc MATCH p = ANY SHORTEST (a:Person)-[k:Knows]->+(b:Person) WHERE a.lname = 'p1' COLUMNS (b.id, path_length(p), vertex_property(p, 'age_next') AS ages, edge_property(p, 'arrow') AS arrows))));
+----
+0	true
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (gc MATCH p = ALL SHORTEST (a:Person)-[k:Knows]->+(b:Person) WHERE a.id <= 3 COLUMNS (a.id, b.id, list_sum(edge_property(p, 'cost')) AS c)) EXCEPT ALL FROM GRAPH_TABLE (gm MATCH p = ALL SHORTEST (a:Person)-[k:Knows]->+(b:Person) WHERE a.id <= 3 COLUMNS (a.id, b.id, list_sum(edge_property(p, 'cost')) AS c)))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (gm MATCH p = ALL SHORTEST (a:Person)-[k:Knows]->+(b:Person) WHERE a.id <= 3 COLUMNS (a.id, b.id, list_sum(edge_property(p, 'cost')) AS c)) EXCEPT ALL FROM GRAPH_TABLE (gc MATCH p = ALL SHORTEST (a:Person)-[k:Knows]->+(b:Person) WHERE a.id <= 3 COLUMNS (a.id, b.id, list_sum(edge_property(p, 'cost')) AS c)))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (gc MATCH p = ALL SHORTEST (a:Person)-[k:Knows]->+(b:Person) WHERE a.id <= 3 COLUMNS (a.id, b.id, list_sum(edge_property(p, 'cost')) AS c))));
+----
+0	true
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (gc MATCH p = ANY CHEAPEST (a:Person)-[k:Knows COST k.cost]->+(b:Person) WHERE a.id <= 4 COLUMNS (a.id, b.id, cost(p) AS c)) EXCEPT ALL FROM GRAPH_TABLE (gm MATCH p = ANY CHEAPEST (a:Person)-[k:Knows COST k.cost]->+(b:Person) WHERE a.id <= 4 COLUMNS (a.id, b.id, cost(p) AS c)))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (gm MATCH p = ANY CHEAPEST (a:Person)-[k:Knows COST k.cost]->+(b:Person) WHERE a.id <= 4 COLUMNS (a.id, b.id, cost(p) AS c)) EXCEPT ALL FROM GRAPH_TABLE (gc MATCH p = ANY CHEAPEST (a:Person)-[k:Knows COST k.cost]->+(b:Person) WHERE a.id <= 4 COLUMNS (a.id, b.id, cost(p) AS c)))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (gc MATCH p = ANY CHEAPEST (a:Person)-[k:Knows COST k.cost]->+(b:Person) WHERE a.id <= 4 COLUMNS (a.id, b.id, cost(p) AS c))));
+----
+0	true
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (gc MATCH p = (a:Person)-[k:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) WHERE a.id <= 5 COLUMNS (a.id, v1.lname, e.arrow, v2.age_next)) EXCEPT ALL FROM GRAPH_TABLE (gm MATCH p = (a:Person)-[k:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) WHERE a.id <= 5 COLUMNS (a.id, v1.lname, e.arrow, v2.age_next)))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (gm MATCH p = (a:Person)-[k:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) WHERE a.id <= 5 COLUMNS (a.id, v1.lname, e.arrow, v2.age_next)) EXCEPT ALL FROM GRAPH_TABLE (gc MATCH p = (a:Person)-[k:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) WHERE a.id <= 5 COLUMNS (a.id, v1.lname, e.arrow, v2.age_next)))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (gc MATCH p = (a:Person)-[k:Knows]->{1,2}(b:Person) ONE ROW PER STEP (v1, e, v2) WHERE a.id <= 5 COLUMNS (a.id, v1.lname, e.arrow, v2.age_next))));
+----
+0	true
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (gc MATCH (a:Person) OPTIONAL MATCH (a)-[k:Knows]->(b:Person WHERE b.third) COLUMNS (a.id, b.fullname, k.cost)) EXCEPT ALL FROM GRAPH_TABLE (gm MATCH (a:Person) OPTIONAL MATCH (a)-[k:Knows]->(b:Person WHERE b.third) COLUMNS (a.id, b.fullname, k.cost)))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (gm MATCH (a:Person) OPTIONAL MATCH (a)-[k:Knows]->(b:Person WHERE b.third) COLUMNS (a.id, b.fullname, k.cost)) EXCEPT ALL FROM GRAPH_TABLE (gc MATCH (a:Person) OPTIONAL MATCH (a)-[k:Knows]->(b:Person WHERE b.third) COLUMNS (a.id, b.fullname, k.cost)))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (gc MATCH (a:Person) OPTIONAL MATCH (a)-[k:Knows]->(b:Person WHERE b.third) COLUMNS (a.id, b.fullname, k.cost))));
+----
+0	true
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (gc MATCH (a:Person) WHERE EXISTS { (a)-[k:Knows WHERE k.cost > 50]->(:Person) } COLUMNS (a.fullname)) EXCEPT ALL FROM GRAPH_TABLE (gm MATCH (a:Person) WHERE EXISTS { (a)-[k:Knows WHERE k.cost > 50]->(:Person) } COLUMNS (a.fullname)))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (gm MATCH (a:Person) WHERE EXISTS { (a)-[k:Knows WHERE k.cost > 50]->(:Person) } COLUMNS (a.fullname)) EXCEPT ALL FROM GRAPH_TABLE (gc MATCH (a:Person) WHERE EXISTS { (a)-[k:Knows WHERE k.cost > 50]->(:Person) } COLUMNS (a.fullname)))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (gc MATCH (a:Person) WHERE EXISTS { (a)-[k:Knows WHERE k.cost > 50]->(:Person) } COLUMNS (a.fullname))));
+----
+0	true
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (gc MATCH (a:Person)-[k:Knows]->(b:Person) COLUMNS (a.age_next + b.age_next AS s, upper(a.lname) AS u)) EXCEPT ALL FROM GRAPH_TABLE (gm MATCH (a:Person)-[k:Knows]->(b:Person) COLUMNS (a.age_next + b.age_next AS s, upper(a.lname) AS u)))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (gm MATCH (a:Person)-[k:Knows]->(b:Person) COLUMNS (a.age_next + b.age_next AS s, upper(a.lname) AS u)) EXCEPT ALL FROM GRAPH_TABLE (gc MATCH (a:Person)-[k:Knows]->(b:Person) COLUMNS (a.age_next + b.age_next AS s, upper(a.lname) AS u)))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (gc MATCH (a:Person)-[k:Knows]->(b:Person) COLUMNS (a.age_next + b.age_next AS s, upper(a.lname) AS u))));
+----
+0	true
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (gc MATCH (a:Person) WHERE a.fullname = 'P3' COLUMNS (a.{fullname, age_next} AS st)) EXCEPT ALL FROM GRAPH_TABLE (gm MATCH (a:Person) WHERE a.fullname = 'P3' COLUMNS (a.{fullname, age_next} AS st)))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (gm MATCH (a:Person) WHERE a.fullname = 'P3' COLUMNS (a.{fullname, age_next} AS st)) EXCEPT ALL FROM GRAPH_TABLE (gc MATCH (a:Person) WHERE a.fullname = 'P3' COLUMNS (a.{fullname, age_next} AS st)))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (gc MATCH (a:Person) WHERE a.fullname = 'P3' COLUMNS (a.{fullname, age_next} AS st))));
+----
+0	true
+
+# The column a renamed property reads stays readable by its own name, as before renamed properties worked.
+query T
+SELECT bool_and(fullname = name) FROM GRAPH_TABLE (gc MATCH (a:Person) COLUMNS (a.fullname, a.name));
+----
+true
+
+# ABI artifacts carry keys; the properties come from the element relation.
+statement ok
+SELECT * FROM pgq_abi_build('gc', max_hops := 2);
+
+statement ok
+SELECT * FROM pgq_abi_build('gm', max_hops := 2);
+
+statement ok
+SET pgq_require_abi_paths = true;
+
+statement ok
+CREATE OR REPLACE TABLE abi_gc AS FROM GRAPH_TABLE (gc MATCH p = ANY SHORTEST (a:Person)-[:Knows]->{1,2}(b:Person) WHERE a.age_next > 25 COLUMNS (a.lname AS a, b.fullname AS b, path_length(p) AS l));
+
+query T
+SELECT bool_or(status = 'selected') FROM pgq_last_rewrite_diagnostics();
+----
+true
+
+statement ok
+CREATE OR REPLACE TABLE abi_gm AS FROM GRAPH_TABLE (gm MATCH p = ANY SHORTEST (a:Person)-[:Knows]->{1,2}(b:Person) WHERE a.age_next > 25 COLUMNS (a.lname AS a, b.fullname AS b, path_length(p) AS l));
+
+query T
+SELECT bool_or(status = 'selected') FROM pgq_last_rewrite_diagnostics();
+----
+true
+
+query II
+SELECT (SELECT count(*) FROM (FROM abi_gc EXCEPT ALL FROM abi_gm)) + (SELECT count(*) FROM (FROM abi_gm EXCEPT ALL FROM abi_gc)), (SELECT count(*) > 0 FROM abi_gc);
+----
+0	true
+
+statement ok
+CREATE OR REPLACE TABLE abi_gc AS FROM GRAPH_TABLE (gc MATCH p = ANY SHORTEST (a:Person)-[:Knows]->{1,2}(b:Person) WHERE a.id = 5 COLUMNS (b.age_next AS b, path_length(p) AS l));
+
+query T
+SELECT bool_or(status = 'selected') FROM pgq_last_rewrite_diagnostics();
+----
+true
+
+statement ok
+CREATE OR REPLACE TABLE abi_gm AS FROM GRAPH_TABLE (gm MATCH p = ANY SHORTEST (a:Person)-[:Knows]->{1,2}(b:Person) WHERE a.id = 5 COLUMNS (b.age_next AS b, path_length(p) AS l));
+
+query T
+SELECT bool_or(status = 'selected') FROM pgq_last_rewrite_diagnostics();
+----
+true
+
+query II
+SELECT (SELECT count(*) FROM (FROM abi_gc EXCEPT ALL FROM abi_gm)) + (SELECT count(*) FROM (FROM abi_gm EXCEPT ALL FROM abi_gc)), (SELECT count(*) > 0 FROM abi_gc);
+----
+0	true
+
+statement ok
+SET pgq_require_abi_paths = false;
+
+# An edge artifact answering a single hop: the edge's computed property and the endpoints' come from their relations.
+statement ok
+CREATE TABLE knows_d AS SELECT DISTINCT ON (src, dst) * FROM knows WHERE src <> dst ORDER BY ALL;
+
+statement ok
+CREATE TABLE knows_dm AS SELECT src, dst, w, w * 2 + 1 AS cost FROM knows_d;
+
+statement ok
+CREATE PROPERTY GRAPH gec VERTEX TABLES (person PROPERTIES (id, lower(name) AS lname) LABEL Person) EDGE TABLES (knows_d SOURCE KEY (src) REFERENCES person (id) DESTINATION KEY (dst) REFERENCES person (id) PROPERTIES (w, w * 2 + 1 AS cost) LABEL Knows);
+
+statement ok
+CREATE PROPERTY GRAPH gem VERTEX TABLES (person_m PROPERTIES (id, lname) LABEL Person) EDGE TABLES (knows_dm SOURCE KEY (src) REFERENCES person_m (id) DESTINATION KEY (dst) REFERENCES person_m (id) PROPERTIES (w, cost) LABEL Knows);
+
+statement ok
+SELECT * FROM pgq_abi_build('gec');
+
+statement ok
+SET pgq_require_abi_paths = true;
+
+statement ok
+CREATE OR REPLACE TABLE abi_gec AS FROM GRAPH_TABLE (gec MATCH (a:Person)-[k:Knows]->(b:Person) WHERE k.cost > 9 COLUMNS (a.lname AS a, k.cost AS c, b.lname AS b));
+
+query T
+SELECT bool_or(status = 'selected') FROM pgq_last_rewrite_diagnostics();
+----
+true
+
+statement ok
+SET pgq_require_abi_paths = false;
+
+query II
+SELECT (SELECT count(*) FROM (FROM abi_gec EXCEPT ALL FROM GRAPH_TABLE (gem MATCH (a:Person)-[k:Knows]->(b:Person) WHERE k.cost > 9 COLUMNS (a.lname AS a, k.cost AS c, b.lname AS b)))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (gem MATCH (a:Person)-[k:Knows]->(b:Person) WHERE k.cost > 9 COLUMNS (a.lname AS a, k.cost AS c, b.lname AS b)) EXCEPT ALL FROM abi_gec)), (SELECT count(*) > 0 FROM abi_gec);
+----
+0	true
+
+# Computed properties survive a restart.
+restart
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+query I
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (gc MATCH (a:Person)-[k:Knows]->(b:Person) COLUMNS (a.fullname, a.age_next, b.lname, k.cost, k.arrow)) EXCEPT ALL FROM GRAPH_TABLE (gm MATCH (a:Person)-[k:Knows]->(b:Person) COLUMNS (a.fullname, a.age_next, b.lname, k.cost, k.arrow)))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (gm MATCH (a:Person)-[k:Knows]->(b:Person) COLUMNS (a.fullname, a.age_next, b.lname, k.cost, k.arrow)) EXCEPT ALL FROM GRAPH_TABLE (gc MATCH (a:Person)-[k:Knows]->(b:Person) COLUMNS (a.fullname, a.age_next, b.lname, k.cost, k.arrow))));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (gc MATCH (a:Person)-[k:Knows]->(b:Person) WHERE a.age_next > 30 AND b.third AND k.cost < 40 COLUMNS (a.id, b.id)) EXCEPT ALL FROM GRAPH_TABLE (gm MATCH (a:Person)-[k:Knows]->(b:Person) WHERE a.age_next > 30 AND b.third AND k.cost < 40 COLUMNS (a.id, b.id)))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (gm MATCH (a:Person)-[k:Knows]->(b:Person) WHERE a.age_next > 30 AND b.third AND k.cost < 40 COLUMNS (a.id, b.id)) EXCEPT ALL FROM GRAPH_TABLE (gc MATCH (a:Person)-[k:Knows]->(b:Person) WHERE a.age_next > 30 AND b.third AND k.cost < 40 COLUMNS (a.id, b.id))));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (gc MATCH p = ANY SHORTEST (a:Person)-[k:Knows]->+(b:Person) WHERE a.lname = 'p1' COLUMNS (b.id, path_length(p), vertex_property(p, 'age_next') AS ages, edge_property(p, 'arrow') AS arrows)) EXCEPT ALL FROM GRAPH_TABLE (gm MATCH p = ANY SHORTEST (a:Person)-[k:Knows]->+(b:Person) WHERE a.lname = 'p1' COLUMNS (b.id, path_length(p), vertex_property(p, 'age_next') AS ages, edge_property(p, 'arrow') AS arrows)))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (gm MATCH p = ANY SHORTEST (a:Person)-[k:Knows]->+(b:Person) WHERE a.lname = 'p1' COLUMNS (b.id, path_length(p), vertex_property(p, 'age_next') AS ages, edge_property(p, 'arrow') AS arrows)) EXCEPT ALL FROM GRAPH_TABLE (gc MATCH p = ANY SHORTEST (a:Person)-[k:Knows]->+(b:Person) WHERE a.lname = 'p1' COLUMNS (b.id, path_length(p), vertex_property(p, 'age_next') AS ages, edge_property(p, 'arrow') AS arrows))));
+----
+0
+
+# A computed property over a view, and two element tables over one table with properties of their own.
+statement ok
+CREATE VIEW person_v AS SELECT * FROM person WHERE age < 50;
+
+statement ok
+CREATE PROPERTY GRAPH gview VERTEX TABLES (person_v PROPERTIES (id, age * 10 AS age10) LABEL Person) EDGE TABLES (knows SOURCE KEY (src) REFERENCES person_v (id) DESTINATION KEY (dst) REFERENCES person_v (id) LABEL Knows);
+
+query I
+SELECT count(*) FROM ((FROM GRAPH_TABLE (gview MATCH (a:Person)-[:Knows]->(b:Person) COLUMNS (a.id, b.age10)) EXCEPT ALL SELECT k.src, p.age * 10 FROM knows k JOIN person_v s ON s.id = k.src JOIN person_v p ON p.id = k.dst) UNION ALL (SELECT k.src, p.age * 10 FROM knows k JOIN person_v s ON s.id = k.src JOIN person_v p ON p.id = k.dst EXCEPT ALL FROM GRAPH_TABLE (gview MATCH (a:Person)-[:Knows]->(b:Person) COLUMNS (a.id, b.age10))));
+----
+0
+
+statement ok
+CREATE PROPERTY GRAPH gtwo VERTEX TABLES (person AS young PROPERTIES (id, age - 18 AS since18) LABEL Young, person AS old PROPERTIES (id, 100 - age AS left100) LABEL Old) EDGE TABLES (knows SOURCE KEY (src) REFERENCES young (id) DESTINATION KEY (dst) REFERENCES old (id) LABEL Knows);
+
+query I
+SELECT count(*) FROM ((FROM GRAPH_TABLE (gtwo MATCH (a:Young)-[:Knows]->(b:Old) COLUMNS (a.since18, b.left100)) EXCEPT ALL SELECT s.age - 18, 100 - d.age FROM knows k JOIN person s ON s.id = k.src JOIN person d ON d.id = k.dst) UNION ALL (SELECT s.age - 18, 100 - d.age FROM knows k JOIN person s ON s.id = k.src JOIN person d ON d.id = k.dst EXCEPT ALL FROM GRAPH_TABLE (gtwo MATCH (a:Young)-[:Knows]->(b:Old) COLUMNS (a.since18, b.left100))));
+----
+0
+
+# A property every label lists the same way is one property; with different definitions it is an error.
+statement ok
+CREATE PROPERTY GRAPH glabels VERTEX TABLES (person LABEL A PROPERTIES (id, age + 1 AS n) LABEL B PROPERTIES (age + 1 AS n));
+
+query T
+SELECT column_aliases FROM __duckpgq_internal WHERE property_graph = 'glabels';
+----
+[id, n]
+
+# Errors.
+statement error
+CREATE PROPERTY GRAPH bad VERTEX TABLES (person PROPERTIES (id, age + 1));
+----
+Property (age + 1) is an expression and needs a name
+
+statement error
+CREATE PROPERTY GRAPH bad VERTEX TABLES (person PROPERTIES (id, nope + 1 AS x));
+----
+A computed property of element table person is invalid
+
+statement error
+CREATE PROPERTY GRAPH bad VERTEX TABLES (person PROPERTIES (id, age + 1 AS name));
+----
+Property name of element table person is also the name of a column of the table
+
+statement error
+CREATE PROPERTY GRAPH bad VERTEX TABLES (person PROPERTIES (id AS age));
+----
+Property age of element table person is also the name of a column of the table
+
+statement error
+CREATE PROPERTY GRAPH bad VERTEX TABLES (person PROPERTIES (id, (SELECT 1) AS x));
+----
+a property expression cannot contain a subquery
+
+statement error
+CREATE PROPERTY GRAPH bad VERTEX TABLES (person PROPERTIES (id, row_number() OVER () AS x));
+----
+a property expression cannot contain a subquery, a window function
+
+statement error
+CREATE PROPERTY GRAPH bad VERTEX TABLES (person PROPERTIES (id, sum(age) AS x));
+----
+A computed property of element table person is invalid
+
+statement error
+CREATE PROPERTY GRAPH bad VERTEX TABLES (person LABEL A PROPERTIES (age + 1 AS n) LABEL B PROPERTIES (age + 2 AS n));
+----
+Property n of element table person is defined twice, differently
+
+statement error
+FROM GRAPH_TABLE (gc MATCH (a:Person) COLUMNS (a.age));
+----
+Property a.age is never registered
+

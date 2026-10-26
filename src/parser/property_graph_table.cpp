@@ -44,6 +44,9 @@ PropertyGraphTable::PropertyGraphTable(string table_name_p, string table_name_al
 string PropertyGraphTable::ToString() const {
 	string result = (catalog_name.empty() ? "" : catalog_name + ".") + (schema_name.empty() ? "" : schema_name + ".") +
 	                table_name + " " + (table_name_alias.empty() ? "" : "AS " + table_name_alias);
+	if (!element_key.empty()) {
+		result += " KEY (" + StringUtil::Join(IdentifiersToStrings(element_key), ", ") + ")";
+	}
 	if (!is_vertex_table) {
 		result += " SOURCE KEY (";
 		for (idx_t i = 0; i < source_fk.size(); i++) {
@@ -96,6 +99,9 @@ string PropertyGraphTable::ToString() const {
 		}
 	}
 	result += " LABEL " + main_label;
+	for (auto &label : extra_labels) {
+		result += " LABEL " + label;
+	}
 	if (!sub_labels.empty()) {
 		result += " IN " + discriminator + "( ";
 		for (idx_t i = 0; i < sub_labels.size(); i++) {
@@ -233,6 +239,11 @@ bool PropertyGraphTable::Equals(const PropertyGraphTable *other_p) const {
 	if (destination_pg_table != other->destination_pg_table) {
 		return false;
 	}
+	if (is_view != other->is_view || identity_columns != other->identity_columns ||
+	    extra_labels != other->extra_labels || element_key != other->element_key ||
+	    property_expressions != other->property_expressions) {
+		return false;
+	}
 
 	return true;
 }
@@ -274,6 +285,11 @@ void PropertyGraphTable::Serialize(Serializer &serializer) const {
 		serializer.WriteProperty(122, "source_pg_table", source_pg_table);
 		serializer.WriteProperty(123, "destination_pg_table", destination_pg_table);
 	}
+	serializer.WritePropertyWithDefault(124, "is_view", is_view, false);
+	serializer.WritePropertyWithDefault(125, "identity_columns", identity_columns);
+	serializer.WritePropertyWithDefault(126, "extra_labels", extra_labels);
+	serializer.WritePropertyWithDefault(127, "element_key", element_key);
+	serializer.WritePropertyWithDefault(128, "property_expressions", property_expressions);
 }
 
 shared_ptr<PropertyGraphTable> PropertyGraphTable::Deserialize(Deserializer &deserializer) {
@@ -309,11 +325,45 @@ shared_ptr<PropertyGraphTable> PropertyGraphTable::Deserialize(Deserializer &des
 		deserializer.ReadProperty(122, "source_pg_table", pg_table->source_pg_table);
 		deserializer.ReadProperty(123, "destination_pg_table", pg_table->destination_pg_table);
 	}
+	deserializer.ReadPropertyWithExplicitDefault(124, "is_view", pg_table->is_view, false);
+	deserializer.ReadPropertyWithDefault(125, "identity_columns", pg_table->identity_columns);
+	deserializer.ReadPropertyWithDefault(126, "extra_labels", pg_table->extra_labels);
+	deserializer.ReadPropertyWithDefault(127, "element_key", pg_table->element_key);
+	deserializer.ReadPropertyWithDefault(128, "property_expressions", pg_table->property_expressions);
 	return pg_table;
 }
 
 bool PropertyGraphTable::IsSourceTable(const Identifier &table_name) {
 	return source_reference == table_name;
+}
+
+bool PropertyGraphTable::HasProperty(const string &name) const {
+	for (idx_t i = 0; i < column_names.size(); i++) {
+		// A renamed column is still found by the column's name, as before renamed properties were readable.
+		if (StringUtil::CIEquals(PropertyName(i).GetIdentifierName(), name) ||
+		    (PropertyExpression(i).empty() && StringUtil::CIEquals(column_names[i].GetIdentifierName(), name))) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool PropertyGraphTable::HasStaticLabel(const string &label) const {
+	if (StringUtil::CIEquals(main_label.GetIdentifierName(), label)) {
+		return true;
+	}
+	for (auto &extra : extra_labels) {
+		if (StringUtil::CIEquals(extra.GetIdentifierName(), label)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+vector<Identifier> PropertyGraphTable::StaticLabels() const {
+	vector<Identifier> result {main_label};
+	result.insert(result.end(), extra_labels.begin(), extra_labels.end());
+	return result;
 }
 
 shared_ptr<PropertyGraphTable> PropertyGraphTable::Copy() const {
@@ -326,6 +376,7 @@ shared_ptr<PropertyGraphTable> PropertyGraphTable::Copy() const {
 		result->column_names.push_back(column_name);
 	}
 	result->column_aliases = column_aliases;
+	result->property_expressions = property_expressions;
 	for (auto &except_column : except_columns) {
 		result->except_columns.push_back(except_column);
 	}
@@ -364,6 +415,10 @@ shared_ptr<PropertyGraphTable> PropertyGraphTable::Copy() const {
 	for (auto &key : destination_pk) {
 		result->destination_pk.push_back(key);
 	}
+	result->is_view = is_view;
+	result->extra_labels = extra_labels;
+	result->element_key = element_key;
+	result->identity_columns = identity_columns;
 	return result;
 }
 

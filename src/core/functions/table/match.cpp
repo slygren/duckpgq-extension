@@ -40,6 +40,7 @@
 #include <duckdb/common/enums/set_operation_type.hpp>
 #include <duckpgq/core/functions/table.hpp>
 #include <duckpgq/core/utils/duckpgq_utils.hpp>
+#include "duckpgq/core/utils/element_relation.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -144,20 +145,32 @@ void PopulateFullyQualifiedColName(const vector<shared_ptr<PropertyGraphTable>> 
                                    const case_insensitive_map_t<vector<string>> &tbl_name_to_aliases,
                                    case_insensitive_set_t &col_names) {
 	for (const auto &cur_tbl : tbls) {
-		for (const auto &cur_col : cur_tbl->column_names) {
+		// A property is read by its name; a renamed column is also still read by the column's name, as before
+		// renamed properties were readable.
+		vector<string> names;
+		names.reserve(cur_tbl->column_names.size());
+		for (idx_t i = 0; i < cur_tbl->column_names.size(); i++) {
+			auto &property = PGQStr(cur_tbl->PropertyName(i));
+			names.push_back(property);
+			auto &column = PGQStr(cur_tbl->column_names[i]);
+			if (cur_tbl->PropertyExpression(i).empty() && !StringUtil::CIEquals(column, property)) {
+				names.push_back(column);
+			}
+		}
+		for (const auto &cur_col : names) {
 			// It's legal to query by `<col>` instead of `<table>.<col>`.
-			col_names.insert(PGQStr(cur_col));
+			col_names.insert(cur_col);
 
 			const string &tbl_name = PGQStr(cur_tbl->table_name);
 			auto iter = tbl_name_to_aliases.find(tbl_name);
 			// Prefer to use table alias specified in the statement, otherwise use
 			// table name.
 			if (iter == tbl_name_to_aliases.end()) {
-				col_names.insert(StringUtil::Format("%s.%s", tbl_name, PGQStr(cur_col)));
+				col_names.insert(StringUtil::Format("%s.%s", tbl_name, cur_col));
 			} else {
 				const auto &all_aliases = iter->second;
 				for (const auto &cur_alias : all_aliases) {
-					col_names.insert(StringUtil::Format("%s.%s", cur_alias, PGQStr(cur_col)));
+					col_names.insert(StringUtil::Format("%s.%s", cur_alias, cur_col));
 				}
 			}
 		}
@@ -190,8 +203,8 @@ GetColRefExprFromPg(const case_insensitive_map_t<shared_ptr<PropertyGraphTable>>
 	D_ASSERT(iter != alias_map.end());
 	const auto &tbl = iter->second;
 	registered_col_names.reserve(tbl->column_names.size());
-	for (const auto &cur_col : tbl->column_names) {
-		auto new_col_names = vector<Identifier> {Identifier(alias), cur_col};
+	for (idx_t i = 0; i < tbl->column_names.size(); i++) {
+		auto new_col_names = vector<Identifier> {Identifier(alias), tbl->PropertyName(i)};
 		registered_col_names.emplace_back(PGQColRef(std::move(new_col_names)));
 	}
 	return registered_col_names;
@@ -209,8 +222,8 @@ GetColRefExprFromPg(const case_insensitive_map_t<shared_ptr<PropertyGraphTable>>
 		const auto &tbl = alias_and_table.second;
 		// Skip edge table.
 		registered_col_names.reserve(registered_col_names.size() + tbl->column_names.size());
-		for (const auto &cur_col : tbl->column_names) {
-			auto new_col_names = vector<Identifier> {Identifier(alias), cur_col};
+		for (idx_t i = 0; i < tbl->column_names.size(); i++) {
+			auto new_col_names = vector<Identifier> {Identifier(alias), tbl->PropertyName(i)};
 			registered_col_names.emplace_back(PGQColRef(std::move(new_col_names)));
 		}
 	}
@@ -988,6 +1001,10 @@ static shared_ptr<PGQExactnessCache> ProcessExactnessCache(ClientContext &contex
 static shared_ptr<PGQPathTableCache> GetPathTableCache(ClientContext &context, DuckPGQState &duckpgq_state,
                                                        const string &graph_name,
                                                        const CreatePropertyGraphInfo *pg_table = nullptr) {
+	if (pg_table && pg_table->abi_disabled) {
+		// ALTER PROPERTY GRAPH changed the graph after its artifacts were built: none answers until a rebuild.
+		return make_shared_ptr<PGQPathTableCache>();
+	}
 	lock_guard<mutex> guard(duckpgq_state.path_table_cache_lock);
 
 	// L1: per-connection cache. Preserves the original per-connection semantics for
@@ -2350,14 +2367,11 @@ struct PGQElementScope {
 	const CreatePropertyGraphInfo *graph = nullptr;
 };
 
-//! The names of the properties an element of `table` has, as declared (`PROPERTIES (c AS name)` names it `name`).
-static const vector<Identifier> &ElementPropertyNames(const PropertyGraphTable &table) {
-	return table.column_aliases.size() == table.column_names.size() ? table.column_aliases : table.column_names;
-}
-
+//! Whether an element of `table` has a property of this name, as declared (`PROPERTIES (c AS name)` and a computed
+//! `PROPERTIES (expr AS name)` name it `name`).
 static bool ElementHasProperty(const PropertyGraphTable &table, const string &property) {
-	for (auto &name : ElementPropertyNames(table)) {
-		if (StringUtil::CIEquals(PGQStr(name), property)) {
+	for (idx_t i = 0; i < table.column_names.size(); i++) {
+		if (StringUtil::CIEquals(PGQStr(table.PropertyName(i)), property)) {
 			return true;
 		}
 	}
@@ -2444,11 +2458,11 @@ static unique_ptr<ParsedExpression> NullWhereElementNull(const PGQElementScope &
 	return std::move(result);
 }
 
-//! Whether an element of `table` has label `label`: TRUE for its main label, the row's discriminator bit for one of
-//! its sub-labels, FALSE otherwise.
+//! Whether an element of `table` has label `label`: TRUE for its main label and its extra labels (LABEL A LABEL B),
+//! the row's discriminator bit for one of its sub-labels, FALSE otherwise.
 static unique_ptr<ParsedExpression> ElementHasLabel(const shared_ptr<PropertyGraphTable> &table, const string &label,
                                                     const string &variable) {
-	if (StringUtil::CIEquals(PGQStr(table->main_label), label)) {
+	if (table->HasStaticLabel(label)) {
 		return ConstantExpression::FromValue(Value::BOOLEAN(true));
 	}
 	for (auto &sub_label : table->sub_labels) {
@@ -2506,9 +2520,14 @@ static unique_ptr<ParsedExpression> RewriteElementFunction(FunctionExpression &f
 			                      "it does not determine one. Give it a label in the pattern",
 			                      variable, variable);
 		}
-		// The main label, then each discriminator sub-label the row has, in declaration order and declared case.
-		unique_ptr<ParsedExpression> result = ConstantExpression::FromValue(
-		    Value::LIST(LogicalType::VARCHAR, {Value(PGQStr(table->main_label))}));
+		// The table's labels (main, then extra), then each discriminator sub-label the row has, in declaration order
+		// and declared case.
+		vector<Value> static_labels;
+		for (auto &static_label : table->StaticLabels()) {
+			static_labels.emplace_back(PGQStr(static_label));
+		}
+		unique_ptr<ParsedExpression> result =
+		    ConstantExpression::FromValue(Value::LIST(LogicalType::VARCHAR, std::move(static_labels)));
 		for (auto &sub_label : table->sub_labels) {
 			auto has = make_uniq<CaseExpression>();
 			CaseCheck check;
@@ -6117,19 +6136,7 @@ void PGQMatchFunction::ProcessPathList(ClientContext &context, vector<unique_ptr
 //! The type of a column of a catalog table, or INVALID when it cannot be looked up.
 static LogicalType QualifiedColumnType(ClientContext &context, const string &catalog, const string &schema,
                                        const string &table, const string &column) {
-	try {
-		const string catalog_name = catalog.empty() ? PGQStr(DatabaseManager::GetDefaultDatabase(context)) : catalog;
-		const string schema_name = schema.empty() ? string(DEFAULT_SCHEMA) : schema;
-		auto entry = Catalog::GetEntry<TableCatalogEntry>(
-		    context, QualifiedName(Identifier(catalog_name), Identifier(schema_name), Identifier(table)),
-		    OnEntryNotFound::RETURN_NULL);
-		if (!entry || !entry->ColumnExists(Identifier(column))) {
-			return LogicalType::INVALID;
-		}
-		return entry->GetColumn(Identifier(column)).Type();
-	} catch (...) {
-		return LogicalType::INVALID;
-	}
+	return PGQRelationColumnType(context, catalog, schema, table, column);
 }
 
 static LogicalType GraphTableColumnType(ClientContext &context, const PropertyGraphTable &table, const string &column) {
@@ -6990,7 +6997,20 @@ void PGQMatchFunction::PopulateGraphTableAliasMap(
 				// Register the first resolvable component as a stub so CheckColumnBinding can
 				// validate qualified column references (alias.property) against it.
 				auto &pg_mut = const_cast<CreatePropertyGraphInfo &>(pg_table);
+				// Only a stub is registered here, so a label over several tables is no reason to split the MATCH per
+				// table (PGQTableSplitNeeded): an ABI route may answer it as written, and the traversal steps check
+				// the guard where they would bind one table.
+				struct SuspendTableSplitGuard {
+					const case_insensitive_set_t *saved = pgq_table_split_guard;
+					SuspendTableSplitGuard() {
+						pgq_table_split_guard = nullptr;
+					}
+					~SuspendTableSplitGuard() {
+						pgq_table_split_guard = saved;
+					}
+				};
 				try {
+					SuspendTableSplitGuard suspended;
 					tbl = ResolveLabelExprTable(path_elem->label, path_elem->match_type, pg_mut);
 				} catch (const Exception &) {
 					if (!path_elem->variable_binding.empty()) {
@@ -7840,19 +7860,7 @@ public:
 	// The type of a table's column, or INVALID when it cannot be looked up. (Here because this is the one object
 	// the expansion builder gets that carries the ClientContext.)
 	LogicalType ColumnType(const string &catalog, const string &schema, const string &table, const string &column) {
-		try {
-			const string catalog_name = catalog.empty() ? PGQStr(DatabaseManager::GetDefaultDatabase(context)) : catalog;
-			const string schema_name = schema.empty() ? string(DEFAULT_SCHEMA) : schema;
-			auto entry = Catalog::GetEntry<TableCatalogEntry>(
-			    context, QualifiedName(Identifier(catalog_name), Identifier(schema_name), Identifier(table)),
-			    OnEntryNotFound::RETURN_NULL);
-			if (!entry || !entry->ColumnExists(Identifier(column))) {
-				return LogicalType::INVALID;
-			}
-			return entry->GetColumn(Identifier(column)).Type();
-		} catch (...) {
-			return LogicalType::INVALID;
-		}
+		return PGQRelationColumnType(context, catalog, schema, table, column);
 	}
 
 	// The type a UNION ALL gives a column whose branches have these two types.
@@ -8515,6 +8523,36 @@ static bool HasTopLevelEndpointFunction(const MatchExpression &ref, const string
 	return false;
 }
 
+//! Whether `binding` is read anywhere but in top-level COLUMNS label(binding): those RewriteTopLevelEndpointFunctions
+//! answers from the expansion's __pgq_dst_label, any other read needs the vertex itself.
+static bool BindingReadBeyondEndpointLabel(const MatchExpression &ref, const string &binding) {
+	case_insensitive_set_t bindings;
+	auto collect = [&](const ParsedExpression *expression) {
+		if (!expression) {
+			return;
+		}
+		ParsedExpressionIterator::VisitExpression<ColumnRefExpression>(*expression, [&](const ColumnRefExpression &col_ref) {
+			if (!col_ref.ColumnNames().empty()) {
+				bindings.insert(PGQStr(col_ref.ColumnNames()[0]));
+			}
+		});
+	};
+	for (const auto &expression : ref.column_list) {
+		auto *function_ref = dynamic_cast<const FunctionExpression *>(expression.get());
+		if (function_ref && function_ref->GetArguments().size() == 1 &&
+		    StringUtil::CIEquals(function_ref->FunctionName().GetIdentifierName(), "label")) {
+			auto *column_ref = dynamic_cast<const ColumnRefExpression *>(&function_ref->GetArguments()[0].GetExpression());
+			if (column_ref && column_ref->ColumnNames().size() == 1 &&
+			    StringUtil::CIEquals(PGQStr(column_ref->ColumnNames()[0]), binding)) {
+				continue;
+			}
+		}
+		collect(expression.get());
+	}
+	collect(ref.where_clause.get());
+	return bindings.count(binding) > 0;
+}
+
 static void RewriteTopLevelEndpointFunctions(MatchExpression &ref, const string &binding,
                                              const string &path_alias) {
 	if (binding.empty()) {
@@ -9146,11 +9184,9 @@ static string BuildJsonScalarSQL(const string &value_expr) {
 static string BuildJsonObjectExpression(const shared_ptr<PropertyGraphTable> &vertex_table, const string &table_alias) {
 	vector<string> entries;
 	for (idx_t idx = 0; idx < vertex_table->column_names.size(); idx++) {
-		const string &column_name = PGQStr(vertex_table->column_names[idx]);
-		const string property_name = idx < vertex_table->column_aliases.size() && !vertex_table->column_aliases[idx].empty()
-		                                 ? PGQStr(vertex_table->column_aliases[idx])
-		                                 : column_name;
-		const string column_expr = table_alias + "." + KeywordHelper::WriteOptionallyQuoted(column_name);
+		const string property_name = PGQStr(vertex_table->PropertyName(idx));
+		// The element relation has every property as a column of its name (see PGQElementRelations).
+		const string column_expr = table_alias + "." + KeywordHelper::WriteOptionallyQuoted(property_name);
 		entries.push_back(KeywordHelper::WriteQuoted("\"" + JsonEscapeSQLPropertyName(property_name) + "\":", '\'') +
 		                  " || " + BuildJsonScalarSQL(column_expr));
 	}
@@ -10461,10 +10497,107 @@ static unique_ptr<ParsedExpression> BuildExistsSubquery(
 
 static void NormalizeMatchExpression(MatchExpression &match);
 
+//------------------------------------------------------------------------------
+// Several labels on one element table
+//------------------------------------------------------------------------------
+// A table's extra labels (LABEL A LABEL B) are on the same rows as its main label, and a label names one table, so
+// a label expression means the same with each extra label replaced by its table's main label. The translation
+// rewrites them up front; everything after it (and every ABI artifact, keyed by main labels) sees main labels only.
+
+static bool GraphHasExtraLabels(const CreatePropertyGraphInfo &graph) {
+	for (auto &table : graph.vertex_tables) {
+		if (!table->extra_labels.empty()) {
+			return true;
+		}
+	}
+	for (auto &table : graph.edge_tables) {
+		if (!table->extra_labels.empty()) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//! The label of the table `label` names, as the table declares its main label; `label` itself when it is no
+//! table's extra label.
+static string MainLabelOf(const string &label, const CreatePropertyGraphInfo &graph) {
+	auto entry = graph.label_map.find(label);
+	if (entry == graph.label_map.end()) {
+		return label;
+	}
+	for (auto &extra : entry->second->extra_labels) {
+		if (StringUtil::CIEquals(extra.GetIdentifierName(), label)) {
+			return PGQStr(entry->second->main_label);
+		}
+	}
+	return label;
+}
+
+static string NormalizeLabelExpression(const string &expression, const CreatePropertyGraphInfo &graph) {
+	string result;
+	string leaf;
+	auto flush = [&]() {
+		if (!leaf.empty()) {
+			result += MainLabelOf(leaf, graph);
+			leaf.clear();
+		}
+	};
+	for (char c : expression) {
+		if (c == '|' || c == '&' || c == '!' || c == '(' || c == ')' || c == '%' || StringUtil::CharacterIsSpace(c)) {
+			flush();
+			result += c;
+		} else {
+			leaf += c;
+		}
+	}
+	flush();
+	return result;
+}
+
+static void NormalizeExtraLabels(PathReference &reference, const CreatePropertyGraphInfo &graph) {
+	if (reference.path_reference_type == PGQPathReferenceType::PATH_ELEMENT) {
+		auto &element = static_cast<PathElement &>(reference);
+		element.label = NormalizeLabelExpression(element.label, graph);
+		return;
+	}
+	for (auto &child : static_cast<SubPath &>(reference).path_list) {
+		NormalizeExtraLabels(*child, graph);
+	}
+}
+
+static void NormalizeExtraLabels(vector<unique_ptr<PathPattern>> &patterns, const CreatePropertyGraphInfo &graph) {
+	for (auto &pattern : patterns) {
+		for (auto &element : pattern->path_elements) {
+			NormalizeExtraLabels(*element, graph);
+		}
+		for (auto &operand : pattern->union_operands) {
+			for (auto &element : operand) {
+				NormalizeExtraLabels(*element, graph);
+			}
+		}
+	}
+}
+
+static void NormalizeExtraLabels(MatchExpression &match, const CreatePropertyGraphInfo &graph) {
+	if (!GraphHasExtraLabels(graph)) {
+		return;
+	}
+	NormalizeExtraLabels(match.path_patterns, graph);
+	for (auto &group : match.optional_match_patterns) {
+		NormalizeExtraLabels(group, graph);
+	}
+	NormalizeExtraLabels(match.joined_patterns, graph);
+	for (auto &branch : match.union_matches) {
+		NormalizeExtraLabels(*branch, graph);
+	}
+}
+
 //! A private, normalised copy of an EXISTS { ... } pattern. The pattern lives in bind_info, which statement copies
 //! share, so the rewrite must never modify it in place.
-static unique_ptr<MatchExpression> CopyExistsPattern(const MatchExpression &pattern) {
+static unique_ptr<MatchExpression> CopyExistsPattern(const MatchExpression &pattern,
+                                                     const CreatePropertyGraphInfo &graph) {
 	auto copy = unique_ptr_cast<ParsedExpression, MatchExpression>(pattern.Copy());
+	NormalizeExtraLabels(*copy, graph);
 	NormalizeMatchExpression(*copy);
 	return copy;
 }
@@ -10484,7 +10617,7 @@ static unique_ptr<ParsedExpression> RewritePGQExists(
 	if (op && op->GetExpressionType() == ExpressionType::OPERATOR_NOT && op->GetChildrenMutable().size() == 1) {
 		auto inner_pattern = DuckPGQGetExistsPattern(*op->GetChildrenMutable()[0]);
 		if (inner_pattern) {
-			auto inner_match = CopyExistsPattern(*inner_pattern);
+			auto inner_match = CopyExistsPattern(*inner_pattern, pg_table);
 			return BuildExistsSubquery(context, *inner_match, pg_table, outer_alias_map, SubqueryType::NOT_EXISTS,
 			                           path_table_cache);
 		}
@@ -10497,7 +10630,7 @@ static unique_ptr<ParsedExpression> RewritePGQExists(
 	// EXISTS { ... }
 	auto pattern = DuckPGQGetExistsPattern(*expr);
 	if (pattern) {
-		auto inner_match = CopyExistsPattern(*pattern);
+		auto inner_match = CopyExistsPattern(*pattern, pg_table);
 		return BuildExistsSubquery(context, *inner_match, pg_table, outer_alias_map, SubqueryType::EXISTS,
 		                           path_table_cache);
 	}
@@ -11859,8 +11992,12 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 			if (ctx_edge && ctx_edge->match_type == PGQMatchType::MATCH_EDGE_RIGHT &&
 			    !binding_is_referenced(ctx_edge->variable_binding) &&
 			    (named_path_projection || dst_endpoint_projection || dst_properties_bindable)) {
+				// The expansion answers label(x) of a destination without a table; any other read of it (element_id(x),
+				// x.prop) needs one, which another route provides.
 				if (!ctx_dst->variable_binding.empty() && binding_is_referenced(ctx_dst->variable_binding) &&
-				    !dst_endpoint_projection && !dst_properties_bindable) {
+				    !dst_properties_bindable &&
+				    (!dst_endpoint_projection ||
+				     BindingReadBeyondEndpointLabel(match_ref, ctx_dst->variable_binding))) {
 					return false;
 				}
 
@@ -13675,31 +13812,39 @@ static vector<shared_ptr<PropertyGraphTable>> PathElementTables(const MatchExpre
 }
 
 //! The type of a table's column, or INVALID when it cannot be looked up.
+//! The type of an element's property `property`: its column's for a plain or renamed property (PROPERTIES (c AS x)),
+//! its expression's for a computed one (PROPERTIES (expr AS x)), else that of the relation's column of that name.
+//! INVALID when there is none (or a computed property's expression does not bind on its own connection).
 static LogicalType PathPropertyColumnType(ClientContext &context, const PropertyGraphTable &table,
-                                          const string &column) {
-	try {
-		const string catalog_name = table.catalog_name.empty() ? PGQStr(DatabaseManager::GetDefaultDatabase(context))
-		                                                       : PGQStr(table.catalog_name);
-		const string schema_name = table.schema_name.empty() ? string(DEFAULT_SCHEMA) : PGQStr(table.schema_name);
-		auto entry = Catalog::GetEntry<TableCatalogEntry>(
-		    context, QualifiedName(Identifier(catalog_name), Identifier(schema_name), table.table_name),
-		    OnEntryNotFound::RETURN_NULL);
-		if (!entry || !entry->ColumnExists(Identifier(column))) {
+                                          const string &property) {
+	const string catalog_name = PGQStr(table.catalog_name);
+	const string schema_name = PGQStr(table.schema_name);
+	const string table_name = PGQStr(table.table_name);
+	for (idx_t i = 0; i < table.column_names.size(); i++) {
+		if (!StringUtil::CIEquals(PGQStr(table.PropertyName(i)), property)) {
+			continue;
+		}
+		const auto expression = table.PropertyExpression(i);
+		if (expression.empty()) {
+			return PGQRelationColumnType(context, catalog_name, schema_name, table_name, PGQStr(table.column_names[i]));
+		}
+		try {
+			Connection connection(*context.db);
+			auto prepared = connection.Prepare(StringUtil::Format(
+			    "SELECT (%s) FROM %s LIMIT 0", expression, QualifiedTableName(catalog_name, schema_name, table_name)));
+			if (!prepared || prepared->HasError() || prepared->GetTypes().size() != 1) {
+				return LogicalType::INVALID;
+			}
+			return prepared->GetTypes()[0];
+		} catch (...) {
 			return LogicalType::INVALID;
 		}
-		return entry->GetColumn(Identifier(column)).Type();
-	} catch (...) {
-		return LogicalType::INVALID;
 	}
+	return PGQRelationColumnType(context, catalog_name, schema_name, table_name, property);
 }
 
 static bool TableHasProperty(const PropertyGraphTable &table, const string &property) {
-	for (auto &column : table.column_names) {
-		if (StringUtil::CIEquals(PGQStr(column), property)) {
-			return true;
-		}
-	}
-	return false;
+	return table.HasProperty(property);
 }
 
 //! An expression another part of the query can evaluate as one column: a property reference, a graph function of
@@ -14822,12 +14967,7 @@ static unique_ptr<PGQGroupLeaf> BuildGroupLeaf(const MatchExpression &block, con
 			tables_by_key[TableKey(*table)] = table;
 		}
 		auto has_property = [](const PropertyGraphTable &table, const string &property) {
-			for (auto &column : table.column_names) {
-				if (StringUtil::CIEquals(PGQStr(column), property)) {
-					return true;
-				}
-			}
-			return false;
+			return table.HasProperty(property);
 		};
 		std::function<void(unique_ptr<ParsedExpression> &)> null_missing = [&](unique_ptr<ParsedExpression> &expression) {
 			if (!expression) {
@@ -15928,7 +16068,7 @@ static PGQLabelOnTable LabelOnTable(const string &raw_expr, const PropertyGraphT
 	if (graph.label_map.find(expr) == graph.label_map.end()) {
 		throw BinderException("The label %s is not registered in property graph %s", expr, graph.property_graph_name);
 	}
-	if (StringUtil::CIEquals(PGQStr(table.main_label), expr)) {
+	if (table.HasStaticLabel(expr)) {
 		result.truth = PGQLabelTruth::YES;
 		return result;
 	}
@@ -16478,16 +16618,25 @@ static unique_ptr<ParsedExpression> NullMissingProperties(ClientContext &context
 	}
 	if (expression->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
 		auto &names = expression->Cast<ColumnRefExpression>().ColumnNames();
+		const auto property = names.size() == 2 ? PGQStr(names[1]) : string();
+		auto readable = [&](const PropertyGraphTable &candidate) {
+			return TableHasProperty(candidate, property) ||
+			       PathPropertyColumnType(context, candidate, property).id() != LogicalTypeId::INVALID;
+		};
 		if (names.size() == 2 && StringUtil::CIEquals(PGQStr(names[0]), variable) &&
-		    !StringUtil::CIEquals(PGQStr(names[1]), "rowid") &&
-		    PathPropertyColumnType(context, table, PGQStr(names[1])).id() == LogicalTypeId::INVALID) {
+		    !StringUtil::CIEquals(property, "rowid") && !readable(table)) {
 			for (auto &candidate : candidates) {
-				auto type = PathPropertyColumnType(context, *candidate, PGQStr(names[1]));
-				if (type.id() != LogicalTypeId::INVALID) {
-					auto null_value = make_uniq<CastExpression>(type, ConstantExpression::FromValue(Value()));
-					null_value->SetAlias(expression->GetAlias().empty() ? names[1] : expression->GetAlias());
-					return std::move(null_value);
+				if (!readable(*candidate)) {
+					continue;
 				}
+				// Typed where the type is known, so the per-table branches unite in it.
+				auto type = PathPropertyColumnType(context, *candidate, property);
+				unique_ptr<ParsedExpression> null_value = ConstantExpression::FromValue(Value());
+				if (type.id() != LogicalTypeId::INVALID) {
+					null_value = make_uniq<CastExpression>(type, std::move(null_value));
+				}
+				null_value->SetAlias(expression->GetAlias().empty() ? names[1] : expression->GetAlias());
+				return null_value;
 			}
 		}
 		return expression;
@@ -16682,7 +16831,8 @@ static unique_ptr<QueryNode> BuildTableSplitNode(ClientContext &context, MatchEx
 			if (!relation.empty() && relabel.count(relation)) {
 				case_insensitive_set_t names;
 				for (auto &table : candidates[relation]) {
-					for (auto &name : table->column_names) {
+					for (idx_t i = 0; i < table->column_names.size(); i++) {
+						auto &name = table->PropertyName(i);
 						if (names.insert(PGQStr(name)).second) {
 							auto reference = PGQColRef(vector<string> {relation, PGQStr(name)});
 							reference->SetAlias(name);
@@ -17951,6 +18101,10 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	// Rewrite a copy: the expansion consumes the expression, and a prepared statement can be bound again.
 	auto match_copy = unique_ptr_cast<ParsedExpression, MatchExpression>(match_info->match->Copy());
 	auto *ref = match_copy.get();
+	{
+		QualifiedName graph_name(Identifier(ref->pg_catalog), Identifier(ref->pg_schema), Identifier(ref->pg_name));
+		NormalizeExtraLabels(*ref, *duckpgq_state->GetPropertyGraph(context, graph_name));
+	}
 	NormalizeMatchExpression(*ref);
 	NameColumns(*ref);
 	HoistVertexElementWhere(*ref);
@@ -17969,10 +18123,13 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	for (auto &branch : ref->union_matches) {
 		MarkGroupAggregates(context, *branch);
 	}
-	if (auto aggregated = AggregateOverUnion(context, *ref)) {
-		return aggregated;
+	auto result = AggregateOverUnion(context, *ref);
+	if (!result) {
+		result = BuildMatchRef(context, *ref);
 	}
-	return BuildMatchRef(context, *ref);
+	QualifiedName graph_name(Identifier(ref->pg_catalog), Identifier(ref->pg_schema), Identifier(ref->pg_name));
+	PGQElementRelations::Apply(context, *duckpgq_state->GetPropertyGraph(context, graph_name), result);
+	return result;
 }
 
 //! A search prefix over a pattern that mixes fixed hops with one variable-length edge, (a)-[e]->(b)-[f]->{1,3}(c):

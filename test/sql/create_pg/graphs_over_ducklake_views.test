@@ -1,0 +1,107 @@
+# name: test/sql/create_pg/graphs_over_ducklake_views.test
+# description: property graphs over views of DuckLake tables: a view stored in the lake and a local view of lake
+#              tables answer like the lake tables themselves, traversed and from ABI artifacts. Needs the ducklake
+#              extension: set DUCKPGQ_TEST_EXTENSION_DIR to a directory holding ducklake.duckdb_extension for DuckDB
+#              v2.0.0 (e.g. ~/.duckdb/extensions/v2.0.0/osx_arm64).
+# group: [create_pg]
+
+require duckpgq
+
+require parquet
+
+require-env DUCKPGQ_TEST_EXTENSION_DIR
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+LOAD '${DUCKPGQ_TEST_EXTENSION_DIR}/ducklake.duckdb_extension';
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/views_lake.ducklake' AS lake (DATA_PATH '__TEST_DIR__/views_lake_data/');
+
+statement ok
+CREATE TABLE lake.P (id BIGINT, name VARCHAR);
+
+statement ok
+INSERT INTO lake.P SELECT range, 'p' || range FROM range(1, 41);
+
+statement ok
+CREATE TABLE lake.K (src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO lake.K SELECT range, (range * 7) % 40 + 1 FROM range(1, 41) UNION ALL SELECT range, range + 1 FROM range(1, 40);
+
+# A view stored in the lake, and a local view over a lake table.
+statement ok
+CREATE VIEW lake.PV AS SELECT id, upper(name) AS name FROM lake.P WHERE id <= 35;
+
+statement ok
+CREATE VIEW kv AS SELECT * FROM lake.K;
+
+statement ok
+CREATE TABLE p_copy AS SELECT * FROM lake.PV;
+
+statement ok
+CREATE PROPERTY GRAPH glake VERTEX TABLES (lake.PV LABEL P) EDGE TABLES (kv SOURCE KEY (src) REFERENCES PV (id)
+  DESTINATION KEY (dst) REFERENCES PV (id) LABEL K);
+
+statement ok
+CREATE PROPERTY GRAPH glocal VERTEX TABLES (p_copy LABEL P) EDGE TABLES (lake.K SOURCE KEY (src) REFERENCES p_copy (id)
+  DESTINATION KEY (dst) REFERENCES p_copy (id) LABEL K);
+
+query I
+SELECT count(*) FROM __duckpgq_internal WHERE property_graph = 'glake' AND is_view;
+----
+2
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (glake MATCH (a:P)-[:K]->(b:P) COLUMNS (a.id, b.name)) EXCEPT ALL
+                              FROM GRAPH_TABLE (glocal MATCH (a:P)-[:K]->(b:P) COLUMNS (a.id, b.name)))) +
+       (SELECT count(*) FROM (FROM GRAPH_TABLE (glocal MATCH (a:P)-[:K]->(b:P) COLUMNS (a.id, b.name)) EXCEPT ALL
+                              FROM GRAPH_TABLE (glake MATCH (a:P)-[:K]->(b:P) COLUMNS (a.id, b.name)))),
+       (SELECT count(*) FROM GRAPH_TABLE (glake MATCH (a:P)-[:K]->(b:P) COLUMNS (a.id))) =
+       (SELECT count(*) FROM lake.K WHERE src <= 35 AND dst <= 35);
+----
+0	true
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (glake MATCH p = ANY SHORTEST (a:P)-[:K]->+(b:P) COLUMNS (a.id, b.id, path_length(p))) EXCEPT ALL
+                              FROM GRAPH_TABLE (glocal MATCH p = ANY SHORTEST (a:P)-[:K]->+(b:P) COLUMNS (a.id, b.id, path_length(p))))) +
+       (SELECT count(*) FROM (FROM GRAPH_TABLE (glocal MATCH p = ANY SHORTEST (a:P)-[:K]->+(b:P) COLUMNS (a.id, b.id, path_length(p))) EXCEPT ALL
+                              FROM GRAPH_TABLE (glake MATCH p = ANY SHORTEST (a:P)-[:K]->+(b:P) COLUMNS (a.id, b.id, path_length(p))))),
+       (SELECT count(*) > 100 FROM GRAPH_TABLE (glake MATCH p = ANY SHORTEST (a:P)-[:K]->+(b:P) COLUMNS (a.id)));
+----
+0	true
+
+# ABI artifacts of the view graph, built into the lake.
+statement ok
+SELECT * FROM pgq_abi_build('glake', schema := 'lake.main', max_hops := 2);
+
+statement ok
+SET pgq_require_abi_paths = true;
+
+statement ok
+CREATE TABLE abi_answer AS FROM GRAPH_TABLE (glake MATCH p = ANY SHORTEST (a:P)-[:K]->{1,2}(b:P) COLUMNS (a.id, b.id, path_length(p) AS l));
+
+query T
+SELECT bool_or(status = 'selected') FROM pgq_last_rewrite_diagnostics();
+----
+true
+
+statement ok
+SET pgq_require_abi_paths = false;
+
+statement ok
+SET pgq_abi_mode = 'off';
+
+query I
+SELECT count(*) FROM ((FROM abi_answer EXCEPT ALL FROM GRAPH_TABLE (glake MATCH p = ANY SHORTEST (a:P)-[:K]->{1,2}(b:P) COLUMNS (a.id, b.id, path_length(p) AS l)))
+  UNION ALL (FROM GRAPH_TABLE (glake MATCH p = ANY SHORTEST (a:P)-[:K]->{1,2}(b:P) COLUMNS (a.id, b.id, path_length(p) AS l)) EXCEPT ALL FROM abi_answer));
+----
+0
+
+query I
+SELECT count(*) > 0 FROM abi_answer;
+----
+true

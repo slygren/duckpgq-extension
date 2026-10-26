@@ -1,0 +1,220 @@
+# name: test/sql/create_pg/element_keys.test
+# description: KEY (...) on vertex and edge tables (SQL/PGQ element table key clause) and REFERENCES v without a
+#              column list (v's key). An explicit KEY wins over the PRIMARY KEY; a key no constraint enforces is
+#              trusted, and checked for uniqueness and NULLs when pgq_verify_edges_on_create is on.
+# group: [create_pg]
+
+require duckpgq
+
+load {TEST_DIR}/element_keys.db
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+# No constraints at all: the keys come from the KEY clauses.
+statement ok
+CREATE TABLE person (id BIGINT, code VARCHAR, name VARCHAR);
+
+statement ok
+INSERT INTO person VALUES (1, 'a', 'Ann'), (2, 'b', 'Bob'), (3, 'c', 'Cid'), (4, 'd', 'Dan');
+
+statement ok
+CREATE TABLE knows (src BIGINT, dst BIGINT, since INTEGER);
+
+statement ok
+INSERT INTO knows VALUES (1, 2, 2000), (2, 3, 2001), (1, 3, 2002), (3, 4, 2003), (4, 9, 2004);
+
+statement ok
+CREATE PROPERTY GRAPH g VERTEX TABLES (person KEY (id) LABEL Person)
+EDGE TABLES (knows KEY (src, dst) SOURCE KEY (src) REFERENCES person DESTINATION KEY (dst) REFERENCES person LABEL Knows);
+
+statement ok
+CREATE PROPERTY GRAPH g_explicit VERTEX TABLES (person LABEL Person)
+EDGE TABLES (knows SOURCE KEY (src) REFERENCES person (id) DESTINATION KEY (dst) REFERENCES person (id) LABEL Knows);
+
+query TTTT
+SELECT table_name, element_key, source_pk, destination_pk FROM __duckpgq_internal WHERE property_graph = 'g'
+ORDER BY table_name;
+----
+knows	[src, dst]	[id]	[id]
+person	[id]	NULL	NULL
+
+query I
+SELECT count(*) FROM __duckpgq_internal WHERE property_graph = 'g_explicit' AND element_key IS NOT NULL;
+----
+0
+
+# The same graph as with the referenced columns spelled out.
+query I
+SELECT count(*) FROM ((FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Person)-[k:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p)))
+    EXCEPT ALL FROM GRAPH_TABLE (g_explicit MATCH p = ANY SHORTEST (a:Person)-[k:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p))))
+  UNION ALL (FROM GRAPH_TABLE (g_explicit MATCH p = ANY SHORTEST (a:Person)-[k:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p)))
+    EXCEPT ALL FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Person)-[k:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p)))));
+----
+0
+
+query III
+FROM GRAPH_TABLE (g MATCH (a:Person)-[k:Knows]->(b:Person) COLUMNS (a.id, b.id, k.since)) ORDER BY ALL;
+----
+1	2	2000
+1	3	2002
+2	3	2001
+3	4	2003
+
+# An explicit KEY wins over the PRIMARY KEY: REFERENCES without a list then means the KEY.
+statement ok
+CREATE TABLE person_pk (id BIGINT PRIMARY KEY, code VARCHAR UNIQUE, name VARCHAR);
+
+statement ok
+INSERT INTO person_pk SELECT * FROM person;
+
+statement ok
+CREATE TABLE knows_code (src VARCHAR, dst VARCHAR);
+
+statement ok
+INSERT INTO knows_code VALUES ('a', 'b'), ('b', 'c'), ('c', 'd');
+
+statement ok
+CREATE PROPERTY GRAPH g_code VERTEX TABLES (person_pk KEY (code) LABEL P)
+EDGE TABLES (knows_code SOURCE KEY (src) REFERENCES person_pk DESTINATION KEY (dst) REFERENCES person_pk LABEL K);
+
+query TT
+SELECT source_pk, destination_pk FROM __duckpgq_internal WHERE property_graph = 'g_code' AND NOT is_vertex_table;
+----
+[code]	[code]
+
+query II
+FROM GRAPH_TABLE (g_code MATCH (a:P)-[:K]->(b:P) COLUMNS (a.id, b.id)) ORDER BY ALL;
+----
+1	2
+2	3
+3	4
+
+# Without a KEY, REFERENCES without a list means the PRIMARY KEY.
+statement ok
+CREATE TABLE knows_id (src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO knows_id VALUES (1, 4), (4, 1);
+
+statement ok
+CREATE PROPERTY GRAPH g_pk VERTEX TABLES (person_pk LABEL P)
+EDGE TABLES (knows_id SOURCE KEY (src) REFERENCES person_pk DESTINATION KEY (dst) REFERENCES person_pk LABEL K);
+
+query TT
+SELECT source_pk, destination_pk FROM __duckpgq_internal WHERE property_graph = 'g_pk' AND NOT is_vertex_table;
+----
+[id]	[id]
+
+# A view's KEY orders its element ids (the key first, then its other columns).
+statement ok
+CREATE VIEW person_v AS SELECT code, name, id FROM person;
+
+statement ok
+CREATE VIEW knows_v AS SELECT since, dst, src FROM knows;
+
+statement ok
+CREATE PROPERTY GRAPH g_view VERTEX TABLES (person_v KEY (id) LABEL Person)
+EDGE TABLES (knows_v KEY (src, dst) SOURCE KEY (src) REFERENCES person_v DESTINATION KEY (dst) REFERENCES person_v LABEL Knows);
+
+query TT
+SELECT table_name, identity_columns FROM __duckpgq_internal WHERE property_graph = 'g_view' ORDER BY table_name;
+----
+knows_v	[src, dst, since]
+person_v	[id, code, name]
+
+query II
+FROM GRAPH_TABLE (g_view MATCH (a:Person) COLUMNS (a.id, element_id(a))) ORDER BY ALL;
+----
+1	0
+2	1
+3	2
+4	3
+
+query I
+SELECT count(*) FROM ((FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Person)-[k:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p)))
+    EXCEPT ALL FROM GRAPH_TABLE (g_view MATCH p = ANY SHORTEST (a:Person)-[k:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p))))
+  UNION ALL (FROM GRAPH_TABLE (g_view MATCH p = ANY SHORTEST (a:Person)-[k:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p)))
+    EXCEPT ALL FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Person)-[k:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p)))));
+----
+0
+
+# Keys survive a restart.
+restart
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+query II
+FROM GRAPH_TABLE (g MATCH (a:Person)-[k:Knows]->{2}(b:Person) COLUMNS (a.id, b.id)) ORDER BY ALL;
+----
+1	3
+1	4
+2	4
+
+query T
+SELECT element_key FROM __duckpgq_internal WHERE property_graph = 'g_view' AND is_vertex_table;
+----
+[id]
+
+# A trusted key is checked when pgq_verify_edges_on_create asks for the data checks.
+statement ok
+CREATE TABLE dup (id BIGINT, n INTEGER);
+
+statement ok
+INSERT INTO dup VALUES (1, 1), (2, 2), (2, 3);
+
+statement ok
+CREATE PROPERTY GRAPH g_dup VERTEX TABLES (dup KEY (id));
+
+statement ok
+SET pgq_verify_edges_on_create = true;
+
+statement error
+CREATE PROPERTY GRAPH g_dup2 VERTEX TABLES (dup KEY (id));
+----
+KEY (id) of element table dup does not identify its rows: (2) occurs 2 times
+
+statement ok
+CREATE PROPERTY GRAPH g_dup3 VERTEX TABLES (dup KEY (id, n));
+
+statement ok
+INSERT INTO dup VALUES (NULL, 4);
+
+statement error
+CREATE PROPERTY GRAPH g_dup4 VERTEX TABLES (dup KEY (id, n));
+----
+does not identify its rows: (NULL, 4) occurs 1 times
+
+statement error
+CREATE PROPERTY GRAPH g_dup5 VERTEX TABLES (person) EDGE TABLES (knows KEY (src) SOURCE KEY (src) REFERENCES person (id) DESTINATION KEY (dst) REFERENCES person (id));
+----
+KEY (src) of element table knows does not identify its rows: (1) occurs 2 times
+
+# A PRIMARY KEY enforces the same key; no check needed.
+statement ok
+CREATE PROPERTY GRAPH g_pk2 VERTEX TABLES (person_pk KEY (id) LABEL P);
+
+statement ok
+SET pgq_verify_edges_on_create = false;
+
+# Errors.
+statement error
+CREATE PROPERTY GRAPH bad VERTEX TABLES (person KEY (nope));
+----
+KEY column nope not found in table person
+
+statement error
+CREATE PROPERTY GRAPH bad VERTEX TABLES (person KEY (id, ID));
+----
+KEY column ID is given twice for table person
+
+statement error
+CREATE PROPERTY GRAPH bad VERTEX TABLES (person) EDGE TABLES (knows SOURCE KEY (src) REFERENCES person DESTINATION KEY (dst) REFERENCES person (id));
+----
+SOURCE KEY of edge table knows references person without a column list, but that table has neither a KEY nor a PRIMARY KEY
+
+statement error
+CREATE PROPERTY GRAPH bad VERTEX TABLES (person KEY (id, code)) EDGE TABLES (knows SOURCE KEY (src) REFERENCES person DESTINATION KEY (dst) REFERENCES person);
+----
+SOURCE KEY of edge table knows has 1 columns, but the key of person has 2

@@ -45,6 +45,16 @@ struct CreatePropertyGraphInfo : public CreateInfo {
 	//! ({'max_hops': 3, ...}). Empty when the statement has none.
 	string abi_options;
 
+	//! Set by ALTER PROPERTY GRAPH: the graph's ABI artifacts were built for another definition, so none of them
+	//! answers until pgq_abi_build builds them again.
+	bool abi_disabled = false;
+
+	//! Points each edge table at its source and destination among vertex_tables, by the name or alias the edge
+	//! references, and resolves those references to the vertex tables' physical names.
+	void ResolveEdgeReferences();
+	//! label_map from the tables' labels; throws when a label is not unique.
+	void RebuildLabelMap();
+
 public:
 	unique_ptr<CreateInfo> Copy() const override;
 
@@ -223,5 +233,38 @@ public:
 	void Serialize(Serializer &serializer) const override;
 	//! Deserializes a blob back into a CreatePropertyGraphInfo
 	static unique_ptr<CreateInfo> Deserialize(Deserializer &deserializer);
+
+protected:
+	void CopyGraph(CreatePropertyGraphInfo &result) const;
+};
+
+enum class PGQAlterGraphAction : uint8_t {
+	ADD_VERTEX_TABLES,
+	ADD_EDGE_TABLES,
+	DROP_VERTEX_TABLES,
+	DROP_EDGE_TABLES,
+	ADD_LABEL,
+	DROP_LABEL
+};
+
+//! ALTER PROPERTY GRAPH: the graph (property_graph_name, the qualified name) and the change. ADD ... TABLES carries
+//! the new element tables in vertex_tables / edge_tables, as CREATE PROPERTY GRAPH does.
+struct AlterPropertyGraphInfo : public CreatePropertyGraphInfo {
+	explicit AlterPropertyGraphInfo(string property_graph_name) : CreatePropertyGraphInfo(std::move(property_graph_name)) {
+	}
+
+	PGQAlterGraphAction action = PGQAlterGraphAction::ADD_VERTEX_TABLES;
+	//! DROP ... TABLES: the element tables, by alias; ALTER ... TABLE: the one table.
+	vector<Identifier> element_tables;
+	bool element_is_vertex = true;
+	//! DROP ... CASCADE (the default, RESTRICT, refuses what would leave a dangling reference).
+	bool cascade = false;
+	//! ADD LABEL / DROP LABEL
+	Identifier label;
+	//! ADD LABEL: the label's PROPERTIES clause, held as a table's property fields (all_columns, except_columns,
+	//! column_names, ...); no clause means all columns.
+	shared_ptr<PropertyGraphTable> label_properties;
+
+	unique_ptr<CreateInfo> Copy() const override;
 };
 } // namespace duckdb

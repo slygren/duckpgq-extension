@@ -23,6 +23,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckpgq/common.hpp"
 #include "duckpgq/core/utils/compressed_sparse_row.hpp"
+#include "duckpgq/parser/parsed_data/create_property_graph_info.hpp"
 
 #include <functional>
 #include <random>
@@ -154,6 +155,7 @@ struct GraphAlgorithmSpec {
 //! The algorithm then runs on the subgraph of the vertices with the vertex label and the edges with the edge label
 //! between them.
 struct GraphAlgorithmBinding {
+	optional_ptr<CreatePropertyGraphInfo> graph;
 	shared_ptr<PropertyGraphTable> edge;
 	string vertex_label;
 	string edge_label;
