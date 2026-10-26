@@ -165,7 +165,10 @@ The cheapest route takes three hops (1 + 1 + 0.5) and beats the two-hop route th
 
 - **Costs:** may be integers, DOUBLE or DECIMAL. A negative, NaN or NULL cost without `COST … DEFAULT n` is an error.
 - **`ALL CHEAPEST`:** returns every tied path.
-- **Bounds** (`{1,3}`) work: the result is the cheapest path within them.
+- **Bounds and directions:** `{1,3}`, `{2,}`, `<-`, `-` all work: the result is the cheapest path within them.
+- **A cost or edge filter reading the endpoints:** `-[k:Knows WHERE k.w < 3 COST k.w * a.factor]->+(b)`; the
+  endpoints are the same on every step.
+- **`cost(p)` in WHERE,** several CHEAPEST patterns in one MATCH, and CHEAPEST inside OPTIONAL MATCH.
 
 ### Path modes
 
@@ -364,11 +367,7 @@ Being worked on now:
 - **Predicates:** `IS SOURCE OF`, `IS DESTINATION OF`, `SAME`, `PROPERTY_EXISTS`, `labels()`.
 - **Selectors:** `ANY k` and `SHORTEST k GROUP`.
 - **Repeated sub-patterns** (`((a)-[:R]->(b)){1,3}`) and **edge variables under a quantifier** (`-[e]->{1,2}` then `e.w`).
-- **CHEAPEST refusals:**
-  - `COST(p)` in the MATCH WHERE;
-  - CHEAPEST inside OPTIONAL MATCH;
-  - a cost that reads the endpoints;
-  - several CHEAPEST patterns in one block.
+- **CHEAPEST over a longer pattern** (several edges), a cost on a vertex, and `CHEAPEST k`.
 - **More algorithms:** strongly connected components, betweenness, triangles, communities, k-core.
 
 By design:

@@ -38,6 +38,10 @@ In every such case the old rows were wrong.
   - **`?`, `{0,1}` and `{0,0}`** return their zero-hop matches.
   - **ANY / ALL CHEAPEST** return the path(s) of least total cost, and every path function describes them. Previously
     the path came from the fewest-hops search and only `cost(p)` was weighted. ALL CHEAPEST ignored costs.
+  - **ALL CHEAPEST with DOUBLE costs** returns every path that ties once rounded (`0.2 + 0.1 + 0.7` and `0.3 + 0.7`
+    both cost 1.0); it missed the one whose prefix was not the cheapest.
+  - **ANY / ALL CHEAPEST with a constant COST and a lower bound above 1** (`COST 1 ->{2,}`) keeps pairs whose overall
+    shortest path is below the bound, as SHORTEST does.
   - **OPTIONAL MATCH:**
     - over several hops it no longer keeps partial matches;
     - an edge to a missing vertex no longer adds a `(t, NULL)` row;
@@ -53,7 +57,6 @@ In every such case the old rows were wrong.
   disappear silently.
 - **A negative, NaN or infinite COST,** or a NULL COST without `DEFAULT`, is an error. A negative cycle used to loop
   for ever.
-- **ANY / ALL CHEAPEST inside OPTIONAL MATCH** is refused for now; the next release lifts it.
 - **Hop-count searches honour cancellation and `max_execution_time` at every level.**
 
 ### Added
@@ -69,8 +72,10 @@ In every such case the old rows were wrong.
 - **`ONE ROW PER VERTEX / EDGE / STEP`** in every direction, bounded and unbounded.
 - **Path search:**
   - **`SHORTEST k`,** the k shortest paths per pair, with deterministic tie-breaking and a row budget;
-  - **ANY / ALL CHEAPEST with real weighted paths:** integer, DOUBLE or DECIMAL costs, `COST … DEFAULT`, bounds,
-    and constant costs answered as SHORTEST;
+  - **ANY / ALL CHEAPEST with real weighted paths:** integer, DOUBLE or DECIMAL costs, `COST … DEFAULT`, any
+    direction and bounds (`<-+`, `-{2,}`), a `COST` or element `WHERE` reading the edge and the pattern's endpoints,
+    `cost(p)` in COLUMNS and WHERE, several CHEAPEST patterns per MATCH, CHEAPEST inside OPTIONAL MATCH, and
+    constant costs answered as SHORTEST;
   - **path modes** `TRAIL`, `ACYCLIC`, `SIMPLE`;
   - **unbounded left-directed and either-direction quantifiers.**
 - **Cypher quantifier syntax** inside the edge: `-[:R*1..5]->`, `*`, `*..3`, `*2`, `*0..`.
@@ -115,6 +120,8 @@ Measured on a production-shaped DuckLake: about 380 tables, a 38M-row edge union
 | `ONE ROW PER VERTEX / EDGE` over a seeded chain | 5.5 s | 0.06 s |
 | Weighted `vertices(p)` under CHEAPEST (20k vertices) | 18.4 s (and wrong) | 0.22 s |
 | ALL CHEAPEST paths (20k vertices) | 75.9 s (and wrong) | 0.26 s |
+| Seeded ANY CHEAPEST `->+` with `cost(p)` (200k vertices, 1M edges) | 9.2 s | 0.17 s |
+| ALL CHEAPEST to one destination from 200 sources (20k vertices) | over 60 s | 0.39 s |
 
 The product's 25 compiled traversal queries and the remaining benchmark queries run at the same speed as before,
 with identical answers.
@@ -125,6 +132,8 @@ with identical answers.
   with "Cannot compare VARCHAR and BIGINT".
 - **`edges(p)`** on an ABI route used to fail. It now traverses.
 - **Bounded CHEAPEST** used to fail with "CSR not found".
+- **`ONE ROW PER` with a path function or `cost(p)`** used to fail to bind ("shortest_path_cte not found").
+- **An OPTIONAL MATCH in a UNION branch with its own COLUMNS** used to fail to bind the branch's columns.
 
 ### Known limitations
 
@@ -136,7 +145,6 @@ See README "Limitations". Work in progress for the next release:
 - **Predicates:** `IS SOURCE/DESTINATION OF`, `SAME`, `PROPERTY_EXISTS`, `labels()`.
 - **Selectors:** `ANY k`, `SHORTEST k GROUP`.
 - **Repeated sub-patterns,** and edge variables under a quantifier.
-- **The remaining CHEAPEST and OPTIONAL refusals.**
 - **More graph algorithms.**
 - **DuckLake version coupling:** DuckDB 2.0 writes DuckLake format 1.1 and a newer file storage version, which 1.5
   tools can't read. A 2.0 write into a Postgres-backed 1.0 catalog once removed column statistics 1.5 then failed on
