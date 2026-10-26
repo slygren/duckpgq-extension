@@ -93,7 +93,8 @@ In every such case the old rows were wrong.
   - **`vertex_properties(p)` and `graph_tree_json` return valid JSON for any property value.** A quote in a value
     used to come out as `\\"`, which ends the string early. Single backslashes and control characters were
     passed through unescaped. Every `attributes_json` on the product lake hit this.
-    - A JSON-typed property now nests as JSON instead of a string of JSON.
+    - A JSON-typed property now nests as JSON instead of a string of JSON. A MAP or STRUCT property is a JSON object
+      and a LIST an array, where they used to be DuckDB's display text (`{gasgroup=IIB, …}`).
   - **Path labels over a label expression of several tables at one hop.**
     `(t:Tag)-[:!HasParent]->{1,1}(x)` and the unquantified `-[:!HasParent]->(x)` labelled every path with the
     first matching table (`[Tag, Tag]` / `[HasParent]`). Each path now carries its own labels.
