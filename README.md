@@ -161,8 +161,12 @@ A quantified pattern without a search prefix returns **every walk** (SQL/PGQ sem
 use `ANY SHORTEST` for one per endpoint, `ALL SHORTEST` for every shortest path. A search prefix applies to the whole path
 pattern: over a fixed-length one (`ANY SHORTEST (a)-[e]->(b)`) it keeps one path per pair of endpoints, and over one
 that mixes fixed hops with a variable-length edge it compares the whole paths' lengths (supported when it is the
-only pattern of its MATCH, without OPTIONAL MATCH, UNION or ONE ROW PER). A walk visits no vertex twice, so
-walks that return to their start vertex are left out, and an edge stored twice is two walks. The path variable
+only pattern of its MATCH, without OPTIONAL MATCH, UNION or ONE ROW PER). Without a search prefix a walk visits no
+vertex twice, so walks that return to their start vertex are left out, and an edge stored twice is two walks. Under
+`ANY SHORTEST`, `ALL SHORTEST` and `SHORTEST k` the walks are SQL/PGQ's: a vertex may repeat and a walk may return to
+its start (`ANY SHORTEST (a)-[:K]->{1,3}(b)` has a row with `b = a` where `a` is on a cycle; `{2,4}` from a vertex to
+its neighbour may go there and back), unless a path mode restricts them: `TRAIL` (no edge twice), `ACYCLIC` (no vertex
+twice), `SIMPLE` (no vertex twice except a return to the start). The path variable
 (`vertices(p)`, `path_length(p)`, `ONE ROW PER`) describes the row's own walk. A quantifier from 0 also matches the
 zero-hop walk, which binds the end vertex to the start; `-[e]->?` (`{0,1}`) is the plain edge's matches, self-loops
 included, plus those, with `e` NULL in them. Over an edge between two vertex tables (`(a:Tag)-[:HasWorkorder]->{0,k}(b)`) the
@@ -171,9 +175,8 @@ NULL there), and since such an edge cannot be taken twice in a row, `{0,k}` and 
 it, unbounded included. With both ends unlabeled, or the unlabeled end used by another pattern, zero hops are not
 matched over such an edge.
 
-`SHORTEST k` follows SQL/PGQ: the k shortest paths per endpoint pair, as walks (a vertex or edge may repeat, and a
-path may return to its start) unless a path mode restricts them: `TRAIL` (no edge twice), `ACYCLIC` (no vertex twice),
-`SIMPLE` (no vertex twice except a return to the start). SQL/PGQ leaves the choice among paths tied at the k-th
+`SHORTEST k` is the k shortest of those walks per endpoint pair, so `SHORTEST 1` and `ANY SHORTEST` give paths of
+the same length for every pair, closed walks included. SQL/PGQ leaves the choice among paths tied at the k-th
 length to the implementation; here the paths of one length are taken in the order of their edge row ids along the
 path, compared position by position, so the answer is deterministic. The search runs from each source the `MATCH
 WHERE` admits (a filter on the source alone seeds it, one on the destination alone ends it early) and counts every
@@ -269,8 +272,12 @@ So a closure answers:
   paths (`preserves_multiplicity`): the edge is acyclic, the depth cap was never reached, and every row is exactly
   one path (for `tc_chain` also no vertex with two out-edges, the usual hierarchy).
 - Never `CHEAPEST` with a per-edge `COST`, or a lower bound of 0. A `COST` that is one positive constant makes
-  `CHEAPEST` the same as `SHORTEST`, and path modes (`TRAIL`, `ACYCLIC`, `SIMPLE`) restrict nothing here: every
-  match already visits no vertex twice.
+  `CHEAPEST` the same as `SHORTEST`.
+- A search prefix's walks (a vertex twice, a return to the start) from an artifact only where no walk within the
+  bound can repeat a vertex: over a directed edge whose `transitive_closure` has no row closing on its start up to
+  the bound (measured once per process; past the closure's deepest row also no deepest row extending), so the walks
+  are the simple paths the artifacts hold. Otherwise they are traversed. Undirected walks can always step back, so
+  only an exact closure answers them.
 
 An artifact holds only edges whose endpoints are vertices, as the traversal sees them (it joins both endpoints):
 `pgq_abi_build` reads every edge table through its vertex keys, so an edge with a key no vertex has (or NULL) is in no

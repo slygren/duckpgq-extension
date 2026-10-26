@@ -3084,6 +3084,14 @@ static unique_ptr<ParsedExpression> CostTypeProbe(const SubPath &edge, const sha
 	return std::move(probe_subquery);
 }
 
+//! A quantified edge under ANY / ALL SHORTEST whose paths from a vertex to itself are closed walks: SQL/PGQ's walk
+//! semantics (and TRAIL, SIMPLE) let a path return to its start, so with a lower bound of 1 or more the shortest
+//! path from a vertex to itself is its shortest closed walk -- what SHORTEST k returns too. ACYCLIC forbids it, and
+//! a lower bound of 0 makes it the zero-length path.
+static bool ClosedWalks(const SubPath &edge_subpath) {
+	return edge_subpath.lower >= 1 && edge_subpath.path_mode != PGQPathMode::ACYCLIC && !edge_subpath.cheapest;
+}
+
 unique_ptr<CommonTableExpressionInfo>
 PGQMatchFunction::GenerateShortestPathCTE(CreatePropertyGraphInfo &pg_table, SubPath *edge_subpath,
                                           PathElement *previous_vertex_element, PathElement *next_vertex_element,
@@ -3107,6 +3115,7 @@ PGQMatchFunction::GenerateShortestPathCTE(CreatePropertyGraphInfo &pg_table, Sub
 	    edge_table->source_pg_table, previous_vertex_element->variable_binding, PGQStr(edge_table->source_pk[0]))));
 	pathfinding_children.push_back(std::move(src_row_id));
 	pathfinding_children.push_back(std::move(dst_row_id));
+	const bool closed = ClosedWalks(*edge_subpath);
 
 	// CHEAPEST: the weighted search over the same CSR, and the paths' cost.
 	unique_ptr<ParsedExpression> cost_column;
@@ -3123,6 +3132,9 @@ PGQMatchFunction::GenerateShortestPathCTE(CreatePropertyGraphInfo &pg_table, Sub
 	}
 	const string all_function = edge_subpath->cheapest ? "allcheapestpaths" : "allshortestpaths";
 	const string any_function = edge_subpath->cheapest ? "cheapestpath" : "shortestpath";
+	if (closed) {
+		pathfinding_children.push_back(ConstantExpression::FromValue(Value::BOOLEAN(true)));
+	}
 	if (all_shortest) {
 		auto all_sp_function = make_uniq<FunctionExpression>(Identifier(all_function), std::move(pathfinding_children));
 		vector<unique_ptr<ParsedExpression>> unnest_children;
@@ -3182,7 +3194,8 @@ static void AddBoundedORPRecursiveCTE(unique_ptr<SelectNode> &select_node, const
                                       const shared_ptr<PropertyGraphTable> &edge_table, idx_t lower, idx_t upper,
                                       unique_ptr<ParsedExpression> anchor_filter, bool reverse = false,
                                       PGQPathSelector selector = PGQPathSelector::WALK, bool undirected = false,
-                                      const string &edge_label = string(), const SubPath *cost_edge = nullptr);
+                                      const string &edge_label = string(), const SubPath *cost_edge = nullptr,
+                                      bool closed_walks = false);
 
 unique_ptr<ParsedExpression> PGQMatchFunction::CreatePathFindingFunction(
     vector<unique_ptr<PathReference>> &path_list, CreatePropertyGraphInfo &pg_table, const string &path_variable,
@@ -3314,7 +3327,8 @@ unique_ptr<ParsedExpression> PGQMatchFunction::CreatePathFindingFunction(
 						                          static_cast<idx_t>(edge_subpath->upper), std::move(anchor_filter),
 						                          edge_element->match_type == PGQMatchType::MATCH_EDGE_LEFT, selector,
 						                          edge_element->match_type == PGQMatchType::MATCH_EDGE_ANY,
-						                          edge_element->label, edge_subpath->cheapest ? edge_subpath : nullptr);
+						                          edge_element->label, edge_subpath->cheapest ? edge_subpath : nullptr,
+						                          selector != PGQPathSelector::WALK && ClosedWalks(*edge_subpath));
 						auto path_ref = make_uniq<BaseTableRef>();
 						path_ref->SetTable(Identifier("shortest_path_cte"));
 						if (!final_select_node->from_table) {
@@ -3508,6 +3522,9 @@ PGQMatchFunction::AddPathQuantifierCondition(const string &prev_binding, const s
 	    std::move(GetCountTable(edge_table->source_pg_table, prev_binding, PGQStr(edge_table->source_pk[0]))));
 	pathfinding_children.push_back(std::move(src_row_id));
 	pathfinding_children.push_back(std::move(dst_row_id));
+	if (ClosedWalks(*subpath)) {
+		pathfinding_children.push_back(ConstantExpression::FromValue(Value::BOOLEAN(true)));
+	}
 
 	auto reachability_function = make_uniq<FunctionExpression>("iterativelength", std::move(pathfinding_children));
 
@@ -3551,10 +3568,14 @@ static PGQStepEdges StepEdges(const shared_ptr<PropertyGraphTable> &edge_table, 
 	                                        PGQStr(edge_table->table_name));
 	const string q_src = KeywordHelper::WriteOptionallyQuoted(src_fk);
 	const string q_dst = KeywordHelper::WriteOptionallyQuoted(dst_fk);
+	// A self-loop is one step either way, not two: its reversed copy is left out (over one vertex table).
+	const bool one_table = edge_table->source_pg_table && edge_table->destination_pg_table &&
+	                       edge_table->source_pg_table->SameTableIdentity(*edge_table->destination_pg_table);
 	const string sql = StringUtil::Format(
 	    "SELECT *, rowid AS __pgq_erid, %s AS __pgq_out, %s AS __pgq_in FROM %s "
-	    "UNION ALL SELECT *, rowid AS __pgq_erid, %s AS __pgq_out, %s AS __pgq_in FROM %s",
-	    q_src, q_dst, table, q_dst, q_src, table);
+	    "UNION ALL SELECT *, rowid AS __pgq_erid, %s AS __pgq_out, %s AS __pgq_in FROM %s%s",
+	    q_src, q_dst, table, q_dst, q_src, table,
+	    one_table ? " WHERE " + q_dst + " IS DISTINCT FROM " + q_src : string());
 	result.ref = make_uniq<SubqueryRef>(ParseSelectStatement(sql), PGQId(alias));
 	result.out_col = "__pgq_out";
 	result.in_col = "__pgq_in";
@@ -3596,7 +3617,7 @@ static void AddBoundedORPRecursiveCTE(unique_ptr<SelectNode> &select_node, const
                                       const shared_ptr<PropertyGraphTable> &edge_table, idx_t lower, idx_t upper,
                                       unique_ptr<ParsedExpression> anchor_filter, bool reverse,
                                       PGQPathSelector selector, bool undirected, const string &edge_label,
-                                      const SubPath *cost_edge) {
+                                      const SubPath *cost_edge, bool closed_walks) {
 	// ONE ROW PER cannot be made key-based the way the reachability CTE was. Its `path` is
 	// an interleaved list of rowids that BuildORPStepsCTE unnests and rejoins to the vertex
 	// and edge tables BY ROWID, and for a cross-table edge the v1 and v2 of ONE ROW PER STEP
@@ -3776,7 +3797,24 @@ static void AddBoundedORPRecursiveCTE(unique_ptr<SelectNode> &select_node, const
 		lc_args.push_back(PGQColRef("visited", rec_alias));
 		lc_args.push_back(PGQColRef("rowid", b_alias));
 		auto lc = make_uniq<FunctionExpression>("list_contains", std::move(lc_args));
-		rec_where.push_back(make_uniq<OperatorExpression>(ExpressionType::OPERATOR_NOT, std::move(lc)));
+		unique_ptr<ParsedExpression> fresh = make_uniq<OperatorExpression>(ExpressionType::OPERATOR_NOT, std::move(lc));
+		if (closed_walks) {
+			// A shortest walk may return to its start (and ends there): the step back to the source is allowed,
+			// and a path that has closed is not extended.
+			fresh = make_uniq<ConjunctionExpression>(
+			    ExpressionType::CONJUNCTION_OR, std::move(fresh),
+			    make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL, PGQColRef("rowid", b_alias),
+			                                    PGQColRef("src_rowid", rec_alias)));
+			rec_where.push_back(make_uniq<OperatorExpression>(
+			    ExpressionType::OPERATOR_NOT,
+			    make_uniq<ConjunctionExpression>(
+			        ExpressionType::CONJUNCTION_AND,
+			        make_uniq<ComparisonExpression>(ExpressionType::COMPARE_GREATERTHAN, PGQColRef("depth", rec_alias),
+			                                        ConstantExpression::FromValue(Value::INTEGER(0))),
+			        make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL, PGQColRef("cur_rowid", rec_alias),
+			                                        PGQColRef("src_rowid", rec_alias)))));
+		}
+		rec_where.push_back(std::move(fresh));
 		recursive->where_clause = PGQMatchFunction::CreateWhereClause(rec_where);
 	}
 
@@ -3857,7 +3895,7 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
                                             unique_ptr<ParsedExpression> anchor_filter, PGQPathSelector selector,
                                             bool reverse = false, const PGQABIArtifactScan *abi_edge = nullptr,
                                             const string &edge_label = string(), bool undirected = false,
-                                            const SubPath *cost_edge = nullptr) {
+                                            const SubPath *cost_edge = nullptr, bool closed_walks = false) {
 	const bool any_shortest = selector == PGQPathSelector::ANY_SHORTEST;
 	// reverse=true walks edges backwards (for left-directed patterns like
 	// (a)<-[e]-{1,3}(b)): the anchor sits on the edge's *destination* side and each
@@ -3874,6 +3912,8 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 	    reverse ? edge_table->destination_pg_table : edge_table->source_pg_table;
 	const shared_ptr<PropertyGraphTable> &far_side_table =
 	    reverse ? edge_table->source_pg_table : edge_table->destination_pg_table;
+	// A walk can only return to its start over an edge between vertices of one table.
+	closed_walks = closed_walks && anchor_side_table->SameTableIdentity(*far_side_table);
 
 	// ANY SHORTEST only needs the minimum depth per (src, dst) pair, never the walk
 	// contents. In that case emit a LEAN reachability CTE: no `visited` list and a
@@ -3890,7 +3930,9 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 	// Lean is exact only from depth 1: a shortest walk is a simple path, but the shortest walk
 	// of length >= 2 may revisit a vertex where no simple path of that length exists. From a
 	// lower bound of 2 the walk CTE is grouped instead.
-	const bool lean = any_shortest && lower <= 1;
+	// From a lower bound above 1 too under walk semantics (closed_walks): every (src, dst, depth) a walk reaches is a
+	// row, and the least depth within the bounds is the shortest walk's length.
+	const bool lean = any_shortest && (lower <= 1 || closed_walks);
 	// CHEAPEST needs the costs only to pick ALL CHEAPEST's paths: for ANY CHEAPEST every pair with a path within the
 	// bounds is an answer, whichever path is the cheapest.
 	const bool costed = cost_edge && selector == PGQPathSelector::ALL_SHORTEST;
@@ -4076,7 +4118,25 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 			lc_args.push_back(PGQColRef("visited", rec_alias));
 			lc_args.push_back(QualifiedVertexKeyExpr(PGQStr(far_side_table->table_name), b_alias, dst_pk));
 			auto lc_fn = make_uniq<FunctionExpression>("list_contains", std::move(lc_args));
-			rec_where.push_back(make_uniq<OperatorExpression>(ExpressionType::OPERATOR_NOT, std::move(lc_fn)));
+			unique_ptr<ParsedExpression> fresh =
+			    make_uniq<OperatorExpression>(ExpressionType::OPERATOR_NOT, std::move(lc_fn));
+			if (closed_walks) {
+				// The step back to the source closes a walk (allowed), and a closed walk is not extended.
+				fresh = make_uniq<ConjunctionExpression>(
+				    ExpressionType::CONJUNCTION_OR, std::move(fresh),
+				    make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL, VertexKeyExpr(b_alias, dst_pk),
+				                                    PGQColRef("src_key", rec_alias)));
+				rec_where.push_back(make_uniq<OperatorExpression>(
+				    ExpressionType::OPERATOR_NOT,
+				    make_uniq<ConjunctionExpression>(
+				        ExpressionType::CONJUNCTION_AND,
+				        make_uniq<ComparisonExpression>(ExpressionType::COMPARE_GREATERTHAN,
+				                                        PGQColRef("depth", rec_alias),
+				                                        ConstantExpression::FromValue(Value::INTEGER(0))),
+				        make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL, PGQColRef("dst_key", rec_alias),
+				                                        PGQColRef("src_key", rec_alias)))));
+			}
+			rec_where.push_back(std::move(fresh));
 		}
 		recursive->where_clause = PGQMatchFunction::CreateWhereClause(rec_where);
 	}
@@ -4132,11 +4192,11 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 		    PGQColRef("depth"),
 		    ConstantExpression::FromValue(Value::INTEGER(static_cast<int32_t>(lower))),
 		    ConstantExpression::FromValue(Value::INTEGER(static_cast<int32_t>(upper))));
-		// The walk CTE's `visited` list excluded self-returns (a path back to its own
-		// source): the source starts in `visited`, so it is never re-reached. The lean
-		// CTE has no `visited`, so a cycle can produce (src, src, depth>0). Drop those
-		// to stay equivalent, but keep the trivial depth-0 self (which {0,hi} wants).
-		{
+		// A path back to its own source: under walk semantics with a lower bound of 1 it is the source's shortest
+		// closed walk, which the lean CTE (no `visited`) finds as (src, src, depth > 0). Where the pattern does not
+		// allow it (ACYCLIC; only the walk CTE's `visited` excluded it before), those rows are dropped, keeping the
+		// trivial depth-0 self (which {0,hi} wants).
+		if (!closed_walks) {
 			auto is_self = make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
 			                                               PGQColRef("src_key"),
 			                                               PGQColRef("dst_key"));
@@ -4193,7 +4253,8 @@ static string BuildBoundedVLReachabilityCTE(unique_ptr<SelectNode> &select_node,
 static string BuildExactLengthABIScanCTE(unique_ptr<SelectNode> &select_node, const string &prev_binding,
                                          const shared_ptr<PropertyGraphTable> &edge_table,
                                          const PGQABIArtifactScan &artifact, idx_t hops,
-                                         unique_ptr<ParsedExpression> anchor_filter, bool reverse) {
+                                         unique_ptr<ParsedExpression> anchor_filter, bool reverse,
+                                         bool walks = false) {
 	const auto cte_idx = select_node->cte_map.map.size();
 	const string cte_name = "__fpx_" + std::to_string(cte_idx);
 	const string fp_alias = "_fpx_a_" + std::to_string(cte_idx);
@@ -4252,17 +4313,20 @@ static string BuildExactLengthABIScanCTE(unique_ptr<SelectNode> &select_node, co
 	scan->select_list.push_back(std::move(s_depth));
 
 	vector<unique_ptr<ParsedExpression>> where_parts;
+	// Under a search prefix's walk semantics (walks) every k-hop walk the artifact holds is a k-hop path, those that
+	// pass a vertex twice or end where they started too; otherwise only the simple paths count, as in the recursive
+	// enumeration.
 	// Exclude a path that ends where it started. Only meaningful when both ends are the
 	// same vertex table -- comparing a near rowid to a far rowid across two different
 	// tables compared positions, not vertices, and dropped rows whose positions coincided.
-	if (StringUtil::CIEquals(PGQStr(near_table->table_name), PGQStr(far_table->table_name))) {
+	if (!walks && StringUtil::CIEquals(PGQStr(near_table->table_name), PGQStr(far_table->table_name))) {
 		where_parts.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_NOTEQUAL,
 		                                                      VertexKeyExpr(prev_binding, near_pk),
 		                                                      VertexKeyExpr(far_alias, far_pk)));
 	}
 	// The artifact holds k-hop walks, which may pass a vertex twice; only a simple path counts, as in
 	// the recursive enumeration. (A walk 1 -> 2 -> 3 -> 2 must not make (1, 2) a 3-hop answer.)
-	{
+	if (!walks) {
 		vector<unique_ptr<ParsedExpression>> keys;
 		for (idx_t idx = 0; idx <= hops; idx++) {
 			keys.push_back(VertexKeyExpr(fp_alias, "v" + std::to_string(idx)));
@@ -4296,15 +4360,16 @@ static void AddBoundedVLPathFinding(unique_ptr<SelectNode> &select_node,
                                     PGQPathSelector selector, bool reverse = false,
                                     const PGQABITraversalPlan *abi_plan = nullptr,
                                     const string &edge_label = string(), bool undirected = false,
-                                    const SubPath *cost_edge = nullptr) {
+                                    const SubPath *cost_edge = nullptr, bool closed_walks = false) {
 	// An exact-length quantifier backed by a k-hop artifact needs no recursion at all.
 	const string scan_name =
 	    (abi_plan && abi_plan->exact.valid)
 	        ? BuildExactLengthABIScanCTE(select_node, prev_binding, edge_table, abi_plan->exact, abi_plan->exact_hops,
-	                                     std::move(anchor_filter), reverse)
+	                                     std::move(anchor_filter), reverse, closed_walks)
 	        : BuildBoundedVLReachabilityCTE(select_node, prev_binding, edge_table, lower, upper,
 	                                        std::move(anchor_filter), selector, reverse,
-	                                        abi_plan ? &abi_plan->step : nullptr, edge_label, undirected, cost_edge);
+	                                        abi_plan ? &abi_plan->step : nullptr, edge_label, undirected, cost_edge,
+	                                        closed_walks);
 	const string cte_alias = scan_name + "_scan";
 
 	// ── Add CTE to FROM (cross join) ─────────────────────────────────────────────
@@ -4452,7 +4517,8 @@ void PGQMatchFunction::AddPathFinding(unique_ptr<SelectNode> &select_node,
 		                        subpath->upper, std::move(anchor_filter), selector,
 		                        edge_type == PGQMatchType::MATCH_EDGE_LEFT,
 		                        undirected_one_table || all_cheapest ? nullptr : abi_plan, edge_label,
-		                        undirected_one_table, subpath->cheapest ? subpath : nullptr);
+		                        undirected_one_table, subpath->cheapest ? subpath : nullptr,
+		                        selector != PGQPathSelector::WALK && ClosedWalks(*subpath));
 		return;
 	}
 
@@ -4548,7 +4614,10 @@ void PGQMatchFunction::AddTraversalPathFinding(
     unique_ptr<SelectNode> &select_node, vector<unique_ptr<ParsedExpression>> &conditions, const string &prev_binding,
     const string &next_binding, const shared_ptr<PropertyGraphTable> &prev_vertex_table,
     const shared_ptr<PropertyGraphTable> &next_vertex_table,
-    const vector<shared_ptr<PropertyGraphTable>> &edge_tables, bool undirected, idx_t lower, idx_t upper) {
+    const vector<shared_ptr<PropertyGraphTable>> &edge_tables, bool undirected, idx_t lower, idx_t upper,
+    bool any_shortest, bool all_shortest, bool closed_walks) {
+	// A walk returns to its start only within one vertex table.
+	closed_walks = closed_walks && prev_vertex_table->SameTableIdentity(*next_vertex_table);
 	if (upper == static_cast<idx_t>(1 << 30)) {
 		throw NotImplementedException(
 		    "Unbounded traversal with compound edge labels is not yet supported — specify an upper bound.");
@@ -4673,7 +4742,23 @@ void PGQMatchFunction::AddTraversalPathFinding(
 	lc_args.push_back(PGQColRef("visited", "t"));
 	lc_args.push_back(QualifiedVertexKeyExpr(PGQStr(next_vertex_table->table_name), "b", dst_pk_col));
 	auto lc_fn = make_uniq<FunctionExpression>("list_contains", std::move(lc_args));
-	rec_where.push_back(make_uniq<OperatorExpression>(ExpressionType::OPERATOR_NOT, std::move(lc_fn)));
+	unique_ptr<ParsedExpression> fresh = make_uniq<OperatorExpression>(ExpressionType::OPERATOR_NOT, std::move(lc_fn));
+	if (closed_walks) {
+		// The step back to the source closes a shortest walk (allowed), and a closed walk is not extended.
+		fresh = make_uniq<ConjunctionExpression>(
+		    ExpressionType::CONJUNCTION_OR, std::move(fresh),
+		    make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL, VertexKeyExpr("b", dst_pk_col),
+		                                    PGQColRef("src_key", "t")));
+		rec_where.push_back(make_uniq<OperatorExpression>(
+		    ExpressionType::OPERATOR_NOT,
+		    make_uniq<ConjunctionExpression>(
+		        ExpressionType::CONJUNCTION_AND,
+		        make_uniq<ComparisonExpression>(ExpressionType::COMPARE_GREATERTHAN, PGQColRef("depth", "t"),
+		                                        ConstantExpression::FromValue(Value::INTEGER(0))),
+		        make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL, PGQColRef("cur_key", "t"),
+		                                        PGQColRef("src_key", "t")))));
+	}
+	rec_where.push_back(std::move(fresh));
 	recursive->where_clause = CreateWhereClause(rec_where);
 
 	// === Build RecursiveCTENode ===
@@ -4690,9 +4775,25 @@ void PGQMatchFunction::AddTraversalPathFinding(
 	cte_info->query_node = std::move(cte_stmt->node);
 	select_node->cte_map.map[Identifier(cte_name)] = std::move(cte_info);
 
+	// A search prefix keeps, per pair of endpoints, the walks of the least depth within the bounds: one (ANY
+	// SHORTEST) or every one (ALL SHORTEST). The enumeration above holds every walk; without this the selector
+	// was ignored here (one row per walk).
+	string scan_name = cte_name;
+	if (any_shortest || all_shortest) {
+		scan_name = cte_name + "_sel";
+		const string sql = StringUtil::Format(
+		    "SELECT src_key, cur_pk, cur_key, depth FROM %s WHERE depth BETWEEN %d AND %d "
+		    "QUALIFY %s OVER (PARTITION BY src_key, cur_key ORDER BY depth) = 1",
+		    KeywordHelper::WriteOptionallyQuoted(cte_name), static_cast<int32_t>(lower), static_cast<int32_t>(upper),
+		    any_shortest ? "row_number()" : "rank()");
+		auto sel_info = make_uniq<CommonTableExpressionInfo>();
+		sel_info->query_node = std::move(ParseSelectStatement(sql)->node);
+		select_node->cte_map.map[Identifier(scan_name)] = std::move(sel_info);
+	}
+
 	// Add a direct BaseTableRef for the CTE into the FROM clause (cross join)
 	auto cte_scan = make_uniq<BaseTableRef>();
-	cte_scan->SetTable(Identifier(cte_name));
+	cte_scan->SetTable(Identifier(scan_name));
 	cte_scan->alias = Identifier(cte_alias);
 	if (select_node->from_table) {
 		auto cross = make_uniq<JoinRef>(JoinRefType::CROSS);
@@ -5396,7 +5497,8 @@ void PGQMatchFunction::ProcessPathList(ClientContext &context, vector<unique_ptr
 				                        previous_vertex_element->variable_binding,
 				                        next_vertex_element->variable_binding, previous_vertex_table,
 				                        next_vertex_table, edge_tbls, undirected, edge_subpath->lower,
-				                        edge_subpath->upper);
+				                        edge_subpath->upper, any_shortest, all_shortest,
+				                        (any_shortest || all_shortest) && ClosedWalks(*edge_subpath));
 			} else if (IsVariableLengthEdge(*edge_subpath) || edge_subpath->cheapest) {
 				if (original_ref.one_row_per != OneRowPerMode::NONE) {
 					// ONE ROW PER: produce path lists for per-step unnesting.
@@ -5432,7 +5534,8 @@ void PGQMatchFunction::ProcessPathList(ClientContext &context, vector<unique_ptr
 							                          orp_selector,
 							                          edge_element->match_type == PGQMatchType::MATCH_EDGE_ANY,
 							                          edge_element->label,
-							                          edge_subpath->cheapest ? edge_subpath : nullptr);
+							                          edge_subpath->cheapest ? edge_subpath : nullptr,
+							                          orp_selector != PGQPathSelector::WALK && ClosedWalks(*edge_subpath));
 						} else {
 							// CSR fallback for unbounded or undirected ONE ROW PER.
 							if (final_select_node->cte_map.map.find("cte1") ==
@@ -5539,8 +5642,13 @@ void PGQMatchFunction::ProcessPathList(ClientContext &context, vector<unique_ptr
 						                                                  : edge_subpath->upper);
 						RecordRewriteDiagnostic(context, std::move(diagnostic));
 					}
+					// Only where the path is listed (a named path): an unnamed one under a selector is a shortest walk,
+					// which visits no vertex twice between two vertices and returns to its start only where the mode
+					// allows (ClosedWalks).
 					if (!used_recursive_cte && edge_subpath->path_mode != PGQPathMode::NONE &&
-					    edge_subpath->path_mode != PGQPathMode::WALK) {
+					    edge_subpath->path_mode != PGQPathMode::WALK &&
+					    final_select_node->cte_map.map.find(Identifier("shortest_path_cte")) !=
+					        final_select_node->cte_map.map.end()) {
 						AddPathModeFilter(edge_subpath->path_mode, "shortest_path_cte", conditions);
 					}
 				}
@@ -7068,6 +7176,34 @@ public:
 		                                           Table(*witness), Table(*tc)));
 	}
 
+	// Every walk of at most `upper` hops over the closure's directed edge visits no vertex twice, so a search
+	// prefix's walks are the simple paths the artifacts hold. A walk that repeats a vertex holds a closed walk at
+	// most as long, which the closure (one row per (v0, v1, depth) of every walk up to its cap) has as a row
+	// closing on its start. Past the cap: no such row at all, and no deepest row extends (the closure is complete).
+	bool WalksSimple(const PGQPathTableInfo &tc, const string &edge_label, int64_t upper) {
+		if (tc.preserves_multiplicity) {
+			return true;
+		}
+		if (tc.max_depth <= 0) {
+			return false;
+		}
+		if (upper <= tc.max_depth) {
+			return Probe("walks_simple|" + Table(tc) + "|" + std::to_string(upper),
+			             StringUtil::Format("SELECT NOT EXISTS (SELECT 1 FROM %s WHERE v0 = v1 AND depth <= %lld)",
+			                                Table(tc), upper));
+		}
+		string bridge;
+		string src_col;
+		string dst_col;
+		if (!Bridge(edge_label, bridge, src_col, dst_col)) {
+			return false;
+		}
+		return Probe("walks_simple|" + Table(tc),
+		             StringUtil::Format("SELECT NOT EXISTS (SELECT 1 FROM %s WHERE v0 = v1) AND NOT EXISTS (SELECT 1 "
+		                                "FROM %s w JOIN %s e ON e.%s = w.v1 WHERE w.depth = (SELECT max(depth) FROM %s))",
+		                                Table(tc), Table(tc), bridge, src_col, Table(tc)));
+	}
+
 	// The type of a table's column, or INVALID when it cannot be looked up. (Here because this is the one object
 	// the expansion builder gets that carries the ClientContext.)
 	LogicalType ColumnType(const string &catalog, const string &schema, const string &table, const string &column) {
@@ -7343,7 +7479,7 @@ static void AddTCWitnessORPCTE(unique_ptr<SelectNode> &select_node, const PGQPat
                                const shared_ptr<PropertyGraphTable> &vertex_table,
                                const shared_ptr<PropertyGraphTable> &edge_table,
                                idx_t lower, idx_t upper,
-                               const vector<string> &endpoint_filters) {
+                               const vector<string> &endpoint_filters, bool closed_walks = false) {
 	static const string kPathCTE = "shortest_path_cte";
 	const auto cte_idx = select_node->cte_map.map.size();
 	const string witness_cte_name = "__tcw_orp_" + std::to_string(cte_idx);
@@ -7358,8 +7494,10 @@ static void AddTCWitnessORPCTE(unique_ptr<SelectNode> &select_node, const PGQPat
 	const string edge_src_fk = KeywordHelper::WriteOptionallyQuoted(PGQStr(edge_table->source_fk[0]));
 	const string edge_dst_fk = KeywordHelper::WriteOptionallyQuoted(PGQStr(edge_table->destination_fk[0]));
 
-	// Never a pair that only closes a cycle: the traversal does not return to its start.
-	string depth_filter = "w.v0 <> w.v1 AND w.depth >= " + std::to_string(static_cast<int64_t>(lower));
+	// A pair that closes a cycle is the start's shortest closed walk where the pattern allows one (ClosedWalks);
+	// otherwise it goes.
+	string depth_filter = string(closed_walks ? "" : "w.v0 <> w.v1 AND ") + "w.depth >= " +
+	                      std::to_string(static_cast<int64_t>(lower));
 	if (upper < static_cast<idx_t>(1 << 30)) {
 		depth_filter += " AND w.depth <= " + std::to_string(static_cast<int64_t>(upper));
 	}
@@ -7559,11 +7697,13 @@ static unique_ptr<TableRef> BuildTCChainNamedPathRef(const PGQPathTableInfo &cha
 static unique_ptr<TableRef> BuildTCWitnessNamedPathRef(const PGQPathTableInfo &witness_info, const string &path_alias,
                                                        idx_t lower, idx_t upper,
                                                        const vector<string> &endpoint_filters,
-                                                       const string &vertex_label, const string &edge_label) {
+                                                       const string &vertex_label, const string &edge_label,
+                                                       bool closed_walks = false) {
 	const string witness_table = QualifiedTableName(witness_info.catalog_name, witness_info.schema_name,
 	                                                witness_info.table_name);
-	// Never a pair that only closes a cycle: the traversal does not return to its start.
-	string base_filter = "w.v0 <> w.v1 AND w.depth >= " + std::to_string(static_cast<int64_t>(std::max<idx_t>(1, lower)));
+	// A pair that closes a cycle is the start's shortest closed walk where the pattern allows one (ClosedWalks).
+	string base_filter = string(closed_walks ? "" : "w.v0 <> w.v1 AND ") + "w.depth >= " +
+	                     std::to_string(static_cast<int64_t>(std::max<idx_t>(1, lower)));
 	if (upper < static_cast<idx_t>(1 << 30)) {
 		base_filter += " AND w.depth <= " + std::to_string(static_cast<int64_t>(upper));
 	}
@@ -8430,10 +8570,21 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
                                                         bool include_vertex_properties,
                                                         bool require_multiplicity_preserving,
                                                         int64_t vl_fallback_budget, PGQPathSelector selector,
-                                                        PGQExactness &exactness) {
+                                                        PGQExactness &exactness, bool closed_walks = false) {
 	if (upper >= static_cast<idx_t>(1 << 30)) {
 		return nullptr;
 	}
+	// A search prefix's walks (closed_walks): a walk back to the source is a path of its own (allowed below), but from
+	// a lower bound above 1 the shortest walk may pass a vertex twice, which this enumeration of simple paths does
+	// not hold.
+	if (closed_walks && lower > 1) {
+		return nullptr;
+	}
+	// The step that closes a walk on its source, and no step after it.
+	const string closing_unrolled =
+	    closed_walks ? " OR %s::VARCHAR || ':' || CAST(%s AS VARCHAR) = c.path_participants[1]) AND NOT (c.depth > 0 AND "
+	                   "c.path_participants[-1] = c.path_participants[1]"
+	                 : "";
 	// The expansion enumerates every simple path, exactly what the traversal walks. A selector then
 	// keeps a subset per endpoint pair: ANY SHORTEST one of the shortest, ALL SHORTEST all of them.
 	// Without this the shortest forms returned every walk.
@@ -8837,8 +8988,20 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 			if (artifact_filters.empty() && artifact.estimated_rows > 0) {
 				unanchored_direct_rows += artifact.estimated_rows;
 			}
-			artifact_filters.push_back("len(list_distinct([" + participant_list + "])) = " +
-			                           to_string(static_cast<int64_t>(artifact.hops + 1)));
+			string simple = "len(list_distinct([" + participant_list + "])) = " +
+			                to_string(static_cast<int64_t>(artifact.hops + 1));
+			if (closed_walks) {
+				// Or a walk that closes on its source and passes no other vertex twice.
+				string prefix_list;
+				for (idx_t idx = 0; idx < artifact.hops; idx++) {
+					prefix_list += (idx ? ", " : "") + KeywordHelper::WriteQuoted(artifact.vertex_labels[idx], '\'') +
+					               " || ':' || CAST(a.v" + to_string(idx) + " AS VARCHAR)";
+				}
+				simple = "(" + simple + " OR ([" + participant_list + "])[1] = ([" + participant_list + "])[-1] AND " +
+				         "len(list_distinct([" + prefix_list + "])) = " + to_string(static_cast<int64_t>(artifact.hops)) +
+				         ")";
+			}
+			artifact_filters.push_back(simple);
 			string artifact_where;
 			for (idx_t idx = 0; idx < artifact_filters.size(); idx++) {
 				artifact_where += (idx ? " AND " : " WHERE ") + artifact_filters[idx];
@@ -9079,10 +9242,11 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 				    "list_append(c.path_edge_labels, %s::VARCHAR) AS path_edge_labels, "
 				    "list_append(c.path_participants, %s::VARCHAR || ':' || CAST(%s AS VARCHAR)) AS path_participants "
 				    "FROM %s c JOIN %s a ON %s = c.dst_id "
-				    "WHERE NOT list_contains(c.path_participants, %s::VARCHAR || ':' || CAST(%s AS VARCHAR))",
+				    "WHERE (NOT list_contains(c.path_participants, %s::VARCHAR || ':' || CAST(%s AS VARCHAR))%s)",
 				    dst_sql, v1, dst_type.ToString(), v1, dst_sql,
 				    KeywordHelper::WriteQuoted(edge_table.edge_label, '\''), dst_sql, v1, source->second, artifact, v0,
-				    dst_sql, v1));
+				    dst_sql, v1,
+				    closed_walks ? StringUtil::Format(closing_unrolled, dst_sql, v1) : string()));
 				if (!next.count(edge_table.dst_label)) {
 					next[edge_table.dst_label] = "__pgq_x" + std::to_string(depth) + "_" + std::to_string(label_index++);
 				}
@@ -9156,7 +9320,7 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 	    "  JOIN (SELECT * FROM (%s) WHERE v0 IN (SELECT f.dst_id FROM __pgq_ctx f WHERE f.depth < %s)) e "
 	    "    ON lower(e.src_label) = lower(c.dst_label) AND e.v0 = c.dst_id "
 	    "  WHERE c.depth < %s "
-	    "    AND NOT list_contains(c.path_participants, e.dst_label || ':' || CAST(e.v1 AS VARCHAR))"
+	    "    AND (NOT list_contains(c.path_participants, e.dst_label || ':' || CAST(e.v1 AS VARCHAR))%s)"
 	    ") %s "
 	    "SELECT c.src_id AS v0, c.dst_id AS v1, "
 	    "       c.dst_label AS __pgq_dst_label, "
@@ -9169,7 +9333,11 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 	    src_label_sql, src_pk, src_pk, src_pk, src_label_sql, src_label_sql, src_pk,
 	    src_table_name, seed_where, JoinSQLUnionAll(edge_selects),
 	    std::to_string(static_cast<int64_t>(recursion_limit)),
-	    std::to_string(static_cast<int64_t>(recursion_limit)), vertex_properties_cte, vertex_properties_select,
+	    std::to_string(static_cast<int64_t>(recursion_limit)),
+	    closed_walks ? string(" OR e.dst_label || ':' || CAST(e.v1 AS VARCHAR) = c.path_participants[1]) AND NOT "
+	                          "(c.depth > 0 AND c.path_participants[-1] = c.path_participants[1]")
+	                 : string(),
+	    vertex_properties_cte, vertex_properties_select,
 	    final_filter, direct_selects.empty() ? string() : " UNION ALL " + JoinSQLUnionAll(direct_selects));
 
 	return select_paths(query);
@@ -10164,7 +10332,7 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 						PushConstraintToSQLFilter(where_constraints, tc_dst->variable_binding, PGQStr(etbl->destination_pk[0]),
 						                          "w.v1", endpoint_filters);
 						AddTCWitnessORPCTE(select_node, *tc_witness_info, vtable, etbl, tc_sp->lower, tc_sp->upper,
-						                   endpoint_filters);
+						                   endpoint_filters, selector != PGQPathSelector::WALK && ClosedWalks(*tc_sp));
 						alias_map[tc_src->variable_binding] = vtable;
 						alias_map[tc_dst->variable_binding] = vtable;
 						auto diagnostic = MakeArtifactDiagnostic(
@@ -10234,7 +10402,8 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 							if (use_witness) {
 								path_ref = BuildTCWitnessNamedPathRef(*tc_witness_info, path_alias, tc_sp->lower, tc_sp->upper,
 								                                      endpoint_filters, PGQStr(vtable->main_label),
-								                                      PGQStr(etbl->main_label));
+								                                      PGQStr(etbl->main_label),
+								                                      selector != PGQPathSelector::WALK && ClosedWalks(*tc_sp));
 							} else {
 								path_ref = BuildTCChainNamedPathRef(*tc_chain_info, path_alias, tc_sp->lower, tc_sp->upper,
 								                                    endpoint_filters, PGQStr(vtable->main_label),
@@ -10316,14 +10485,17 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 								                          endpoint_filters);
 								PushConstraintToSQLFilter(where_constraints, tc_dst->variable_binding, PGQStr(etbl->destination_pk[0]), "v1",
 								                          endpoint_filters);
+								// The closure is over walks: a (v, v) row is a closed walk, the shortest path from v to itself
+								// under walk semantics (ClosedWalks); kept there, dropped where the pattern forbids it.
+								const string self_filter = ClosedWalks(*tc_sp) ? "" : " AND v0 <> v1";
 								pt_ref = make_uniq<SubqueryRef>(
 								    ParseSelectStatement("SELECT v0, v1, min(depth) AS depth FROM " +
 								                         QualifiedTableName(tc_info->catalog_name, tc_info->schema_name, tc_info->table_name) +
-								                         " WHERE " + BuildSQLFilter(depth_filter + " AND v0 <> v1", endpoint_filters) +
+								                         " WHERE " + BuildSQLFilter(depth_filter + self_filter, endpoint_filters) +
 								                         " GROUP BY v0, v1"),
 								    PGQId(pt_alias));
-							} else if (selector != PGQPathSelector::WALK) {
-								// Already one row per pair; only a pair closing a cycle must go.
+							} else if (selector != PGQPathSelector::WALK && !ClosedWalks(*tc_sp)) {
+								// Already one row per pair; a pair closing a cycle goes where the pattern forbids it.
 								conditions.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_NOTEQUAL,
 								                                                     PGQColRef("v0", pt_alias), PGQColRef("v1", pt_alias)));
 							}
@@ -10475,7 +10647,8 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 				                                            // duplicate edge cannot change it; every other
 				                                            // selector counts paths.
 				                                            /*require_multiplicity_preserving=*/!any_shortest,
-				                                            MaxVLFallbackRows(context), selector, exactness);
+				                                            MaxVLFallbackRows(context), selector, exactness,
+				                                            selector != PGQPathSelector::WALK && ClosedWalks(*ctx_sp));
 				if (!path_ref || src_pk.empty()) {
 					return false;
 				}
@@ -11234,8 +11407,27 @@ static void CheckUnboundedWalk(const PathReference &reference, PGQPathMode inher
 	}
 }
 
+//! A path mode written on the pattern, `ANY SHORTEST ACYCLIC (a)-[e]->+(b)`, sits on the subpath around it. Where
+//! that pattern is one quantified edge between two vertices, the path is the quantifier's path, so the mode is the
+//! quantifier's too: copied there, where the routes read it (which paths may return to their start, ClosedWalks).
+static void InheritPathMode(PathPattern &pattern) {
+	if (pattern.path_elements.size() != 1) {
+		return;
+	}
+	auto *wrapper = PGQMatchFunction::GetSubPath(pattern.path_elements[0]);
+	if (!wrapper || wrapper->path_mode == PGQPathMode::NONE || wrapper->path_list.size() != 3) {
+		return;
+	}
+	auto *quantifier = PGQMatchFunction::GetSubPath(wrapper->path_list[1]);
+	if (quantifier && quantifier->path_list.size() == 1 && quantifier->path_mode == PGQPathMode::NONE &&
+	    PGQMatchFunction::GetPathElement(quantifier->path_list[0])) {
+		quantifier->path_mode = wrapper->path_mode;
+	}
+}
+
 static void NormalizePatterns(vector<unique_ptr<PathPattern>> &patterns) {
 	for (auto &pattern : patterns) {
+		InheritPathMode(*pattern);
 		for (auto &reference : pattern->path_elements) {
 			NormalizeQuantifiers(*reference);
 			if (!pattern->shortest) {
@@ -13597,6 +13789,8 @@ struct PGQNativePathSearch {
 	int64_t k = 1;
 	bool all_shortest = false;
 	string mode = "walk";
+	//! ANY / ALL SHORTEST under walk semantics: no artifact holds such walks, so the search answers it directly
+	bool walks = false;
 	PathElement *src = nullptr;
 	SubPath *src_wrapper = nullptr;
 	SubPath *quantifier = nullptr;
@@ -13640,15 +13834,18 @@ static string PathModeName(PGQPathMode mode) {
 //! - an unbounded quantifier the CSR path functions cannot answer: with only a path mode (every path is a match),
 //!   or ANY / ALL SHORTEST from a lower bound above 1 (the shortest path within the bounds is not the shortest
 //!   path). These follow the traversal's semantics for bounded patterns: paths that visit no vertex twice.
-static PGQNativePathSearch NativePathSearchFor(PathPattern &pattern) {
+static PGQNativePathSearch NativePathSearchFor(PathPattern &pattern, bool one_row_per = false) {
 	PGQNativePathSearch search;
 	vector<unique_ptr<PathReference>> *elements = &pattern.path_elements;
 	PGQPathMode mode = PGQPathMode::NONE;
+	//! The paths themselves are read (a path variable, ONE ROW PER), not only the endpoints
+	bool paths_read = one_row_per;
 	if (elements->size() == 1) {
 		auto *wrapper = PGQMatchFunction::GetSubPath((*elements)[0]);
 		if (wrapper && wrapper->path_list.size() > 1) {
 			mode = wrapper->path_mode;
 			elements = &wrapper->path_list;
+			paths_read = paths_read || !wrapper->path_variable.empty();
 		}
 	}
 	const bool topk = pattern.topk > 0;
@@ -13680,15 +13877,33 @@ static PGQNativePathSearch NativePathSearchFor(PathPattern &pattern) {
 		mode = search.quantifier->path_mode;
 	}
 	const bool unbounded = search.quantifier->upper >= static_cast<int64_t>(1 << 30);
+	const bool undirected = search.edge->match_type == PGQMatchType::MATCH_EDGE_ANY ||
+	                        search.edge->match_type == PGQMatchType::MATCH_EDGE_LEFT_RIGHT;
 	if (topk) {
 		search.k = pattern.topk;
 		search.mode = PathModeName(mode);
-	} else if (pattern.cheapest || !unbounded) {
+	} else if (pattern.cheapest) {
+		return search;
+	} else if (pattern.shortest && mode != PGQPathMode::ACYCLIC &&
+	           (search.quantifier->lower > 1 || (search.quantifier->lower == 1 && mode == PGQPathMode::TRAIL && undirected)) &&
+	           // ANY SHORTEST over bounded walks, where only the endpoints are read, needs no enumeration: the
+	           // walk-reachability CTE (or a k-hop artifact holding every k-hop walk) has the least depth per pair.
+	           !(!pattern.all && !unbounded && mode <= PGQPathMode::WALK && !paths_read)) {
+		// ANY / ALL SHORTEST are walks (SQL/PGQ) unless a mode says otherwise. From a lower bound above 1 the shortest
+		// walk within the bounds may repeat a vertex, which only the search enumerates (the artifacts and the
+		// recursive routes hold paths that visit no vertex twice); and an undirected TRAIL may close on its start
+		// only over edges it has not used, which only the search checks.
+		search.k = 1;
+		search.all_shortest = pattern.all;
+		search.mode = PathModeName(mode);
+		search.walks = true;
+	} else if (!unbounded) {
 		return search;
 	} else if (!pattern.shortest && mode > PGQPathMode::WALK) {
 		search.k = -1;
 		search.mode = "acyclic";
 	} else if (pattern.shortest && search.quantifier->lower > 1) {
+		// ACYCLIC from a lower bound above 1
 		search.k = 1;
 		search.all_shortest = pattern.all;
 		search.mode = "acyclic";
@@ -13885,9 +14100,42 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 		}
 		// SHORTEST k, and the unbounded shapes the CSR path functions cannot answer exactly, take the native path
 		// search. No artifact holds k paths per pair; the other shapes try the artifacts first.
-		auto native_search = NativePathSearchFor(*path_pattern);
+		auto native_search = NativePathSearchFor(*path_pattern, ref->one_row_per != OneRowPerMode::NONE);
+		// Walks over an edge proven acyclic within the bound are its simple paths, which the artifacts hold. (An
+		// undirected walk can always step back over its last edge: only an exact closure proves it has none.)
+		// Directed and bounded, they are also what the ordinary traversal enumerates, so the pattern takes the
+		// route it takes without a search prefix's walks (whole-pattern artifacts, else per-step artifact scans).
+		bool walks_are_paths = false;
+		const bool artifact_walks = native_search.walks && allow_abi && [&]() {
+			shared_ptr<PropertyGraphTable> edge_table;
+			try {
+				edge_table = ResolveTable(native_search.edge->label, PGQMatchType::MATCH_EDGE_RIGHT, *pg_table);
+			} catch (...) {
+				return false;
+			}
+			if (!edge_table || !edge_table->source_pg_table) {
+				return false;
+			}
+			const string src_label = PGQStr(edge_table->source_pg_table->main_label);
+			const string edge_label = PGQStr(edge_table->main_label);
+			const auto *closure = FindPathTableInfo(
+			    path_table_cache, "__pg_" + pg_table->property_graph_name + "__tc__" + src_label + "__" + edge_label,
+			    "transitive_closure", {src_label, src_label}, {edge_label});
+			if (!closure) {
+				return false;
+			}
+			const auto match_type = native_search.edge->match_type;
+			if (match_type == PGQMatchType::MATCH_EDGE_RIGHT || match_type == PGQMatchType::MATCH_EDGE_LEFT) {
+				walks_are_paths = optional_exactness.WalksSimple(*closure, edge_label, native_search.quantifier->upper);
+				return walks_are_paths;
+			}
+			return optional_exactness.ClosureExact(*closure, native_search.quantifier->upper);
+		}();
+		if (walks_are_paths && native_search.quantifier->upper < static_cast<int64_t>(1 << 30)) {
+			native_search.applies = false;
+		}
 		if (native_search.applies &&
-		    (path_pattern->topk > 0 || !allow_abi ||
+		    (path_pattern->topk > 0 || (native_search.walks && !artifact_walks) || !allow_abi ||
 		     !TryPathTableRewrite(context, *pg_table, path_pattern->path_elements, *ref, conditions, final_select_node,
 		                          alias_map, extra_alias_counter, path_table_cache, referenced_bindings,
 		                          covered_columns, ref->one_row_per, ref->where_clause.get(),
@@ -14116,9 +14364,9 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 				                branch_cte1_slot, all_shortest, any_shortest, nullptr, MaxVLFallbackRows(context));
 				continue;
 			}
-			auto native_search = NativePathSearchFor(*path_pattern);
+			auto native_search = NativePathSearchFor(*path_pattern, branch.one_row_per != OneRowPerMode::NONE);
 			if (native_search.applies &&
-			    (path_pattern->topk > 0 ||
+			    (path_pattern->topk > 0 || native_search.walks ||
 			     !TryPathTableRewrite(context, *pg_table, path_pattern->path_elements, branch, branch_conditions,
 			                          branch_select, branch_alias_map, branch_counter, path_table_cache,
 			                          branch_referenced_bindings, branch_covered_columns, branch.one_row_per,

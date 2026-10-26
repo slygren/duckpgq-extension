@@ -10,10 +10,15 @@
 
 namespace duckdb {
 
+//! closed_lanes: the lanes searching a closed walk (source = destination), with their source, whose first re-entry
+//! is recorded in closing_v / closing_e -- the source's own parent is itself, so the walk back into it needs a record
+//! of its own. Usually none, and then the step costs what it did without them.
 static bool IterativeLength(int64_t v_size, int64_t *V, vector<int64_t> &E, vector<int64_t> &edge_ids,
                             vector<std::vector<int64_t>> &parents_v, vector<std::vector<int64_t>> &parents_e,
                             vector<std::bitset<LANE_LIMIT>> &seen, vector<std::bitset<LANE_LIMIT>> &visit,
-                            vector<std::bitset<LANE_LIMIT>> &next) {
+                            vector<std::bitset<LANE_LIMIT>> &next,
+                            const vector<std::pair<int64_t, int64_t>> *closed_lanes = nullptr,
+                            int64_t *closing_v = nullptr, int64_t *closing_e = nullptr) {
 	bool change = false;
 	for (auto v = 0; v < v_size; v++) {
 		next[v] = 0;
@@ -28,6 +33,15 @@ static bool IterativeLength(int64_t v_size, int64_t *V, vector<int64_t> &E, vect
 				for (auto l = 0; l < LANE_LIMIT; l++) {
 					parents_v[n][l] = ((parents_v[n][l] == -1) && visit[v][l]) ? v : parents_v[n][l];
 					parents_e[n][l] = ((parents_e[n][l] == -1) && visit[v][l]) ? edge_id : parents_e[n][l];
+				}
+				if (closed_lanes) {
+					for (auto &lane : *closed_lanes) {
+						const auto l = lane.first;
+						if (n == lane.second && visit[v][l] && closing_v[l] == -1) {
+							closing_v[l] = v;
+							closing_e[l] = edge_id;
+						}
+					}
 				}
 			}
 		}
@@ -67,6 +81,11 @@ static void ShortestPathFunction(DataChunk &args, ExpressionState &state, Vector
 	src.ToUnifiedFormat(vdata_src);
 	target.ToUnifiedFormat(vdata_dst);
 	CheckCSRVertices(*csr_found, v_size, vdata_src, vdata_dst, args.size(), "shortestpath");
+	// The optional fifth argument: a path from a vertex to itself is its shortest closed walk, not the vertex alone.
+	const bool closed = args.ColumnCount() > 4 && args.data[4].GetValue(0).GetValue<bool>();
+	vector<std::pair<int64_t, int64_t>> closed_lanes;
+	int64_t closing_v[LANE_LIMIT];
+	int64_t closing_e[LANE_LIMIT];
 
 	auto src_data = reinterpret_cast<const int64_t *>(vdata_src.data);
 	auto dst_data = reinterpret_cast<const int64_t *>(vdata_dst.data);
@@ -103,8 +122,11 @@ static void ShortestPathFunction(DataChunk &args, ExpressionState &state, Vector
 
 		// add search jobs to free lanes
 		uint64_t active = 0;
+		closed_lanes.clear();
 		for (int64_t lane = 0; lane < LANE_LIMIT; lane++) {
 			lane_to_num[lane] = -1;
+			closing_v[lane] = -1;
+			closing_e[lane] = -1;
 			while (started_searches < args.size()) {
 				int64_t search_num = started_searches++;
 				auto src_pos = vdata_src.sel->get_index(search_num);
@@ -117,6 +139,9 @@ static void ShortestPathFunction(DataChunk &args, ExpressionState &state, Vector
 					parents_e[src_data[src_pos]][lane] = -2; // Mark the source with -2, there is no incoming edge for
 					                                         // the source.
 					lane_to_num[lane] = search_num;          // active lane
+					if (closed && src_data[src_pos] == dst_data[dst_pos_check]) {
+						closed_lanes.emplace_back(lane, src_data[src_pos]);
+					}
 					active++;
 					break;
 				}
@@ -129,7 +154,8 @@ static void ShortestPathFunction(DataChunk &args, ExpressionState &state, Vector
 			info.context.BlockingInterruptCheck();
 			//! Perform one step of bfs exploration
 			if (!IterativeLength(v_size, v, e, edge_ids, parents_v, parents_e, seen, (iter & 1) ? visit1 : visit2,
-			                     (iter & 1) ? visit2 : visit1)) {
+			                     (iter & 1) ? visit2 : visit1, closed_lanes.empty() ? nullptr : &closed_lanes, closing_v,
+			                     closing_e)) {
 				break;
 			}
 			int64_t finished_searches = 0;
@@ -158,6 +184,30 @@ static void ShortestPathFunction(DataChunk &args, ExpressionState &state, Vector
 			//! Searches that have stopped have found a path
 			auto src_pos = vdata_src.sel->get_index(search_num);
 			auto dst_pos = vdata_dst.sel->get_index(search_num);
+			if (src_data[src_pos] == dst_data[dst_pos] && closed) {
+				// The shortest closed walk: back from the vertex that stepped into the source, then that step.
+				if (closing_v[lane] == -1) {
+					result_validity.SetInvalid(search_num);
+					continue;
+				}
+				std::vector<int64_t> walk {src_data[src_pos], closing_e[lane]};
+				for (auto vertex = closing_v[lane]; vertex != src_data[src_pos];) {
+					walk.push_back(vertex);
+					walk.push_back(parents_e[vertex][lane]);
+					vertex = parents_v[vertex][lane];
+				}
+				walk.push_back(src_data[src_pos]);
+				std::reverse(walk.begin(), walk.end());
+				auto output = make_uniq<Vector>(LogicalType::LIST(LogicalType::BIGINT));
+				for (auto element : walk) {
+					ListVector::PushBack(*output, Value::BIGINT(element));
+				}
+				result_data[search_num].length = ListVector::GetListSize(*output);
+				result_data[search_num].offset = total_len;
+				ListVector::Append(result, ListVector::GetChild(*output), ListVector::GetListSize(*output));
+				total_len += result_data[search_num].length;
+				continue;
+			}
 			if (src_data[src_pos] == dst_data[dst_pos]) { // Source == destination
 				unique_ptr<Vector> output = make_uniq<Vector>(LogicalType::LIST(LogicalType::BIGINT));
 				ListVector::PushBack(*output, src_data[src_pos]);
@@ -213,10 +263,16 @@ static void ShortestPathFunction(DataChunk &args, ExpressionState &state, Vector
 // Register functions
 //------------------------------------------------------------------------------
 void CoreScalarFunctions::RegisterShortestPathScalarFunction(ExtensionLoader &loader) {
-	loader.RegisterFunction(Fallible(ScalarFunction(
-	    "shortestpath", {LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT},
-	    LogicalType::LIST(LogicalType::BIGINT), ShortestPathFunction,
-	    IterativeLengthFunctionData::IterativeLengthBind)));
+	ScalarFunctionSet set("shortestpath");
+	set.AddFunction(ScalarFunction({LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT},
+	                               LogicalType::LIST(LogicalType::BIGINT), ShortestPathFunction,
+	                               IterativeLengthFunctionData::IterativeLengthBind));
+	//! shortestpath(csr, v_size, src, dst, closed): closed = true takes a vertex to itself by its shortest closed walk
+	set.AddFunction(ScalarFunction({LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT,
+	                                LogicalType::BOOLEAN},
+	                               LogicalType::LIST(LogicalType::BIGINT), ShortestPathFunction,
+	                               IterativeLengthFunctionData::IterativeLengthBind));
+	loader.RegisterFunction(Fallible(set));
 }
 
 } // namespace duckdb

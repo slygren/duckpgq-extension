@@ -58,6 +58,14 @@ In every such case the old rows were wrong.
     per pair of endpoints, in every direction; it returned one row per parallel edge. Over a pattern that mixes fixed
     hops with a variable-length one, ANY / ALL SHORTEST compare the whole paths: they returned the shortest
     variable-length part per pair of its own ends, so longer paths and extra ties per endpoint pair.
+  - **ANY / ALL SHORTEST match walks, as in SQL/PGQ and as `SHORTEST k` already did.** A walk may return to its
+    start and repeat a vertex: `ANY SHORTEST (a)-[:K]->{1,3}(b)` has a row with `b = a` for every `a` on a cycle (the
+    shortest closed walk), `ALL SHORTEST` every shortest closed walk, and from a lower bound above 1 the shortest walk
+    within the bounds may pass a vertex twice (`{2,4}` from `a` to a neighbour `b` can be `a -> b -> a -> b`). They
+    left those out, so `SHORTEST 1` and `ANY SHORTEST` disagreed. `ACYCLIC` keeps the old answers, `TRAIL` and
+    `SIMPLE` restrict the walks as they define (an undirected `TRAIL` cannot go back over the edge it came by). The
+    CSR path functions take a fifth argument for it (`iterativelength`, `shortestpath`, `allshortestpaths`: the
+    shortest closed walk from a vertex to itself).
   - **Column names do not depend on the route.** `COLUMNS (p.id)` was named `id` traversed and `v0` when an ABI
     artifact answered; it is `id` on every route (an expression without `AS` is named by its text).
   - **Several `GRAPH_TABLE`s in one statement** (a join, `EXCEPT`, two scalar subqueries over the same graph) give

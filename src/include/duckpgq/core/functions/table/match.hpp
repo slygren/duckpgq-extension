@@ -322,7 +322,8 @@ public:
 	                                    const shared_ptr<PropertyGraphTable> &prev_vertex_table,
 	                                    const shared_ptr<PropertyGraphTable> &next_vertex_table,
 	                                    const vector<shared_ptr<PropertyGraphTable>> &edge_tables, bool undirected,
-	                                    idx_t lower, idx_t upper);
+	                                    idx_t lower, idx_t upper, bool any_shortest = false, bool all_shortest = false,
+	                                    bool closed_walks = false);
 
 	// csr_id_counter hands out a distinct registry slot per CSR built in this query. It is
 	// a reference to DuckPGQState::csr_id_counter, threaded because this call chain carries

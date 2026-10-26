@@ -56,6 +56,9 @@ static void IterativeLengthFunction(DataChunk &args, ExpressionState &state, Vec
 	src.ToUnifiedFormat(vdata_src);
 	dst.ToUnifiedFormat(vdata_dst);
 	CheckCSRVertices(*csr_found, v_size, vdata_src, vdata_dst, args.size(), "iterativelength");
+	// The optional fifth argument: a path from a vertex to itself takes at least one step (a closed walk, under
+	// a lower bound of 1) instead of being the zero-length path.
+	const bool closed = args.ColumnCount() > 4 && args.data[4].GetValue(0).GetValue<bool>();
 	auto src_data = reinterpret_cast<const int64_t *>(vdata_src.data);
 	auto dst_data = reinterpret_cast<const int64_t *>(vdata_dst.data);
 
@@ -96,9 +99,10 @@ static void IterativeLengthFunction(DataChunk &args, ExpressionState &state, Vec
 					// a NULL source or destination has no path (the destination used to be read as its raw value)
 					result_validity.SetInvalid(search_num);
 					result_data[search_num] = -1; /* no path */
-				} else if (src_data[src_pos] == dst_data[dst_pos]) {
+				} else if (src_data[src_pos] == dst_data[dst_pos] && !closed) {
 					result_data[search_num] = 0; // path of length 0 does not require a search
 				} else {
+					// The source is not marked seen: a closed search finds it again at its shortest return.
 					visit1[src_data[src_pos]][lane] = true;
 					lane_to_num[lane] = search_num; // active lane
 					active++;
@@ -145,9 +149,16 @@ static void IterativeLengthFunction(DataChunk &args, ExpressionState &state, Vec
 // Register functions
 //------------------------------------------------------------------------------
 void CoreScalarFunctions::RegisterIterativeLengthScalarFunction(ExtensionLoader &loader) {
-	loader.RegisterFunction(Fallible(ScalarFunction(
-	    "iterativelength", {LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT},
-	    LogicalType::BIGINT, IterativeLengthFunction, IterativeLengthFunctionData::IterativeLengthBind)));
+	ScalarFunctionSet set("iterativelength");
+	set.AddFunction(ScalarFunction({LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT},
+	                               LogicalType::BIGINT, IterativeLengthFunction,
+	                               IterativeLengthFunctionData::IterativeLengthBind));
+	//! iterativelength(csr, v_size, src, dst, closed): closed = true takes a vertex to itself by a closed walk
+	set.AddFunction(ScalarFunction({LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT,
+	                                LogicalType::BOOLEAN},
+	                               LogicalType::BIGINT, IterativeLengthFunction,
+	                               IterativeLengthFunctionData::IterativeLengthBind));
+	loader.RegisterFunction(Fallible(set));
 }
 
 } // namespace duckdb

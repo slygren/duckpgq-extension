@@ -70,10 +70,12 @@ WHERE NOT EXISTS (SELECT 1 FROM P a, K k, P b WHERE a.rowid = t.v[i + 1] AND k.r
 0
 
 # Unnamed, seeded from one vertex
+# (2 -> 3 -> 1 -> 2 closes a walk on 2)
 query II
 SELECT * FROM GRAPH_TABLE (g MATCH ANY SHORTEST (x:P)-[:K]->+(y:P) WHERE x.id = 2 COLUMNS (x.id, y.id)) ORDER BY ALL;
 ----
 2	1
+2	2
 2	3
 2	4
 2	5

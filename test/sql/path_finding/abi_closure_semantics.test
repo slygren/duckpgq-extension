@@ -142,11 +142,12 @@ SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (dia_
 ----
 match	true
 
-# ANY SHORTEST from depth 1 is answerable from the closures on any graph: a shortest walk is a simple path.
-# The closure must still leave out the pair that only closes the cycle (1 -> ... -> 1).
+# ANY SHORTEST from depth 1 is answerable from the closures on any graph: the least depth per pair is the
+# shortest walk, and the pair that closes the cycle (1 -> 2 -> 4 -> 5 -> 1, 4 hops) is 1's shortest closed walk.
 query II rowsort
 FROM GRAPH_TABLE (dia_g MATCH ANY SHORTEST (a:Person)-[:Knows]->{1,4}(b:Person) WHERE a.id = 1 COLUMNS (b.id AS b, a.id AS a));
 ----
+1	1
 2	1
 3	1
 4	1
@@ -171,15 +172,16 @@ SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (dia_
 match	true
 
 # From depth 2 the shortest path within the bounds may be one the closure does not hold, and ALL SHORTEST
-# counts tied paths, which a closure does not hold either. Neither takes the closure; the expansion over the
-# 1-hop artifacts answers them.
+# counts tied paths, which a closure does not hold either. Neither takes the closure. ANY SHORTEST is the least
+# depth of a walk (which may pass a vertex twice), from the walk reachability over the 1-hop artifact; ALL SHORTEST
+# is answered by the expansion over the 1-hop artifacts.
 statement ok
 FROM GRAPH_TABLE (dia_g MATCH ANY SHORTEST (a:Person)-[:Knows]->{2,3}(b:Person) COLUMNS (a.id AS a, b.id AS b));
 
 query T
 SELECT rewrite_type FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
 ----
-abi_context_expansion
+abi_step_scan
 
 query TT
 SELECT status, rewrite_fired FROM pgq_verify_abi_rewrite('FROM GRAPH_TABLE (dia_g MATCH ANY SHORTEST (a:Person)-[:Knows]->{2,3}(b:Person)

@@ -99,6 +99,7 @@ SELECT * FROM GRAPH_TABLE (pg MATCH (a:Person WHERE a.name = 'David')-[k:Knows]-
 4	David	3	Peter
 
 # Shortest paths with a path variable, bounded quantifier, and path functions.
+# (a walk may return to its start under a search prefix: Daniel -> Peter -> Daniel, the shortest from Daniel to Daniel)
 query II
 SELECT len, b_name
 FROM GRAPH_TABLE (pg
@@ -110,6 +111,7 @@ ORDER BY ALL;
 1	Gabor
 1	Peter
 1	Tavneet
+2	Daniel
 
 # Quantifier spellings, including the ones the tokenizer fuses with the arrow.
 statement ok

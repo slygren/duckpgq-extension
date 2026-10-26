@@ -15,11 +15,15 @@ namespace duckdb {
 // Returns the list of all shortest paths from src to dst.
 // Each path is encoded as [src, edge0, v1, edge1, v2, ..., dst].
 // Returns an empty vector if no path exists.
+//! closed: a path from a vertex to itself is a closed walk -- every shortest one -- rather than the vertex alone.
 static vector<vector<int64_t>> FindAllShortestPaths(int64_t src, int64_t dst, int64_t *V, vector<int64_t> &E,
-                                                     vector<int64_t> &edge_ids, int64_t v_size) {
-	if (src == dst) {
+                                                     vector<int64_t> &edge_ids, int64_t v_size, bool closed) {
+	if (src == dst && !closed) {
 		return {{src}};
 	}
+	const bool closing = src == dst;
+	// The steps back into the source, and the length of the walk each closes.
+	vector<std::tuple<int64_t, int64_t, int64_t>> closing_steps;
 
 	vector<int64_t> dist(v_size, -1);
 	// all_parents[v] = list of (parent_vertex, edge_id_from_parent_to_v)
@@ -35,6 +39,9 @@ static vector<vector<int64_t>> FindAllShortestPaths(int64_t src, int64_t dst, in
 		for (auto e = V[v]; e < V[v + 1]; e++) {
 			int64_t n = E[e];
 			int64_t eid = edge_ids[e];
+			if (closing && n == src) {
+				closing_steps.emplace_back(dist[v] + 1, v, eid);
+			}
 			if (dist[n] == -1) {
 				dist[n] = dist[v] + 1;
 				q.push(n);
@@ -52,6 +59,37 @@ static vector<vector<int64_t>> FindAllShortestPaths(int64_t src, int64_t dst, in
 	// DFS from dst back to src, building paths in reverse then reversing.
 	vector<vector<int64_t>> paths;
 	vector<int64_t> current;
+	if (closing) {
+		// Every shortest path to a vertex that steps back into the source, then that step.
+		int64_t shortest = -1;
+		for (auto &step : closing_steps) {
+			shortest = shortest == -1 ? std::get<0>(step) : MinValue(shortest, std::get<0>(step));
+		}
+		std::sort(closing_steps.begin(), closing_steps.end());
+		for (auto &step : closing_steps) {
+			if (std::get<0>(step) != shortest) {
+				continue;
+			}
+			current = {src, std::get<2>(step), std::get<1>(step)};
+			std::function<void(int64_t)> back = [&](int64_t v) {
+				if (v == src) {
+					auto path = current;
+					std::reverse(path.begin(), path.end());
+					paths.push_back(std::move(path));
+					return;
+				}
+				for (auto [pv, pe] : all_parents[v]) {
+					current.push_back(pe);
+					current.push_back(pv);
+					back(pv);
+					current.pop_back();
+					current.pop_back();
+				}
+			};
+			back(std::get<1>(step));
+		}
+		return paths;
+	}
 	current.push_back(dst);
 
 	std::function<void(int64_t)> dfs = [&](int64_t v) {
@@ -100,6 +138,8 @@ static void AllShortestPathsFunction(DataChunk &args, ExpressionState &state, Ve
 	src.ToUnifiedFormat(args.size(), vdata_src);
 	target.ToUnifiedFormat(args.size(), vdata_dst);
 	CheckCSRVertices(*csr_found, v_size, vdata_src, vdata_dst, args.size(), "allshortestpaths");
+	// The optional fifth argument: a path from a vertex to itself is a closed walk (every shortest one).
+	const bool closed = args.ColumnCount() > 4 && args.data[4].GetValue(0).GetValue<bool>();
 
 	auto src_data = reinterpret_cast<const int64_t *>(vdata_src.data);
 	auto dst_data = reinterpret_cast<const int64_t *>(vdata_dst.data);
@@ -123,7 +163,7 @@ static void AllShortestPathsFunction(DataChunk &args, ExpressionState &state, Ve
 		int64_t dst_v = dst_data[dst_pos];
 
 		info.context.BlockingInterruptCheck();
-		auto all_paths = FindAllShortestPaths(src_v, dst_v, v, e, edge_ids, v_size);
+		auto all_paths = FindAllShortestPaths(src_v, dst_v, v, e, edge_ids, v_size, closed);
 
 		// Build Value::LIST(LIST(BIGINT)) for this row
 		vector<Value> outer_list;
@@ -148,11 +188,16 @@ static void AllShortestPathsFunction(DataChunk &args, ExpressionState &state, Ve
 }
 
 void CoreScalarFunctions::RegisterAllShortestPathsScalarFunction(ExtensionLoader &loader) {
-	loader.RegisterFunction(
-	    Fallible(ScalarFunction("allshortestpaths",
-	                   {LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT},
-	                   LogicalType::LIST(LogicalType::LIST(LogicalType::BIGINT)), AllShortestPathsFunction,
-	                   IterativeLengthFunctionData::IterativeLengthBind)));
+	ScalarFunctionSet set("allshortestpaths");
+	set.AddFunction(ScalarFunction({LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT},
+	                               LogicalType::LIST(LogicalType::LIST(LogicalType::BIGINT)), AllShortestPathsFunction,
+	                               IterativeLengthFunctionData::IterativeLengthBind));
+	//! allshortestpaths(csr, v_size, src, dst, closed): closed = true takes a vertex to itself by its shortest closed walks
+	set.AddFunction(ScalarFunction({LogicalType::INTEGER, LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::BIGINT,
+	                                LogicalType::BOOLEAN},
+	                               LogicalType::LIST(LogicalType::LIST(LogicalType::BIGINT)), AllShortestPathsFunction,
+	                               IterativeLengthFunctionData::IterativeLengthBind));
+	loader.RegisterFunction(Fallible(set));
 }
 
 } // namespace duckdb
