@@ -99,11 +99,17 @@ DuckDB SQL. Inside `MATCH`, the pattern features follow PGQL 2.1. Everything aro
 
 ```sql
 CREATE [OR REPLACE] PROPERTY GRAPH [IF NOT EXISTS] g
-  VERTEX TABLES (person [AS p] [PROPERTIES (…) | PROPERTIES ARE ALL COLUMNS [EXCEPT (…)] | NO PROPERTIES]
-                        [LABEL Person [IN kind (Student, Teacher)]], …)
-  EDGE TABLES (knows SOURCE KEY (src) REFERENCES person (id)
-                     DESTINATION KEY (dst) REFERENCES person (id) LABEL Knows, …)
+  {VERTEX | NODE} TABLES (
+    person [AS p]
+      { LABEL Person | DEFAULT LABEL } [IN kind (Student, Teacher)] [properties]   -- one or more labels
+      [ LABEL Human [properties] ] …, …)
+  {EDGE | RELATIONSHIP} TABLES (
+    knows SOURCE KEY (src) REFERENCES person (id)
+          DESTINATION KEY (dst) REFERENCES person (id) LABEL Knows [properties], …)
   [WITH ABI (max_hops := 2, closures := ['Knows'])];      -- see ABI path tables
+
+-- properties: PROPERTIES (col [AS name], …) | PROPERTIES [ARE] ALL COLUMNS [EXCEPT (…)] | NO PROPERTIES
+-- The first label's properties may also come before it: person PROPERTIES (id, name) LABEL Person.
 
 DROP PROPERTY GRAPH [IF EXISTS] g;
 DESCRIBE PROPERTY GRAPH g;     -- also SHOW, and SUMMARIZE PROPERTY GRAPH for statistics
@@ -113,6 +119,12 @@ Vertex and edge tables may live in other attached databases or schemas (`f001.ra
 put over DuckLake catalogs. A graph is stored in the database it is created in and lasts as long as that database.
 `CREATE PROPERTY GRAPH` does not check that edges reference existing vertices unless
 `pgq_verify_edges_on_create = true` (that check scans every edge table).
+
+An element table may have **several labels** (`LABEL Person LABEL Human`); without a label clause, or with `DEFAULT
+LABEL`, its label is its alias (or table name). Every row has all of them, so `(x:Human)` matches what `(x:Person)`
+matches, on every route and with the same ABI artifacts. `label(x)` is the first declared label, and `IS LABELED`
+accepts any of them. Each label may have its own `PROPERTIES` clause, and the table has the properties of all its
+labels; a label without one has all columns, as SQL/PGQ says. A label still names one table (see Limitations).
 
 A vertex or edge table may be a **view**, also a view in an attached database or DuckLake catalog. A view has no
 foreign keys, so an edge view needs `SOURCE KEY (…) REFERENCES … (…)` and `DESTINATION KEY (…)`. A view has no
@@ -650,6 +662,9 @@ building in [abi_build.cpp](src/core/functions/table/abi_build.cpp); vertex-join
 ## Limitations
 
 - **One DuckDB version per binary**, and unsigned (see [Deployment](#deployment)).
+- **Graph definition:** a label names one element table; SQL/PGQ also lets several tables share a label (refused:
+  "Label … is not unique"). Properties are per table, the union of its labels' clauses, so a label does not restrict
+  which properties a pattern on it may read.
 - **Patterns not supported:** `LATERAL` inside `MATCH`, graph updates (`INSERT`/`DELETE` of vertices or edges; the
   graph is a view over tables).
 - **Quantified path patterns** are written out per repetition count. A group allows at most 8 repetitions, and a

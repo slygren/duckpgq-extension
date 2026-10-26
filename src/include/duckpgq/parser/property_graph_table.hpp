@@ -38,7 +38,10 @@ public:
 	vector<Identifier> except_columns;
 
 	vector<Identifier> sub_labels;
+	//! The first label declared for the table; label(x) returns it.
 	Identifier main_label;
+	//! The table's other labels, in declaration order (LABEL A LABEL B ...). Like main_label, every row has them.
+	vector<Identifier> extra_labels;
 
 	Identifier catalog_name;
 	Identifier schema_name;
@@ -109,5 +112,10 @@ public:
 	}
 
 	bool IsSourceTable(const Identifier &table_name);
+
+	//! Whether every row of the table has this label: its main label or one of its extra labels.
+	bool HasStaticLabel(const string &label) const;
+	//! main_label followed by extra_labels.
+	vector<Identifier> StaticLabels() const;
 };
 } // namespace duckdb

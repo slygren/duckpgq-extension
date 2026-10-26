@@ -86,7 +86,8 @@ void DuckPGQState::CreateInternalTable(Connection &connection) {
 	                              "verified boolean, "
 	                              "abi_options varchar, "
 	                              "is_view boolean, "
-	                              "identity_columns varchar[]"
+	                              "identity_columns varchar[], "
+	                              "extra_labels varchar[]"
 	                              ")");
 	if (query->HasError()) {
 		throw TransactionException(query->GetError());
@@ -95,7 +96,7 @@ void DuckPGQState::CreateInternalTable(Connection &connection) {
 	// written before the incomplete-edge check have no verified column (NULL: not verified).
 	// Later columns are NULL in rows written before they existed, which reads as what those graphs meant.
 	for (auto column : {"graph_catalog VARCHAR", "graph_schema VARCHAR", "verified BOOLEAN", "abi_options VARCHAR",
-	                    "is_view BOOLEAN", "identity_columns VARCHAR[]"}) {
+	                    "is_view BOOLEAN", "identity_columns VARCHAR[]", "extra_labels VARCHAR[]"}) {
 		auto alter =
 		    connection.Query(StringUtil::Format("ALTER TABLE __duckpgq_internal ADD COLUMN IF NOT EXISTS %s", column));
 		if (alter->HasError()) {
@@ -195,9 +196,6 @@ void DuckPGQState::ProcessPropertyGraphs(ClientContext &context, unique_ptr<Quer
 				auto verified_value = chunk->GetValue(22, i);
 				verified = !verified_value.IsNull() && verified_value.GetValue<bool>();
 			}
-			QualifiedName graph_name(graph_catalog, graph_schema, Identifier(chunk->GetValue(0, i).GetValue<string>()));
-			auto resolved_name = ResolvePropertyGraphName(context, graph_name);
-			RegisterPropertyGraph(table, resolved_name, is_vertex, verified);
 			if (chunk->ColumnCount() > 25) {
 				auto is_view = chunk->GetValue(24, i);
 				table->is_view = !is_view.IsNull() && is_view.GetValue<bool>();
@@ -206,6 +204,12 @@ void DuckPGQState::ProcessPropertyGraphs(ClientContext &context, unique_ptr<Quer
 					ExtractListValues(identity, table->identity_columns);
 				}
 			}
+			if (chunk->ColumnCount() > 26 && !chunk->GetValue(26, i).IsNull()) {
+				ExtractListValues(chunk->GetValue(26, i), table->extra_labels);
+			}
+			QualifiedName graph_name(graph_catalog, graph_schema, Identifier(chunk->GetValue(0, i).GetValue<string>()));
+			auto resolved_name = ResolvePropertyGraphName(context, graph_name);
+			RegisterPropertyGraph(table, resolved_name, is_vertex, verified);
 			if (chunk->ColumnCount() > 23 && !chunk->GetValue(23, i).IsNull()) {
 				auto &info = registered_property_graphs[resolved_name.Name().GetIdentifierName()]
 				                 ->Cast<CreatePropertyGraphInfo>();
@@ -250,7 +254,9 @@ void DuckPGQState::RegisterPropertyGraph(const shared_ptr<PropertyGraphTable> &t
 	auto &pg_info = registered_property_graphs[name]->Cast<CreatePropertyGraphInfo>();
 	// A graph is verified only if every persisted row says so.
 	pg_info.verified = pg_info.verified && verified;
-	pg_info.label_map[table->main_label.GetIdentifierName()] = table;
+	for (auto &label : table->StaticLabels()) {
+		pg_info.label_map[label.GetIdentifierName()] = table;
+	}
 
 	if (!table->discriminator.empty()) {
 		for (const auto &label : table->sub_labels) {

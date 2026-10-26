@@ -2444,7 +2444,7 @@ RewriteGraphFunctions(unique_ptr<ParsedExpression> expr,
 				auto tbl_iter = alias_map.find(var);
 				if (tbl_iter != alias_map.end()) {
 					string expected = StringUtil::Lower(lbl->GetLiteral().ToValue().ToString());
-					bool matches = tbl_iter->second->main_label == expected;
+					bool matches = tbl_iter->second->HasStaticLabel(expected);
 					if (!matches) {
 						for (const auto &sub : tbl_iter->second->sub_labels) {
 							if (StringUtil::Lower(PGQStr(sub)) == expected) {
@@ -2466,7 +2466,7 @@ RewriteGraphFunctions(unique_ptr<ParsedExpression> expr,
 				auto tbl_iter = alias_map.find(var);
 				if (tbl_iter != alias_map.end()) {
 					string expected = StringUtil::Lower(lbl->GetLiteral().ToValue().ToString());
-					bool matches = tbl_iter->second->main_label == expected;
+					bool matches = tbl_iter->second->HasStaticLabel(expected);
 					if (!matches) {
 						for (const auto &sub : tbl_iter->second->sub_labels) {
 							if (StringUtil::Lower(PGQStr(sub)) == expected) {
@@ -10134,10 +10134,107 @@ static unique_ptr<ParsedExpression> BuildExistsSubquery(
 
 static void NormalizeMatchExpression(MatchExpression &match);
 
+//------------------------------------------------------------------------------
+// Several labels on one element table
+//------------------------------------------------------------------------------
+// A table's extra labels (LABEL A LABEL B) are on the same rows as its main label, and a label names one table, so
+// a label expression means the same with each extra label replaced by its table's main label. The translation
+// rewrites them up front; everything after it (and every ABI artifact, keyed by main labels) sees main labels only.
+
+static bool GraphHasExtraLabels(const CreatePropertyGraphInfo &graph) {
+	for (auto &table : graph.vertex_tables) {
+		if (!table->extra_labels.empty()) {
+			return true;
+		}
+	}
+	for (auto &table : graph.edge_tables) {
+		if (!table->extra_labels.empty()) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//! The label of the table `label` names, as the table declares its main label; `label` itself when it is no
+//! table's extra label.
+static string MainLabelOf(const string &label, const CreatePropertyGraphInfo &graph) {
+	auto entry = graph.label_map.find(label);
+	if (entry == graph.label_map.end()) {
+		return label;
+	}
+	for (auto &extra : entry->second->extra_labels) {
+		if (StringUtil::CIEquals(extra.GetIdentifierName(), label)) {
+			return PGQStr(entry->second->main_label);
+		}
+	}
+	return label;
+}
+
+static string NormalizeLabelExpression(const string &expression, const CreatePropertyGraphInfo &graph) {
+	string result;
+	string leaf;
+	auto flush = [&]() {
+		if (!leaf.empty()) {
+			result += MainLabelOf(leaf, graph);
+			leaf.clear();
+		}
+	};
+	for (char c : expression) {
+		if (c == '|' || c == '&' || c == '!' || c == '(' || c == ')' || c == '%' || StringUtil::CharacterIsSpace(c)) {
+			flush();
+			result += c;
+		} else {
+			leaf += c;
+		}
+	}
+	flush();
+	return result;
+}
+
+static void NormalizeExtraLabels(PathReference &reference, const CreatePropertyGraphInfo &graph) {
+	if (reference.path_reference_type == PGQPathReferenceType::PATH_ELEMENT) {
+		auto &element = static_cast<PathElement &>(reference);
+		element.label = NormalizeLabelExpression(element.label, graph);
+		return;
+	}
+	for (auto &child : static_cast<SubPath &>(reference).path_list) {
+		NormalizeExtraLabels(*child, graph);
+	}
+}
+
+static void NormalizeExtraLabels(vector<unique_ptr<PathPattern>> &patterns, const CreatePropertyGraphInfo &graph) {
+	for (auto &pattern : patterns) {
+		for (auto &element : pattern->path_elements) {
+			NormalizeExtraLabels(*element, graph);
+		}
+		for (auto &operand : pattern->union_operands) {
+			for (auto &element : operand) {
+				NormalizeExtraLabels(*element, graph);
+			}
+		}
+	}
+}
+
+static void NormalizeExtraLabels(MatchExpression &match, const CreatePropertyGraphInfo &graph) {
+	if (!GraphHasExtraLabels(graph)) {
+		return;
+	}
+	NormalizeExtraLabels(match.path_patterns, graph);
+	for (auto &group : match.optional_match_patterns) {
+		NormalizeExtraLabels(group, graph);
+	}
+	NormalizeExtraLabels(match.joined_patterns, graph);
+	for (auto &branch : match.union_matches) {
+		NormalizeExtraLabels(*branch, graph);
+	}
+}
+
 //! A private, normalised copy of an EXISTS { ... } pattern. The pattern lives in bind_info, which statement copies
 //! share, so the rewrite must never modify it in place.
-static unique_ptr<MatchExpression> CopyExistsPattern(const MatchExpression &pattern) {
+static unique_ptr<MatchExpression> CopyExistsPattern(const MatchExpression &pattern,
+                                                     const CreatePropertyGraphInfo &graph) {
 	auto copy = unique_ptr_cast<ParsedExpression, MatchExpression>(pattern.Copy());
+	NormalizeExtraLabels(*copy, graph);
 	NormalizeMatchExpression(*copy);
 	return copy;
 }
@@ -10157,7 +10254,7 @@ static unique_ptr<ParsedExpression> RewritePGQExists(
 	if (op && op->GetExpressionType() == ExpressionType::OPERATOR_NOT && op->GetChildrenMutable().size() == 1) {
 		auto inner_pattern = DuckPGQGetExistsPattern(*op->GetChildrenMutable()[0]);
 		if (inner_pattern) {
-			auto inner_match = CopyExistsPattern(*inner_pattern);
+			auto inner_match = CopyExistsPattern(*inner_pattern, pg_table);
 			return BuildExistsSubquery(context, *inner_match, pg_table, outer_alias_map, SubqueryType::NOT_EXISTS,
 			                           path_table_cache);
 		}
@@ -10170,7 +10267,7 @@ static unique_ptr<ParsedExpression> RewritePGQExists(
 	// EXISTS { ... }
 	auto pattern = DuckPGQGetExistsPattern(*expr);
 	if (pattern) {
-		auto inner_match = CopyExistsPattern(*pattern);
+		auto inner_match = CopyExistsPattern(*pattern, pg_table);
 		return BuildExistsSubquery(context, *inner_match, pg_table, outer_alias_map, SubqueryType::EXISTS,
 		                           path_table_cache);
 	}
@@ -16692,6 +16789,10 @@ unique_ptr<TableRef> PGQMatchFunction::MatchBindReplace(ClientContext &context, 
 	// Rewrite a copy: the expansion consumes the expression, and a prepared statement can be bound again.
 	auto match_copy = unique_ptr_cast<ParsedExpression, MatchExpression>(match_info->match->Copy());
 	auto *ref = match_copy.get();
+	{
+		QualifiedName graph_name(Identifier(ref->pg_catalog), Identifier(ref->pg_schema), Identifier(ref->pg_name));
+		NormalizeExtraLabels(*ref, *duckpgq_state->GetPropertyGraph(context, graph_name));
+	}
 	NormalizeMatchExpression(*ref);
 	NameColumns(*ref);
 	HoistVertexElementWhere(*ref);

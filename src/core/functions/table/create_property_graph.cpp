@@ -159,8 +159,34 @@ void CreatePropertyGraphFunction::CheckPropertyGraphTableColumns(const shared_pt
 			}
 		}
 
+		// The properties another label of the table lists come after the expanded columns.
+		auto listed_names = std::move(pg_table->column_names);
+		auto listed_aliases = std::move(pg_table->column_aliases);
 		pg_table->column_names = ExpandAllColumnsExcept(IdentifiersToStrings(table.names), pg_table->except_columns);
 		pg_table->column_aliases = pg_table->column_names;
+		for (idx_t i = 0; i < listed_names.size(); i++) {
+			if (!table.Exists(PGQIdentifier(listed_names[i]))) {
+				throw Exception(ExceptionType::INVALID,
+				                "Column " + listed_names[i] + " not found in table " + pg_table->table_name);
+			}
+			bool known = false;
+			for (idx_t j = 0; j < pg_table->column_aliases.size(); j++) {
+				if (!StringUtil::CIEquals(pg_table->column_aliases[j].GetIdentifierName(),
+				                          listed_aliases[i].GetIdentifierName())) {
+					continue;
+				}
+				if (!StringUtil::CIEquals(pg_table->column_names[j].GetIdentifierName(),
+				                          listed_names[i].GetIdentifierName())) {
+					throw Exception(ExceptionType::INVALID, "Property " + listed_aliases[i] + " of element table " +
+					                                            pg_table->table_name + " is defined twice, differently");
+				}
+				known = true;
+			}
+			if (!known) {
+				pg_table->column_names.push_back(listed_names[i]);
+				pg_table->column_aliases.push_back(listed_aliases[i]);
+			}
+		}
 		return;
 	}
 
@@ -511,7 +537,8 @@ static string StringListSQL(const vector<Identifier> &values) {
 
 //! The values of the __duckpgq_internal columns after abi_options, for one element table.
 static string ElementColumnsSQL(const PropertyGraphTable &table) {
-	return string(table.is_view ? "true" : "NULL") + ", " + StringListSQL(table.identity_columns);
+	return string(table.is_view ? "true" : "NULL") + ", " + StringListSQL(table.identity_columns) + ", " +
+	       StringListSQL(table.extra_labels);
 }
 
 unique_ptr<GlobalTableFunctionState>

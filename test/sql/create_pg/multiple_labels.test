@@ -1,0 +1,279 @@
+# name: test/sql/create_pg/multiple_labels.test
+# description: several labels on one element table (LABEL A LABEL B, DEFAULT LABEL), each with its own PROPERTIES
+#              clause; NODE / RELATIONSHIP as synonyms of VERTEX / EDGE. A label every row of a table has matches the
+#              same rows as the table's main label on every route; label(x) stays the first declared label.
+# group: [create_pg]
+
+require duckpgq
+
+load __TEST_DIR__/multiple_labels.db
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE person (id BIGINT, name VARCHAR, age INTEGER, kind INTEGER);
+
+statement ok
+INSERT INTO person VALUES (1, 'Ann', 30, 1), (2, 'Bob', 40, 2), (3, 'Cid', 50, 3), (4, 'Dan', 60, 1), (5, 'Eve', 25, 2);
+
+statement ok
+CREATE TABLE knows (src BIGINT, dst BIGINT, since INTEGER);
+
+statement ok
+INSERT INTO knows VALUES (1, 2, 2000), (2, 3, 2001), (1, 3, 2002), (3, 4, 2003), (4, 5, 2004), (5, 1, 2005), (2, 2, 2006);
+
+statement ok
+CREATE TABLE city (cid BIGINT, cname VARCHAR);
+
+statement ok
+INSERT INTO city VALUES (10, 'Oslo'), (20, 'Rome');
+
+statement ok
+CREATE TABLE lives (p BIGINT, c BIGINT);
+
+statement ok
+INSERT INTO lives VALUES (1, 10), (2, 20), (3, 10), (5, 20);
+
+# The standard's order (LABEL, then its PROPERTIES), repeated; the extension's order (PROPERTIES, then LABEL) for the
+# first label; DEFAULT LABEL; sub-labels next to extra labels; NODE / RELATIONSHIP.
+statement ok
+CREATE PROPERTY GRAPH g
+NODE TABLES (
+    person LABEL Person PROPERTIES (id, name) LABEL Human PROPERTIES (id, age) IN kind (Student, Teacher),
+    city PROPERTIES (cid, cname) DEFAULT LABEL LABEL Place
+)
+RELATIONSHIP TABLES (
+    knows SOURCE KEY (src) REFERENCES person (id) DESTINATION KEY (dst) REFERENCES person (id)
+          LABEL Knows LABEL Friend PROPERTIES (since),
+    lives SOURCE KEY (p) REFERENCES person (id) DESTINATION KEY (c) REFERENCES city (cid) LABEL LivesIn
+);
+
+# One table each, with its main label, extra labels and the union of the labels' properties.
+query IIIII
+SELECT table_name, label, extra_labels, properties, sub_labels FROM __duckpgq_internal WHERE property_graph = 'g'
+ORDER BY table_name;
+----
+city	city	[Place]	[cid, cname]	NULL
+knows	Knows	[Friend]	[dst, since, src]	NULL
+lives	LivesIn	NULL	[c, p]	NULL
+person	Person	[Human]	[id, name, age]	[Student, Teacher]
+
+# Knows has no PROPERTIES clause, so it has all columns; Friend's (since) adds nothing.
+# Every label of a table matches the table's rows.
+query II
+SELECT
+  (SELECT count(*) FROM ((FROM GRAPH_TABLE (g MATCH (a:Person)-[k:Knows]->(b:Person) COLUMNS (a.id, b.id, k.since))
+      EXCEPT ALL FROM GRAPH_TABLE (g MATCH (a:Human)-[k:Friend]->(b:Human) COLUMNS (a.id, b.id, k.since)))
+    UNION ALL (FROM GRAPH_TABLE (g MATCH (a:Human)-[k:Friend]->(b:Human) COLUMNS (a.id, b.id, k.since))
+      EXCEPT ALL FROM GRAPH_TABLE (g MATCH (a:Person)-[k:Knows]->(b:Person) COLUMNS (a.id, b.id, k.since))))),
+  (SELECT count(*) FROM GRAPH_TABLE (g MATCH (a:Human)-[k:Friend]->(b:Person) COLUMNS (a.id)));
+----
+0	7
+
+query IIT
+FROM GRAPH_TABLE (g MATCH (a:Human)-[:LivesIn]->(c:Place) COLUMNS (a.id, c.cid, label(c))) ORDER BY ALL;
+----
+1	10	city
+2	20	city
+3	10	city
+5	20	city
+
+# label(x) is the first declared label; IS LABELED knows every label.
+query TI
+FROM GRAPH_TABLE (g MATCH (a:Human WHERE a.id = 1) COLUMNS (label(a), a.id));
+----
+Person	1
+
+query IIIII
+SELECT
+  (SELECT count(*) FROM GRAPH_TABLE (g MATCH (a:Person) WHERE a IS LABELED Human COLUMNS (a.id))),
+  (SELECT count(*) FROM GRAPH_TABLE (g MATCH (a:Human) WHERE a IS LABELED person COLUMNS (a.id))),
+  (SELECT count(*) FROM GRAPH_TABLE (g MATCH (a:Human) WHERE a IS NOT LABELED human COLUMNS (a.id))),
+  (SELECT count(*) FROM GRAPH_TABLE (g MATCH (a:Human)-[k:Knows]->(b) WHERE k IS LABELED Friend COLUMNS (a.id))),
+  (SELECT count(*) FROM GRAPH_TABLE (g MATCH (c:Place) WHERE c IS LABELED city COLUMNS (c.cid)));
+----
+5	5	0	7	2
+
+# Label expressions over the labels of one table.
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH (a:Person&Human) COLUMNS (a.id));
+----
+5
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH (a:Human&!Person) COLUMNS (a.id));
+----
+0
+
+# Teacher is bit 1 of kind: Bob (2), Cid (3), Eve (2), as for Person&Teacher.
+query II
+SELECT (SELECT count(*) FROM GRAPH_TABLE (g MATCH (a:Human&Teacher) COLUMNS (a.id))),
+       (SELECT count(*) FROM GRAPH_TABLE (g MATCH (a:Person&Teacher) COLUMNS (a.id)));
+----
+3	3
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH (a:Human|Student) COLUMNS (a.id));
+----
+5
+
+# Properties of every label: name from Person, age from Human.
+query ITI
+FROM GRAPH_TABLE (g MATCH (a:Human WHERE a.id = 2) COLUMNS (a.id, a.name, a.age));
+----
+2	Bob	40
+
+statement error
+FROM GRAPH_TABLE (g MATCH (a:Human) COLUMNS (a.kind));
+----
+Property a.kind is never registered
+
+# Paths, quantifiers, EXISTS, OPTIONAL, path functions and graph algorithms with the extra labels.
+query I
+SELECT count(*) FROM ((FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Human)-[k:Friend]->+(b:Human) COLUMNS (a.id, b.id, path_length(p), vertex_labels(p)))
+    EXCEPT ALL FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Person)-[k:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p), vertex_labels(p))))
+  UNION ALL (FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Person)-[k:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p), vertex_labels(p)))
+    EXCEPT ALL FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Human)-[k:Friend]->+(b:Human) COLUMNS (a.id, b.id, path_length(p), vertex_labels(p)))));
+----
+0
+
+query I
+SELECT count(*) FROM ((FROM GRAPH_TABLE (g MATCH (a:Human)-[k:Friend]->{1,3}(b:Student) COLUMNS (a.id, b.id))
+    EXCEPT ALL FROM GRAPH_TABLE (g MATCH (a:Person)-[k:Knows]->{1,3}(b:Student) COLUMNS (a.id, b.id)))
+  UNION ALL (FROM GRAPH_TABLE (g MATCH (a:Person)-[k:Knows]->{1,3}(b:Student) COLUMNS (a.id, b.id))
+    EXCEPT ALL FROM GRAPH_TABLE (g MATCH (a:Human)-[k:Friend]->{1,3}(b:Student) COLUMNS (a.id, b.id))));
+----
+0
+
+query I
+SELECT count(*) FROM ((FROM GRAPH_TABLE (g MATCH (a:Human) OPTIONAL MATCH (a)-[:LivesIn]->(c:Place) WHERE EXISTS { (a)-[:Friend]->(:Teacher) } COLUMNS (a.id, c.cid))
+    EXCEPT ALL FROM GRAPH_TABLE (g MATCH (a:Person) OPTIONAL MATCH (a)-[:LivesIn]->(c:city) WHERE EXISTS { (a)-[:Knows]->(:Teacher) } COLUMNS (a.id, c.cid)))
+  UNION ALL (FROM GRAPH_TABLE (g MATCH (a:Person) OPTIONAL MATCH (a)-[:LivesIn]->(c:city) WHERE EXISTS { (a)-[:Knows]->(:Teacher) } COLUMNS (a.id, c.cid))
+    EXCEPT ALL FROM GRAPH_TABLE (g MATCH (a:Human) OPTIONAL MATCH (a)-[:LivesIn]->(c:Place) WHERE EXISTS { (a)-[:Friend]->(:Teacher) } COLUMNS (a.id, c.cid))));
+----
+0
+
+query I
+SELECT count(*) FROM ((FROM pagerank('g', 'Human', 'Friend') EXCEPT ALL FROM pagerank('g', 'Person', 'Knows'))
+  UNION ALL (FROM pagerank('g', 'Person', 'Knows') EXCEPT ALL FROM pagerank('g', 'Human', 'Friend')));
+----
+0
+
+# ABI artifacts are keyed by the main label and answer for every label of the table, also when WITH ABI / the
+# build options name an extra label.
+statement ok
+SELECT * FROM pgq_abi_build('g', closures := ['Friend'], max_hops := 2);
+
+statement ok
+SET pgq_require_abi_paths = true;
+
+statement ok
+CREATE TABLE abi_a AS FROM GRAPH_TABLE (g MATCH (a:Human)-[:LivesIn]->(c:Place) COLUMNS (a.id AS a, c.cid AS c));
+
+query T
+SELECT bool_or(status = 'selected') FROM pgq_last_rewrite_diagnostics();
+----
+true
+
+statement ok
+CREATE TABLE abi_b AS FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Human)-[:Friend]->{1,2}(b:Human) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+query T
+SELECT bool_or(status = 'selected') FROM pgq_last_rewrite_diagnostics();
+----
+true
+
+statement ok
+SET pgq_require_abi_paths = false;
+
+statement ok
+SET pgq_abi_mode = 'off';
+
+query I
+SELECT count(*) FROM ((FROM abi_a EXCEPT ALL FROM GRAPH_TABLE (g MATCH (a:Person)-[:LivesIn]->(c:city) COLUMNS (a.id AS a, c.cid AS c)))
+  UNION ALL (FROM GRAPH_TABLE (g MATCH (a:Person)-[:LivesIn]->(c:city) COLUMNS (a.id AS a, c.cid AS c)) EXCEPT ALL FROM abi_a));
+----
+0
+
+query I
+SELECT count(*) FROM ((FROM abi_b EXCEPT ALL FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Person)-[:Knows]->{1,2}(b:Person) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)))
+  UNION ALL (FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Person)-[:Knows]->{1,2}(b:Person) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l)) EXCEPT ALL FROM abi_b));
+----
+0
+
+statement ok
+SET pgq_abi_mode = 'consume';
+
+# The labels survive a restart.
+restart
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+query IT
+FROM GRAPH_TABLE (g MATCH (a:Human WHERE a.id = 3)-[k:Friend]->(b:Human) COLUMNS (b.id, label(k)));
+----
+4	Knows
+
+# A label without a PROPERTIES clause has every column (SQL/PGQ), so the union is every column.
+statement ok
+CREATE PROPERTY GRAPH g_all VERTEX TABLES (person LABEL A PROPERTIES (id) LABEL B);
+
+query T
+SELECT properties FROM __duckpgq_internal WHERE property_graph = 'g_all';
+----
+[age, id, kind, name]
+
+# ALL COLUMNS EXCEPT next to a list: a listed column is a property even if another label excepts it.
+statement ok
+CREATE PROPERTY GRAPH g_except VERTEX TABLES (person LABEL A PROPERTIES ARE ALL COLUMNS EXCEPT (kind, age) LABEL B PROPERTIES (age));
+
+query T
+SELECT properties FROM __duckpgq_internal WHERE property_graph = 'g_except';
+----
+[age, id, name]
+
+# Every label NO PROPERTIES: none.
+statement ok
+CREATE PROPERTY GRAPH g_none VERTEX TABLES (person LABEL A NO PROPERTIES LABEL B NO PROPERTIES);
+
+query T
+SELECT properties FROM __duckpgq_internal WHERE property_graph = 'g_none';
+----
+[]
+
+# DEFAULT LABEL is the element table's alias.
+statement ok
+CREATE PROPERTY GRAPH g_alias VERTEX TABLES (person AS people DEFAULT LABEL LABEL Human);
+
+query TI
+FROM GRAPH_TABLE (g_alias MATCH (a:Human) WHERE a IS LABELED people AND a.id = 1 COLUMNS (label(a), a.id));
+----
+people	1
+
+# Errors.
+statement error
+CREATE PROPERTY GRAPH bad VERTEX TABLES (person LABEL A LABEL a);
+----
+Label a is given twice for element table person
+
+statement error
+CREATE PROPERTY GRAPH bad VERTEX TABLES (person LABEL A LABEL B, city LABEL B);
+----
+Label b is not unique
+
+statement error
+CREATE PROPERTY GRAPH bad VERTEX TABLES (person PROPERTIES (id) LABEL A PROPERTIES (name));
+----
+Label A of element table person has two PROPERTIES clauses
+
+statement error
+CREATE PROPERTY GRAPH bad VERTEX TABLES (person LABEL A IN kind (X) LABEL B IN kind (Y));
+----
+more than one IN discriminator
+
+statement error
+CREATE PROPERTY GRAPH bad VERTEX TABLES (person LABEL A PROPERTIES (id AS x) LABEL B PROPERTIES (name AS x));
+----
+Property x of element table person is defined twice, differently

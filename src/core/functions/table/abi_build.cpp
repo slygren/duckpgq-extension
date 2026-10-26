@@ -270,7 +270,16 @@ private:
 		}
 	}
 
-	optional_ptr<AbiVertex> FindVertex(const string &label) {
+	//! Artifacts are keyed by main labels; an option may name a table by any of its labels.
+	string MainLabel(const string &label) const {
+		auto entry = pg_info.label_map.find(label);
+		return entry != pg_info.label_map.end() && entry->second->HasStaticLabel(label)
+		           ? PGQStr(entry->second->main_label)
+		           : label;
+	}
+
+	optional_ptr<AbiVertex> FindVertex(const string &label_p) {
+		auto label = MainLabel(label_p);
 		for (auto &vertex : vertices) {
 			if (SameLabel(vertex.label, label)) {
 				return &vertex;
@@ -279,7 +288,8 @@ private:
 		return nullptr;
 	}
 
-	optional_ptr<AbiEdge> FindEdge(const string &label) {
+	optional_ptr<AbiEdge> FindEdge(const string &label_p) {
+		auto label = MainLabel(label_p);
 		for (auto &edge : edges) {
 			if (SameLabel(edge.label, label)) {
 				return &edge;
@@ -387,7 +397,7 @@ private:
 			}
 			bool same = true;
 			for (idx_t i = 0; i < sequence.size() && same; i++) {
-				same = SameLabel(excluded[i], edges[sequence[i]].label);
+				same = SameLabel(MainLabel(excluded[i]), edges[sequence[i]].label);
 			}
 			if (same) {
 				return true;

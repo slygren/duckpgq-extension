@@ -8,11 +8,21 @@ DuckPGQCreatePropertyGraph <- 'CREATE' OrReplace? 'PROPERTY' 'GRAPH' IfNotExists
 DuckPGQAbiClause <- 'WITH' 'ABI' Parens(List(DuckPGQAbiOption))
 DuckPGQAbiOption <- ColId NamedParameterAssignment Expression
 
-# Vertex and edge tables.
-DuckPGQVertexTables <- 'VERTEX' 'TABLES' Parens(List(DuckPGQVertexTable))
-DuckPGQEdgeTables <- 'EDGE' 'TABLES' Parens(List(DuckPGQEdgeTable))
-DuckPGQVertexTable <- BaseTableName TableAliasAs? DuckPGQProperties? DuckPGQLabel?
-DuckPGQEdgeTable <- BaseTableName TableAliasAs? DuckPGQSourceReference DuckPGQDestinationReference DuckPGQProperties? DuckPGQLabel?
+# Vertex and edge tables. NODE and RELATIONSHIP are the standard's synonyms.
+DuckPGQVertexTables <- DuckPGQVertexKeyword 'TABLES' Parens(List(DuckPGQVertexTable))
+DuckPGQEdgeTables <- DuckPGQEdgeKeyword 'TABLES' Parens(List(DuckPGQEdgeTable))
+DuckPGQVertexKeyword <- 'VERTEX' / 'NODE'
+DuckPGQEdgeKeyword <- 'EDGE' / 'RELATIONSHIP'
+DuckPGQVertexTable <- BaseTableName TableAliasAs? DuckPGQLabelsAndProperties
+DuckPGQEdgeTable <- BaseTableName TableAliasAs? DuckPGQSourceReference DuckPGQDestinationReference DuckPGQLabelsAndProperties
+
+# Labels with their properties, in the standard's order (LABEL l PROPERTIES (...), repeated), after an optional
+# PROPERTIES clause of the first label in this extension's original order (PROPERTIES (...) LABEL l).
+DuckPGQLabelsAndProperties <- DuckPGQProperties? DuckPGQLabelEntry* DuckPGQSubLabels?
+DuckPGQLabelEntry <- DuckPGQLabelName DuckPGQSubLabels? DuckPGQProperties?
+DuckPGQLabelName <- DuckPGQDefaultLabel / DuckPGQNamedLabel
+DuckPGQDefaultLabel <- 'DEFAULT' 'LABEL'
+DuckPGQNamedLabel <- 'LABEL' ColId
 
 # Property selection and aliases. Try EXCEPT before its ALL COLUMNS prefix.
 DuckPGQProperties <- DuckPGQAllColumnsExcept / DuckPGQAllColumns / DuckPGQAllProperties / DuckPGQNoProperties / DuckPGQPropertyList
@@ -24,10 +34,7 @@ DuckPGQPropertyList <- 'PROPERTIES' Parens(List(DuckPGQProperty))
 DuckPGQProperty <- ColId DuckPGQPropertyAlias?
 DuckPGQPropertyAlias <- 'AS' ColId
 
-# Labels and discriminator sublabels.
-DuckPGQLabel <- DuckPGQExplicitLabel / DuckPGQImplicitLabel
-DuckPGQExplicitLabel <- 'LABEL' ColId DuckPGQSubLabels?
-DuckPGQImplicitLabel <- DuckPGQSubLabels
+# Discriminator sub-labels: rows whose discriminator has bit i set also carry the i-th of these labels.
 DuckPGQSubLabels <- 'IN' Identifier Parens(List(ColId))
 
 # Edge endpoint references, with explicit or inferred keys.

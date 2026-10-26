@@ -150,10 +150,10 @@ void CanonicalizeLabels(vector<int64_t> &labels) {
 	}
 }
 
-//! The condition a single label puts on a table's rows (as MATCH's label filter builds it): none for the main label,
-//! the discriminator bit for a sub-label.
+//! The condition a single label puts on a table's rows (as MATCH's label filter builds it): none for a label every
+//! row has, the discriminator bit for a sub-label.
 static string LabelCondition(const PropertyGraphTable &table, const string &label, const string &alias) {
-	if (StringUtil::CIEquals(PGQStr(table.main_label), label)) {
+	if (table.HasStaticLabel(label)) {
 		return "";
 	}
 	for (idx_t i = 0; i < table.sub_labels.size(); i++) {

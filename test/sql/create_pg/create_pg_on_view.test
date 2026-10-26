@@ -144,22 +144,18 @@ b	x
 c	y
 d	y
 
-# Graphs written before views were supported: the internal table has no is_view and identity_columns columns. They
-# load as the tables they always were, and the columns are added on the next read-write start.
+# Graphs written before views were supported: the internal table as those builds created it, with 24 columns. They
+# load as the tables they always were, and the newer columns are added on the next read-write start.
 statement ok
-DROP PROPERTY GRAPH g1;
+DROP TABLE __duckpgq_internal;
 
 statement ok
-DROP PROPERTY GRAPH g2;
-
-statement ok
-DROP PROPERTY GRAPH g3;
-
-statement ok
-ALTER TABLE __duckpgq_internal DROP COLUMN identity_columns;
-
-statement ok
-ALTER TABLE __duckpgq_internal DROP COLUMN is_view;
+CREATE TABLE __duckpgq_internal (property_graph varchar, table_name varchar, label varchar, is_vertex_table boolean,
+  source_table varchar, source_pk varchar[], source_fk varchar[], destination_table varchar, destination_pk varchar[],
+  destination_fk varchar[], discriminator varchar, sub_labels varchar[], catalog varchar, schema varchar,
+  source_catalog varchar, source_schema varchar, destination_catalog varchar, destination_schema varchar,
+  properties varchar[], column_aliases varchar[], graph_catalog varchar, graph_schema varchar, verified boolean,
+  abi_options varchar);
 
 statement ok
 INSERT INTO __duckpgq_internal VALUES
