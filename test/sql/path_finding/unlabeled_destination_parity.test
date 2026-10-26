@@ -111,18 +111,18 @@ FROM GRAPH_TABLE ( g MATCH (x)<-[:HasWorkorder]-(t:Tag) WHERE t.id = 'T1'
 Workorder
 Workorder
 
-# ── when it is genuinely ambiguous, refuse ──────────────────────────────────────
-# An unlabeled edge can reach Workorder, Note or Tag, so x has no single label. The
-# only wrong behaviour is to answer anyway. On a graph without ABI artifacts the
-# generic path refuses first, with its own wording; on an artifact-backed graph the
-# traversal is answerable and label() itself refuses (see abi_context_mixed_key_types).
-# Either message is fine -- returning a label is not.
+# ── an unlabeled edge and vertex over several tables ────────────────────────────
+# An unlabeled edge can reach Workorder, Note or Tag, so x has no single label: SQL/PGQ matches
+# every one of them, and label(x) is each row's own (the union of one match per table).
 
-statement error
+query T rowsort
 FROM GRAPH_TABLE ( g MATCH (t:Tag)-[]->(x) WHERE t.id = 'T1'
     COLUMNS (label(x) AS lbl) );
 ----
-ambiguous
+Note
+Tag
+Workorder
+Workorder
 
 # ── ONE ROW PER over a compound edge label ──────────────────────────────────────
 # Named edge: works, and is the baseline the compound form is measured against.
@@ -176,25 +176,25 @@ SELECT DISTINCT depth FROM GRAPH_TABLE ( g MATCH p = (t:Tag)-[:!HasParent]->{1,2
     WHERE t.id = 'T1' COLUMNS (path_length(p) AS depth) );
 ----
 
-# ── variable length on a graph with NO ABI artifacts ────────────────────────────
-# The artifact-backed expansion answers an unlabeled variable-length destination per
-# row (see abi_context_mixed_key_types). This graph has no artifacts, so the same
-# query falls to the generic path, which cannot enumerate the destination table. That
-# is a real capability difference and it is allowed -- what matters is that it SAYS so
-# instead of returning a partial or empty result. These assertions exist to catch the
-# day that refusal silently becomes zero rows.
+# ── one hop on a graph with NO ABI artifacts ────────────────────────────────────
+# The artifact-backed expansion answers an unlabeled destination per row (see
+# abi_context_mixed_key_types). Without artifacts the pattern is answered per table: the
+# edges that are not HasParent are HasWorkorder (to two Workorders) and HasNote (to a Note).
+# (These refused before; what mattered was never to return a partial or empty result.)
 
-statement error
+query IT rowsort
 FROM GRAPH_TABLE ( g MATCH p = (t:Tag)-[:!HasParent]->{1,1}(x) WHERE t.id = 'T1'
     COLUMNS (path_length(p) AS depth, label(x) AS lbl) );
 ----
-Unlabeled vertex pattern is ambiguous
+1	Note
+1	Workorder
+1	Workorder
 
-statement error
+query I
 FROM GRAPH_TABLE ( g MATCH p = (t:Tag)-[:!HasParent]->{1,1}() WHERE t.id = 'T1'
-    COLUMNS (path_length(p) AS depth) );
+    COLUMNS (count(*) AS n) );
 ----
-Unlabeled vertex pattern is ambiguous
+3
 
 # Two further PRE-EXISTING defects were found here and deliberately left unasserted,
 # because writing them down as expectations would freeze wrong behaviour in place. Both

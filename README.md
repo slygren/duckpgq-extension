@@ -118,8 +118,8 @@ put over DuckLake catalogs. A graph is stored in the database it is created in a
 
 | Pattern | Meaning |
 | --- | --- |
-| `(v)`, `()`, `(v:Label)` | vertex with any label, anonymous, labelled |
-| `(v:A\|B)`, `(v:A&B)`, `(v:!A)` | label disjunction, conjunction, negation (`!` binds tightest, then `&`, then `\|`) |
+| `(v)`, `()`, `(v:Label)` | vertex with any label (every vertex table), anonymous, labelled |
+| `(v:A\|B)`, `(v:A&B)`, `(v:!A)` | label disjunction, conjunction, negation (`!` binds tightest, then `&`, then `\|`), over every table whose labels satisfy it: `(v:Person\|Course)` matches both tables' rows, `(v:!Person)` every vertex of another table |
 | `(v:Person WHERE v.age > 30)` | element-level predicate |
 | `-[e:Knows]->`, `<-[e:Knows]-`, `-[e:Knows]-`, `<-[e:Knows]->` | directed, reversed, either direction; `<-[ ]->` is SQL/PGQ's "left or right", which over directed edges is the same as `-[ ]-` |
 | `->`, `<-`, `-`, `<->` | anonymous edge of any label |
@@ -141,6 +141,15 @@ put over DuckLake catalogs. A graph is stored in the database it is created in a
 | `MATCH … COLUMNS (…) UNION [ALL] MATCH … COLUMNS (…)` | each MATCH block with its own `COLUMNS`, combined by position as in a SQL `UNION` |
 | `MATCH (a)-[:R]->(b) \| (a)-[:S]->(b)`, `… \|+\| …` | path pattern union: either operand; `\|` removes duplicate path bindings, `\|+\|` (multiset alternation) keeps them. A variable an operand does not bind is NULL in its rows |
 | `ONE ROW PER VERTEX (v)`, `ONE ROW PER EDGE (e)`, `ONE ROW PER STEP (v1, e, v2)` | one output row per element of each matched path |
+
+An element whose label expression selects several tables, or that has no label where its kind has several tables,
+matches the elements of all of them (SQL/PGQ). The MATCH is answered as the union of one match per choice of a table
+for each such element, an edge's table fixing the tables at its ends; each choice keeps every route a single-table
+pattern has, ABI artifacts included. A property one of the tables lacks is NULL on its rows, `v.*` is every property
+of any of the tables, and `label(v)`, `labels(v)` and the other element functions are each row's own.
+`element_id(v)` is the row id within the element's table, so `label(v)` together with `element_id(v)` identifies an
+element across tables. A MATCH the translation answers as written (an ABI route covering a label expression over
+several edge tables, a quantified edge over several edge tables) keeps answering it that way.
 
 Cypher's quantifier inside the edge means what it means in Cypher, so a pattern copied from Neo4j returns the same
 paths. Its lower bound defaults to 1, so **a bare `*` is one or more hops here, but zero or more in the arrow form
@@ -674,6 +683,9 @@ building in [abi_build.cpp](src/core/functions/table/abi_build.cpp); vertex-join
   - `SHORTEST k` and `CHEAPEST` over a group;
   - `ONE ROW PER` or a search prefix over a group whose pattern is not the MATCH's only one;
   - a path variable or search prefix inside the group.
+- **Elements over several tables** (above): a search prefix over a pattern whose fixed elements span several tables,
+  `COLUMNS (*)` over them, and an `OPTIONAL MATCH` reading a variable of an earlier `OPTIONAL MATCH` whose elements
+  span tables are refused; a MATCH has at most 256 choices of tables.
 - **Path pattern unions** (`|`, `|+|`) stand at the top level of a MATCH pattern, and take no search prefix
   (`ANY SHORTEST … | …`), OPTIONAL MATCH or ONE ROW PER. `|` removes duplicates only between fixed-length, directed
   operands; operands that may match the same variable-length walk need `|+|` or disjoint labels.
