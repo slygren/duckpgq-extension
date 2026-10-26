@@ -76,6 +76,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    "immediately instead of running an unbounded scan. 0 disables the guard.",
 		    LogicalType::BIGINT, Value::BIGINT(20000000), nullptr, SetScope::SESSION);
 	}
+	if (!config.HasExtensionOption("pgq_completeness_probe_budget_ms")) {
+		config.AddExtensionOption(
+		    "pgq_completeness_probe_budget_ms",
+		    "How long one measurement of whether an ABI artifact's rows all reach vertices may run (once per process) "
+		    "when its catalog row records no endpoints_complete. Over it, or with 0, the query checks those vertices "
+		    "itself instead. A stored endpoints_complete = true needs neither.",
+		    LogicalType::BIGINT, Value::BIGINT(250), nullptr, SetScope::SESSION);
+	}
 	if (!config.HasExtensionOption("pgq_verify_edges_on_create")) {
 		config.AddExtensionOption(
 		    "pgq_verify_edges_on_create",

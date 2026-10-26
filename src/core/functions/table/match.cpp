@@ -2356,6 +2356,20 @@ static void RecordRewriteDiagnostic(ClientContext &context, PGQRewriteDiagnostic
 	duckpgq_state->rewrite_diagnostics.push_back(std::move(diagnostic));
 }
 
+//! A route answering from an artifact not known to hold only edges between vertices does what makes it exact in the
+//! query itself (joins the vertices, checks the paths, keeps a far-vertex guard): shown in
+//! pgq_last_rewrite_diagnostics as endpoint_check / per_query, so it can be seen that a stored proof spares it.
+static void RecordEndpointCheck(ClientContext &context, const string &graph_name, const string &path_table_name,
+                                const string &reason) {
+	PGQRewriteDiagnostic diagnostic;
+	diagnostic.graph_name = graph_name;
+	diagnostic.rewrite_type = "endpoint_check";
+	diagnostic.status = "per_query";
+	diagnostic.path_table_name = path_table_name;
+	diagnostic.reason = reason;
+	RecordRewriteDiagnostic(context, std::move(diagnostic));
+}
+
 static bool PathPatternRequiresABIPath(const vector<unique_ptr<PathReference>> &path_elements) {
 	if (path_elements.size() < 3) {
 		return false;
@@ -6227,6 +6241,11 @@ void PGQMatchFunction::ProcessOptionalPathList(
 					// cannot leave a half-matched row either.
 					bool far_end_cannot_fail =
 					    pg_table.verified || (endpoints_complete && endpoints_complete(*path_info));
+					if (!far_end_cannot_fail) {
+						RecordEndpointCheck(context, pg_table.property_graph_name, path_info->table_name,
+						                    "OPTIONAL hop keeps its far-vertex guard: the artifact is not known to reach a "
+						                    "vertex on every row");
+					}
 					if (!next_elem->label.empty()) {
 						vector<unique_ptr<ParsedExpression>> label_conds;
 						CheckInheritance(next_vertex_table, next_elem, label_conds);
@@ -7137,7 +7156,11 @@ public:
 	//! How a completeness check may find out: from what is known only, or also by a probe that gives up after
 	//! kCompletenessProbeBudgetMs (and is then not retried in this process).
 	enum class Look : uint8_t { KNOWN, BOUNDED_PROBE };
+	//! The default of pgq_completeness_probe_budget_ms (0 there: measure nothing, check per query).
 	static constexpr int64_t kCompletenessProbeBudgetMs = 250;
+	ClientContext &Context() const {
+		return context;
+	}
 	//! What the completeness probes of one statement may spend together before it starts no more (the last one may
 	//! run its whole budget past it): what is still unknown it checks itself; the next statement measures on.
 	static constexpr int64_t kStatementProbeBudgetMs = 300;
@@ -7241,13 +7264,18 @@ public:
 			state->completeness_probe_query = query;
 			state->completeness_probe_ms = 0;
 		}
-		if (state->completeness_probe_ms >= kStatementProbeBudgetMs) {
-			return Endpoints::UNKNOWN; // this statement's time is spent; a later one measures it
+		int64_t probe_budget = kCompletenessProbeBudgetMs;
+		Value setting;
+		if (context.TryGetCurrentSetting("pgq_completeness_probe_budget_ms", setting) && !setting.IsNull()) {
+			probe_budget = setting.GetValue<int64_t>();
+		}
+		if (probe_budget <= 0 || state->completeness_probe_ms >= kStatementProbeBudgetMs) {
+			return Endpoints::UNKNOWN; // no measuring, or this statement's time is spent; a later one measures it
 		}
 		// Always the whole per-probe budget, so that a probe over it is over it for good (and not retried).
 		bool over_budget = false;
 		const auto started = std::chrono::steady_clock::now();
-		const bool value = Probe(key, sql, kCompletenessProbeBudgetMs, &over_budget);
+		const bool value = Probe(key, sql, probe_budget, &over_budget);
 		state->completeness_probe_ms +=
 		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
 		if (over_budget) {
@@ -9009,6 +9037,13 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 	//! The (lower-case) labels whose vertices it checks: those reached by an artifact not known complete there.
 	case_insensitive_set_t check_labels;
 	auto select_paths = [&](const string &paths_sql) -> unique_ptr<TableRef> {
+		if (check_path_vertices) {
+			vector<string> labels(check_labels.begin(), check_labels.end());
+			std::sort(labels.begin(), labels.end());
+			RecordEndpointCheck(exactness.Context(), pg_table.property_graph_name, "",
+			                    "context expansion checks the vertices of its paths (labels " +
+			                        StringUtil::Join(labels, ", ") + "): artifacts not known to reach a vertex on every row");
+		}
 		const string sql = check_path_vertices ? CheckedPathsSQL(pg_table, paths_sql, check_labels) : paths_sql;
 		string query = sql;
 		if (selector == PGQPathSelector::ANY_SHORTEST) {
@@ -12263,6 +12298,19 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 	// measured); otherwise every vertex is joined, which drops an edge to a vertex that is gone.
 	const bool keys_are_vertices =
 	    exactness.EndpointsState(*path_info, PGQExactness::Look::BOUNDED_PROBE) == PGQExactness::Endpoints::COMPLETE;
+	if (!keys_are_vertices) {
+		bool coverable = BindingReferencesOnlyCovered(match_ref, hops[0].src_binding, src_covered_properties);
+		for (size_t i = 0; i < hops.size() && !coverable; i++) {
+			CoveredPropertyMap keys_only;
+			keys_only[hops[i].dst_pk] = {pt_alias, "v" + to_string(i + 1)};
+			coverable = BindingReferencesOnlyCovered(match_ref, hops[i].dst_binding, keys_only);
+		}
+		if (coverable) {
+			RecordEndpointCheck(context, pg_table.property_graph_name, path_info->table_name,
+			                    "vertices joined instead of read from the artifact: it is not known to reach a vertex "
+			                    "on every row");
+		}
+	}
 	const bool src_fully_covered =
 	    keys_are_vertices && BindingReferencesOnlyCovered(match_ref, hops[0].src_binding, src_covered_properties);
 	if (src_fully_covered && !path_info->endpoints_complete) {

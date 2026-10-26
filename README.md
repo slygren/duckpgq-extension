@@ -539,6 +539,7 @@ distinct sources at once share the lane search, 512 sources per pass.
 | `duckpgq_factorized_joins` | `true` | Pre-aggregate join sides that are only counted or summed, so path counts become degree products. |
 | `duckpgq_factorized_join_operator` | `true` | Use the `FACTORIZED_GROUP_JOIN` operator when both sides are only counted or summed. |
 | `duckpgq_factorized_join_directory` | `true` | Let that operator count into a dense array when key bounds are known. |
+| `pgq_completeness_probe_budget_ms` | `250` | How long one measurement of an ABI artifact may run (once per process) when its catalog row records no `endpoints_complete`: whether every row reaches a vertex at its ends. Over it, or with `0`, the queries check those vertices themselves (`endpoint_check` in `pgq_last_rewrite_diagnostics()`). A stored `endpoints_complete = true` (pgq_abi_build, the dwh layout compiler) needs neither. |
 | `duckpgq_common_subplan_guard` | `true` | Keep DuckDB's `common_subplan` optimizer off the subplans at risk in a statement with a `GRAPH_TABLE`: one that occurs twice and scans a table twice. DuckDB 2.0.0's optimizer can merge two occurrences of such a subplan and read one table scan's column for another's, which gave wrong rows when several `GRAPH_TABLE`s shared one statement. Other repeated subplans (a seed subquery the rewrite repeats) are still merged, and statements without `GRAPH_TABLE` are untouched. |
 
 All but `duckpgq_default_grammar` are per session.

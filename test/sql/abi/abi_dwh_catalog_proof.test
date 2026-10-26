@@ -1,0 +1,189 @@
+# name: test/sql/abi/abi_dwh_catalog_proof.test
+# description: A path catalog shaped as the dwh layout compiler writes it -- no abi_version, graph_fingerprint,
+#              built_by or source_* columns, with endpoints_complete -- is read with its proof: a stored
+#              endpoints_complete = true spares every route both the completeness probes (far_ends, complete) and
+#              the per-query checks (endpoint_check rows in pgq_last_rewrite_diagnostics). Without the proof the
+#              probes run (pgq_completeness_probe_budget_ms), and with no budget every route checks per query.
+# group: [abi]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE Person AS SELECT range AS id FROM range(1, 7);
+
+statement ok
+CREATE TABLE Tag AS SELECT range AS id FROM range(10, 14);
+
+statement ok
+CREATE TABLE likes(personId BIGINT, tagId BIGINT);
+
+statement ok
+INSERT INTO likes VALUES (1,10),(1,11),(2,12),(3,10),(5,13);
+
+statement ok
+CREATE TABLE knows(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO knows VALUES (1,2),(2,3),(3,4),(4,5),(2,5);
+
+statement ok
+CREATE PROPERTY GRAPH h VERTEX TABLES (Person LABEL Person, Tag LABEL Tag) EDGE TABLES (
+    likes SOURCE KEY (personId) REFERENCES Person (id) DESTINATION KEY (tagId) REFERENCES Tag (id) LABEL Likes,
+    knows SOURCE KEY (src) REFERENCES Person (id) DESTINATION KEY (dst) REFERENCES Person (id) LABEL Knows);
+
+# h2: the same graph, whose catalog rows will carry no proof
+statement ok
+CREATE PROPERTY GRAPH h2 VERTEX TABLES (Person LABEL Person, Tag LABEL Tag) EDGE TABLES (
+    likes SOURCE KEY (personId) REFERENCES Person (id) DESTINATION KEY (tagId) REFERENCES Tag (id) LABEL Likes,
+    knows SOURCE KEY (src) REFERENCES Person (id) DESTINATION KEY (dst) REFERENCES Person (id) LABEL Knows);
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('h', max_hops := 2, closures := ['Knows']);
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('h2', max_hops := 2, closures := ['Knows']);
+
+# The dwh shape: the provenance columns are not there
+statement ok
+ALTER TABLE graph.__pgq_path_catalog DROP COLUMN abi_version;
+
+statement ok
+ALTER TABLE graph.__pgq_path_catalog DROP COLUMN graph_fingerprint;
+
+statement ok
+ALTER TABLE graph.__pgq_path_catalog DROP COLUMN built_by;
+
+statement ok
+ALTER TABLE graph.__pgq_path_catalog DROP COLUMN source_snapshot;
+
+statement ok
+ALTER TABLE graph.__pgq_path_catalog DROP COLUMN source_tables;
+
+statement ok
+UPDATE graph.__pgq_path_catalog SET endpoints_complete = NULL WHERE graph_name = 'h2';
+
+query TII
+SELECT graph_name, count(*), count(*) FILTER (endpoints_complete) FROM graph.__pgq_path_catalog GROUP BY ALL ORDER BY ALL;
+----
+h	5	5
+h2	5	0
+
+# ── With the proof: no probe, no check, on every route ─────────────────────────────────────────────────────────────
+statement ok
+CREATE MACRO completeness_work() AS TABLE
+SELECT count(*) FILTER (rewrite_type = 'multiplicity_probe' AND (reason LIKE 'far_ends|%' OR reason LIKE 'complete|%')) AS probes,
+       count(*) FILTER (rewrite_type = 'endpoint_check') AS checks
+FROM pgq_last_rewrite_diagnostics();
+
+query II
+FROM GRAPH_TABLE (h MATCH (p:Person)-[:Likes]->(t:Tag) COLUMNS (p.id AS p, t.id AS t)) ORDER BY ALL;
+----
+1	10
+1	11
+2	12
+3	10
+5	13
+
+query TII
+SELECT (SELECT string_agg(rewrite_type, ',') FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected'), * FROM completeness_work();
+----
+edge	0	0
+
+statement ok
+FROM GRAPH_TABLE (h MATCH (a:Person) OPTIONAL MATCH (a)-[:Likes]->(t:Tag) COLUMNS (a.id AS a, t.id AS t));
+
+query II
+FROM completeness_work();
+----
+0	0
+
+query II
+FROM GRAPH_TABLE (h MATCH ANY SHORTEST (a:Person)-[:Knows]->{1,3}(b:Person) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b)) ORDER BY ALL;
+----
+1	2
+1	3
+1	4
+1	5
+
+query TII
+SELECT (SELECT string_agg(rewrite_type, ',') FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected'), * FROM completeness_work();
+----
+transitive_closure	0	0
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (h MATCH p = (a:Person)-[:!Knows]->{1,2}(x) WHERE a.id = 1 COLUMNS (vertices(p) AS v));
+----
+2
+
+query TII
+SELECT (SELECT string_agg(rewrite_type, ',') FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected'), * FROM completeness_work();
+----
+abi_context_expansion	0	0
+
+# Also with measuring turned off: the proof needs nothing
+statement ok
+SET pgq_completeness_probe_budget_ms = 0;
+
+statement ok
+FROM GRAPH_TABLE (h MATCH (p:Person)-[:Likes]->(t:Tag) COLUMNS (p.id AS p, t.id AS t));
+
+query II
+FROM completeness_work();
+----
+0	0
+
+# ── Without the proof, no measuring: each route checks per query, with the same rows ───────────────────────────────
+query II
+FROM GRAPH_TABLE (h2 MATCH (p:Person)-[:Likes]->(t:Tag) COLUMNS (p.id AS p, t.id AS t)) ORDER BY ALL;
+----
+1	10
+1	11
+2	12
+3	10
+5	13
+
+query II
+FROM completeness_work();
+----
+0	1
+
+statement ok
+FROM GRAPH_TABLE (h2 MATCH (a:Person) OPTIONAL MATCH (a)-[:Likes]->(t:Tag) COLUMNS (a.id AS a, t.id AS t));
+
+query II
+FROM completeness_work();
+----
+0	1
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (h2 MATCH p = (a:Person)-[:!Knows]->{1,2}(x) WHERE a.id = 1 COLUMNS (vertices(p) AS v));
+----
+2
+
+query II
+FROM completeness_work();
+----
+0	1
+
+# ── Without the proof, with the default budget: measured once, then nothing more ───────────────────────────────────
+statement ok
+RESET pgq_completeness_probe_budget_ms;
+
+statement ok
+FROM GRAPH_TABLE (h2 MATCH (p:Person)-[:Likes]->(t:Tag) COLUMNS (p.id AS p, t.id AS t));
+
+query II
+FROM completeness_work();
+----
+2	0
+
+statement ok
+FROM GRAPH_TABLE (h2 MATCH (p:Person)-[:Likes]->(t:Tag) COLUMNS (p.id AS p, t.id AS t));
+
+query II
+FROM completeness_work();
+----
+0	0
