@@ -512,29 +512,60 @@ vector<unique_ptr<PathReference>> WrapPathSequence(vector<unique_ptr<PathReferen
 	return result;
 }
 
-// DuckPGQPathVariable? DuckPGQSearchPrefix? DuckPGQPathMode? DuckPGQPathSequence DuckPGQPathUnionOperand*
+// DuckPGQPathVariable? DuckPGQSearchPrefix? DuckPGQPathMode? DuckPGQPathOrPaths? DuckPGQPathSequence
+// DuckPGQPathUnionOperand*
 unique_ptr<PathPattern> TransformPathPattern(PEGTransformer &transformer, ParseResult &parse_result,
                                              AnonymousNames &anon_names) {
 	auto &list = parse_result.Cast<ListParseResult>();
-	auto pattern = TransformPathSequence(transformer, list.GetChild(3), anon_names);
-	auto &prefix = list.Child<OptionalParseResult>(1);
-	if (prefix.HasResult()) {
-		auto &choice = DuckPGQGetChoice(prefix.GetResult());
+	auto pattern = TransformPathSequence(transformer, list.GetChild(4), anon_names);
+	auto &prefix_result = list.Child<OptionalParseResult>(1);
+	// ALL alone asks for every path, which is what no prefix asks for.
+	const bool prefix = prefix_result.HasResult() &&
+	                    DuckPGQGetChoice(prefix_result.GetResult()).Name() != "DuckPGQAllPaths";
+	// The group form's own path mode: SHORTEST 2 TRAIL GROUPS.
+	optional_ptr<ParseResult> prefix_mode;
+	if (prefix) {
+		auto &choice = DuckPGQGetChoice(prefix_result.GetResult());
 		// CHEAPEST is a shortest path by cost rather than by hop count.
 		pattern->shortest = true;
 		pattern->cheapest = choice.Name() == "DuckPGQAllCheapest" || choice.Name() == "DuckPGQAnyCheapest";
 		pattern->all = choice.Name() == "DuckPGQAllShortest" || choice.Name() == "DuckPGQAllCheapest";
+		auto count = [&](idx_t child, const char *selector) -> int32_t {
+			auto &number = choice.Cast<ListParseResult>().Child<OptionalParseResult>(child);
+			if (!number.HasResult()) {
+				return 1;
+			}
+			auto k = TransformNumber(transformer, number.GetResult());
+			if (k <= 0) {
+				throw ParserException("%s requires a positive k", selector);
+			}
+			return NumericCast<int32_t>(k);
+		};
 		if (choice.Name() == "DuckPGQTopKShortest") {
 			auto k = TransformNumber(transformer, choice.Cast<ListParseResult>().GetChild(1));
 			if (k <= 0) {
 				throw ParserException("SHORTEST k requires a positive k");
 			}
 			pattern->topk = NumericCast<int32_t>(k);
+		} else if (choice.Name() == "DuckPGQShortestGroups") {
+			pattern->topk = count(1, "SHORTEST k GROUP");
+			pattern->group = true;
+			auto &mode = choice.Cast<ListParseResult>().Child<OptionalParseResult>(2);
+			if (mode.HasResult()) {
+				prefix_mode = &mode.GetResult();
+			}
+		} else if (choice.Name() == "DuckPGQAnyPaths") {
+			pattern->topk = count(1, "ANY k");
+			pattern->any = true;
 		}
+	}
+	if (list.Child<OptionalParseResult>(3).HasResult() && !prefix_result.HasResult() &&
+	    !list.Child<OptionalParseResult>(2).HasResult()) {
+		throw ParserException("PATH / PATHS follows a search prefix or a path mode (ANY SHORTEST PATHS, TRAIL PATH)");
 	}
 	// '|' (union) or '|+|' (multiset alternation) DuckPGQPathSequence, repeated
 	vector<vector<unique_ptr<PathReference>>> union_operands;
-	auto &union_tail = list.Child<OptionalParseResult>(4);
+	auto &union_tail = list.Child<OptionalParseResult>(5);
 	if (union_tail.HasResult()) {
 		string union_operator;
 		for (auto &operand : union_tail.GetResult().Cast<RepeatParseResult>().GetChildren()) {
@@ -549,7 +580,7 @@ unique_ptr<PathPattern> TransformPathPattern(PEGTransformer &transformer, ParseR
 			union_operands.push_back(
 			    std::move(TransformPathSequence(transformer, operand_list.GetChild(1), anon_names)->path_elements));
 		}
-		if (prefix.HasResult()) {
+		if (prefix) {
 			throw ParserException("A search prefix (ANY / ALL SHORTEST, SHORTEST k, ANY / ALL CHEAPEST) over a path "
 			                      "pattern union is not supported: it would choose among the paths of all operands. "
 			                      "Write each alternative as its own MATCH block and combine them with UNION");
@@ -564,8 +595,13 @@ unique_ptr<PathPattern> TransformPathPattern(PEGTransformer &transformer, ParseR
 	}
 	auto path_mode = PGQPathMode::NONE;
 	auto &mode = list.Child<OptionalParseResult>(2);
+	if (mode.HasResult() && prefix_mode) {
+		throw ParserException("A path pattern has one path mode: write it before GROUP (SHORTEST 2 TRAIL GROUPS)");
+	}
 	if (mode.HasResult()) {
 		path_mode = PathModeFromText(DuckPGQLiteralText(mode.GetResult()));
+	} else if (prefix_mode) {
+		path_mode = PathModeFromText(DuckPGQLiteralText(*prefix_mode));
 	}
 	// The path variable and the path mode apply to every operand of a union.
 	pattern->path_elements = WrapPathSequence(std::move(pattern->path_elements), path_variable, path_mode);

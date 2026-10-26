@@ -17186,11 +17186,26 @@ static void CollectSelectionElements(PathReference &reference, vector<PathElemen
 	}
 }
 
+//! The selector as written, for messages.
+static string SelectorName(const PathPattern &pattern) {
+	if (pattern.group) {
+		return "SHORTEST k GROUPS";
+	}
+	if (pattern.any) {
+		return "ANY k";
+	}
+	if (pattern.topk > 0) {
+		return "SHORTEST k";
+	}
+	return pattern.all ? "ALL SHORTEST" : "ANY SHORTEST";
+}
+
 static PGQFixedPathSelection SelectorOverFixedPattern(PathPattern &pattern, MatchExpression &block) {
 	PGQFixedPathSelection selection;
-	if (!pattern.shortest || pattern.cheapest || pattern.topk > 0 || !pattern.union_operands.empty()) {
+	if (!pattern.shortest || pattern.cheapest || !pattern.union_operands.empty()) {
 		return selection;
 	}
+	const bool counted = pattern.topk > 0;
 	auto *elements = &pattern.path_elements;
 	if (elements->size() == 1) {
 		auto *wrapper = PGQMatchFunction::GetSubPath((*elements)[0]);
@@ -17199,6 +17214,13 @@ static PGQFixedPathSelection SelectorOverFixedPattern(PathPattern &pattern, Matc
 		}
 	}
 	if (elements->size() < 3) {
+		// One vertex: its zero-length path is the only one, whatever the selector asks for.
+		if (counted) {
+			pattern.shortest = false;
+			pattern.group = false;
+			pattern.any = false;
+			pattern.topk = 0;
+		}
 		return selection;
 	}
 	idx_t fixed = 0;
@@ -17217,20 +17239,35 @@ static PGQFixedPathSelection SelectorOverFixedPattern(PathPattern &pattern, Matc
 		CollectSelectionElements(*reference, path);
 	}
 	if (variable > 0) {
+		if (fixed > 0 && counted) {
+			throw NotImplementedException("%s is supported for one quantified edge between two vertices, or for a "
+			                              "fixed-length pattern; this pattern mixes fixed hops with a variable-length "
+			                              "one",
+			                              SelectorName(pattern));
+		}
 		if (fixed > 0 && !MixedPathSelectionSupported(block)) {
 			throw NotImplementedException(
 			    "%s over a pattern that mixes fixed hops with a variable-length one is supported when it is the only "
 			    "pattern of its MATCH, without OPTIONAL MATCH, UNION or ONE ROW PER",
-			    pattern.all ? "ALL SHORTEST" : "ANY SHORTEST");
+			    SelectorName(pattern));
 		}
+		return selection;
+	}
+	// Every path of a fixed-length pattern has its one length: the k shortest lengths hold all of them, as ALL
+	// SHORTEST does, and the pattern is matched without a selector.
+	if (pattern.group) {
+		pattern.shortest = false;
+		pattern.group = false;
+		pattern.topk = 0;
 		return selection;
 	}
 	if (pattern.all) {
 		return selection;
 	}
 	if (!block.optional_match_patterns.empty()) {
-		throw NotImplementedException("ANY SHORTEST over a fixed-length pattern is not supported in a MATCH with "
-		                              "OPTIONAL MATCH yet");
+		throw NotImplementedException("%s over a fixed-length pattern is not supported in a MATCH with OPTIONAL "
+		                              "MATCH yet",
+		                              SelectorName(pattern));
 	}
 	auto *start = path.front();
 	auto *end = path.back();
@@ -17252,9 +17289,9 @@ static PGQFixedPathSelection SelectorOverFixedPattern(PathPattern &pattern, Matc
 		}
 		for (auto *element : other_elements) {
 			if (interior.find(element->variable_binding) != interior.end()) {
-				throw NotImplementedException("ANY SHORTEST over a fixed-length pattern whose interior variable '%s' is "
-				                              "also used by another pattern of the MATCH is not supported",
-				                              element->variable_binding);
+				throw NotImplementedException("%s over a fixed-length pattern whose interior variable '%s' is also "
+				                              "used by another pattern of the MATCH is not supported",
+				                              SelectorName(pattern), element->variable_binding);
 			}
 			if (others.insert(element->variable_binding).second) {
 				partition.push_back(SelectionIdentity(*element));
@@ -17267,8 +17304,8 @@ static PGQFixedPathSelection SelectorOverFixedPattern(PathPattern &pattern, Matc
 	}
 	Parser parser(ParserOptions::Builtin());
 	auto expressions = parser.ParseExpressionList(
-	    StringUtil::Format("row_number() OVER (PARTITION BY %s ORDER BY %s) = 1", StringUtil::Join(partition, ", "),
-	                       StringUtil::Join(order, ", ")));
+	    StringUtil::Format("row_number() OVER (PARTITION BY %s ORDER BY %s) <= %d", StringUtil::Join(partition, ", "),
+	                       StringUtil::Join(order, ", "), counted ? pattern.topk : 1));
 	selection.applies = true;
 	selection.qualify = std::move(expressions[0]);
 	return selection;
@@ -17280,8 +17317,10 @@ struct PGQNativePathSearch {
 	//! A CHEAPEST pattern whose COST varies by edge, outside what the long-standing routes answer (see
 	//! NativePathSearchFor): searched by cost (pgq_cheapest_paths).
 	bool cheapest = false;
-	//! paths per destination, < 0 for all; ignored with all_shortest
+	//! paths per destination, < 0 for all; ignored with all_shortest; with groups, the number of path lengths
 	int64_t k = 1;
+	//! SHORTEST k GROUPS: every path of the k least lengths per pair
+	bool groups = false;
 	bool all_shortest = false;
 	string mode = "walk";
 	//! ANY / ALL SHORTEST under walk semantics: no artifact holds such walks, so the search answers it directly
@@ -17346,9 +17385,10 @@ static PGQNativePathSearch NativePathSearchFor(PathPattern &pattern, bool one_ro
 	const bool topk = pattern.topk > 0;
 	auto refuse = [&](const string &why) {
 		if (topk) {
-			throw NotImplementedException("SHORTEST k is supported for one quantified edge between two vertices, "
-			                              "over one edge table whose two ends are one vertex table: %s",
-			                              why);
+			throw NotImplementedException("%s is supported for one quantified edge between two vertices, over one "
+			                              "edge table whose two ends are one vertex table, or for a fixed-length "
+			                              "pattern: %s",
+			                              SelectorName(pattern), why);
 		}
 		return search;
 	};
@@ -17399,6 +17439,7 @@ static PGQNativePathSearch NativePathSearchFor(PathPattern &pattern, bool one_ro
 	const bool shortest = pattern.shortest || constant_cost;
 	if (topk) {
 		search.k = pattern.topk;
+		search.groups = pattern.group;
 		search.mode = PathModeName(mode);
 	} else if (pattern.cheapest && !constant_cost) {
 		return search;
@@ -17498,7 +17539,8 @@ static void AddNativePathSearch(ClientContext &context, const PGQNativePathSearc
 	    "(SELECT 0 * count(cte1.temp) AS temp FROM cte1) AS __x%s",
 	    q_src, csr_slot.slot, vertices, q_src, destinations, static_cast<long long>(search.k),
 	    static_cast<long long>(search.quantifier->lower), static_cast<long long>(search.quantifier->upper),
-	    search.mode, all_shortest ? "all_shortest" : "k", static_cast<long long>(MaxVLFallbackRows(context)), vertices,
+	    search.mode, all_shortest ? "all_shortest" : search.groups ? "groups" : "k",
+	    static_cast<long long>(MaxVLFallbackRows(context)), vertices,
 	    q_src, src_seed.empty() ? "" : " WHERE " + src_seed);
 	auto search_info = make_uniq<CommonTableExpressionInfo>();
 	search_info->query_node = std::move(ParseSelectStatement(search_sql)->node);
@@ -17538,7 +17580,10 @@ static void AddNativePathSearch(ClientContext &context, const PGQNativePathSearc
 	                                       all_shortest ? "all shortest"
 	                                       : search.k < 0
 	                                           ? "every path"
-	                                           : StringUtil::Format("first %lld per pair", static_cast<long long>(search.k)),
+	                                           : search.groups
+	                                               ? StringUtil::Format("the %lld shortest lengths per pair",
+	                                                                    static_cast<long long>(search.k))
+	                                               : StringUtil::Format("first %lld per pair", static_cast<long long>(search.k)),
 	                                       search.mode, static_cast<long long>(search.quantifier->lower),
 	                                       static_cast<long long>(search.quantifier->upper));
 	diagnostic.edge_label_sequence = edge.label.empty() ? "*" : edge.label;

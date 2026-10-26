@@ -21,11 +21,19 @@ DuckPGQColumns <- 'COLUMNS' Parens(TargetList)
 
 # A path pattern: optional path variable, search prefix and path mode, then the element sequence. Further sequences
 # after '|' (path pattern union) or '|+|' (multiset alternation) are alternatives binding the same variables.
-DuckPGQPathPattern <- DuckPGQPathVariable? DuckPGQSearchPrefix? DuckPGQPathMode? DuckPGQPathSequence DuckPGQPathUnionOperand*
+DuckPGQPathPattern <- DuckPGQPathVariable? DuckPGQSearchPrefix? DuckPGQPathMode? DuckPGQPathOrPaths? DuckPGQPathSequence DuckPGQPathUnionOperand*
 DuckPGQPathUnionOperand <- DuckPGQPathUnionOperator DuckPGQPathSequence
 DuckPGQPathUnionOperator <- '|+|' / ('|' '+' '|') / '|'
 DuckPGQPathVariable <- Identifier '='
-DuckPGQSearchPrefix <- DuckPGQAllShortest / DuckPGQAnyShortest / DuckPGQTopKShortest / DuckPGQAllCheapest / DuckPGQAnyCheapest
+# The search prefixes of SQL/PGQ: ALL SHORTEST, ANY SHORTEST, SHORTEST k, SHORTEST [k] [mode] [PATH|PATHS] GROUP(S), ANY [k], ALL
+# (every path, as without a prefix), plus CHEAPEST. The group form carries its path mode before GROUP; it is tried before
+# SHORTEST k, which would otherwise take its first two words.
+DuckPGQSearchPrefix <- DuckPGQAllShortest / DuckPGQAnyShortest / DuckPGQShortestGroups / DuckPGQTopKShortest / DuckPGQAllCheapest / DuckPGQAnyCheapest / DuckPGQAnyPaths / DuckPGQAllPaths
+DuckPGQShortestGroups <- 'SHORTEST' NumberLiteral? DuckPGQPathMode? DuckPGQPathOrPaths? DuckPGQGroupOrGroups
+DuckPGQGroupOrGroups <- 'GROUPS' / 'GROUP'
+DuckPGQAnyPaths <- 'ANY' NumberLiteral?
+DuckPGQAllPaths <- 'ALL'
+DuckPGQPathOrPaths <- 'PATHS' / 'PATH'
 DuckPGQAllShortest <- 'ALL' 'SHORTEST'
 DuckPGQAnyShortest <- 'ANY' 'SHORTEST'
 DuckPGQTopKShortest <- 'SHORTEST' NumberLiteral

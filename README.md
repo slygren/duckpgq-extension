@@ -129,7 +129,11 @@ put over DuckLake catalogs. A graph is stored in the database it is created in a
 | `MATCH (t)-[:A]->(a), (t)-[:B]->(b)` | several patterns sharing a variable |
 | `MATCH p = …` | path variable |
 | `ANY SHORTEST`, `ALL SHORTEST`, `ANY CHEAPEST`, `ALL CHEAPEST` | path search; `COST expr [DEFAULT n]` on an edge gives its weight, a number (`DEFAULT` where `expr` is NULL). A NULL cost without `DEFAULT`, and a negative or non-finite one, is an error. CHEAPEST returns the path(s) of the least total cost within the quantifier's bounds (`ALL`: every tied path), in every direction, from any lower bound, and the path functions, `ONE ROW PER` and `cost(p)` (in `COLUMNS` and `WHERE`) all describe them. The `COST` and an element `WHERE` on the costed edge (which filters its steps) may read the edge and the pattern's two endpoints (see [CHEAPEST](#cheapest-paths)) |
-| `SHORTEST k` | the k shortest paths per endpoint pair (one quantified edge between two vertices); walks unless a path mode is given |
+| `SHORTEST k` | the k shortest paths per endpoint pair (one quantified edge between two vertices, or a fixed-length pattern); walks unless a path mode is given |
+| `SHORTEST k GROUPS`, `SHORTEST k GROUP`, `SHORTEST GROUP` | every path of the k shortest distinct lengths per endpoint pair (`SHORTEST GROUP` is one length: `ALL SHORTEST`); a mode goes before `GROUP`: `SHORTEST 2 TRAIL GROUPS` |
+| `ANY k`, `ANY` | k paths per endpoint pair (`ANY` is `ANY 1`): the k that `SHORTEST k` returns |
+| `ALL` | every path, as without a search prefix |
+| `… PATH`, `… PATHS` | optional after a search prefix or path mode: `ANY SHORTEST PATHS`, `ALL TRAIL PATH` |
 | `WALK`, `TRAIL`, `SIMPLE`, `ACYCLIC` | path mode |
 | `OPTIONAL MATCH …` | the whole pattern left-joined onto the bindings so far (a row without a match keeps NULLs); any pattern a `MATCH` answers, `ANY`/`ALL CHEAPEST` included |
 | `WHERE EXISTS { (t)-[:HAS_WORKORDER]->() }`, `NOT EXISTS { … }` | correlated pattern existence |
@@ -179,10 +183,17 @@ matched over such an edge.
 `SHORTEST k` is the k shortest of those walks per endpoint pair, so `SHORTEST 1` and `ANY SHORTEST` give paths of
 the same length for every pair, closed walks included. SQL/PGQ leaves the choice among paths tied at the k-th
 length to the implementation; here the paths of one length are taken in the order of their edge row ids along the
-path, compared position by position, so the answer is deterministic. The search runs from each source the `MATCH
+path, compared position by position, so the answer is deterministic. `ANY k` leaves the choice of the k paths to
+the implementation altogether; here they are the ones `SHORTEST k` returns. `SHORTEST k GROUPS` chooses nothing:
+it is every walk whose length is among the pair's k shortest (fewer when fewer lengths exist), and `SHORTEST 1 GROUP`
+returns what `ALL SHORTEST` returns. Over walks the search keeps a vertex only at its first k depths, which is
+exact (a walk reaching it later ends no walk of a destination's k least lengths) and ends on cycles. Over a
+fixed-length pattern every path has the one length: `ANY k` and `SHORTEST k` keep the first k per pair of
+endpoints by element row ids, and `SHORTEST k GROUPS` keeps every path. The search runs from each source the `MATCH
 WHERE` admits (a filter on the source alone seeds it, one on the destination alone ends it early) and counts every
 partial path it builds against `pgq_max_vl_fallback_rows`, so an unseeded search on a large graph fails rather than
-runs on. No artifact holds k paths per pair: `SHORTEST k` always traverses.
+runs on. No artifact holds k paths per pair or the paths of k lengths: `SHORTEST k`, `ANY k` and `SHORTEST k
+GROUPS` always traverse.
 
 ### Quantified path patterns
 
@@ -670,8 +681,9 @@ building in [abi_build.cpp](src/core/functions/table/abi_build.cpp); vertex-join
   after the match (one join per element table), so they cost about what the equivalent hand-written join does.
 - **`OPTIONAL MATCH`**: its path variable can be read in `COLUMNS` and `WHERE` (NULL where it did not match), `cost(p)`
   of an `ANY` / `ALL CHEAPEST` pattern included, but not in `COLUMNS` shared by `UNION` branches.
-- **`SHORTEST k`** takes one quantified edge between two vertices over one edge table (no element `WHERE` on the
-  edge); longer patterns are refused. Inside a longer pattern, an unbounded quantifier with only a path mode or with a
+- **`SHORTEST k`, `ANY k`, `SHORTEST k GROUPS`** take one quantified edge between two vertices over one edge table
+  (no element `WHERE` on the edge), or a fixed-length pattern; a pattern mixing fixed hops with a quantified edge
+  is refused. k is a literal (not a parameter). Inside a longer pattern, an unbounded quantifier with only a path mode or with a
   lower bound above 1 is answered from the CSR, which finds one shortest path per pair (refused for `<-`).
 - **ABI rewrites** cover the common path shapes, not every pattern. Fixed-length chains longer than three hops, and
   chains with an undirected hop between two different vertex tables or an edge variable on an undirected hop,
