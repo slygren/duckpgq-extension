@@ -113,6 +113,13 @@ CREATE [OR REPLACE] PROPERTY GRAPH [IF NOT EXISTS] g
 --           | PROPERTIES [ARE] ALL COLUMNS [EXCEPT (…)] | NO PROPERTIES
 -- The first label's properties may also come before it: person PROPERTIES (id, name) LABEL Person.
 
+ALTER PROPERTY GRAPH g ADD {VERTEX | NODE} TABLES (…);              -- as in CREATE
+ALTER PROPERTY GRAPH g ADD {EDGE | RELATIONSHIP} TABLES (…);
+ALTER PROPERTY GRAPH g DROP {VERTEX | NODE} TABLES (alias, …) [CASCADE | RESTRICT];
+ALTER PROPERTY GRAPH g DROP {EDGE | RELATIONSHIP} TABLES (alias, …) [CASCADE | RESTRICT];
+ALTER PROPERTY GRAPH g ALTER {VERTEX | EDGE} TABLE alias ADD LABEL l [properties];
+ALTER PROPERTY GRAPH g ALTER {VERTEX | EDGE} TABLE alias DROP LABEL l [CASCADE | RESTRICT];
+
 DROP PROPERTY GRAPH [IF EXISTS] g;
 DESCRIBE PROPERTY GRAPH g;     -- also SHOW, and SUMMARIZE PROPERTY GRAPH for statistics
 ```
@@ -140,6 +147,15 @@ KEY. It wins over the PRIMARY KEY: `REFERENCES person` without a column list ref
 PRIMARY KEY. A key that a PRIMARY KEY or UNIQUE constraint enforces needs no check; any other key is trusted, and
 checked (unique, no NULLs) when `pgq_verify_edges_on_create = true`. A trusted key never enables vertex-join
 elimination. Element ids stay row ids for tables; for a view the key orders them.
+
+**`ALTER PROPERTY GRAPH`** changes the definition in place: the result is checked like a `CREATE` of it and
+replaces the stored graph, on every connection and across restarts. Element tables are named by their alias (their
+table name when they have none). `DROP VERTEX TABLES` refuses a table that edge tables reference (`RESTRICT`, the
+default); `CASCADE` drops those edge tables too. `ADD LABEL` without `PROPERTIES` adds all columns, as a label clause
+does in `CREATE`; `DROP LABEL` of the first label makes the next one first. Any `ALTER` stops the graph's ABI
+artifacts from answering (`pgq_abi_status` shows `fresh = false`) until `pgq_abi_build` builds them for the new
+definition; under `pgq_abi_mode = 'auto'` that happens right away. An `ALTER` that would leave the `WITH ABI` clause
+naming a label the graph no longer has is refused.
 
 A vertex or edge table may be a **view**, also a view in an attached database or DuckLake catalog. A view has no
 foreign keys, so an edge view needs `SOURCE KEY (…) REFERENCES …` and `DESTINATION KEY (…)`. A view has no `rowid`
@@ -681,7 +697,11 @@ building in [abi_build.cpp](src/core/functions/table/abi_build.cpp); vertex-join
   "Label … is not unique"). Properties are per table, the union of its labels' clauses, so a label does not restrict
   which properties a pattern on it may read. `WHERE` may also read columns that are no property (only `COLUMNS` is
   checked). A graph created before renamed properties worked, whose alias is another column's name, keeps reading
-  that column under the name (CREATE refuses such a graph now).
+  that column under the name (CREATE refuses such a graph now). `ALTER PROPERTY GRAPH` has no `ALTER LABEL … ADD /
+  DROP PROPERTIES`, `RENAME TO` or `SET SCHEMA`; `DROP LABEL` keeps the table's properties, and the `WITH ABI` clause
+  is changed by recreating the graph. After an `ALTER`, artifacts written by `pgq_abi_sql` scripts or an external
+  builder stay unused until `pgq_abi_build` runs (or the graph is recreated). `DROP PROPERTY GRAPH` has no
+  `CASCADE` / `RESTRICT` and leaves the graph's artifacts (use `pgq_abi_drop`).
 - **Patterns not supported:** `LATERAL` inside `MATCH`, graph updates (`INSERT`/`DELETE` of vertices or edges; the
   graph is a view over tables).
 - **Quantified path patterns** are written out per repetition count. A group allows at most 8 repetitions, and a

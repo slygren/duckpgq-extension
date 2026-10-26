@@ -14,6 +14,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckpgq/core/utils/duckpgq_sql.hpp"
+#include "duckpgq/core/utils/duckpgq_identifier.hpp"
 
 namespace duckdb {
 
@@ -420,36 +421,12 @@ void CreatePropertyGraphFunction::ValidatePrimaryKeyInTable(ClientContext &conte
 	}
 }
 
-unique_ptr<FunctionData> CreatePropertyGraphFunction::CreatePropertyGraphBind(ClientContext &context,
-                                                                              TableFunctionBindInput &input,
-                                                                              vector<LogicalType> &return_types,
-                                                                              vector<Identifier> &names) {
-	names.emplace_back("Success");
-	return_types.emplace_back(LogicalType::BOOLEAN);
-	auto duckpgq_state = GetDuckPGQState(context);
-
-	const auto duckpgq_parse_data = dynamic_cast<DuckPGQParseData *>(duckpgq_state->parse_data.get());
-
-	if (!duckpgq_parse_data) {
-		return {};
-	}
-	auto statement = dynamic_cast<CreateStatement *>(duckpgq_parse_data->statement.get());
-	auto info = dynamic_cast<CreatePropertyGraphInfo *>(statement->info.get());
-	// Record where the graph lives so qualified references can be checked; the schema must exist like for a table.
-	auto graph_name = DuckPGQState::ResolvePropertyGraphName(context, info->GetQualifiedName());
-	Catalog::GetSchema(context, graph_name.Catalog(), graph_name.Schema());
-	info->SetQualifiedName(graph_name);
-	auto pg_table = duckpgq_state->registered_property_graphs.find(info->property_graph_name);
-
-	if (pg_table != duckpgq_state->registered_property_graphs.end() &&
-	    info->on_conflict == OnCreateConflict::ERROR_ON_CONFLICT) {
-		throw Exception(ExceptionType::INVALID,
-		                "Property graph table with name " + info->property_graph_name + " already exists");
-	}
-
+//! Checks a property graph's definition against the catalog and completes it: binds the tables' catalogs and
+//! schemas, expands ALL COLUMNS, resolves keys (FOREIGN KEY, REFERENCES v without a list), and records views.
+void CreatePropertyGraphFunction::ValidatePropertyGraph(ClientContext &context, CreatePropertyGraphInfo &info) {
 	case_insensitive_set_t v_table_names;
 	case_insensitive_map_t<ElementColumns> vertex_columns;
-	for (auto &vertex_table : info->vertex_tables) {
+	for (auto &vertex_table : info.vertex_tables) {
 		ElementColumns table;
 		try {
 			BindPropertyGraphTable(context, vertex_table);
@@ -471,7 +448,7 @@ unique_ptr<FunctionData> CreatePropertyGraphFunction::CreatePropertyGraphBind(Cl
 		}
 	}
 
-	for (auto &edge_table : info->edge_tables) {
+	for (auto &edge_table : info.edge_tables) {
 		try {
 			BindPropertyGraphTable(context, edge_table);
 			auto table = ResolveElementColumns(context, *edge_table);
@@ -510,7 +487,7 @@ unique_ptr<FunctionData> CreatePropertyGraphFunction::CreatePropertyGraphBind(Cl
 
 			// Validate source table registration
 			if (!edge_table->source_pg_table) {
-				ThrowMissingVertexReference(*info, edge_table->source_catalog, edge_table->source_schema,
+				ThrowMissingVertexReference(info, edge_table->source_catalog, edge_table->source_schema,
 				                            edge_table->source_reference);
 			}
 			ValidateVertexTableRegistration(edge_table->source_pg_table, v_table_names);
@@ -522,7 +499,7 @@ unique_ptr<FunctionData> CreatePropertyGraphFunction::CreatePropertyGraphBind(Cl
 
 			// Validate destination table registration
 			if (!edge_table->destination_pg_table) {
-				ThrowMissingVertexReference(*info, edge_table->destination_catalog, edge_table->destination_schema,
+				ThrowMissingVertexReference(info, edge_table->destination_catalog, edge_table->destination_schema,
 				                            edge_table->destination_reference);
 			}
 			ValidateVertexTableRegistration(edge_table->destination_pg_table, v_table_names);
@@ -540,7 +517,7 @@ unique_ptr<FunctionData> CreatePropertyGraphFunction::CreatePropertyGraphBind(Cl
 			throw Exception(ExceptionType::INVALID, "Catalog '" + edge_table->catalog_name + "' does not exist!");
 		}
 	}
-	for (auto &vertex_table : info->vertex_tables) {
+	for (auto &vertex_table : info.vertex_tables) {
 		if (!vertex_table->is_view) {
 			continue;
 		}
@@ -553,7 +530,7 @@ unique_ptr<FunctionData> CreatePropertyGraphFunction::CreatePropertyGraphBind(Cl
 		}
 		vector<Identifier> referenced;
 		bool agree = true;
-		for (auto &edge_table : info->edge_tables) {
+		for (auto &edge_table : info.edge_tables) {
 			for (int side = 0; side < 2; side++) {
 				auto &vertex = side == 0 ? edge_table->source_pg_table : edge_table->destination_pg_table;
 				auto &keys = side == 0 ? edge_table->source_pk : edge_table->destination_pk;
@@ -570,6 +547,36 @@ unique_ptr<FunctionData> CreatePropertyGraphFunction::CreatePropertyGraphBind(Cl
 		vertex_table->identity_columns = IdentityColumns(agree ? referenced : vector<Identifier>(),
 		                                                 vertex_columns[vertex_table->FullTableName()].names);
 	}
+}
+
+unique_ptr<FunctionData> CreatePropertyGraphFunction::CreatePropertyGraphBind(ClientContext &context,
+                                                                              TableFunctionBindInput &input,
+                                                                              vector<LogicalType> &return_types,
+                                                                              vector<Identifier> &names) {
+	names.emplace_back("Success");
+	return_types.emplace_back(LogicalType::BOOLEAN);
+	auto duckpgq_state = GetDuckPGQState(context);
+
+	const auto duckpgq_parse_data = dynamic_cast<DuckPGQParseData *>(duckpgq_state->parse_data.get());
+
+	if (!duckpgq_parse_data) {
+		return {};
+	}
+	auto statement = dynamic_cast<CreateStatement *>(duckpgq_parse_data->statement.get());
+	auto info = dynamic_cast<CreatePropertyGraphInfo *>(statement->info.get());
+	// Record where the graph lives so qualified references can be checked; the schema must exist like for a table.
+	auto graph_name = DuckPGQState::ResolvePropertyGraphName(context, info->GetQualifiedName());
+	Catalog::GetSchema(context, graph_name.Catalog(), graph_name.Schema());
+	info->SetQualifiedName(graph_name);
+	auto pg_table = duckpgq_state->registered_property_graphs.find(info->property_graph_name);
+
+	if (pg_table != duckpgq_state->registered_property_graphs.end() &&
+	    info->on_conflict == OnCreateConflict::ERROR_ON_CONFLICT) {
+		throw Exception(ExceptionType::INVALID,
+		                "Property graph table with name " + info->property_graph_name + " already exists");
+	}
+
+	ValidatePropertyGraph(context, *info);
 	return make_uniq<CreatePropertyGraphBindData>(info);
 }
 
@@ -687,8 +694,8 @@ static string StringListSQL(const vector<Identifier> &values) {
 	return "[" + StringUtil::Join(literals, ", ") + "]::VARCHAR[]";
 }
 
-//! The values of the __duckpgq_internal columns after abi_options, for one element table.
-static string ElementColumnsSQL(const PropertyGraphTable &table) {
+//! The values of the __duckpgq_internal columns after abi_options, for one element table of the graph.
+static string ElementColumnsSQL(const CreatePropertyGraphInfo &graph, const PropertyGraphTable &table) {
 	string expressions = "NULL";
 	for (idx_t i = 0; i < table.column_names.size(); i++) {
 		if (!table.PropertyExpression(i).empty()) {
@@ -702,7 +709,10 @@ static string ElementColumnsSQL(const PropertyGraphTable &table) {
 		}
 	}
 	return string(table.is_view ? "true" : "NULL") + ", " + StringListSQL(table.identity_columns) + ", " +
-	       StringListSQL(table.extra_labels) + ", " + StringListSQL(table.element_key) + ", " + expressions;
+	       StringListSQL(table.extra_labels) + ", " + StringListSQL(table.element_key) + ", " + expressions + ", " +
+	       (table.table_name_alias.empty() ? string("NULL")
+	                                       : KeywordHelper::WriteQuoted(PGQStr(table.table_name_alias), '\'')) +
+	       ", " + (graph.abi_disabled ? "true" : "NULL");
 }
 
 //! A KEY must identify the table's rows (SQL/PGQ element key). A PRIMARY KEY or UNIQUE constraint on the same columns
@@ -778,6 +788,15 @@ void CreatePropertyGraphFunction::CreatePropertyGraphFunc(ClientContext &context
 		replace_existing = pg_info->on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT;
 	}
 
+	StorePropertyGraph(context, *pg_info, *new_conn, replace_existing);
+}
+
+//! Verifies the data (when pgq_verify_edges_on_create asks for it), registers the graph on every connection and
+//! writes its __duckpgq_internal rows, replacing the graph's previous rows when replace_existing.
+void CreatePropertyGraphFunction::StorePropertyGraph(ClientContext &context, CreatePropertyGraphInfo &info,
+                                                     Connection &connection, bool replace_existing) {
+	auto pg_info = &info;
+	auto new_conn = &connection;
 	// Verify the data before anything is registered, so that a failed CREATE leaves no trace and CREATE OR REPLACE
 	// keeps the previous definition.
 	// The check scans every edge table, so it is opt-in.
@@ -863,7 +882,7 @@ void CreatePropertyGraphFunction::CreatePropertyGraphFunc(ClientContext &context
 		insert_info += "'" + graph_catalog + "', '" + graph_schema + "', ";
 		insert_info += pg_info->verified ? "true" : "false";
 		insert_info += ", " + abi_options_sql;
-		insert_info += ", " + ElementColumnsSQL(*v_table);
+		insert_info += ", " + ElementColumnsSQL(*pg_info, *v_table);
 		insert_info += "), ";
 	}
 
@@ -927,7 +946,7 @@ void CreatePropertyGraphFunction::CreatePropertyGraphFunc(ClientContext &context
 		insert_info += "'" + graph_catalog + "', '" + graph_schema + "', ";
 		insert_info += pg_info->verified ? "true" : "false";
 		insert_info += ", " + abi_options_sql;
-		insert_info += ", " + ElementColumnsSQL(*e_table);
+		insert_info += ", " + ElementColumnsSQL(*pg_info, *e_table);
 		insert_info += "), ";
 	}
 	auto insert_query = new_conn->Query(insert_info);
@@ -939,10 +958,280 @@ void CreatePropertyGraphFunction::CreatePropertyGraphFunc(ClientContext &context
 }
 
 //------------------------------------------------------------------------------
+// ALTER PROPERTY GRAPH
+//------------------------------------------------------------------------------
+//! The element table an ALTER names: by its alias, or by its table name when that is unambiguous.
+static shared_ptr<PropertyGraphTable> FindElementTable(const vector<shared_ptr<PropertyGraphTable>> &tables,
+                                                       const Identifier &name, bool vertex, const string &graph) {
+	shared_ptr<PropertyGraphTable> by_alias;
+	vector<shared_ptr<PropertyGraphTable>> by_name;
+	for (auto &table : tables) {
+		if (!table->table_name_alias.empty() &&
+		    StringUtil::CIEquals(table->table_name_alias.GetIdentifierName(), name.GetIdentifierName())) {
+			by_alias = table;
+		}
+		if (StringUtil::CIEquals(table->table_name.GetIdentifierName(), name.GetIdentifierName())) {
+			by_name.push_back(table);
+		}
+	}
+	if (by_alias) {
+		return by_alias;
+	}
+	if (by_name.size() == 1) {
+		return by_name[0];
+	}
+	throw BinderException("%s %s of property graph %s %s", vertex ? "Vertex table" : "Edge table",
+	                      name.GetIdentifierName(), graph,
+	                      by_name.empty() ? "does not exist" : "is ambiguous: name it by its alias");
+}
+
+static string ElementName(const PropertyGraphTable &table) {
+	return PGQStr(table.table_name_alias.empty() ? table.table_name : table.table_name_alias);
+}
+
+static void RemoveTable(vector<shared_ptr<PropertyGraphTable>> &tables, const shared_ptr<PropertyGraphTable> &table) {
+	tables.erase(std::remove(tables.begin(), tables.end(), table), tables.end());
+}
+
+//! ADD LABEL l [PROPERTIES ...]: the table gets the label, and the label's properties (SQL/PGQ: all columns when it
+//! has no PROPERTIES clause) join the table's.
+static void AddLabel(PropertyGraphTable &table, const AlterPropertyGraphInfo &alter) {
+	auto &label = alter.label;
+	if (table.HasStaticLabel(label.GetIdentifierName())) {
+		throw BinderException("Element table %s already has label %s", ElementName(table), label.GetIdentifierName());
+	}
+	table.extra_labels.push_back(label);
+	auto &clause = *alter.label_properties;
+	if (clause.no_columns) {
+		return;
+	}
+	table.no_columns = false;
+	if (clause.all_columns) {
+		// Expanded again, with the table's current properties after them (see CheckPropertyGraphTableColumns).
+		if (!table.all_columns) {
+			table.except_columns = clause.except_columns;
+		} else {
+			vector<Identifier> kept;
+			for (auto &column : table.except_columns) {
+				for (auto &other : clause.except_columns) {
+					if (StringUtil::CIEquals(column.GetIdentifierName(), other.GetIdentifierName())) {
+						kept.push_back(column);
+					}
+				}
+			}
+			table.except_columns = std::move(kept);
+		}
+		table.all_columns = true;
+	}
+	for (idx_t i = 0; i < clause.column_names.size(); i++) {
+		bool known = false;
+		for (idx_t j = 0; j < table.column_names.size(); j++) {
+			if (!StringUtil::CIEquals(table.PropertyName(j).GetIdentifierName(),
+			                          clause.PropertyName(i).GetIdentifierName())) {
+				continue;
+			}
+			if (!StringUtil::CIEquals(table.column_names[j].GetIdentifierName(),
+			                          clause.column_names[i].GetIdentifierName()) ||
+			    table.PropertyExpression(j) != clause.PropertyExpression(i)) {
+				throw BinderException("Property %s of element table %s is defined twice, differently",
+				                      clause.PropertyName(i).GetIdentifierName(), ElementName(table));
+			}
+			known = true;
+		}
+		if (!known) {
+			table.property_expressions.resize(table.column_names.size());
+			table.column_names.push_back(clause.column_names[i]);
+			table.column_aliases.push_back(clause.PropertyName(i));
+			table.property_expressions.push_back(clause.PropertyExpression(i));
+		}
+	}
+}
+
+//! DROP LABEL l: the table's first label is the next one when l was the first. Its properties stay.
+static void DropLabel(PropertyGraphTable &table, const Identifier &label) {
+	auto name = label.GetIdentifierName();
+	for (auto &sub_label : table.sub_labels) {
+		if (StringUtil::CIEquals(sub_label.GetIdentifierName(), name)) {
+			throw BinderException("Label %s of element table %s is a discriminator sub-label (IN %s (...)); recreate "
+			                      "the graph to change those",
+			                      name, ElementName(table), PGQStr(table.discriminator));
+		}
+	}
+	if (!table.HasStaticLabel(name)) {
+		throw BinderException("Element table %s has no label %s", ElementName(table), name);
+	}
+	if (StringUtil::CIEquals(table.main_label.GetIdentifierName(), name)) {
+		if (table.extra_labels.empty()) {
+			throw BinderException("Label %s is the only label of element table %s; an element table has at least one",
+			                      name, ElementName(table));
+		}
+		table.main_label = table.extra_labels[0];
+		table.extra_labels.erase(table.extra_labels.begin());
+		return;
+	}
+	for (idx_t i = 0; i < table.extra_labels.size(); i++) {
+		if (StringUtil::CIEquals(table.extra_labels[i].GetIdentifierName(), name)) {
+			table.extra_labels.erase(table.extra_labels.begin() + i);
+			return;
+		}
+	}
+}
+
+//! The WITH ABI clause may name labels (closures, branch summaries, ...); after a DROP it must still name existing
+//! ones, or pgq_abi_build would refuse the graph.
+static void CheckAbiOptionLabels(ClientContext &context, const CreatePropertyGraphInfo &graph) {
+	if (graph.abi_options.empty()) {
+		return;
+	}
+	auto options = PGQAbiOptionsForGraph(context, graph, {});
+	vector<string> labels;
+	for (auto &closure : options.closures) {
+		labels.push_back(closure.relationship);
+	}
+	for (auto &branch : options.branch_summaries) {
+		labels.push_back(branch.anchor);
+		labels.insert(labels.end(), branch.branches.begin(), branch.branches.end());
+	}
+	for (auto &path : options.exclude_paths) {
+		labels.insert(labels.end(), path.begin(), path.end());
+	}
+	for (auto &entry : options.cover) {
+		labels.push_back(entry.first);
+	}
+	for (auto &entry : options.edge_domains) {
+		labels.push_back(entry.first);
+	}
+	for (auto &label : labels) {
+		if (graph.label_map.find(label) == graph.label_map.end()) {
+			throw BinderException("The WITH ABI clause of property graph %s names label %s, which the altered graph "
+			                      "would not have; recreate the graph (CREATE OR REPLACE) with a WITH ABI clause "
+			                      "that does not name it",
+			                      graph.property_graph_name, label);
+		}
+	}
+}
+
+unique_ptr<FunctionData> AlterPropertyGraphFunction::AlterPropertyGraphBind(ClientContext &context,
+                                                                            TableFunctionBindInput &input,
+                                                                            vector<LogicalType> &return_types,
+                                                                            vector<Identifier> &names) {
+	names.emplace_back("Success");
+	return_types.emplace_back(LogicalType::BOOLEAN);
+	auto duckpgq_state = GetDuckPGQState(context);
+	auto parse_data = dynamic_cast<DuckPGQParseData *>(duckpgq_state->parse_data.get());
+	if (!parse_data) {
+		return {};
+	}
+	auto &statement = parse_data->statement->Cast<CreateStatement>();
+	auto &alter = statement.info->Cast<AlterPropertyGraphInfo>();
+	auto current = duckpgq_state->TryGetPropertyGraph(context, alter.GetQualifiedName());
+	if (!current) {
+		throw BinderException("Property graph %s does not exist", alter.GetQualifiedName().ToString());
+	}
+	auto altered = unique_ptr_cast<CreateInfo, CreatePropertyGraphInfo>(current->Copy());
+	altered->on_conflict = OnCreateConflict::REPLACE_ON_CONFLICT;
+	auto &graph = altered->property_graph_name;
+
+	switch (alter.action) {
+	case PGQAlterGraphAction::ADD_VERTEX_TABLES:
+	case PGQAlterGraphAction::ADD_EDGE_TABLES: {
+		const bool vertex = alter.action == PGQAlterGraphAction::ADD_VERTEX_TABLES;
+		auto &added = vertex ? alter.vertex_tables : alter.edge_tables;
+		auto &tables = vertex ? altered->vertex_tables : altered->edge_tables;
+		for (auto &table : added) {
+			for (auto &existing : altered->vertex_tables) {
+				if (StringUtil::CIEquals(ElementName(*existing), ElementName(*table))) {
+					throw BinderException("Property graph %s already has an element table %s", graph,
+					                      ElementName(*table));
+				}
+			}
+			for (auto &existing : altered->edge_tables) {
+				if (StringUtil::CIEquals(ElementName(*existing), ElementName(*table))) {
+					throw BinderException("Property graph %s already has an element table %s", graph,
+					                      ElementName(*table));
+				}
+			}
+			auto copy = table->Copy();
+			copy->source_pg_table = nullptr;
+			copy->destination_pg_table = nullptr;
+			tables.push_back(std::move(copy));
+		}
+		break;
+	}
+	case PGQAlterGraphAction::DROP_VERTEX_TABLES:
+		for (auto &name : alter.element_tables) {
+			auto table = FindElementTable(altered->vertex_tables, name, true, graph);
+			vector<shared_ptr<PropertyGraphTable>> referencing;
+			for (auto &edge : altered->edge_tables) {
+				if (edge->source_pg_table == table || edge->destination_pg_table == table) {
+					referencing.push_back(edge);
+				}
+			}
+			if (!referencing.empty() && !alter.cascade) {
+				vector<string> edge_names;
+				for (auto &edge : referencing) {
+					edge_names.push_back(ElementName(*edge));
+				}
+				throw BinderException("Vertex table %s of property graph %s is referenced by edge table(s) %s: drop "
+				                      "them first, or DROP VERTEX TABLES (...) CASCADE to drop them with it",
+				                      ElementName(*table), graph, StringUtil::Join(edge_names, ", "));
+			}
+			for (auto &edge : referencing) {
+				RemoveTable(altered->edge_tables, edge);
+			}
+			RemoveTable(altered->vertex_tables, table);
+		}
+		if (altered->vertex_tables.empty()) {
+			throw BinderException("Property graph %s would have no vertex table left; DROP PROPERTY GRAPH drops it",
+			                      graph);
+		}
+		break;
+	case PGQAlterGraphAction::DROP_EDGE_TABLES:
+		for (auto &name : alter.element_tables) {
+			RemoveTable(altered->edge_tables, FindElementTable(altered->edge_tables, name, false, graph));
+		}
+		break;
+	case PGQAlterGraphAction::ADD_LABEL:
+	case PGQAlterGraphAction::DROP_LABEL: {
+		auto &tables = alter.element_is_vertex ? altered->vertex_tables : altered->edge_tables;
+		auto table = FindElementTable(tables, alter.element_tables[0], alter.element_is_vertex, graph);
+		if (alter.action == PGQAlterGraphAction::ADD_LABEL) {
+			AddLabel(*table, alter);
+		} else {
+			DropLabel(*table, alter.label);
+		}
+		break;
+	}
+	}
+	altered->ResolveEdgeReferences();
+	altered->RebuildLabelMap();
+	CreatePropertyGraphFunction::ValidatePropertyGraph(context, *altered);
+	CheckAbiOptionLabels(context, *altered);
+	// Artifacts were built for the previous definition: a dropped table's, or a family the new one adds to.
+	altered->abi_disabled = true;
+	return make_uniq<AlterPropertyGraphBindData>(std::move(altered));
+}
+
+void AlterPropertyGraphFunction::AlterPropertyGraphFunc(ClientContext &context, TableFunctionInput &data_p,
+                                                        DataChunk &output) {
+	auto &bind_data = data_p.bind_data->Cast<AlterPropertyGraphBindData>();
+	auto &global = data_p.global_state->Cast<CreatePropertyGraphFunction::CreatePropertyGraphGlobalData>();
+	if (global.done) {
+		return;
+	}
+	global.done = true;
+	auto duckpgq_state = GetDuckPGQState(context);
+	duckpgq_state->InitializeInternalTable(context);
+	Connection connection(*context.db);
+	CreatePropertyGraphFunction::StorePropertyGraph(context, *bind_data.altered, connection, true);
+}
+
+//------------------------------------------------------------------------------
 // Register functions
 //------------------------------------------------------------------------------
 void CoreTableFunctions::RegisterCreatePropertyGraphTableFunction(ExtensionLoader &loader) {
 	loader.RegisterFunction(CreatePropertyGraphFunction());
+	loader.RegisterFunction(AlterPropertyGraphFunction());
 }
 
 } // namespace duckdb

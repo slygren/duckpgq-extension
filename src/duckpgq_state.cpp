@@ -89,7 +89,9 @@ void DuckPGQState::CreateInternalTable(Connection &connection) {
 	                              "identity_columns varchar[], "
 	                              "extra_labels varchar[], "
 	                              "element_key varchar[], "
-	                              "property_expressions varchar[]"
+	                              "property_expressions varchar[], "
+	                              "table_alias varchar, "
+	                              "abi_disabled boolean"
 	                              ")");
 	if (query->HasError()) {
 		throw TransactionException(query->GetError());
@@ -99,7 +101,8 @@ void DuckPGQState::CreateInternalTable(Connection &connection) {
 	// Later columns are NULL in rows written before they existed, which reads as what those graphs meant.
 	for (auto column : {"graph_catalog VARCHAR", "graph_schema VARCHAR", "verified BOOLEAN", "abi_options VARCHAR",
 	                    "is_view BOOLEAN", "identity_columns VARCHAR[]", "extra_labels VARCHAR[]",
-	                    "element_key VARCHAR[]", "property_expressions VARCHAR[]"}) {
+	                    "element_key VARCHAR[]", "property_expressions VARCHAR[]", "table_alias VARCHAR",
+	                    "abi_disabled BOOLEAN"}) {
 		auto alter =
 		    connection.Query(StringUtil::Format("ALTER TABLE __duckpgq_internal ADD COLUMN IF NOT EXISTS %s", column));
 		if (alter->HasError()) {
@@ -220,9 +223,20 @@ void DuckPGQState::ProcessPropertyGraphs(ClientContext &context, unique_ptr<Quer
 					                                                          : expression.GetValue<string>());
 				}
 			}
+			if (chunk->ColumnCount() > 29 && !chunk->GetValue(29, i).IsNull()) {
+				table->table_name_alias = Identifier(chunk->GetValue(29, i).GetValue<string>());
+			}
 			QualifiedName graph_name(graph_catalog, graph_schema, Identifier(chunk->GetValue(0, i).GetValue<string>()));
 			auto resolved_name = ResolvePropertyGraphName(context, graph_name);
 			RegisterPropertyGraph(table, resolved_name, is_vertex, verified);
+			if (chunk->ColumnCount() > 30) {
+				auto disabled = chunk->GetValue(30, i);
+				if (!disabled.IsNull() && disabled.GetValue<bool>()) {
+					registered_property_graphs[resolved_name.Name().GetIdentifierName()]
+					    ->Cast<CreatePropertyGraphInfo>()
+					    .abi_disabled = true;
+				}
+			}
 			if (chunk->ColumnCount() > 23 && !chunk->GetValue(23, i).IsNull()) {
 				auto &info = registered_property_graphs[resolved_name.Name().GetIdentifierName()]
 				                 ->Cast<CreatePropertyGraphInfo>();

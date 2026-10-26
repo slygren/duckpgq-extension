@@ -4,6 +4,21 @@
 
 DuckPGQCreatePropertyGraph <- 'CREATE' OrReplace? 'PROPERTY' 'GRAPH' IfNotExists? QualifiedName DuckPGQVertexTables DuckPGQEdgeTables? DuckPGQAbiClause?
 
+# ALTER PROPERTY GRAPH: add or drop element tables, add or drop a label of one. Element tables are named by their
+# alias (the table name when they have none).
+DuckPGQAlterPropertyGraph <- 'ALTER' 'PROPERTY' 'GRAPH' QualifiedName DuckPGQAlterGraphAction
+DuckPGQAlterGraphAction <- DuckPGQAddVertexTables / DuckPGQAddEdgeTables / DuckPGQDropVertexTables / DuckPGQDropEdgeTables / DuckPGQAlterElementTable
+DuckPGQAddVertexTables <- 'ADD' DuckPGQVertexTables
+DuckPGQAddEdgeTables <- 'ADD' DuckPGQEdgeTables
+DuckPGQDropVertexTables <- 'DROP' DuckPGQVertexKeyword 'TABLES' Parens(List(ColId)) DuckPGQDropBehavior?
+DuckPGQDropEdgeTables <- 'DROP' DuckPGQEdgeKeyword 'TABLES' Parens(List(ColId)) DuckPGQDropBehavior?
+DuckPGQDropBehavior <- 'CASCADE' / 'RESTRICT'
+DuckPGQAlterElementTable <- 'ALTER' DuckPGQElementKind 'TABLE' ColId DuckPGQAlterElementAction
+DuckPGQElementKind <- DuckPGQVertexKeyword / DuckPGQEdgeKeyword
+DuckPGQAlterElementAction <- DuckPGQAddLabel / DuckPGQDropLabel
+DuckPGQAddLabel <- 'ADD' DuckPGQNamedLabel DuckPGQProperties?
+DuckPGQDropLabel <- 'DROP' DuckPGQNamedLabel DuckPGQDropBehavior?
+
 # What pgq_abi_build builds for the graph, with the option names of pgq_abi_build. Declaring it builds nothing.
 DuckPGQAbiClause <- 'WITH' 'ABI' Parens(List(DuckPGQAbiOption))
 DuckPGQAbiOption <- ColId NamedParameterAssignment Expression

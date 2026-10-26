@@ -1,0 +1,548 @@
+# name: test/sql/create_pg/alter_property_graph.test
+# description: ALTER PROPERTY GRAPH ADD / DROP VERTEX and EDGE TABLES, ALTER ... TABLE ADD / DROP LABEL. An altered
+#              graph answers like the graph created with the resulting definition; it persists, every connection
+#              sees it, and the graph's ABI artifacts stop answering until they are rebuilt.
+# group: [create_pg]
+
+require duckpgq
+
+load {TEST_DIR}/alter_property_graph.db
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE person (id BIGINT, name VARCHAR, age INTEGER);
+
+statement ok
+INSERT INTO person SELECT range, 'p' || range, 20 + range % 30 FROM range(1, 31);
+
+statement ok
+CREATE TABLE city (cid BIGINT, cname VARCHAR);
+
+statement ok
+INSERT INTO city VALUES (100, 'Oslo'), (101, 'Rome'), (102, 'Lima');
+
+statement ok
+CREATE TABLE knows (src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO knows SELECT range, (range * 7) % 30 + 1 FROM range(1, 31) UNION ALL SELECT range, range + 1 FROM range(1, 30);
+
+statement ok
+CREATE TABLE lives (p BIGINT, c BIGINT);
+
+statement ok
+INSERT INTO lives SELECT range, 100 + range % 3 FROM range(1, 31) WHERE range % 4 <> 0;
+
+statement ok
+CREATE TABLE likes (a BIGINT, b BIGINT);
+
+statement ok
+INSERT INTO likes SELECT range, (range * 3) % 30 + 1 FROM range(1, 31);
+
+# Built up by ALTER, and created at once.
+statement ok
+CREATE PROPERTY GRAPH g VERTEX TABLES (person LABEL Person);
+
+statement ok
+ALTER PROPERTY GRAPH g ADD VERTEX TABLES (city AS c LABEL City);
+
+statement ok
+ALTER PROPERTY GRAPH g ADD EDGE TABLES (knows SOURCE KEY (src) REFERENCES person (id) DESTINATION KEY (dst) REFERENCES person (id) LABEL Knows, lives SOURCE KEY (p) REFERENCES person (id) DESTINATION KEY (c) REFERENCES c (cid) LABEL LivesIn);
+
+statement ok
+ALTER PROPERTY GRAPH g ALTER VERTEX TABLE person ADD LABEL Human PROPERTIES (id, age + 1 AS next_age);
+
+statement ok
+CREATE PROPERTY GRAPH g_direct VERTEX TABLES (person LABEL Person LABEL Human PROPERTIES (id, age + 1 AS next_age), city AS c LABEL City) EDGE TABLES (knows SOURCE KEY (src) REFERENCES person (id) DESTINATION KEY (dst) REFERENCES person (id) LABEL Knows, lives SOURCE KEY (p) REFERENCES person (id) DESTINATION KEY (c) REFERENCES c (cid) LABEL LivesIn);
+
+query TTTT
+SELECT table_name, label, extra_labels, column_aliases FROM __duckpgq_internal WHERE property_graph = 'g' ORDER BY table_name;
+----
+city	City	NULL	[cid, cname]
+knows	Knows	NULL	[dst, src]
+lives	LivesIn	NULL	[c, p]
+person	Person	[Human]	[age, id, name, next_age]
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->(b:Human) COLUMNS (a.id, b.next_age)) EXCEPT ALL FROM GRAPH_TABLE (g_direct MATCH (a:Person)-[:Knows]->(b:Human) COLUMNS (a.id, b.next_age)))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (g_direct MATCH (a:Person)-[:Knows]->(b:Human) COLUMNS (a.id, b.next_age)) EXCEPT ALL FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->(b:Human) COLUMNS (a.id, b.next_age)))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->(b:Human) COLUMNS (a.id, b.next_age))));
+----
+0	true
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH (a:Human)-[:LivesIn]->(x:City) COLUMNS (a.name, x.cname)) EXCEPT ALL FROM GRAPH_TABLE (g_direct MATCH (a:Human)-[:LivesIn]->(x:City) COLUMNS (a.name, x.cname)))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (g_direct MATCH (a:Human)-[:LivesIn]->(x:City) COLUMNS (a.name, x.cname)) EXCEPT ALL FROM GRAPH_TABLE (g MATCH (a:Human)-[:LivesIn]->(x:City) COLUMNS (a.name, x.cname)))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (g MATCH (a:Human)-[:LivesIn]->(x:City) COLUMNS (a.name, x.cname))));
+----
+0	true
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Person)-[:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p))) EXCEPT ALL FROM GRAPH_TABLE (g_direct MATCH p = ANY SHORTEST (a:Person)-[:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p))))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (g_direct MATCH p = ANY SHORTEST (a:Person)-[:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p))) EXCEPT ALL FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Person)-[:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p))))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Person)-[:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p)))));
+----
+0	true
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->{1,2}(b:Person)-[:LivesIn]->(x:City) COLUMNS (a.id, x.cid)) EXCEPT ALL FROM GRAPH_TABLE (g_direct MATCH (a:Person)-[:Knows]->{1,2}(b:Person)-[:LivesIn]->(x:City) COLUMNS (a.id, x.cid)))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (g_direct MATCH (a:Person)-[:Knows]->{1,2}(b:Person)-[:LivesIn]->(x:City) COLUMNS (a.id, x.cid)) EXCEPT ALL FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->{1,2}(b:Person)-[:LivesIn]->(x:City) COLUMNS (a.id, x.cid)))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->{1,2}(b:Person)-[:LivesIn]->(x:City) COLUMNS (a.id, x.cid))));
+----
+0	true
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH (a:Person) OPTIONAL MATCH (a)-[:LivesIn]->(x:City) COLUMNS (a.id, x.cid)) EXCEPT ALL FROM GRAPH_TABLE (g_direct MATCH (a:Person) OPTIONAL MATCH (a)-[:LivesIn]->(x:City) COLUMNS (a.id, x.cid)))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (g_direct MATCH (a:Person) OPTIONAL MATCH (a)-[:LivesIn]->(x:City) COLUMNS (a.id, x.cid)) EXCEPT ALL FROM GRAPH_TABLE (g MATCH (a:Person) OPTIONAL MATCH (a)-[:LivesIn]->(x:City) COLUMNS (a.id, x.cid)))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (g MATCH (a:Person) OPTIONAL MATCH (a)-[:LivesIn]->(x:City) COLUMNS (a.id, x.cid))));
+----
+0	true
+
+# Every connection sees the altered graph.
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH (a:Human)-[:LivesIn]->(x:City) COLUMNS (a.name, x.cname)) EXCEPT ALL FROM GRAPH_TABLE (g_direct MATCH (a:Human)-[:LivesIn]->(x:City) COLUMNS (a.name, x.cname)))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (g_direct MATCH (a:Human)-[:LivesIn]->(x:City) COLUMNS (a.name, x.cname)) EXCEPT ALL FROM GRAPH_TABLE (g MATCH (a:Human)-[:LivesIn]->(x:City) COLUMNS (a.name, x.cname)))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (g MATCH (a:Human)-[:LivesIn]->(x:City) COLUMNS (a.name, x.cname))));
+----
+0	true
+
+statement ok con2
+SET active_grammar_extensions = ['duckpgq'];
+
+query I con2
+SELECT count(*) FROM GRAPH_TABLE (g MATCH (a:Human)-[:LivesIn]->(x:City) COLUMNS (a.id));
+----
+23
+
+# DROP VERTEX TABLES refuses a table edges reference (RESTRICT, the default); CASCADE drops those edges too.
+statement error
+ALTER PROPERTY GRAPH g DROP VERTEX TABLES (c);
+----
+Vertex table c of property graph g is referenced by edge table(s) lives
+
+statement error
+ALTER PROPERTY GRAPH g DROP VERTEX TABLES (c) RESTRICT;
+----
+is referenced by edge table(s) lives
+
+statement ok
+ALTER PROPERTY GRAPH g DROP NODE TABLES (c) CASCADE;
+
+query T
+SELECT list(table_name ORDER BY table_name) FROM __duckpgq_internal WHERE property_graph = 'g';
+----
+[knows, person]
+
+statement error
+FROM GRAPH_TABLE (g MATCH (a:Person)-[:LivesIn]->(x:City) COLUMNS (a.id));
+----
+LivesIn
+
+statement ok
+ALTER PROPERTY GRAPH g ADD VERTEX TABLES (city AS c LABEL City);
+
+statement ok
+ALTER PROPERTY GRAPH g ADD RELATIONSHIP TABLES (lives SOURCE KEY (p) REFERENCES person (id) DESTINATION KEY (c) REFERENCES c (cid) LABEL LivesIn, likes SOURCE KEY (a) REFERENCES person (id) DESTINATION KEY (b) REFERENCES person (id) LABEL Likes);
+
+statement ok
+ALTER PROPERTY GRAPH g DROP EDGE TABLES (likes);
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->(b:Human) COLUMNS (a.id, b.next_age)) EXCEPT ALL FROM GRAPH_TABLE (g_direct MATCH (a:Person)-[:Knows]->(b:Human) COLUMNS (a.id, b.next_age)))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (g_direct MATCH (a:Person)-[:Knows]->(b:Human) COLUMNS (a.id, b.next_age)) EXCEPT ALL FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->(b:Human) COLUMNS (a.id, b.next_age)))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->(b:Human) COLUMNS (a.id, b.next_age))));
+----
+0	true
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH (a:Human)-[:LivesIn]->(x:City) COLUMNS (a.name, x.cname)) EXCEPT ALL FROM GRAPH_TABLE (g_direct MATCH (a:Human)-[:LivesIn]->(x:City) COLUMNS (a.name, x.cname)))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (g_direct MATCH (a:Human)-[:LivesIn]->(x:City) COLUMNS (a.name, x.cname)) EXCEPT ALL FROM GRAPH_TABLE (g MATCH (a:Human)-[:LivesIn]->(x:City) COLUMNS (a.name, x.cname)))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (g MATCH (a:Human)-[:LivesIn]->(x:City) COLUMNS (a.name, x.cname))));
+----
+0	true
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Person)-[:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p))) EXCEPT ALL FROM GRAPH_TABLE (g_direct MATCH p = ANY SHORTEST (a:Person)-[:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p))))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (g_direct MATCH p = ANY SHORTEST (a:Person)-[:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p))) EXCEPT ALL FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Person)-[:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p))))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Person)-[:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p)))));
+----
+0	true
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->{1,2}(b:Person)-[:LivesIn]->(x:City) COLUMNS (a.id, x.cid)) EXCEPT ALL FROM GRAPH_TABLE (g_direct MATCH (a:Person)-[:Knows]->{1,2}(b:Person)-[:LivesIn]->(x:City) COLUMNS (a.id, x.cid)))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (g_direct MATCH (a:Person)-[:Knows]->{1,2}(b:Person)-[:LivesIn]->(x:City) COLUMNS (a.id, x.cid)) EXCEPT ALL FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->{1,2}(b:Person)-[:LivesIn]->(x:City) COLUMNS (a.id, x.cid)))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->{1,2}(b:Person)-[:LivesIn]->(x:City) COLUMNS (a.id, x.cid))));
+----
+0	true
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH (a:Person) OPTIONAL MATCH (a)-[:LivesIn]->(x:City) COLUMNS (a.id, x.cid)) EXCEPT ALL FROM GRAPH_TABLE (g_direct MATCH (a:Person) OPTIONAL MATCH (a)-[:LivesIn]->(x:City) COLUMNS (a.id, x.cid)))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (g_direct MATCH (a:Person) OPTIONAL MATCH (a)-[:LivesIn]->(x:City) COLUMNS (a.id, x.cid)) EXCEPT ALL FROM GRAPH_TABLE (g MATCH (a:Person) OPTIONAL MATCH (a)-[:LivesIn]->(x:City) COLUMNS (a.id, x.cid)))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (g MATCH (a:Person) OPTIONAL MATCH (a)-[:LivesIn]->(x:City) COLUMNS (a.id, x.cid))));
+----
+0	true
+
+# An edge table with an alias: path searches work in the session that created it (they used to fail with
+# 'Referenced table knows not found') and after a restart, where the alias is now kept.
+statement ok
+CREATE PROPERTY GRAPH g_alias VERTEX TABLES (person AS pp LABEL Person) EDGE TABLES (knows AS kk SOURCE KEY (src) REFERENCES pp (id) DESTINATION KEY (dst) REFERENCES pp (id) LABEL Knows);
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g_alias MATCH p = ANY SHORTEST (a:Person)-[:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p))) EXCEPT ALL FROM GRAPH_TABLE (g_direct MATCH p = ANY SHORTEST (a:Person)-[:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p))))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (g_direct MATCH p = ANY SHORTEST (a:Person)-[:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p))) EXCEPT ALL FROM GRAPH_TABLE (g_alias MATCH p = ANY SHORTEST (a:Person)-[:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p))))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (g_alias MATCH p = ANY SHORTEST (a:Person)-[:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p)))));
+----
+0	true
+
+query I
+SELECT count(*) FROM pagerank('g_alias', 'Person', 'Knows');
+----
+30
+
+# The graph survives a restart, with its alias c.
+restart
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g_alias MATCH p = ANY SHORTEST (a:Person)-[:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p))) EXCEPT ALL FROM GRAPH_TABLE (g_direct MATCH p = ANY SHORTEST (a:Person)-[:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p))))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (g_direct MATCH p = ANY SHORTEST (a:Person)-[:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p))) EXCEPT ALL FROM GRAPH_TABLE (g_alias MATCH p = ANY SHORTEST (a:Person)-[:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p))))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (g_alias MATCH p = ANY SHORTEST (a:Person)-[:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p)))));
+----
+0	true
+
+query T
+SELECT list(table_alias ORDER BY table_alias) FROM __duckpgq_internal WHERE property_graph = 'g_alias';
+----
+[kk, pp]
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->(b:Human) COLUMNS (a.id, b.next_age)) EXCEPT ALL FROM GRAPH_TABLE (g_direct MATCH (a:Person)-[:Knows]->(b:Human) COLUMNS (a.id, b.next_age)))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (g_direct MATCH (a:Person)-[:Knows]->(b:Human) COLUMNS (a.id, b.next_age)) EXCEPT ALL FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->(b:Human) COLUMNS (a.id, b.next_age)))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (g MATCH (a:Person)-[:Knows]->(b:Human) COLUMNS (a.id, b.next_age))));
+----
+0	true
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH (a:Human)-[:LivesIn]->(x:City) COLUMNS (a.name, x.cname)) EXCEPT ALL FROM GRAPH_TABLE (g_direct MATCH (a:Human)-[:LivesIn]->(x:City) COLUMNS (a.name, x.cname)))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (g_direct MATCH (a:Human)-[:LivesIn]->(x:City) COLUMNS (a.name, x.cname)) EXCEPT ALL FROM GRAPH_TABLE (g MATCH (a:Human)-[:LivesIn]->(x:City) COLUMNS (a.name, x.cname)))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (g MATCH (a:Human)-[:LivesIn]->(x:City) COLUMNS (a.name, x.cname))));
+----
+0	true
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Person)-[:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p))) EXCEPT ALL FROM GRAPH_TABLE (g_direct MATCH p = ANY SHORTEST (a:Person)-[:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p))))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (g_direct MATCH p = ANY SHORTEST (a:Person)-[:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p))) EXCEPT ALL FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Person)-[:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p))))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:Person)-[:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p)))));
+----
+0	true
+
+statement ok
+ALTER PROPERTY GRAPH g DROP VERTEX TABLES (c) CASCADE;
+
+statement ok
+ALTER PROPERTY GRAPH g ADD VERTEX TABLES (city AS c LABEL City);
+
+statement ok
+ALTER PROPERTY GRAPH g ADD EDGE TABLES (lives SOURCE KEY (p) REFERENCES person (id) DESTINATION KEY (c) REFERENCES c (cid) LABEL LivesIn);
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (g MATCH (a:Human)-[:LivesIn]->(x:City) COLUMNS (a.name, x.cname)) EXCEPT ALL FROM GRAPH_TABLE (g_direct MATCH (a:Human)-[:LivesIn]->(x:City) COLUMNS (a.name, x.cname)))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (g_direct MATCH (a:Human)-[:LivesIn]->(x:City) COLUMNS (a.name, x.cname)) EXCEPT ALL FROM GRAPH_TABLE (g MATCH (a:Human)-[:LivesIn]->(x:City) COLUMNS (a.name, x.cname)))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (g MATCH (a:Human)-[:LivesIn]->(x:City) COLUMNS (a.name, x.cname))));
+----
+0	true
+
+# Labels: ADD LABEL without PROPERTIES brings every column (SQL/PGQ); DROP LABEL of the first label makes the next
+# one first; a table keeps at least one label.
+statement ok
+CREATE PROPERTY GRAPH gl VERTEX TABLES (person PROPERTIES (id) LABEL Person) EDGE TABLES (knows SOURCE KEY (src) REFERENCES person (id) DESTINATION KEY (dst) REFERENCES person (id) LABEL Knows);
+
+statement error
+FROM GRAPH_TABLE (gl MATCH (a:Person) COLUMNS (a.name));
+----
+Property a.name is never registered
+
+statement ok
+ALTER PROPERTY GRAPH gl ALTER VERTEX TABLE person ADD LABEL Human;
+
+query T
+SELECT column_aliases FROM __duckpgq_internal WHERE property_graph = 'gl' AND is_vertex_table;
+----
+[age, id, name]
+
+statement ok
+ALTER PROPERTY GRAPH gl ALTER EDGE TABLE knows ADD LABEL Friend NO PROPERTIES;
+
+query TI
+FROM GRAPH_TABLE (gl MATCH (a:Human WHERE a.id = 1)-[k:Friend]->(b) COLUMNS (label(a), b.id)) ORDER BY ALL;
+----
+Person	2
+Person	8
+
+statement ok
+ALTER PROPERTY GRAPH gl ALTER VERTEX TABLE person DROP LABEL Person;
+
+query TI
+FROM GRAPH_TABLE (gl MATCH (a:Human WHERE a.id = 1)-[k:Knows]->(b) COLUMNS (label(a), b.id)) ORDER BY ALL;
+----
+Human	2
+Human	8
+
+statement error
+FROM GRAPH_TABLE (gl MATCH (a:Person) COLUMNS (a.id));
+----
+Person
+
+statement error
+ALTER PROPERTY GRAPH gl ALTER VERTEX TABLE person DROP LABEL Human;
+----
+Label Human is the only label of element table person
+
+statement error
+ALTER PROPERTY GRAPH gl ALTER VERTEX TABLE person ADD LABEL Human;
+----
+Element table person already has label Human
+
+statement error
+ALTER PROPERTY GRAPH gl ALTER VERTEX TABLE person ADD LABEL Friend;
+----
+Label friend is not unique
+
+statement error
+ALTER PROPERTY GRAPH gl ALTER VERTEX TABLE person DROP LABEL Nope;
+----
+Element table person has no label Nope
+
+statement error
+ALTER PROPERTY GRAPH gl ALTER VERTEX TABLE nope ADD LABEL X;
+----
+Vertex table nope of property graph gl does not exist
+
+statement ok
+CREATE TABLE typed (id BIGINT, kind INTEGER);
+
+statement ok
+CREATE PROPERTY GRAPH gs VERTEX TABLES (typed LABEL T IN kind (A, B));
+
+statement error
+ALTER PROPERTY GRAPH gs ALTER VERTEX TABLE typed DROP LABEL A;
+----
+is a discriminator sub-label
+
+# Errors.
+statement error
+ALTER PROPERTY GRAPH nope ADD VERTEX TABLES (person);
+----
+Property graph nope does not exist
+
+statement error
+ALTER PROPERTY GRAPH g ADD VERTEX TABLES (person);
+----
+Property graph g already has an element table person
+
+statement error
+ALTER PROPERTY GRAPH g ADD VERTEX TABLES (likes LABEL Person);
+----
+Label person is not unique
+
+statement error
+ALTER PROPERTY GRAPH g ADD EDGE TABLES (likes SOURCE KEY (a) REFERENCES nope (id) DESTINATION KEY (b) REFERENCES person (id));
+----
+nope
+
+statement error
+ALTER PROPERTY GRAPH g DROP EDGE TABLES (nope);
+----
+Edge table nope of property graph g does not exist
+
+statement error
+ALTER PROPERTY GRAPH gl DROP VERTEX TABLES (person) CASCADE;
+----
+Property graph gl would have no vertex table left
+
+statement ok
+CREATE PROPERTY GRAPH gtwice VERTEX TABLES (person AS a LABEL A, person AS b LABEL B);
+
+statement error
+ALTER PROPERTY GRAPH gtwice DROP VERTEX TABLES (person);
+----
+is ambiguous: name it by its alias
+
+statement ok
+ALTER PROPERTY GRAPH gtwice DROP VERTEX TABLES (b);
+
+query T
+SELECT list(label) FROM __duckpgq_internal WHERE property_graph = 'gtwice';
+----
+[A]
+
+# A failed ALTER changes nothing.
+query T
+SELECT list(table_name ORDER BY table_name) FROM __duckpgq_internal WHERE property_graph = 'g';
+----
+[city, knows, lives, person]
+
+# ABI artifacts: an ALTER stops them from answering (the graph they were built for is gone) until pgq_abi_build
+# builds them for the new definition.
+statement ok
+CREATE PROPERTY GRAPH ga VERTEX TABLES (person LABEL Person, city LABEL City) EDGE TABLES (lives SOURCE KEY (p) REFERENCES person (id) DESTINATION KEY (c) REFERENCES city (cid) LABEL LivesIn) WITH ABI (max_hops := 1);
+
+statement ok
+SELECT * FROM pgq_abi_build('ga');
+
+statement ok
+SET pgq_require_abi_paths = true;
+
+statement ok
+FROM GRAPH_TABLE (ga MATCH (a:Person)-[:LivesIn]->(x:City) COLUMNS (a.id, x.cid)) LIMIT 1;
+
+query T
+SELECT bool_or(status = 'selected') FROM pgq_last_rewrite_diagnostics();
+----
+true
+
+statement ok
+ALTER PROPERTY GRAPH ga ADD EDGE TABLES (knows SOURCE KEY (src) REFERENCES person (id) DESTINATION KEY (dst) REFERENCES person (id) LABEL Knows);
+
+statement error
+FROM GRAPH_TABLE (ga MATCH (a:Person)-[:LivesIn]->(x:City) COLUMNS (a.id, x.cid));
+----
+DuckPGQ ABI path required by pgq_require_abi_paths, but no matching ABI path table rewrite was available
+
+query TT
+SELECT bool_and(fresh = false), bool_and(table_exists) FROM pgq_abi_status('ga');
+----
+true	true
+
+query T
+SELECT DISTINCT abi_disabled FROM __duckpgq_internal WHERE property_graph = 'ga';
+----
+true
+
+statement ok
+SET pgq_require_abi_paths = false;
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (ga MATCH (a:Person)-[:LivesIn]->(x:City) COLUMNS (a.id, x.cid));
+----
+23
+
+# Disabled across a restart too.
+restart
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+SET pgq_require_abi_paths = true;
+
+statement error
+FROM GRAPH_TABLE (ga MATCH (a:Person)-[:LivesIn]->(x:City) COLUMNS (a.id, x.cid));
+----
+no matching ABI path table rewrite was available
+
+# A build for the new definition makes them answer again, on every connection.
+statement ok
+SELECT * FROM pgq_abi_build('ga');
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (ga MATCH (a:Person)-[:LivesIn]->(x:City) COLUMNS (a.id, x.cid));
+----
+23
+
+query T
+SELECT bool_or(status = 'selected') FROM pgq_last_rewrite_diagnostics();
+----
+true
+
+query T
+SELECT DISTINCT abi_disabled FROM __duckpgq_internal WHERE property_graph = 'ga';
+----
+NULL
+
+statement ok con3
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok con3
+SET pgq_require_abi_paths = true;
+
+query I con3
+SELECT count(*) FROM GRAPH_TABLE (ga MATCH (a:Person)-[:LivesIn]->(x:City) COLUMNS (a.id, x.cid));
+----
+23
+
+# A dropped edge table's artifact answers nothing after the DROP, nor after a rebuild (which drops it).
+statement ok
+ALTER PROPERTY GRAPH ga DROP EDGE TABLES (lives);
+
+statement error
+FROM GRAPH_TABLE (ga MATCH (a:Person)-[:LivesIn]->(x:City) COLUMNS (a.id, x.cid));
+----
+LivesIn
+
+statement ok
+SET pgq_require_abi_paths = false;
+
+statement ok
+SELECT * FROM pgq_abi_build('ga');
+
+query I
+SELECT count(*) FROM pgq_abi_status('ga') WHERE artifact ILIKE '%LivesIn%';
+----
+0
+
+# pgq_abi_mode = 'auto' rebuilds right after the ALTER.
+statement ok
+SET pgq_abi_mode = 'auto';
+
+statement ok
+ALTER PROPERTY GRAPH ga ADD EDGE TABLES (lives SOURCE KEY (p) REFERENCES person (id) DESTINATION KEY (c) REFERENCES city (cid) LABEL LivesIn);
+
+query T
+SELECT DISTINCT abi_disabled FROM __duckpgq_internal WHERE property_graph = 'ga';
+----
+NULL
+
+statement ok
+SET pgq_require_abi_paths = true;
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (ga MATCH (a:Person)-[:LivesIn]->(x:City) COLUMNS (a.id, x.cid));
+----
+23
+
+statement ok
+SET pgq_require_abi_paths = false;
+
+statement ok
+SET pgq_abi_mode = 'consume';
+
+# The WITH ABI clause must still name labels the graph has.
+statement ok
+CREATE PROPERTY GRAPH gw VERTEX TABLES (person LABEL Person) EDGE TABLES (knows SOURCE KEY (src) REFERENCES person (id) DESTINATION KEY (dst) REFERENCES person (id) LABEL Knows) WITH ABI (closures := ['Knows']);
+
+statement error
+ALTER PROPERTY GRAPH gw DROP EDGE TABLES (knows);
+----
+The WITH ABI clause of property graph gw names label Knows, which the altered graph would not have
+
+query T
+SELECT abi_options FROM __duckpgq_internal WHERE property_graph = 'gw' AND is_vertex_table;
+----
+{'closures': list_value('Knows')}
+
+statement ok
+ALTER PROPERTY GRAPH gw ADD VERTEX TABLES (city LABEL City);
+
+query T
+SELECT DISTINCT abi_options FROM __duckpgq_internal WHERE property_graph = 'gw';
+----
+{'closures': list_value('Knows')}
+
+# A graph persisted before ALTER existed (the 24-column internal table) can be altered.
+statement ok
+CREATE TABLE legacy_rows AS SELECT * FROM __duckpgq_internal WHERE false;
+
+statement ok
+DROP TABLE __duckpgq_internal;
+
+statement ok
+CREATE TABLE __duckpgq_internal (property_graph varchar, table_name varchar, label varchar, is_vertex_table boolean, source_table varchar, source_pk varchar[], source_fk varchar[], destination_table varchar, destination_pk varchar[], destination_fk varchar[], discriminator varchar, sub_labels varchar[], catalog varchar, schema varchar, source_catalog varchar, source_schema varchar, destination_catalog varchar, destination_schema varchar, properties varchar[], column_aliases varchar[], graph_catalog varchar, graph_schema varchar, verified boolean, abi_options varchar);
+
+statement ok
+INSERT INTO __duckpgq_internal VALUES ('old', 'person', 'Person', true, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, '', '', NULL, NULL, NULL, NULL, ['age', 'id', 'name'], ['age', 'id', 'name'], 'alter_property_graph', 'main', false, NULL), ('old', 'knows', 'Knows', false, 'person', ['id'], ['src'], 'person', ['id'], ['dst'], NULL, NULL, '', '', '', '', '', '', ['dst', 'src'], ['dst', 'src'], 'alter_property_graph', 'main', false, NULL);
+
+restart
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+ALTER PROPERTY GRAPH old ADD VERTEX TABLES (city LABEL City);
+
+statement ok
+ALTER PROPERTY GRAPH old ADD EDGE TABLES (lives SOURCE KEY (p) REFERENCES person (id) DESTINATION KEY (c) REFERENCES city (cid) LABEL LivesIn);
+
+statement ok
+CREATE PROPERTY GRAPH old_direct VERTEX TABLES (person LABEL Person, city LABEL City) EDGE TABLES (knows SOURCE KEY (src) REFERENCES person (id) DESTINATION KEY (dst) REFERENCES person (id) LABEL Knows, lives SOURCE KEY (p) REFERENCES person (id) DESTINATION KEY (c) REFERENCES city (cid) LABEL LivesIn);
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (old MATCH (a:Person)-[:Knows]->(b:Person)-[:LivesIn]->(x:City) COLUMNS (a.name, x.cname)) EXCEPT ALL FROM GRAPH_TABLE (old_direct MATCH (a:Person)-[:Knows]->(b:Person)-[:LivesIn]->(x:City) COLUMNS (a.name, x.cname)))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (old_direct MATCH (a:Person)-[:Knows]->(b:Person)-[:LivesIn]->(x:City) COLUMNS (a.name, x.cname)) EXCEPT ALL FROM GRAPH_TABLE (old MATCH (a:Person)-[:Knows]->(b:Person)-[:LivesIn]->(x:City) COLUMNS (a.name, x.cname)))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (old MATCH (a:Person)-[:Knows]->(b:Person)-[:LivesIn]->(x:City) COLUMNS (a.name, x.cname))));
+----
+0	true
+
+query II
+SELECT (SELECT count(*) FROM (FROM GRAPH_TABLE (old MATCH p = ANY SHORTEST (a:Person)-[:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p))) EXCEPT ALL FROM GRAPH_TABLE (old_direct MATCH p = ANY SHORTEST (a:Person)-[:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p))))) + (SELECT count(*) FROM (FROM GRAPH_TABLE (old_direct MATCH p = ANY SHORTEST (a:Person)-[:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p))) EXCEPT ALL FROM GRAPH_TABLE (old MATCH p = ANY SHORTEST (a:Person)-[:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p))))), (SELECT count(*) > 0 FROM (FROM GRAPH_TABLE (old MATCH p = ANY SHORTEST (a:Person)-[:Knows]->+(b:Person) COLUMNS (a.id, b.id, path_length(p)))));
+----
+0	true
+

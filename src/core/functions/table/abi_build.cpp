@@ -1,4 +1,5 @@
 #include "duckpgq/core/functions/table/abi_build.hpp"
+#include "duckdb/main/connection_manager.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -1292,6 +1293,28 @@ void InvalidateArtifactCache(ClientContext &context, const string &graph_name) {
 	duckpgq_state->path_table_caches.erase(graph_name);
 }
 
+//! A build for the graph's current definition lets its artifacts answer again after an ALTER PROPERTY GRAPH.
+void EnableArtifacts(ClientContext &context, const string &graph_name) {
+	bool disabled = false;
+	for (auto &connection : ConnectionManager::Get(*context.db).GetConnectionList()) {
+		auto state = connection->registered_state->Get<DuckPGQState>("duckpgq");
+		if (!state) {
+			continue;
+		}
+		auto entry = state->registered_property_graphs.find(graph_name);
+		if (entry != state->registered_property_graphs.end()) {
+			auto &info = entry->second->Cast<CreatePropertyGraphInfo>();
+			disabled = disabled || info.abi_disabled;
+			info.abi_disabled = false;
+		}
+	}
+	if (disabled) {
+		Connection connection(*context.db);
+		connection.Query("UPDATE __duckpgq_internal SET abi_disabled = NULL WHERE property_graph = " +
+		                 Literal(graph_name));
+	}
+}
+
 //! The databases the graph binds tables from: the only places its artifacts are looked for (see match.cpp).
 vector<string> GraphDatabases(ClientContext &context, const CreatePropertyGraphInfo &pg_info) {
 	vector<string> result;
@@ -1504,6 +1527,7 @@ vector<vector<Value>> RunAbiPlan(ClientContext &context, const string &graph_nam
 		rows.push_back({Value(step.name), Value(step.kind), Value("built"), row_count, Value::DOUBLE(seconds), Value()});
 	}
 	InvalidateArtifactCache(context, graph_name);
+	EnableArtifacts(context, graph_name);
 	return rows;
 }
 
@@ -1706,6 +1730,12 @@ unique_ptr<FunctionData> AbiStatusBind(ClientContext &context, TableFunctionBind
 			}
 		}
 	}
+	if (pg_info.abi_disabled) {
+		// Built for the graph's definition before an ALTER PROPERTY GRAPH; not used until rebuilt.
+		for (auto &row : result->rows) {
+			row[9] = Value::BOOLEAN(false);
+		}
+	}
 	return std::move(result);
 }
 
@@ -1893,9 +1923,13 @@ string PGQAutoBuildAbi(ClientContext &context, const CreatePropertyGraphInfo &pg
 	    !StringUtil::CIEquals(mode.ToString(), "auto")) {
 		return string();
 	}
-	// A graph that already has artifacts (a frozen lake, a previous build) is consumed as it is.
+	// A graph that already has artifacts (a frozen lake, a previous build) is consumed as it is, unless ALTER
+	// PROPERTY GRAPH changed it since.
 	Connection connection(*context.db);
 	for (auto &location : GraphArtifactCatalogs(context, connection, pg_info)) {
+		if (pg_info.abi_disabled) {
+			break;
+		}
 		auto listed = connection.Query("SELECT count(*) FROM " +
 		                               TableSql(location.catalog, location.schema, "__pgq_path_catalog") +
 		                               " WHERE lower(graph_name) = lower(" + Literal(pg_info.property_graph_name) + ")");

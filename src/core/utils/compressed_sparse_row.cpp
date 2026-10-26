@@ -323,7 +323,8 @@ unique_ptr<SubqueryExpression> CreateDirectedCSRVertexSubquery(const shared_ptr<
 	auto left_join_ref = make_uniq<JoinRef>(JoinRefType::REGULAR);
 	left_join_ref->type = JoinType::LEFT;
 	left_join_ref->left = edge_table->source_pg_table->CreateBaseTableRef(prev_binding);
-	left_join_ref->right = edge_table->CreateBaseTableRef(PGQStr(edge_table->table_name_alias));
+	// Named by the table, as the conditions below refer to it (a graph's alias for the table is not a SQL alias).
+	left_join_ref->right = edge_table->CreateBaseTableRef();
 
 	auto join_condition = make_uniq<ComparisonExpression>(
 	    ExpressionType::COMPARE_EQUAL, PGQColRef(edge_table->source_fk[0], edge_table->table_name),

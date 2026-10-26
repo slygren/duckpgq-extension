@@ -301,46 +301,6 @@ static vector<shared_ptr<PropertyGraphTable>> TransformGraphTables(PEGTransforme
 	return result;
 }
 
-static shared_ptr<PropertyGraphTable> FindVertexTable(const CreatePropertyGraphInfo &info, const Identifier &catalog,
-                                                      const Identifier &schema, const Identifier &name) {
-	for (auto &table : info.vertex_tables) {
-		if ((!catalog.empty() && table->catalog_name != catalog) || (!schema.empty() && table->schema_name != schema)) {
-			continue;
-		}
-		if (table->table_name == name || (!table->table_name_alias.empty() && table->table_name_alias == name)) {
-			return table;
-		}
-	}
-	return nullptr;
-}
-
-static void ResolveReference(const shared_ptr<PropertyGraphTable> &vertex, Identifier &catalog, Identifier &schema,
-                             Identifier &reference) {
-	if (!vertex) {
-		return; // left as written so the binder can report the unknown reference
-	}
-	catalog = vertex->catalog_name;
-	schema = vertex->schema_name;
-	reference = vertex->table_name;
-}
-
-static void RegisterLabels(CreatePropertyGraphInfo &info, const shared_ptr<PropertyGraphTable> &table) {
-	auto register_label = [&](const Identifier &label) {
-		auto name = label.GetIdentifierName();
-		if (!info.label_map.emplace(name, table).second) {
-			throw ConstraintException("Label %s is not unique, make sure all labels are unique",
-			                          StringUtil::Lower(name));
-		}
-	};
-	register_label(table->main_label);
-	for (auto &label : table->extra_labels) {
-		register_label(label);
-	}
-	for (auto &label : table->sub_labels) {
-		register_label(label);
-	}
-}
-
 static arena_ptr<TransformResultValue> TransformCreateGraph(PEGTransformer &transformer, ParseResult &parse_result) {
 	auto &list = parse_result.Cast<ListParseResult>();
 	auto or_replace = list.Child<OptionalParseResult>(1).HasResult();
@@ -377,25 +337,68 @@ static arena_ptr<TransformResultValue> TransformCreateGraph(PEGTransformer &tran
 		// Kept as one STRUCT literal: SELECT of it gives the option values back without re-parsing the clause.
 		info->abi_options = "{" + StringUtil::Join(options, ", ") + "}";
 	}
-	for (auto &table : info->vertex_tables) {
-		RegisterLabels(*info, table);
-	}
-	for (auto &table : info->edge_tables) {
-		table->source_pg_table =
-		    FindVertexTable(*info, table->source_catalog, table->source_schema, table->source_reference);
-		table->destination_pg_table =
-		    FindVertexTable(*info, table->destination_catalog, table->destination_schema, table->destination_reference);
-		// A reference may use the vertex table's statement alias; the rest of the extension compares physical names.
-		ResolveReference(table->source_pg_table, table->source_catalog, table->source_schema, table->source_reference);
-		ResolveReference(table->destination_pg_table, table->destination_catalog, table->destination_schema,
-		                 table->destination_reference);
-		RegisterLabels(*info, table);
+	info->ResolveEdgeReferences();
+	info->RebuildLabelMap();
+	auto statement = make_uniq<CreateStatement>();
+	statement->info = std::move(info);
+	auto parse_data = make_uniq_base<ParserExtensionParseData, DuckPGQParseData>(std::move(statement));
+	unique_ptr<SQLStatement> result = make_uniq<ExtensionStatement>(DuckPGQParserExtension(), std::move(parse_data));
+	return transformer.MakeResult<unique_ptr<SQLStatement>>(std::move(result));
+}
+
+static bool IsCascade(OptionalParseResult &behavior) {
+	return behavior.HasResult() && DuckPGQLiteralText(DuckPGQGetChoice(behavior.GetResult())) == "CASCADE";
+}
+
+// 'ALTER' 'PROPERTY' 'GRAPH' QualifiedName DuckPGQAlterGraphAction
+static arena_ptr<TransformResultValue> TransformAlterGraph(PEGTransformer &transformer, ParseResult &parse_result) {
+	auto &list = parse_result.Cast<ListParseResult>();
+	auto name = transformer.Transform<QualifiedName>(list.GetChild(3));
+	auto info = make_uniq<AlterPropertyGraphInfo>(name.Name().GetIdentifierName());
+	info->SetQualifiedName(name);
+	auto &action = DuckPGQGetChoice(list.GetChild(4));
+	auto &action_list = action.Cast<ListParseResult>();
+	if (action.Name() == "DuckPGQAddVertexTables" || action.Name() == "DuckPGQAddEdgeTables") {
+		const bool vertex = action.Name() == "DuckPGQAddVertexTables";
+		info->action = vertex ? PGQAlterGraphAction::ADD_VERTEX_TABLES : PGQAlterGraphAction::ADD_EDGE_TABLES;
+		auto tables = TransformGraphTables(transformer, action_list.GetChild(1).Cast<ListParseResult>().GetChild(2));
+		(vertex ? info->vertex_tables : info->edge_tables) = std::move(tables);
+	} else if (action.Name() == "DuckPGQDropVertexTables" || action.Name() == "DuckPGQDropEdgeTables") {
+		info->element_is_vertex = action.Name() == "DuckPGQDropVertexTables";
+		info->action = info->element_is_vertex ? PGQAlterGraphAction::DROP_VERTEX_TABLES
+		                                       : PGQAlterGraphAction::DROP_EDGE_TABLES;
+		info->element_tables = TransformParensList<Identifier>(transformer, action_list.GetChild(3));
+		info->cascade = IsCascade(action_list.Child<OptionalParseResult>(4));
+	} else {
+		// 'ALTER' DuckPGQElementKind 'TABLE' ColId DuckPGQAlterElementAction
+		auto &kind = DuckPGQGetChoice(action_list.GetChild(1));
+		info->element_is_vertex = kind.Name() == "DuckPGQVertexKeyword";
+		info->element_tables.push_back(transformer.Transform<Identifier>(action_list.GetChild(3)));
+		auto &element_action = DuckPGQGetChoice(action_list.GetChild(4));
+		auto &element_list = element_action.Cast<ListParseResult>();
+		info->label = transformer.Transform<Identifier>(element_list.GetChild(1).Cast<ListParseResult>().GetChild(1));
+		if (element_action.Name() == "DuckPGQAddLabel") {
+			info->action = PGQAlterGraphAction::ADD_LABEL;
+			auto &properties = element_list.Child<OptionalParseResult>(2);
+			info->label_properties = make_shared_ptr<PropertyGraphTable>();
+			info->label_properties->table_name = info->element_tables[0];
+			ApplyPropertyUnion({properties.HasResult() ? TransformProperties(transformer, properties.GetResult())
+			                                           : PropertyClause()},
+			                   *info->label_properties);
+		} else {
+			info->action = PGQAlterGraphAction::DROP_LABEL;
+			info->cascade = IsCascade(element_list.Child<OptionalParseResult>(2));
+		}
 	}
 	auto statement = make_uniq<CreateStatement>();
 	statement->info = std::move(info);
 	auto parse_data = make_uniq_base<ParserExtensionParseData, DuckPGQParseData>(std::move(statement));
 	unique_ptr<SQLStatement> result = make_uniq<ExtensionStatement>(DuckPGQParserExtension(), std::move(parse_data));
 	return transformer.MakeResult<unique_ptr<SQLStatement>>(std::move(result));
+}
+
+static arena_ptr<TransformProcess> StartAlterGraphTransform(PEGTransformer &transformer, ParseResult &parse_result) {
+	return transformer.MakeProcess<FinalizeTransformProcess>(transformer, parse_result, TransformAlterGraph);
 }
 
 static arena_ptr<TransformProcess> StartCreateGraphTransform(PEGTransformer &transformer, ParseResult &parse_result) {
@@ -412,6 +415,8 @@ void DuckPGQAddCreatePropertyGraphGrammar(vector<GrammarChange> &changes) {
 	changes.push_back(GrammarChange::SetTransformProcess("DuckPGQCreatePropertyGraph", StartCreateGraphTransform));
 	// Return an ExtensionStatement directly, without intercepting ordinary CREATE statements.
 	changes.push_back(GrammarChange::PrependChoice("Statement", "DuckPGQCreatePropertyGraph"));
+	changes.push_back(GrammarChange::SetTransformProcess("DuckPGQAlterPropertyGraph", StartAlterGraphTransform));
+	changes.push_back(GrammarChange::PrependChoice("Statement", "DuckPGQAlterPropertyGraph"));
 }
 
 } // namespace duckdb

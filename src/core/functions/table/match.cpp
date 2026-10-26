@@ -1067,6 +1067,10 @@ static shared_ptr<PGQExactnessCache> ProcessExactnessCache(ClientContext &contex
 static shared_ptr<PGQPathTableCache> GetPathTableCache(ClientContext &context, DuckPGQState &duckpgq_state,
                                                        const string &graph_name,
                                                        const CreatePropertyGraphInfo *pg_table = nullptr) {
+	if (pg_table && pg_table->abi_disabled) {
+		// ALTER PROPERTY GRAPH changed the graph after its artifacts were built: none answers until a rebuild.
+		return make_shared_ptr<PGQPathTableCache>();
+	}
 	lock_guard<mutex> guard(duckpgq_state.path_table_cache_lock);
 
 	// L1: per-connection cache. Preserves the original per-connection semantics for
