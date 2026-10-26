@@ -84,7 +84,7 @@ static void IterativeLengthFunction(DataChunk &args, ExpressionState &state, Vec
 				const auto target = dst_data[vdata_dst.sel->get_index(row)];
 				auto distance = search.Distance(target);
 				if (closed && target == group.first) {
-					auto &steps = search.ClosingSteps(v_size, csr_found->v, e, csr_found->edge_ids);
+					auto &steps = search.ClosingSteps();
 					distance = steps.empty() ? -1 : steps[0].length;
 				}
 				result_data[row] = distance;

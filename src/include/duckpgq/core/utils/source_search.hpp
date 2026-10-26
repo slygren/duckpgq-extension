@@ -59,10 +59,11 @@ public:
 		int64_t edge;
 	};
 	//! The steps into the source from the reached vertices nearest to it, all closing walks of the same (shortest)
-	//! length, in vertex order and each vertex's edges in CSR order: the first is the lane search's closing step.
-	//! Empty when no walk returns. Computed on first use and kept with the search.
-	const vector<ClosingStep> &ClosingSteps(int64_t v_size, const atomic<int64_t> *v, const vector<int64_t> &e,
-	                                        const vector<int64_t> &edge_ids) const;
+	//! length, in the order the search met them -- level, then vertex order and CSR order for the breadth-first
+	//! search, so the first is the lane search's closing step. Empty when no walk returns. Recorded by Run.
+	const vector<ClosingStep> &ClosingSteps() const {
+		return closing_steps;
+	}
 
 	//! Run the search. scratch_distance is v_size long, all -1, and is all -1 again on return.
 	void Run(ClientContext &context, int64_t v_size, const atomic<int64_t> *v, const vector<int64_t> &e,
@@ -79,8 +80,8 @@ private:
 	unordered_map<int64_t, Entry> sparse_entries;
 	//! allshortestpaths: vertex -> (parent vertex, edge) for every parent one level up
 	unordered_map<int64_t, vector<pair<int64_t, int64_t>>> parents;
-	mutable bool closing_known = false;
-	mutable vector<ClosingStep> closing_steps;
+	void RecordClosingStep(int64_t length, int64_t vertex, int64_t edge);
+	vector<ClosingStep> closing_steps;
 };
 
 //! Thread-local cache of source searches over one CSR, the function local state of the path functions.

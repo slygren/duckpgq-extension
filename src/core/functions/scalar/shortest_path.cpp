@@ -113,7 +113,7 @@ static void ShortestPathFunction(DataChunk &args, ExpressionState &state, Vector
 				bool found;
 				if (closed && target == group.first) {
 					// The lane search's closed walk: the path to the first vertex stepping back in, then that step.
-					auto &steps = search.ClosingSteps(v_size, csr_found->v, e, edge_ids);
+					auto &steps = search.ClosingSteps();
 					found = !steps.empty() && search.Path(steps[0].vertex, path);
 					if (found) {
 						path.push_back(steps[0].edge);

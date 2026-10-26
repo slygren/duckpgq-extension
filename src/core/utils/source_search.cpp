@@ -21,6 +21,9 @@ void PGQSourceSearch::Run(ClientContext &context, int64_t v_size, const atomic<i
 			const int64_t from = reached[head++];
 			for (auto offset = v[from].load(); offset < v[from + 1].load(); offset++) {
 				const int64_t to = e[offset];
+				if (to == source) {
+					RecordClosingStep(scratch_distance[from] + 1, from, edge_ids[offset]);
+				}
 				if (scratch_distance[to] == -1) {
 					scratch_distance[to] = scratch_distance[from] + 1;
 					reached.push_back(to);
@@ -43,6 +46,9 @@ void PGQSourceSearch::Run(ClientContext &context, int64_t v_size, const atomic<i
 			for (auto from : frontier) {
 				for (auto offset = v[from].load(); offset < v[from + 1].load(); offset++) {
 					const int64_t to = e[offset];
+					if (to == source) {
+						RecordClosingStep(level, from, edge_ids[offset]);
+					}
 					if (scratch_distance[to] != -1) {
 						continue;
 					}
@@ -151,45 +157,14 @@ vector<vector<int64_t>> PGQSourceSearch::AllPaths(int64_t target) const {
 	return paths;
 }
 
-const vector<PGQSourceSearch::ClosingStep> &PGQSourceSearch::ClosingSteps(int64_t v_size, const atomic<int64_t> *v,
-                                                                          const vector<int64_t> &e,
-                                                                          const vector<int64_t> &edge_ids) const {
-	if (closing_known) {
-		return closing_steps;
+void PGQSourceSearch::RecordClosingStep(int64_t length, int64_t vertex, int64_t edge) {
+	if (!closing_steps.empty() && length > closing_steps[0].length) {
+		return;
 	}
-	closing_known = true;
-	vector<int64_t> reached;
-	if (dense) {
-		for (int64_t vertex = 0; vertex < static_cast<int64_t>(dense_entries.size()); vertex++) {
-			if (dense_entries[vertex].distance >= 0) {
-				reached.push_back(vertex);
-			}
-		}
-	} else {
-		for (auto &entry : sparse_entries) {
-			reached.push_back(entry.first);
-		}
-		std::sort(reached.begin(), reached.end());
+	if (!closing_steps.empty() && length < closing_steps[0].length) {
+		closing_steps.clear();
 	}
-	for (auto from : reached) {
-		if (from < 0 || from >= v_size) {
-			continue;
-		}
-		const int64_t length = Lookup(from).distance + 1;
-		if (!closing_steps.empty() && length > closing_steps[0].length) {
-			continue;
-		}
-		for (auto offset = v[from].load(); offset < v[from + 1].load(); offset++) {
-			if (e[offset] != source) {
-				continue;
-			}
-			if (!closing_steps.empty() && length < closing_steps[0].length) {
-				closing_steps.clear();
-			}
-			closing_steps.push_back(ClosingStep {length, from, edge_ids[offset]});
-		}
-	}
-	return closing_steps;
+	closing_steps.push_back(ClosingStep {length, vertex, edge});
 }
 
 idx_t PGQSourceSearch::Cells() const {

@@ -170,7 +170,7 @@ static void AllShortestPathsFunction(DataChunk &args, ExpressionState &state, Ve
 				}
 				// Every shortest closed walk, in the per-row order: the closing steps by (vertex, edge id), each after
 				// every shortest path to its vertex.
-				auto steps = search.ClosingSteps(v_size, csr->v, e, edge_ids);
+				auto steps = search.ClosingSteps();
 				std::sort(steps.begin(), steps.end(), [](const PGQSourceSearch::ClosingStep &a,
 				                                         const PGQSourceSearch::ClosingStep &b) {
 					return a.vertex != b.vertex ? a.vertex < b.vertex : a.edge < b.edge;
