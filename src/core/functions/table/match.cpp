@@ -2626,9 +2626,8 @@ static unique_ptr<CommonTableExpressionInfo> CreateStepCSRCTE(const shared_ptr<P
 	auto &vertex_table = *edge_table->source_pg_table;
 	const string vertices = QualifiedTableName(PGQStr(vertex_table.catalog_name), PGQStr(vertex_table.schema_name),
 	                                           PGQStr(vertex_table.table_name));
-	const string v_size = StringUtil::Format("(SELECT count(__v.%s) FROM %s __v)",
-	                                         KeywordHelper::WriteOptionallyQuoted(PGQStr(edge_table->source_pk[0])),
-	                                         vertices);
+	// One slot per rowid, like GetCountTable: rowids keep their gaps after a DELETE.
+	const string v_size = StringUtil::Format("(SELECT coalesce(max(__v.rowid) + 1, 0) FROM %s __v)", vertices);
 	const string steps = StepRelationSQL(edge_table, edge_type, edge_label);
 	const string sql = StringUtil::Format(
 	    "SELECT create_csr_edge(%d, %s, CAST((SELECT sum(create_csr_vertex(%d, %s, __sub.dense_id, __sub.cnt)) "
@@ -15520,7 +15519,6 @@ static void AddNativePathSearch(ClientContext &context, const PGQNativePathSearc
 	auto &vertex_table = *edge_table->source_pg_table;
 	const string vertices = QualifiedTableName(PGQStr(vertex_table.catalog_name), PGQStr(vertex_table.schema_name),
 	                                           PGQStr(vertex_table.table_name));
-	const string pk = KeywordHelper::WriteOptionallyQuoted(PGQStr(edge_table->source_pk[0]));
 
 	// The endpoints' own predicates (element WHERE, and the MATCH WHERE's conjuncts on that vertex alone) seed the
 	// search: it starts from the admitted sources only, and stops once every admitted destination has its paths.
@@ -15552,10 +15550,10 @@ static void AddNativePathSearch(ClientContext &context, const PGQNativePathSearc
 	}
 	const string paths_cte = "__pgq_paths_" + std::to_string(select_node->cte_map.map.size());
 	const string search_sql = StringUtil::Format(
-	    "SELECT %s.rowid AS src_rowid, unnest(pgq_shortest_k_paths(%d, (SELECT count(__v.%s) FROM %s __v), %s.rowid, "
+	    "SELECT %s.rowid AS src_rowid, unnest(pgq_shortest_k_paths(%d, (SELECT coalesce(max(__v.rowid) + 1, 0) FROM %s __v), %s.rowid, "
 	    "%s, %lld, %lld, %lld, '%s', '%s', %lld, __x.temp)) AS __found FROM %s AS %s, "
 	    "(SELECT 0 * count(cte1.temp) AS temp FROM cte1) AS __x%s",
-	    q_src, csr_slot.slot, pk, vertices, q_src, destinations, static_cast<long long>(search.k),
+	    q_src, csr_slot.slot, vertices, q_src, destinations, static_cast<long long>(search.k),
 	    static_cast<long long>(search.quantifier->lower), static_cast<long long>(search.quantifier->upper),
 	    search.mode, all_shortest ? "all_shortest" : "k", static_cast<long long>(MaxVLFallbackRows(context)), vertices,
 	    q_src, src_seed.empty() ? "" : " WHERE " + src_seed);
