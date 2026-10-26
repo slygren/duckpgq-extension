@@ -327,29 +327,51 @@ q1	41	e
 q2	21	d
 
 # ---------------------------------------------------------------------------------------------------- selectors
-# ANY SHORTEST over a group: per endpoint pair, by hop count (ties: the smallest edge sequence)
+# ANY SHORTEST over a group: per endpoint pair, by hop count (ties: the smallest edge sequence). Its walks may
+# repeat a vertex and return to the start, as a quantified edge's do under ANY SHORTEST: 1 -> 2 -> 3 -> 1 -> 2 and
+# the closed walk back to 1 in three repetitions
 query TTT rowsort
 FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P) ((x)-[e:K]->(m)-[f:K]->(y)){1,3} (b) WHERE a.id = 1 COLUMNS (b.id AS b, path_length(p) AS n, edges(p) AS es));
 ----
+1	6	[0, 2, 3, 0, 2, 3]
+2	4	[0, 2, 3, 0]
 3	2	[0, 2]
 4	2	[0, 5]
 5	4	[0, 2, 4, 7]
 
 # ALL SHORTEST over a group: per endpoint pair, by hop count
+# Walks, as a quantified edge's under ALL SHORTEST: closed walks back to 1, and walks through a vertex twice
 query TTT rowsort
 FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P) ((x)-[e:K]->(m)-[f:K]->(y)){1,3} (b) WHERE a.id = 1 COLUMNS (b.id AS b, path_length(p) AS n, edges(p) AS es));
 ----
+1	6	[0, 2, 3, 0, 2, 3]
+1	6	[0, 2, 3, 1, 2, 3]
+1	6	[0, 5, 7, 8, 2, 3]
+1	6	[1, 2, 3, 0, 2, 3]
+1	6	[1, 2, 3, 1, 2, 3]
+1	6	[1, 5, 7, 8, 2, 3]
+2	4	[0, 2, 3, 0]
+2	4	[0, 2, 3, 1]
+2	4	[0, 5, 7, 8]
+2	4	[1, 2, 3, 0]
+2	4	[1, 2, 3, 1]
+2	4	[1, 5, 7, 8]
 3	2	[0, 2]
 3	2	[1, 2]
 4	2	[0, 5]
 4	2	[1, 5]
 5	4	[0, 2, 4, 7]
+5	4	[0, 5, 6, 7]
 5	4	[1, 2, 4, 7]
+5	4	[1, 5, 6, 7]
 
 # a condition on the path beyond its endpoints filters the chosen shortest paths (it does not choose longer ones)
+# Walks, as a quantified edge's under ALL SHORTEST: closed walks back to 1, and walks through a vertex twice
 query TT rowsort
 FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P) ((x)-[e:K]->(y)){1,3} (b) WHERE a.id = 1 AND list_contains(e.w, 31) COLUMNS (b.id AS b, e.w AS ws));
 ----
+1	[11, 31, 41]
+1	[21, 31, 41]
 3	[11, 31]
 3	[21, 31]
 
@@ -756,3 +778,287 @@ statement error
 FROM GRAPH_TABLE (g MATCH (a:P) ((x)-[:K]->(y)){1,2} (b), (b)-[:L]->(c) ONE ROW PER VERTEX (v) COLUMNS (v.id));
 ----
 ONE ROW PER over a quantified path pattern needs it to be the only path pattern
+
+# ---------------------------------------------------------------------------------------------------- group = quantified edge under a selector
+# Under ANY / ALL SHORTEST a quantified edge matches walks (round2-correctness), and the group written for it,
+# ((x)-[e:K]->(y)){n,m}, matches the same ones: every direction, a lower bound above 1, and ACYCLIC (no vertex
+# twice) for both. ANY SHORTEST compares endpoints and lengths (which path among ties is the route's), ALL SHORTEST
+# the edge sequences. Each side is materialized on its own.
+
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE OR REPLACE TABLE qe_1 AS FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[e:K]->{1,3}(b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE grp_1 AS FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P) ((x)-[e:K]->(y)){1,3} (b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+query II
+SELECT (SELECT count(*) > 0 FROM qe_1), (SELECT count(*) FROM ((FROM qe_1 EXCEPT ALL FROM grp_1) UNION ALL (FROM grp_1 EXCEPT ALL FROM qe_1)));
+----
+true	0
+
+statement ok
+CREATE OR REPLACE TABLE qe_2 AS FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST ACYCLIC (a:P)-[e:K]->{1,3}(b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE grp_2 AS FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST ACYCLIC (a:P) ((x)-[e:K]->(y)){1,3} (b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+query II
+SELECT (SELECT count(*) > 0 FROM qe_2), (SELECT count(*) FROM ((FROM qe_2 EXCEPT ALL FROM grp_2) UNION ALL (FROM grp_2 EXCEPT ALL FROM qe_2)));
+----
+true	0
+
+statement ok
+CREATE OR REPLACE TABLE qe_3 AS FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[e:K]->{2,3}(b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE grp_3 AS FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P) ((x)-[e:K]->(y)){2,3} (b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+query II
+SELECT (SELECT count(*) > 0 FROM qe_3), (SELECT count(*) FROM ((FROM qe_3 EXCEPT ALL FROM grp_3) UNION ALL (FROM grp_3 EXCEPT ALL FROM qe_3)));
+----
+true	0
+
+statement ok
+CREATE OR REPLACE TABLE qe_4 AS FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST ACYCLIC (a:P)-[e:K]->{2,3}(b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE grp_4 AS FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST ACYCLIC (a:P) ((x)-[e:K]->(y)){2,3} (b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+query II
+SELECT (SELECT count(*) > 0 FROM qe_4), (SELECT count(*) FROM ((FROM qe_4 EXCEPT ALL FROM grp_4) UNION ALL (FROM grp_4 EXCEPT ALL FROM qe_4)));
+----
+true	0
+
+statement ok
+CREATE OR REPLACE TABLE qe_5 AS FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)<-[e:K]-{1,3}(b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE grp_5 AS FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P) ((x)<-[e:K]-(y)){1,3} (b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+query II
+SELECT (SELECT count(*) > 0 FROM qe_5), (SELECT count(*) FROM ((FROM qe_5 EXCEPT ALL FROM grp_5) UNION ALL (FROM grp_5 EXCEPT ALL FROM qe_5)));
+----
+true	0
+
+statement ok
+CREATE OR REPLACE TABLE qe_6 AS FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST ACYCLIC (a:P)<-[e:K]-{1,3}(b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE grp_6 AS FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST ACYCLIC (a:P) ((x)<-[e:K]-(y)){1,3} (b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+query II
+SELECT (SELECT count(*) > 0 FROM qe_6), (SELECT count(*) FROM ((FROM qe_6 EXCEPT ALL FROM grp_6) UNION ALL (FROM grp_6 EXCEPT ALL FROM qe_6)));
+----
+true	0
+
+statement ok
+CREATE OR REPLACE TABLE qe_7 AS FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)<-[e:K]-{2,3}(b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE grp_7 AS FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P) ((x)<-[e:K]-(y)){2,3} (b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+query II
+SELECT (SELECT count(*) > 0 FROM qe_7), (SELECT count(*) FROM ((FROM qe_7 EXCEPT ALL FROM grp_7) UNION ALL (FROM grp_7 EXCEPT ALL FROM qe_7)));
+----
+true	0
+
+statement ok
+CREATE OR REPLACE TABLE qe_8 AS FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST ACYCLIC (a:P)<-[e:K]-{2,3}(b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE grp_8 AS FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST ACYCLIC (a:P) ((x)<-[e:K]-(y)){2,3} (b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+query II
+SELECT (SELECT count(*) > 0 FROM qe_8), (SELECT count(*) FROM ((FROM qe_8 EXCEPT ALL FROM grp_8) UNION ALL (FROM grp_8 EXCEPT ALL FROM qe_8)));
+----
+true	0
+
+statement ok
+CREATE OR REPLACE TABLE qe_9 AS FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[e:K]-{1,3}(b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE grp_9 AS FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P) ((x)-[e:K]-(y)){1,3} (b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+query II
+SELECT (SELECT count(*) > 0 FROM qe_9), (SELECT count(*) FROM ((FROM qe_9 EXCEPT ALL FROM grp_9) UNION ALL (FROM grp_9 EXCEPT ALL FROM qe_9)));
+----
+true	0
+
+statement ok
+CREATE OR REPLACE TABLE qe_10 AS FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST ACYCLIC (a:P)-[e:K]-{1,3}(b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE grp_10 AS FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST ACYCLIC (a:P) ((x)-[e:K]-(y)){1,3} (b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+query II
+SELECT (SELECT count(*) > 0 FROM qe_10), (SELECT count(*) FROM ((FROM qe_10 EXCEPT ALL FROM grp_10) UNION ALL (FROM grp_10 EXCEPT ALL FROM qe_10)));
+----
+true	0
+
+statement ok
+CREATE OR REPLACE TABLE qe_11 AS FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P)-[e:K]-{2,3}(b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE grp_11 AS FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST (a:P) ((x)-[e:K]-(y)){2,3} (b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+query II
+SELECT (SELECT count(*) > 0 FROM qe_11), (SELECT count(*) FROM ((FROM qe_11 EXCEPT ALL FROM grp_11) UNION ALL (FROM grp_11 EXCEPT ALL FROM qe_11)));
+----
+true	0
+
+statement ok
+CREATE OR REPLACE TABLE qe_12 AS FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST ACYCLIC (a:P)-[e:K]-{2,3}(b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+statement ok
+CREATE OR REPLACE TABLE grp_12 AS FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST ACYCLIC (a:P) ((x)-[e:K]-(y)){2,3} (b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l));
+
+query II
+SELECT (SELECT count(*) > 0 FROM qe_12), (SELECT count(*) FROM ((FROM qe_12 EXCEPT ALL FROM grp_12) UNION ALL (FROM grp_12 EXCEPT ALL FROM qe_12)));
+----
+true	0
+
+statement ok
+CREATE OR REPLACE TABLE qe_13 AS FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[e:K]->{1,3}(b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE grp_13 AS FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P) ((x)-[e:K]->(y)){1,3} (b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, edges(p) AS es));
+
+query II
+SELECT (SELECT count(*) > 0 FROM qe_13), (SELECT count(*) FROM ((FROM qe_13 EXCEPT ALL FROM grp_13) UNION ALL (FROM grp_13 EXCEPT ALL FROM qe_13)));
+----
+true	0
+
+statement ok
+CREATE OR REPLACE TABLE qe_14 AS FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST ACYCLIC (a:P)-[e:K]->{1,3}(b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE grp_14 AS FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST ACYCLIC (a:P) ((x)-[e:K]->(y)){1,3} (b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, edges(p) AS es));
+
+query II
+SELECT (SELECT count(*) > 0 FROM qe_14), (SELECT count(*) FROM ((FROM qe_14 EXCEPT ALL FROM grp_14) UNION ALL (FROM grp_14 EXCEPT ALL FROM qe_14)));
+----
+true	0
+
+statement ok
+CREATE OR REPLACE TABLE qe_15 AS FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[e:K]->{2,3}(b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE grp_15 AS FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P) ((x)-[e:K]->(y)){2,3} (b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, edges(p) AS es));
+
+query II
+SELECT (SELECT count(*) > 0 FROM qe_15), (SELECT count(*) FROM ((FROM qe_15 EXCEPT ALL FROM grp_15) UNION ALL (FROM grp_15 EXCEPT ALL FROM qe_15)));
+----
+true	0
+
+statement ok
+CREATE OR REPLACE TABLE qe_16 AS FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST ACYCLIC (a:P)-[e:K]->{2,3}(b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE grp_16 AS FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST ACYCLIC (a:P) ((x)-[e:K]->(y)){2,3} (b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, edges(p) AS es));
+
+query II
+SELECT (SELECT count(*) > 0 FROM qe_16), (SELECT count(*) FROM ((FROM qe_16 EXCEPT ALL FROM grp_16) UNION ALL (FROM grp_16 EXCEPT ALL FROM qe_16)));
+----
+true	0
+
+statement ok
+CREATE OR REPLACE TABLE qe_17 AS FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)<-[e:K]-{1,3}(b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE grp_17 AS FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P) ((x)<-[e:K]-(y)){1,3} (b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, edges(p) AS es));
+
+query II
+SELECT (SELECT count(*) > 0 FROM qe_17), (SELECT count(*) FROM ((FROM qe_17 EXCEPT ALL FROM grp_17) UNION ALL (FROM grp_17 EXCEPT ALL FROM qe_17)));
+----
+true	0
+
+statement ok
+CREATE OR REPLACE TABLE qe_18 AS FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST ACYCLIC (a:P)<-[e:K]-{1,3}(b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE grp_18 AS FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST ACYCLIC (a:P) ((x)<-[e:K]-(y)){1,3} (b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, edges(p) AS es));
+
+query II
+SELECT (SELECT count(*) > 0 FROM qe_18), (SELECT count(*) FROM ((FROM qe_18 EXCEPT ALL FROM grp_18) UNION ALL (FROM grp_18 EXCEPT ALL FROM qe_18)));
+----
+true	0
+
+statement ok
+CREATE OR REPLACE TABLE qe_19 AS FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)<-[e:K]-{2,3}(b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE grp_19 AS FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P) ((x)<-[e:K]-(y)){2,3} (b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, edges(p) AS es));
+
+query II
+SELECT (SELECT count(*) > 0 FROM qe_19), (SELECT count(*) FROM ((FROM qe_19 EXCEPT ALL FROM grp_19) UNION ALL (FROM grp_19 EXCEPT ALL FROM qe_19)));
+----
+true	0
+
+statement ok
+CREATE OR REPLACE TABLE qe_20 AS FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST ACYCLIC (a:P)<-[e:K]-{2,3}(b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE grp_20 AS FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST ACYCLIC (a:P) ((x)<-[e:K]-(y)){2,3} (b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, edges(p) AS es));
+
+query II
+SELECT (SELECT count(*) > 0 FROM qe_20), (SELECT count(*) FROM ((FROM qe_20 EXCEPT ALL FROM grp_20) UNION ALL (FROM grp_20 EXCEPT ALL FROM qe_20)));
+----
+true	0
+
+statement ok
+CREATE OR REPLACE TABLE qe_21 AS FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[e:K]-{1,3}(b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE grp_21 AS FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P) ((x)-[e:K]-(y)){1,3} (b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, edges(p) AS es));
+
+query II
+SELECT (SELECT count(*) > 0 FROM qe_21), (SELECT count(*) FROM ((FROM qe_21 EXCEPT ALL FROM grp_21) UNION ALL (FROM grp_21 EXCEPT ALL FROM qe_21)));
+----
+true	0
+
+statement ok
+CREATE OR REPLACE TABLE qe_22 AS FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST ACYCLIC (a:P)-[e:K]-{1,3}(b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE grp_22 AS FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST ACYCLIC (a:P) ((x)-[e:K]-(y)){1,3} (b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, edges(p) AS es));
+
+query II
+SELECT (SELECT count(*) > 0 FROM qe_22), (SELECT count(*) FROM ((FROM qe_22 EXCEPT ALL FROM grp_22) UNION ALL (FROM grp_22 EXCEPT ALL FROM qe_22)));
+----
+true	0
+
+statement ok
+CREATE OR REPLACE TABLE qe_23 AS FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P)-[e:K]-{2,3}(b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE grp_23 AS FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST (a:P) ((x)-[e:K]-(y)){2,3} (b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, edges(p) AS es));
+
+query II
+SELECT (SELECT count(*) > 0 FROM qe_23), (SELECT count(*) FROM ((FROM qe_23 EXCEPT ALL FROM grp_23) UNION ALL (FROM grp_23 EXCEPT ALL FROM qe_23)));
+----
+true	0
+
+statement ok
+CREATE OR REPLACE TABLE qe_24 AS FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST ACYCLIC (a:P)-[e:K]-{2,3}(b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, edges(p) AS es));
+
+statement ok
+CREATE OR REPLACE TABLE grp_24 AS FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST ACYCLIC (a:P) ((x)-[e:K]-(y)){2,3} (b:P) WHERE a.id IN (1, 3, 4) COLUMNS (a.id AS a, b.id AS b, path_length(p) AS l, edges(p) AS es));
+
+query II
+SELECT (SELECT count(*) > 0 FROM qe_24), (SELECT count(*) FROM ((FROM qe_24 EXCEPT ALL FROM grp_24) UNION ALL (FROM grp_24 EXCEPT ALL FROM qe_24)));
+----
+true	0
+
+# TRAIL and SIMPLE restrict walks in ways the unrolled group does not express: refused rather than answered as ACYCLIC
+statement error
+FROM GRAPH_TABLE (g MATCH p = ANY SHORTEST TRAIL (a:P) ((x)-[e:K]->(y)){1,3} (b:P) COLUMNS (b.id));
+----
+ANY / ALL SHORTEST TRAIL over a quantified path pattern is not supported
+
+statement error
+FROM GRAPH_TABLE (g MATCH p = ALL SHORTEST SIMPLE (a:P) ((x)-[e:K]->(y)){1,3} (b:P) COLUMNS (b.id));
+----
+ANY / ALL SHORTEST SIMPLE over a quantified path pattern is not supported

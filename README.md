@@ -209,8 +209,9 @@ parenthesis holds in each repetition, and element `WHERE`s inside the body do to
   before, and so is one that reads only `label(e)`, which keeps its single value.
 - **No vertex twice.** A group with an upper bound above 1 visits no vertex twice across its repetitions, the
   vertices before and after it included. This is the rule of a quantified edge: `(()-[e:R]->()){1,3}` and
-  `-[e:R]->{1,3}` return the same rows. SQL/PGQ's default would be WALK. Path modes add nothing, as for quantified
-  edges.
+  `-[e:R]->{1,3}` return the same rows. Under `ANY` / `ALL SHORTEST` both match walks instead (SQL/PGQ: a vertex may
+  repeat and a walk may return to its start), and `ACYCLIC` keeps the rule; `TRAIL` and `SIMPLE` over a group under
+  a selector are refused.
 - **Paths.** A path variable, `ONE ROW PER VERTEX / EDGE / STEP` and `ANY` / `ALL SHORTEST` describe the whole
   path pattern: the fixed parts and every repetition. A property that a table on the path does not have is NULL in
   `ONE ROW PER`. A shortest path is chosen per pair of endpoints by hop count; `ANY` breaks ties by the smallest

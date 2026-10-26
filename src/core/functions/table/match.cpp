@@ -14281,8 +14281,32 @@ static unique_ptr<PGQGroupLeaf> BuildGroupLeaf(const MatchExpression &block, con
 	}
 
 	// No vertex twice across a group's iterations, the vertex before and after it included, as a quantified edge.
-	// Vertices are identified by their key, as the variable-length traversal identifies them.
+	// Vertices are identified by their key, as the variable-length traversal identifies them. Under ANY / ALL
+	// SHORTEST a quantified edge matches walks (SQL/PGQ: a vertex may repeat, a walk may return to its start), and so
+	// does a group: no condition. ACYCLIC keeps the rule (it is the mode's); TRAIL and SIMPLE, which restrict walks
+	// otherwise (no edge twice; a return to the start only), are refused rather than answered as ACYCLIC.
 	for (auto &range : ranges) {
+		{
+			auto &pattern = *leaf->match->path_patterns[range.pattern];
+			if (pattern.shortest && !pattern.cheapest) {
+				PGQPathMode mode = PGQPathMode::NONE;
+				if (pattern.path_elements.size() == 1) {
+					auto *wrapper = PGQMatchFunction::GetSubPath(pattern.path_elements[0]);
+					if (wrapper && wrapper->path_list.size() > 1) {
+						mode = wrapper->path_mode;
+					}
+				}
+				if (mode == PGQPathMode::TRAIL || mode == PGQPathMode::SIMPLE) {
+					throw NotImplementedException("ANY / ALL SHORTEST %s over a quantified path pattern is not supported; "
+					                              "without a path mode it matches walks, with ACYCLIC paths that visit no "
+					                              "vertex twice",
+					                              mode == PGQPathMode::TRAIL ? "TRAIL" : "SIMPLE");
+				}
+				if (mode != PGQPathMode::ACYCLIC) {
+					continue;
+				}
+			}
+		}
 		auto &names = leaf->sequences[range.pattern];
 		auto &edges = leaf->sequence_edges[range.pattern];
 		vector<string> vertices;
