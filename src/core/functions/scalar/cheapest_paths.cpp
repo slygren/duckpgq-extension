@@ -332,11 +332,12 @@ private:
 			int64_t next; // next reverse position to try
 			int option;   // which from-class
 			T budget;     // the most the prefix up to this vertex may cost
+			bool led;     // whether a path was found through it
 		};
 		vector<Frame> stack;
 		vector<int64_t> edges_in;  // edges_in[i]: the edge from stack[i + 1].vertex into stack[i].vertex
 		vector<T> weights_in;      // and its cost
-		stack.push_back({t, k, reverse_offsets[static_cast<idx_t>(t)], 0, cost});
+		stack.push_back({t, k, reverse_offsets[static_cast<idx_t>(t)], 0, cost, false});
 		on_path[static_cast<idx_t>(t)] = true;
 		const bool single_class = classes == 1;
 		idx_t steps = 0;
@@ -356,6 +357,7 @@ private:
 					int64_t node = AddChainNode(src, -1, -1);
 					for (idx_t i = stack.size() - 1; i-- > 0;) {
 						node = AddChainNode(stack[i].vertex, edges_in[i], node);
+						stack[i].led = true;
 					}
 					found.push_back({t, node, cost});
 				}
@@ -393,18 +395,21 @@ private:
 				if (previous_least == Unreachable() || previous_least > prefix_budget) {
 					continue;
 				}
-				CountNode(); // a walk back through many steps that repeat vertices is bounded by the budget too
 				if (previous != src) {
 					on_path[static_cast<idx_t>(previous)] = true;
 				}
 				edges_in.push_back(reverse_edge[pos]);
 				weights_in.push_back(reverse_weight[pos]);
 				stack.push_back(
-				    {previous, previous_class, reverse_offsets[static_cast<idx_t>(previous)], 0, prefix_budget});
+				    {previous, previous_class, reverse_offsets[static_cast<idx_t>(previous)], 0, prefix_budget, false});
 				pushed = true;
 				break;
 			}
 			if (!pushed) {
+				if (!frame.led) {
+					// A dead end: the walk back through steps that repeat vertices is bounded by the budget.
+					CountNode();
+				}
 				if (frame.vertex != src) {
 					on_path[vertex] = false;
 				}
@@ -592,8 +597,8 @@ private:
 		});
 	}
 
+	//! A node of a path found (not of the search): as many as the answer has steps, so not counted in the budget.
 	int64_t AddChainNode(int64_t vertex, int64_t edge, int64_t parent) {
-		CountNode();
 		const int64_t depth = parent < 0 ? 0 : nodes[static_cast<idx_t>(parent)].depth + 1;
 		nodes.push_back({vertex, edge, parent, depth, 0});
 		return static_cast<int64_t>(nodes.size()) - 1;
