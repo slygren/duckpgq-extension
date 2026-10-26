@@ -1,0 +1,283 @@
+# name: test/sql/pattern_matching/element_functions_everywhere.test
+# description: element_id(x), label(x), x IS [NOT] LABELED l and ALL_DIFFERENT(...) wherever an expression can stand:
+#              nested in any expression (NOT, CASE, function arguments), in COLUMNS, in an element WHERE, in an
+#              EXISTS pattern's WHERE, in a UNION branch. IS [NOT] LABELED of a discriminator sub-label is the row's
+#              bit, not a constant. An undirected edge's element_id is its row id. A function of an OPTIONAL element
+#              that matched nothing is NULL. Each is compared with the same question asked with plain SQL.
+# group: [pattern_matching]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE P(id BIGINT PRIMARY KEY, name VARCHAR);
+
+statement ok
+INSERT INTO P VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e');
+
+statement ok
+CREATE TABLE C(cid BIGINT PRIMARY KEY, title VARCHAR);
+
+statement ok
+INSERT INTO C VALUES (1, 'x'), (2, 'y');
+
+# parallel edges 1->2, a reciprocal pair 1<->2, a self-loop on 5
+statement ok
+CREATE TABLE K(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO K VALUES (1, 2), (1, 2), (2, 3), (1, 3), (3, 4), (2, 4), (4, 1), (2, 1), (3, 5), (5, 5);
+
+statement ok
+CREATE TABLE L(pid BIGINT, cid BIGINT);
+
+statement ok
+INSERT INTO L VALUES (1, 1), (2, 2), (3, 1);
+
+statement ok
+CREATE PROPERTY GRAPH g
+VERTEX TABLES (P LABEL Person, C LABEL Course)
+EDGE TABLES (K SOURCE KEY (src) REFERENCES P (id) DESTINATION KEY (dst) REFERENCES P (id) LABEL Knows,
+             L SOURCE KEY (pid) REFERENCES P (id) DESTINATION KEY (cid) REFERENCES C (cid) LABEL Takes);
+
+# kind is a bit mask over the sub-labels: 1 Student, 2 Teacher, 3 both
+statement ok
+CREATE TABLE S(id BIGINT PRIMARY KEY, kind INTEGER);
+
+statement ok
+INSERT INTO S VALUES (1, 1), (2, 2), (3, 3), (4, 0);
+
+statement ok
+CREATE TABLE F(a BIGINT, b BIGINT);
+
+statement ok
+INSERT INTO F VALUES (1, 2), (2, 3), (3, 4);
+
+statement ok
+CREATE PROPERTY GRAPH g2
+VERTEX TABLES (S LABEL Member IN kind (Student, Teacher))
+EDGE TABLES (F SOURCE KEY (a) REFERENCES S (id) DESTINATION KEY (b) REFERENCES S (id) LABEL Follows);
+
+# --- IS [NOT] LABELED of a sub-label is the row's bit (it was a constant: true for every row)
+
+query I
+FROM GRAPH_TABLE (g2 MATCH (m:Member) WHERE m IS LABELED Student COLUMNS (m.id)) ORDER BY ALL;
+----
+1
+3
+
+query I
+FROM GRAPH_TABLE (g2 MATCH (m:Member) WHERE m IS NOT LABELED Student COLUMNS (m.id)) ORDER BY ALL;
+----
+2
+4
+
+# the same as the label in the pattern
+query I
+FROM GRAPH_TABLE (g2 MATCH (m:Student) COLUMNS (m.id)) ORDER BY ALL;
+----
+1
+3
+
+query I
+FROM GRAPH_TABLE (g2 MATCH (m:Member) WHERE m IS LABELED teacher COLUMNS (m.id)) ORDER BY ALL;
+----
+2
+3
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (g2 MATCH (m:Member) WHERE m IS LABELED Member COLUMNS (m.id));
+----
+4
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (g2 MATCH (m:Member) WHERE m IS LABELED Person COLUMNS (m.id));
+----
+0
+
+# in COLUMNS, per row, and of an edge's endpoint
+query IIII
+FROM GRAPH_TABLE (g2 MATCH (m:Member)-[f:Follows]->(n:Member)
+                  COLUMNS (m.id, n.id, m IS LABELED Student AS ms, NOT (n IS LABELED Teacher) AS nt)) ORDER BY ALL;
+----
+1	2	true	false
+2	3	false	false
+3	4	true	true
+
+# --- nested positions that failed to bind before
+
+query I
+FROM GRAPH_TABLE (g MATCH (a:Person) WHERE NOT (a IS LABELED Person) COLUMNS (a.id));
+----
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH (a:Person)-[e:Knows]->(b:Person) WHERE NOT ALL_DIFFERENT(a, b) COLUMNS (a.id));
+----
+1
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH (a:Person)-[e:Knows]->(b:Person)
+                                  WHERE CASE WHEN ALL_DIFFERENT(a, b) THEN element_id(a) < element_id(b) ELSE false END
+                                  COLUMNS (a.id));
+----
+7
+
+query II
+SELECT count(*), count(*) FILTER (WHERE x.src < x.dst) FROM K x WHERE x.src <> x.dst;
+----
+9	7
+
+query II
+FROM GRAPH_TABLE (g MATCH (a:Person) WHERE a.id < 3 COLUMNS (a.id, lower(label(a)) || '/' || element_id(a) AS l)) ORDER BY ALL;
+----
+1	person/0
+2	person/1
+
+query I
+FROM GRAPH_TABLE (g MATCH (c:Course) COLUMNS (CASE WHEN c IS LABELED Course THEN label(c) END AS l)) ORDER BY ALL;
+----
+Course
+Course
+
+# element WHERE
+query I
+FROM GRAPH_TABLE (g MATCH (a:Person WHERE label(a) = 'Person' AND element_id(a) = 2)-[t:Takes]->(c:Course) COLUMNS (c.cid));
+----
+1
+
+query II
+FROM GRAPH_TABLE (g MATCH (a:Person)-[t:Takes WHERE element_id(t) > 0]->(c:Course) COLUMNS (a.id, c.cid)) ORDER BY ALL;
+----
+2	2
+3	1
+
+# EXISTS pattern WHERE
+query I
+FROM GRAPH_TABLE (g MATCH (a:Person) WHERE EXISTS { (a)-[x:Takes]->(c:Course) WHERE label(c) = 'Course' AND element_id(c) = 0 }
+                  COLUMNS (a.id)) ORDER BY ALL;
+----
+1
+3
+
+query I
+FROM GRAPH_TABLE (g MATCH (a:Person) WHERE NOT EXISTS { (a)-[x:Knows]->(b:Person) WHERE NOT ALL_DIFFERENT(a, b) }
+                  COLUMNS (a.id)) ORDER BY ALL;
+----
+1
+2
+3
+4
+
+# a UNION branch
+query II
+FROM GRAPH_TABLE (g MATCH (a:Person) WHERE element_id(a) = 0 COLUMNS (a.id, label(a))
+                  UNION ALL MATCH (c:Course) WHERE NOT (c IS NOT LABELED Course) AND element_id(c) = 1 COLUMNS (c.cid, label(c)))
+ORDER BY ALL;
+----
+1	Person
+2	Course
+
+# --- an undirected edge: element_id is the edge's row id, read both ways
+
+statement ok
+CREATE TABLE und AS FROM GRAPH_TABLE (g MATCH (a:Person)-[e:Knows]-(b:Person) COLUMNS (a.id AS a, b.id AS b, element_id(e) AS e));
+
+statement ok
+CREATE TABLE und_ref AS SELECT src AS a, dst AS b, rowid AS e FROM K UNION ALL SELECT dst, src, rowid FROM K WHERE src <> dst;
+
+query I
+SELECT count(*) FROM ((FROM und EXCEPT ALL FROM und_ref) UNION ALL (FROM und_ref EXCEPT ALL FROM und));
+----
+0
+
+query I
+SELECT count(*) FROM und;
+----
+19
+
+statement ok
+CREATE TABLE und2 AS FROM GRAPH_TABLE (g MATCH (a:Person)-[e:Knows]-(b:Person)-[f:Knows]-(c:Person) WHERE ALL_DIFFERENT(e, f)
+                                        COLUMNS (a.id AS a, b.id AS b, c.id AS c, element_id(e) AS e, element_id(f) AS f));
+
+query I
+SELECT count(*) FROM ((FROM und2 EXCEPT ALL SELECT x.a, x.b, y.b, x.e, y.e FROM und_ref x JOIN und_ref y ON y.a = x.b AND y.e <> x.e)
+                      UNION ALL (SELECT x.a, x.b, y.b, x.e, y.e FROM und_ref x JOIN und_ref y ON y.a = x.b AND y.e <> x.e EXCEPT ALL FROM und2));
+----
+0
+
+# --- OPTIONAL MATCH: the functions of an element that matched nothing are NULL
+
+query IIIII
+FROM GRAPH_TABLE (g MATCH (a:Person) OPTIONAL MATCH (a)-[t:Takes]->(c:Course)
+                  COLUMNS (a.id, label(c) AS l, c IS LABELED Course AS lab, element_id(c) AS i, label(a) AS la)) ORDER BY ALL;
+----
+1	Course	true	0	Person
+2	Course	true	1	Person
+3	Course	true	0	Person
+4	NULL	NULL	NULL	Person
+5	NULL	NULL	NULL	Person
+
+query I
+FROM GRAPH_TABLE (g MATCH (a:Person) OPTIONAL MATCH (a)-[t:Takes]->(c:Course) WHERE c IS NOT LABELED Person COLUMNS (a.id)) ORDER BY ALL;
+----
+1
+2
+3
+
+# --- with ABI artifacts built: the same answers
+
+statement ok
+CREATE TABLE before_abi AS FROM GRAPH_TABLE (g2 MATCH (m:Member)-[f:Follows]->(n:Member)
+                                              WHERE NOT (m IS LABELED Teacher) OR CASE WHEN n IS LABELED Student THEN true END
+                                              COLUMNS (m.id AS m, n.id AS n, label(n) AS l, element_id(f) AS f));
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('g2', exclude_self_referential := false, max_hops := 2);
+
+statement ok
+CREATE TABLE after_abi AS FROM GRAPH_TABLE (g2 MATCH (m:Member)-[f:Follows]->(n:Member)
+                                             WHERE NOT (m IS LABELED Teacher) OR CASE WHEN n IS LABELED Student THEN true END
+                                             COLUMNS (m.id AS m, n.id AS n, label(n) AS l, element_id(f) AS f));
+
+query I
+SELECT count(*) FROM ((FROM before_abi EXCEPT ALL FROM after_abi) UNION ALL (FROM after_abi EXCEPT ALL FROM before_abi));
+----
+0
+
+query IIII
+FROM after_abi ORDER BY ALL;
+----
+1	2	Member	0
+2	3	Member	1
+
+statement ok
+CREATE TABLE before_abi_g AS FROM GRAPH_TABLE (g MATCH (a:Person)-[e:Knows]->(b:Person)-[t:Takes]->(c:Course)
+                                                WHERE ALL_DIFFERENT(a, b) AND label(c) = 'Course' AND NOT (c IS NOT LABELED Course)
+                                                COLUMNS (a.id AS a, element_id(b) AS b, upper(label(c)) AS c));
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('g', exclude_self_referential := false, max_hops := 2);
+
+statement ok
+CREATE TABLE after_abi_g AS FROM GRAPH_TABLE (g MATCH (a:Person)-[e:Knows]->(b:Person)-[t:Takes]->(c:Course)
+                                               WHERE ALL_DIFFERENT(a, b) AND label(c) = 'Course' AND NOT (c IS NOT LABELED Course)
+                                               COLUMNS (a.id AS a, element_id(b) AS b, upper(label(c)) AS c));
+
+query I
+SELECT count(*) FROM ((FROM before_abi_g EXCEPT ALL FROM after_abi_g) UNION ALL (FROM after_abi_g EXCEPT ALL FROM before_abi_g));
+----
+0
+
+query I
+SELECT count(*) FROM after_abi_g;
+----
+6
+
+# --- refusals
+
+statement error
+FROM GRAPH_TABLE (g MATCH (a:Person) WHERE ALL_DIFFERENT(a, a.id) COLUMNS (a.id));
+----
+ALL_DIFFERENT arguments must be element variable references

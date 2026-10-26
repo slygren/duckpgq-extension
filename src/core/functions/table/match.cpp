@@ -14,6 +14,7 @@
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 
 #include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/expression/case_expression.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/between_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
@@ -1694,53 +1695,6 @@ void PGQMatchFunction::CheckEdgeTableConstraints(const string &src_reference, co
 	}
 }
 
-// Expand ALL_DIFFERENT(e1, e2, ..., en) into pairwise rowid inequality conjunctions.
-// Recurses into AND/OR/NOT to handle ALL_DIFFERENT nested inside boolean expressions.
-static unique_ptr<ParsedExpression> RewriteAllDifferent(unique_ptr<ParsedExpression> expr) {
-	if (!expr) {
-		return expr;
-	}
-
-	auto *func = dynamic_cast<FunctionExpression *>(expr.get());
-	if (func && StringUtil::Lower(func->FunctionName().GetIdentifierName()) == "all_different") {
-		vector<unique_ptr<ParsedExpression>> ne_exprs;
-		for (idx_t i = 0; i < func->GetArgumentsMutable().size(); i++) {
-			for (idx_t j = i + 1; j < func->GetArgumentsMutable().size(); j++) {
-				auto *col_i = dynamic_cast<ColumnRefExpression *>(func->GetArgumentsMutable()[i].GetExpressionMutable().get());
-				auto *col_j = dynamic_cast<ColumnRefExpression *>(func->GetArgumentsMutable()[j].GetExpressionMutable().get());
-				if (!col_i || !col_j) {
-					throw BinderException("ALL_DIFFERENT arguments must be element variable references");
-				}
-				string var_i = PGQStr(col_i->ColumnNames().back());
-				string var_j = PGQStr(col_j->ColumnNames().back());
-				ne_exprs.push_back(make_uniq<ComparisonExpression>(
-				    ExpressionType::COMPARE_NOTEQUAL, PGQColRef("rowid", var_i),
-				    PGQColRef("rowid", var_j)));
-			}
-		}
-		if (ne_exprs.empty()) {
-			return ConstantExpression::FromValue(Value::BOOLEAN(true));
-		}
-		auto result = std::move(ne_exprs[0]);
-		for (idx_t k = 1; k < ne_exprs.size(); k++) {
-			result = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(result),
-			                                          std::move(ne_exprs[k]));
-		}
-		return result;
-	}
-
-	// Recurse into conjunction/disjunction children
-	auto *conj = dynamic_cast<ConjunctionExpression *>(expr.get());
-	if (conj) {
-		for (auto &child : conj->GetChildrenMutable()) {
-			child = RewriteAllDifferent(std::move(child));
-		}
-		return expr;
-	}
-
-	return expr;
-}
-
 // Return true if expr contains an EXISTS { ... } graph pattern predicate (EXISTS / NOT EXISTS).
 // Used to exclude un-rewritable PGQ subqueries from CTE pushdown.
 static bool ContainsPGQExists(const ParsedExpression &expr) {
@@ -2403,110 +2357,195 @@ static bool PatternHasCostExpr(const vector<unique_ptr<PathReference>> &path_ele
 	return false;
 }
 
-// Rewrite element_id(x) → x.rowid and label(x) → constant string in WHERE clause expressions.
-static unique_ptr<ParsedExpression>
-RewriteGraphFunctions(unique_ptr<ParsedExpression> expr,
-                      const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map) {
-	if (!expr) {
-		return expr;
-	}
+//! What the element functions of a MATCH -- element_id(x), label(x), x IS [NOT] LABELED l, ALL_DIFFERENT(...) --
+//! need to know about its variables where they become SQL.
+struct PGQElementScope {
+	//! Element variable -> its element table.
+	const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> *tables = nullptr;
+	//! Variables whose table is a placeholder (no label, no edge implying one): their label varies per row.
+	const case_insensitive_set_t *stubs = nullptr;
+	//! Edge variables read from the undirected edge union, whose row id is the union's __pgq_erowid column.
+	case_insensitive_set_t undirected_edges;
+	//! Variables NULL in the rows where their OPTIONAL MATCH found nothing: a function of such an element is NULL there.
+	case_insensitive_set_t optional;
+};
 
-	auto *func = dynamic_cast<FunctionExpression *>(expr.get());
-	if (func) {
-		// element_id(x) → x.rowid
-		if (func->FunctionName().GetIdentifierName() == "element_id" && func->GetArgumentsMutable().size() == 1) {
-			auto *col = dynamic_cast<ColumnRefExpression *>(func->GetArgumentsMutable()[0].GetExpressionMutable().get());
-			if (col != nullptr && !col->ColumnNames().empty()) {
-				auto rowid_ref = PGQColRef("rowid", col->ColumnNames().back());
-				rowid_ref->SetAlias(Identifier(func->GetAlias().GetIdentifierName()));
-				return rowid_ref;
+//! The element variable an element function's argument names, or empty when it is not a plain variable reference.
+static string ElementArgument(FunctionExpression &function, idx_t index) {
+	auto &argument = function.GetArgumentsMutable()[index].GetExpressionMutable();
+	if (!argument || argument->GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+		return string();
+	}
+	auto &names = argument->Cast<ColumnRefExpression>().ColumnNames();
+	return names.size() == 1 ? PGQStr(names[0]) : string();
+}
+
+//! The column holding the row id of element `variable`.
+static unique_ptr<ParsedExpression> ElementRowid(const PGQElementScope &scope, const string &variable) {
+	return PGQColRef(scope.undirected_edges.count(variable) ? "__pgq_erowid" : "rowid", variable);
+}
+
+//! `value`, or NULL in the rows where an OPTIONAL element `variable` is NULL.
+static unique_ptr<ParsedExpression> NullWhereElementNull(const PGQElementScope &scope, const string &variable,
+                                                         unique_ptr<ParsedExpression> value) {
+	if (!scope.optional.count(variable)) {
+		return value;
+	}
+	auto missing = make_uniq<OperatorExpression>(ExpressionType::OPERATOR_IS_NULL, ElementRowid(scope, variable));
+	auto result = make_uniq<CaseExpression>();
+	CaseCheck check;
+	check.when_expr = std::move(missing);
+	check.then_expr = ConstantExpression::FromValue(Value());
+	result->CaseChecksMutable().push_back(std::move(check));
+	result->ElseMutable() = std::move(value);
+	return std::move(result);
+}
+
+//! Whether an element of `table` has label `label`: TRUE for its main label, the row's discriminator bit for one of
+//! its sub-labels, FALSE otherwise.
+static unique_ptr<ParsedExpression> ElementHasLabel(const shared_ptr<PropertyGraphTable> &table, const string &label,
+                                                    const string &variable) {
+	if (StringUtil::CIEquals(PGQStr(table->main_label), label)) {
+		return ConstantExpression::FromValue(Value::BOOLEAN(true));
+	}
+	for (auto &sub_label : table->sub_labels) {
+		if (StringUtil::CIEquals(PGQStr(sub_label), label)) {
+			return MakeSingleLabelCond(PGQStr(sub_label), table, variable);
+		}
+	}
+	return ConstantExpression::FromValue(Value::BOOLEAN(false));
+}
+
+//! The SQL of one element function call, or null when `function` is none or does not name an element variable.
+static unique_ptr<ParsedExpression> RewriteElementFunction(FunctionExpression &function, const PGQElementScope &scope) {
+	const auto name = StringUtil::Lower(PGQStr(function.FunctionName()));
+	const auto argument_count = function.GetArgumentsMutable().size();
+	auto table_of = [&](const string &variable) -> shared_ptr<PropertyGraphTable> {
+		if (variable.empty() || !scope.tables) {
+			return nullptr;
+		}
+		auto entry = scope.tables->find(variable);
+		return entry == scope.tables->end() ? nullptr : entry->second;
+	};
+	if (name == "element_id" && argument_count == 1) {
+		auto variable = ElementArgument(function, 0);
+		if (variable.empty()) {
+			return nullptr;
+		}
+		return ElementRowid(scope, variable);
+	}
+	if (name == "label" && argument_count == 1) {
+		auto variable = ElementArgument(function, 0);
+		auto table = table_of(variable);
+		if (!table) {
+			return nullptr;
+		}
+		if (scope.stubs && scope.stubs->count(variable)) {
+			// A stub entry is a placeholder table picked for column validation, not this binding's actual label:
+			// folding it into a constant would report a confidently wrong answer.
+			throw BinderException(
+			    "label(%s) cannot be resolved: '%s' has no label in the pattern and the edge reaching it does not "
+			    "determine one, so its label varies per row. Give the vertex a label (%s:SOME_LABEL), or name a "
+			    "single edge label so the destination table is implied. For a variable-length pattern, label() is "
+			    "answered per row and works without either.",
+			    variable.c_str(), variable.c_str(), variable.c_str());
+		}
+		return NullWhereElementNull(scope, variable, ConstantExpression::FromValue(Value(PGQStr(table->main_label))));
+	}
+	if ((name == "is_labeled" || name == "not_labeled") && argument_count == 2) {
+		auto variable = ElementArgument(function, 0);
+		auto table = table_of(variable);
+		auto &label_argument = function.GetArgumentsMutable()[1].GetExpressionMutable();
+		if (!table || label_argument->GetExpressionClass() != ExpressionClass::CONSTANT) {
+			return nullptr;
+		}
+		if (scope.stubs && scope.stubs->count(variable)) {
+			throw BinderException("%s IS [NOT] LABELED cannot be resolved: '%s' has no label in the pattern and the "
+			                      "edge reaching it does not determine one. Give it a label in the pattern",
+			                      variable, variable);
+		}
+		const auto label = label_argument->Cast<ConstantExpression>().GetLiteral().ToValue().ToString();
+		auto test = ElementHasLabel(table, label, variable);
+		if (name == "not_labeled") {
+			test = make_uniq<OperatorExpression>(ExpressionType::OPERATOR_NOT, std::move(test));
+		}
+		return NullWhereElementNull(scope, variable, std::move(test));
+	}
+	if (name == "all_different") {
+		vector<string> variables;
+		for (idx_t i = 0; i < argument_count; i++) {
+			variables.push_back(ElementArgument(function, i));
+			if (variables.back().empty()) {
+				throw BinderException("ALL_DIFFERENT arguments must be element variable references");
 			}
 		}
-		// label(x) → string constant of x's label
-		if (func->FunctionName().GetIdentifierName() == "label" && func->GetArgumentsMutable().size() == 1) {
-			auto *col = dynamic_cast<ColumnRefExpression *>(func->GetArgumentsMutable()[0].GetExpressionMutable().get());
-			if (col != nullptr && !col->ColumnNames().empty()) {
-				auto tbl_iter = alias_map.find(PGQStr(col->ColumnNames().back()));
-				if (tbl_iter != alias_map.end()) {
-					auto label_const = ConstantExpression::FromValue(Value(PGQStr(tbl_iter->second->main_label)));
-					label_const->SetAlias(Identifier(func->GetAlias().GetIdentifierName()));
-					return label_const;
-				}
+		unique_ptr<ParsedExpression> result;
+		for (idx_t i = 0; i < variables.size(); i++) {
+			for (idx_t j = i + 1; j < variables.size(); j++) {
+				unique_ptr<ParsedExpression> different = make_uniq<ComparisonExpression>(
+				    ExpressionType::COMPARE_NOTEQUAL, ElementRowid(scope, variables[i]), ElementRowid(scope, variables[j]));
+				result = result ? make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(result),
+				                                                   std::move(different))
+				                : std::move(different);
 			}
 		}
-		// x IS LABELED 'lbl' → label matches (case-insensitive)
-		if (func->FunctionName().GetIdentifierName() == "is_labeled" && func->GetArgumentsMutable().size() == 2) {
-			auto *col = dynamic_cast<ColumnRefExpression *>(func->GetArgumentsMutable()[0].GetExpressionMutable().get());
-			auto *lbl = dynamic_cast<ConstantExpression *>(func->GetArgumentsMutable()[1].GetExpressionMutable().get());
-			if (col != nullptr && lbl != nullptr && !col->ColumnNames().empty()) {
-				string var = PGQStr(col->ColumnNames().back());
-				auto tbl_iter = alias_map.find(var);
-				if (tbl_iter != alias_map.end()) {
-					string expected = StringUtil::Lower(lbl->GetLiteral().ToValue().ToString());
-					bool matches = tbl_iter->second->main_label == expected;
-					if (!matches) {
-						for (const auto &sub : tbl_iter->second->sub_labels) {
-							if (StringUtil::Lower(PGQStr(sub)) == expected) {
-								matches = true;
-								break;
-							}
-						}
-					}
-					return ConstantExpression::FromValue(Value::BOOLEAN(matches));
-				}
+		return result ? std::move(result) : ConstantExpression::FromValue(Value::BOOLEAN(true));
+	}
+	return nullptr;
+}
+
+//! Rewrites every element function in `expression`, at any depth, into SQL over the variables' tables. A subquery is
+//! left alone: an EXISTS pattern has its own variables and is rewritten where it is built.
+static unique_ptr<ParsedExpression> RewriteElementFunctions(unique_ptr<ParsedExpression> expression,
+                                                            const PGQElementScope &scope) {
+	if (!expression || expression->GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		return expression;
+	}
+	if (expression->GetExpressionClass() == ExpressionClass::FUNCTION) {
+		if (auto rewritten = RewriteElementFunction(expression->Cast<FunctionExpression>(), scope)) {
+			rewritten->SetAlias(expression->GetAlias());
+			return rewritten;
+		}
+	}
+	ParsedExpressionIterator::EnumerateChildren(*expression, [&](unique_ptr<ParsedExpression> &child) {
+		child = RewriteElementFunctions(std::move(child), scope);
+	});
+	return expression;
+}
+
+//! The variables of `from` read from an undirected edge union: a subquery whose rows carry __pgq_erowid.
+static void CollectUndirectedEdgeBindings(const TableRef *from, case_insensitive_set_t &bindings) {
+	if (!from) {
+		return;
+	}
+	switch (from->type) {
+	case TableReferenceType::JOIN: {
+		auto &join = from->Cast<JoinRef>();
+		CollectUndirectedEdgeBindings(join.left.get(), bindings);
+		CollectUndirectedEdgeBindings(join.right.get(), bindings);
+		return;
+	}
+	case TableReferenceType::SUBQUERY: {
+		auto &subquery = from->Cast<SubqueryRef>();
+		auto *node = subquery.subquery && subquery.subquery->node ? subquery.subquery->node.get() : nullptr;
+		while (node && node->type == QueryNodeType::SET_OPERATION_NODE) {
+			auto &set_operation = node->Cast<SetOperationNode>();
+			node = set_operation.children.empty() ? nullptr : set_operation.children[0].get();
+		}
+		if (!node || node->type != QueryNodeType::SELECT_NODE || subquery.alias.empty()) {
+			return;
+		}
+		for (auto &column : node->Cast<SelectNode>().select_list) {
+			if (StringUtil::CIEquals(column->GetAlias().GetIdentifierName(), "__pgq_erowid")) {
+				bindings.insert(PGQStr(subquery.alias));
+				return;
 			}
 		}
-		// x IS NOT LABELED 'lbl' → negation of is_labeled
-		if (func->FunctionName().GetIdentifierName() == "not_labeled" && func->GetArgumentsMutable().size() == 2) {
-			auto *col = dynamic_cast<ColumnRefExpression *>(func->GetArgumentsMutable()[0].GetExpressionMutable().get());
-			auto *lbl = dynamic_cast<ConstantExpression *>(func->GetArgumentsMutable()[1].GetExpressionMutable().get());
-			if (col != nullptr && lbl != nullptr && !col->ColumnNames().empty()) {
-				string var = PGQStr(col->ColumnNames().back());
-				auto tbl_iter = alias_map.find(var);
-				if (tbl_iter != alias_map.end()) {
-					string expected = StringUtil::Lower(lbl->GetLiteral().ToValue().ToString());
-					bool matches = tbl_iter->second->main_label == expected;
-					if (!matches) {
-						for (const auto &sub : tbl_iter->second->sub_labels) {
-							if (StringUtil::Lower(PGQStr(sub)) == expected) {
-								matches = true;
-								break;
-							}
-						}
-					}
-					return ConstantExpression::FromValue(Value::BOOLEAN(!matches));
-				}
-			}
-		}
+		return;
 	}
-
-	// Recurse into children of conjunction/disjunction
-	auto *conj = dynamic_cast<ConjunctionExpression *>(expr.get());
-	if (conj) {
-		for (auto &child : conj->GetChildrenMutable()) {
-			child = RewriteGraphFunctions(std::move(child), alias_map);
-		}
-		return expr;
+	default:
+		return;
 	}
-
-	// Recurse into children of comparison (e.g. label(x) = 'Person')
-	auto *comp = dynamic_cast<ComparisonExpression *>(expr.get());
-	if (comp) {
-		comp->LeftMutable() = RewriteGraphFunctions(std::move(comp->LeftMutable()), alias_map);
-		comp->RightMutable() = RewriteGraphFunctions(std::move(comp->RightMutable()), alias_map);
-		return expr;
-	}
-
-	// Recurse into other function expressions
-	if (func) {
-		for (auto &argument : func->GetArgumentsMutable()) {
-			auto &child = argument.GetExpressionMutable();
-			child = RewriteGraphFunctions(std::move(child), alias_map);
-		}
-		return expr;
-	}
-
-	return expr;
 }
 
 unique_ptr<ParsedExpression> PGQMatchFunction::CreateMatchJoinExpression(vector<string> vertex_keys,
@@ -10139,6 +10178,12 @@ static unique_ptr<ParsedExpression> BuildExistsSubquery(
 	if (inner_match.where_clause) {
 		conditions.push_back(std::move(inner_match.where_clause));
 	}
+	PGQElementScope element_scope;
+	element_scope.tables = &inner_alias_map;
+	CollectUndirectedEdgeBindings(inner_select->from_table.get(), element_scope.undirected_edges);
+	for (auto &condition : conditions) {
+		condition = RewriteElementFunctions(std::move(condition), element_scope);
+	}
 	inner_select->where_clause = PGQMatchFunction::CreateWhereClause(conditions);
 
 	auto stmt = make_uniq<SelectStatement>();
@@ -10521,7 +10566,7 @@ static idx_t RewriteDirectLinkReferences(CreatePropertyGraphInfo &pg_table, uniq
 static vector<unique_ptr<ParsedExpression>>
 BuildFinalColumnList(vector<unique_ptr<ParsedExpression>> col_list,
                      const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_to_vertex_and_edge_tables,
-                     const case_insensitive_set_t &stub_bindings) {
+                     const PGQElementScope &element_scope) {
 	vector<unique_ptr<ParsedExpression>> final_column_list;
 	for (auto &expression : col_list) {
 		auto *column_ref = dynamic_cast<ColumnRefExpression *>(expression.get());
@@ -10550,48 +10595,10 @@ BuildFinalColumnList(vector<unique_ptr<ParsedExpression>> col_list,
 				                      "...), or the route chosen for the pattern does not provide %s()",
 				                      path_function, argument_name, argument_name, argument_name, path_function);
 			}
-			if (function_ref->FunctionName().GetIdentifierName() == "element_id" && function_ref->GetArgumentsMutable().size() == 1) {
-				column_ref = dynamic_cast<ColumnRefExpression *>(function_ref->GetArgumentsMutable()[0].GetExpressionMutable().get());
-				if (column_ref != nullptr && !column_ref->ColumnNames().empty()) {
-					string var = PGQStr(column_ref->ColumnNames().back());
-					auto rowid_ref = PGQColRef("rowid", var);
-					rowid_ref->SetAlias(Identifier(function_ref->GetAlias().GetIdentifierName().empty() ? "element_id(" + var + ")" : function_ref->GetAlias().GetIdentifierName()));
-					final_column_list.emplace_back(std::move(rowid_ref));
-				} else {
-					final_column_list.push_back(std::move(expression));
-				}
-			} else if (function_ref->FunctionName().GetIdentifierName() == "label" && function_ref->GetArgumentsMutable().size() == 1) {
-				column_ref = dynamic_cast<ColumnRefExpression *>(function_ref->GetArgumentsMutable()[0].GetExpressionMutable().get());
-				if (column_ref != nullptr && !column_ref->ColumnNames().empty()) {
-					string var = PGQStr(column_ref->ColumnNames().back());
-					auto tbl_iter = alias_to_vertex_and_edge_tables.find(var);
-					// A stub entry is a placeholder table picked for column validation, not
-					// this binding's actual label. Folding it into a constant reports a
-					// confidently wrong answer -- the traversal and element_id() stay
-					// correct, so nothing looks broken and the label is simply untrue.
-					// Refuse instead, and say what to write to get an answer.
-					if (tbl_iter != alias_to_vertex_and_edge_tables.end() &&
-					    stub_bindings.find(var) != stub_bindings.end()) {
-						throw BinderException(
-						    "label(%s) cannot be resolved: '%s' has no label in the pattern and the edge reaching it "
-						    "does not determine one, so its label varies per row. Give the vertex a label "
-						    "(%s:SOME_LABEL), or name a single edge label so the destination table is implied. For a "
-						    "variable-length pattern, label() is answered per row and works without either.",
-						    var.c_str(), var.c_str(), var.c_str());
-					}
-					if (tbl_iter != alias_to_vertex_and_edge_tables.end()) {
-						auto label_const = ConstantExpression::FromValue(Value(PGQStr(tbl_iter->second->main_label)));
-						label_const->SetAlias(Identifier(function_ref->GetAlias().GetIdentifierName().empty() ? "label(" + var + ")" : function_ref->GetAlias().GetIdentifierName()));
-						final_column_list.emplace_back(std::move(label_const));
-					} else {
-						final_column_list.push_back(std::move(expression));
-					}
-				} else {
-					final_column_list.push_back(std::move(expression));
-				}
-			} else {
-				final_column_list.push_back(std::move(expression));
+			if (!expression->HasAlias()) {
+				expression->SetAlias(expression->GetName());
 			}
+			final_column_list.push_back(RewriteElementFunctions(std::move(expression), element_scope));
 			continue;
 		}
 
@@ -10618,7 +10625,10 @@ BuildFinalColumnList(vector<unique_ptr<ParsedExpression>> col_list,
 			continue;
 		}
 
-		final_column_list.emplace_back(std::move(expression));
+		if (!expression->HasAlias()) {
+			expression->SetAlias(expression->GetName());
+		}
+		final_column_list.emplace_back(RewriteElementFunctions(std::move(expression), element_scope));
 	}
 	return final_column_list;
 }
@@ -17790,6 +17800,14 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 	for (auto &entry : optional_alias_map) {
 		alias_to_vertex_and_edge_tables.emplace(entry.first, entry.second);
 	}
+	PGQElementScope element_scope;
+	element_scope.tables = &alias_to_vertex_and_edge_tables;
+	element_scope.stubs = &stub_bindings;
+	for (auto &entry : optional_alias_map) {
+		if (alias_map.find(entry.first) == alias_map.end()) {
+			element_scope.optional.insert(entry.first);
+		}
+	}
 
 	// ONE ROW PER: replace the from_clause and conditions with step-unnested equivalents.
 	// Must run after alias_to_vertex_and_edge_tables is built (so we can extend it with step vars)
@@ -17821,8 +17839,7 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 			if (!wraps_orp_path_source) {
 				auto cte_filter = ExtractSafeCTEConjuncts(*ref->where_clause);
 				if (cte_filter) {
-					cte_filter = RewriteAllDifferent(std::move(cte_filter));
-					cte_filter = RewriteGraphFunctions(std::move(cte_filter), alias_to_vertex_and_edge_tables);
+					cte_filter = RewriteElementFunctions(std::move(cte_filter), element_scope);
 					if (inner_sel) {
 						if (inner_sel->where_clause) {
 							inner_sel->where_clause = make_uniq<ConjunctionExpression>(
@@ -17859,9 +17876,12 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 		// Rewrite PGQ EXISTS/NOT EXISTS predicates first, then standard rewrites.
 		ref->where_clause = RewritePGQExists(std::move(ref->where_clause), context, *pg_table, alias_map,
 		                                      path_table_cache);
-		auto where = RewriteAllDifferent(std::move(ref->where_clause));
-		where = RewriteGraphFunctions(std::move(where), alias_to_vertex_and_edge_tables);
-		conditions.push_back(std::move(where));
+		conditions.push_back(std::move(ref->where_clause));
+	}
+	// Element functions in the MATCH WHERE and in the element WHEREs the translation moved into the conditions.
+	CollectUndirectedEdgeBindings(final_select_node->from_table.get(), element_scope.undirected_edges);
+	for (auto &condition : conditions) {
+		condition = RewriteElementFunctions(std::move(condition), element_scope);
 	}
 
 	// A UNION branch either has its own COLUMNS or shares the head's: deep-copy the shared list for each branch before
@@ -17882,7 +17902,7 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 		final_select_node->qualify = CreateWhereClause(selection_qualify);
 	}
 	final_select_node->select_list =
-	    BuildFinalColumnList(std::move(ref->column_list), alias_to_vertex_and_edge_tables, stub_bindings);
+	    BuildFinalColumnList(std::move(ref->column_list), alias_to_vertex_and_edge_tables, element_scope);
 	PGQEliminateVertexJoins(context, *final_select_node, vertex_joins, alias_map);
 
 	if (ref->union_matches.empty()) {
@@ -18024,6 +18044,14 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 		for (auto &entry : branch_opt_alias_map) {
 			branch_alias_to_ve.emplace(entry.first, entry.second);
 		}
+		PGQElementScope branch_scope;
+		branch_scope.tables = &branch_alias_to_ve;
+		branch_scope.stubs = &branch_stub_bindings;
+		for (auto &entry : branch_opt_alias_map) {
+			if (branch_alias_map.find(entry.first) == branch_alias_map.end()) {
+				branch_scope.optional.insert(entry.first);
+			}
+		}
 
 		if (branch.one_row_per != OneRowPerMode::NONE) {
 			ApplyOneRowPer(branch, *pg_table, branch_select, branch_conditions, branch_alias_to_ve);
@@ -18047,9 +18075,11 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 		if (branch.where_clause) {
 			branch.where_clause = RewritePGQExists(std::move(branch.where_clause), context, *pg_table,
 			                                       branch_alias_map, path_table_cache);
-			auto where = RewriteAllDifferent(std::move(branch.where_clause));
-			where = RewriteGraphFunctions(std::move(where), branch_alias_to_ve);
-			branch_conditions.push_back(std::move(where));
+			branch_conditions.push_back(std::move(branch.where_clause));
+		}
+		CollectUndirectedEdgeBindings(branch_select->from_table.get(), branch_scope.undirected_edges);
+		for (auto &condition : branch_conditions) {
+			condition = RewriteElementFunctions(std::move(condition), branch_scope);
 		}
 
 		if (own_columns) {
@@ -18060,7 +18090,7 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 			branch_select->qualify = CreateWhereClause(branch_selection_qualify);
 		}
 		branch_select->select_list =
-		    BuildFinalColumnList(std::move(branch_columns), branch_alias_to_ve, branch_stub_bindings);
+		    BuildFinalColumnList(std::move(branch_columns), branch_alias_to_ve, branch_scope);
 		// Branches are combined by position, as in SQL. A star expands at bind time; DuckDB reports a mismatch there.
 		if (own_columns && !head_has_star && !HasStarExpression(branch_select->select_list) &&
 		    branch_select->select_list.size() != head_column_count) {
