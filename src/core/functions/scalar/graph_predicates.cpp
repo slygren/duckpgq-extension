@@ -43,6 +43,13 @@ static unique_ptr<FunctionData> ElementLabelsBind(BindScalarFunctionInput &) {
 	throw BinderException("labels() is only allowed inside a GRAPH_TABLE, on an element variable of its MATCH");
 }
 
+// vertex_properties(p) lists the properties of each vertex of path p as JSON. Only the ABI context expansion
+// answers it (it replaces the call with a column of its own); every other route leaves the call to this definition.
+static unique_ptr<FunctionData> VertexPropertiesBind(BindScalarFunctionInput &) {
+	throw BinderException("vertex_properties(p) is only allowed inside a GRAPH_TABLE, on a path variable of its MATCH "
+	                      "that the ABI context expansion answers");
+}
+
 //------------------------------------------------------------------------------
 // Register functions
 //------------------------------------------------------------------------------
@@ -57,6 +64,9 @@ void CoreScalarFunctions::RegisterGraphPredicateScalarFunctions(ExtensionLoader 
 	loader.RegisterFunction(Fallible(ScalarFunction("property_exists", {LogicalType::ANY, LogicalType::ANY},
 	                                                LogicalType::BOOLEAN, ElementComparisonFunction,
 	                                                ElementPropertyBind)));
+	loader.RegisterFunction(Fallible(ScalarFunction("vertex_properties", {LogicalType::ANY},
+	                                                LogicalType::LIST(LogicalType::VARCHAR), ElementComparisonFunction,
+	                                                VertexPropertiesBind)));
 	for (auto name : {"same", "all_different"}) {
 		loader.RegisterFunction(Fallible(ScalarFunction(name, vector<LogicalType> {}, LogicalType::BOOLEAN,
 		                                                ElementComparisonFunction, ElementComparisonBind, nullptr,
