@@ -90,6 +90,17 @@ In every such case the old rows were wrong.
     the rows each gives alone. DuckDB 2.0.0's `common_subplan` optimizer merged their subplans and could read one
     vertex scan's column in place of another's; in a statement with a `GRAPH_TABLE` it is kept off the subplans of
     that shape (one that occurs twice and scans a table twice), and still merges the others.
+  - **`vertex_properties(p)` and `graph_tree_json` return valid JSON for any property value.** A quote in a value
+    used to come out as `\\"`, which ends the string early. Single backslashes and control characters were
+    passed through unescaped. Every `attributes_json` on the product lake hit this.
+    - A JSON-typed property now nests as JSON instead of a string of JSON.
+  - **Path labels over a label expression of several tables at one hop.**
+    `(t:Tag)-[:!HasParent]->{1,1}(x)` and the unquantified `-[:!HasParent]->(x)` labelled every path with the
+    first matching table (`[Tag, Tag]` / `[HasParent]`). Each path now carries its own labels.
+  - **`&` in label expressions:** `-[:!A&!B]->` also returned `A` and `B` paths on the context expansion, and failed
+    on the traversal.
+  - **A quantified edge with one label fixes its far end,** as a single edge does: `label(x)` and `x.prop` of
+    `(t:Tag)-[:HasWorkorder]->{1,1}(x)` used to fail to bind.
 
 **Errors where there used to be silent wrong output**
 - **A path function on a name that isn't a path** (`path_length(o)` with no `o = …`) is an error. The column used to
@@ -97,6 +108,9 @@ In every such case the old rows were wrong.
 - **A negative, NaN or infinite COST,** or a NULL COST without `DEFAULT`, is an error. A negative cycle used to loop
   for ever.
 - **Hop-count searches honour cancellation and `max_execution_time` at every level.**
+- **`vertex_properties(p)` outside the context expansion** (a quantified pattern from a seeded vertex over its
+  edge families) is refused, with a message naming the shapes that take it. It used to fail with "function does
+  not exist".
 - **A function without arguments in the COLUMNS of a MATCH with a path variable** (`COLUMNS (list_value())` next to
   `p = …`) answers. It used to raise an INTERNAL error, which invalidates the database in DuckDB 2.0.
 
