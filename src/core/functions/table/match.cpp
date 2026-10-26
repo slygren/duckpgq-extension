@@ -2812,11 +2812,55 @@ static unique_ptr<SubqueryRef> UndirectedEdgeUnion(const PropertyGraphTable &edg
 	return union_subquery;
 }
 
+//! Which stored orientations of an undirected edge join prev to next. Read forwards, prev must be in the edge's
+//! source table and next in its destination table; read backwards, the other way round. Over an edge between two
+//! different vertex tables only one reading fits; reading the other would compare one table's key with the other's.
+//! Unknown tables allow both.
+struct PGQUndirectedOrientations {
+	bool forward = true;
+	bool reverse = true;
+};
+
+static PGQUndirectedOrientations UndirectedOrientations(const PropertyGraphTable &edge_table,
+                                                        const shared_ptr<PropertyGraphTable> &prev_table,
+                                                        const shared_ptr<PropertyGraphTable> &next_table) {
+	PGQUndirectedOrientations result;
+	auto &source = edge_table.source_pg_table;
+	auto &destination = edge_table.destination_pg_table;
+	if (!source || !destination || !prev_table || !next_table) {
+		return result;
+	}
+	result.forward = prev_table->SameTableIdentity(*source) && next_table->SameTableIdentity(*destination);
+	result.reverse = prev_table->SameTableIdentity(*destination) && next_table->SameTableIdentity(*source);
+	if (!result.forward && !result.reverse) {
+		throw BinderException("Edge pattern of table %s connects %s and %s, so it cannot join %s to %s in either "
+		                      "direction",
+		                      PGQStr(edge_table.table_name), PGQStr(source->table_name),
+		                      PGQStr(destination->table_name), PGQStr(prev_table->table_name),
+		                      PGQStr(next_table->table_name));
+	}
+	return result;
+}
+
+//! The undirected reading of an edge, with the orientations that cannot join prev to next left out.
+static unique_ptr<SubqueryRef> UndirectedEdgeUnionBetween(const PropertyGraphTable &edge_table,
+                                                          const string &edge_binding,
+                                                          const shared_ptr<PropertyGraphTable> &prev_table,
+                                                          const shared_ptr<PropertyGraphTable> &next_table) {
+	auto orientations = UndirectedOrientations(edge_table, prev_table, next_table);
+	auto never = [](bool allowed) -> unique_ptr<ParsedExpression> {
+		return allowed ? nullptr : ConstantExpression::FromValue(Value::BOOLEAN(false));
+	};
+	return UndirectedEdgeUnion(edge_table, edge_binding, never(orientations.forward), never(orientations.reverse));
+}
+
 void PGQMatchFunction::EdgeTypeAny(const shared_ptr<PropertyGraphTable> &edge_table, const string &edge_binding,
                                    const string &prev_binding, const string &next_binding,
+                                   const shared_ptr<PropertyGraphTable> &prev_table,
+                                   const shared_ptr<PropertyGraphTable> &next_table,
                                    vector<unique_ptr<ParsedExpression>> &conditions,
                                    unique_ptr<TableRef> &from_clause) {
-	auto union_subquery = UndirectedEdgeUnion(*edge_table, edge_binding);
+	auto union_subquery = UndirectedEdgeUnionBetween(*edge_table, edge_binding, prev_table, next_table);
 	if (from_clause) {
 		auto from_join = make_uniq<JoinRef>(JoinRefType::CROSS);
 		from_join->left = std::move(from_clause);
@@ -3455,7 +3499,8 @@ void PGQMatchFunction::AddEdgeJoins(const shared_ptr<PropertyGraphTable> &edge_t
 	}
 	switch (edge_type) {
 	case PGQMatchType::MATCH_EDGE_ANY: {
-		EdgeTypeAny(edge_table, edge_binding, prev_binding, next_binding, conditions, from_clause);
+		EdgeTypeAny(edge_table, edge_binding, prev_binding, next_binding, previous_vertex_table, next_vertex_table,
+		            conditions, from_clause);
 		break;
 	}
 	case PGQMatchType::MATCH_EDGE_LEFT:
@@ -5836,7 +5881,7 @@ void PGQMatchFunction::ProcessOptionalPathList(
 				// LEFT JOIN ((edge read both ways) JOIN next ON next.pk = edge.dst [AND label]) ON prev.pk = edge.src:
 				// the edge and its far vertex match together or not at all. The union is the one a MATCH reads
 				// (a self-loop once, not once per direction).
-				auto un_sub = UndirectedEdgeUnion(*edge_table, edge_binding);
+				auto un_sub = UndirectedEdgeUnionBetween(*edge_table, edge_binding, prev_vertex_table, next_vertex_table);
 				unique_ptr<ParsedExpression> vertex_on = CreateMatchJoinExpression(
 				    PGQStrs(edge_table->destination_pk), PGQStrs(edge_table->destination_fk), next_binding, edge_binding);
 				bool far_end_cannot_fail = pg_table.verified;
@@ -14216,7 +14261,8 @@ static void SplitZeroOrOneHopEdges(MatchExpression &block, CreatePropertyGraphIn
 	if (block.one_row_per != OneRowPerMode::NONE) {
 		return;
 	}
-	for (auto &pattern : block.path_patterns) {
+	for (idx_t pattern_index = 0; pattern_index < block.path_patterns.size(); pattern_index++) {
+		auto &pattern = block.path_patterns[pattern_index];
 		if (!pattern->union_operands.empty() || pattern->shortest || pattern->cheapest || pattern->topk ||
 		    SequenceHasGroup(pattern->path_elements)) {
 			continue; // a pattern with a quantified group is split once its groups are unrolled
@@ -14284,6 +14330,52 @@ static void SplitZeroOrOneHopEdges(MatchExpression &block, CreatePropertyGraphIn
 				}
 			}
 			operands.push_back(std::move(operand->path_elements));
+		}
+		// An operand whose tables cannot connect (its one-hop edge leaves a vertex of another table) has no match.
+		// Leaving it out keeps the other operands' rows instead of failing on it.
+		vector<vector<unique_ptr<PathReference>>> feasible;
+		for (auto &operand : operands) {
+			PGQGroupLeaf probe;
+			probe.match = unique_ptr_cast<ParsedExpression, MatchExpression>(block.Copy());
+			auto &probe_pattern = *probe.match->path_patterns[pattern_index];
+			probe_pattern.path_elements.clear();
+			for (auto &reference : operand) {
+				probe_pattern.path_elements.push_back(reference->Copy());
+			}
+			if (PropagateGroupDomains(probe, pg_table)) {
+				feasible.push_back(std::move(operand));
+			}
+		}
+		if (!feasible.empty()) {
+			operands = std::move(feasible);
+		}
+		if (operands.size() == 1) {
+			// One operand is left: no union is built, so the variables it does not bind (the edge of a zero-hop
+			// operand) are NULL here.
+			case_insensitive_set_t before;
+			case_insensitive_set_t after;
+			case_insensitive_set_t path_names;
+			for (auto &reference : pattern->path_elements) {
+				CollectUnionNamedVariables(*reference, before, path_names);
+			}
+			for (auto &reference : operands[0]) {
+				CollectUnionNamedVariables(*reference, after, path_names);
+			}
+			case_insensitive_set_t missing;
+			for (auto &name : before) {
+				if (!after.count(name)) {
+					missing.insert(name);
+				}
+			}
+			for (auto &column : block.column_list) {
+				auto name = column->GetAlias().empty() ? column->GetName() : column->GetAlias();
+				const bool star = column->GetExpressionClass() == ExpressionClass::STAR;
+				column = NullMissingVariables(std::move(column), missing);
+				if (!star && column->GetAlias().empty()) {
+					column->SetAlias(name);
+				}
+			}
+			block.where_clause = NullMissingVariables(std::move(block.where_clause), missing);
 		}
 		pattern->path_elements = std::move(operands[0]);
 		for (idx_t i = 1; i < operands.size(); i++) {

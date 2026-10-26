@@ -239,6 +239,7 @@ public:
 
 	static void EdgeTypeAny(const shared_ptr<PropertyGraphTable> &edge_table, const string &edge_binding,
 	                        const string &prev_binding, const string &next_binding,
+	                        const shared_ptr<PropertyGraphTable> &prev_table, const shared_ptr<PropertyGraphTable> &next_table,
 	                        vector<unique_ptr<ParsedExpression>> &conditions, unique_ptr<TableRef> &from_clause);
 
 	static void EdgeTypeLeft(const shared_ptr<PropertyGraphTable> &edge_table, const string &next_table_name,

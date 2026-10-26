@@ -565,6 +565,54 @@ FROM GRAPH_TABLE (g MATCH (a:P)-[:K]->(b:P) | (a:P)-[:L]->(b:Q) WHERE a.id = 1 C
 2	branch
 2	branch
 
+# ---------------------------------------------------------------------------------------------------- undirected edges between two tables
+# an undirected edge between two vertex tables is read in the one direction its tables allow
+query TTT rowsort
+FROM GRAPH_TABLE (g MATCH (a:Q) -[e:L]- (b:P) COLUMNS (a.id AS a, b.id AS b, e.w AS w));
+----
+1	1	11
+1	2	21
+2	3	31
+3	4	41
+3	5	51
+
+# ... also along a chain
+query TTT rowsort
+FROM GRAPH_TABLE (g MATCH (a:Q) -[e:M]- (b:P) -[f:L]- (c:Q) COLUMNS (a.id AS a, b.id AS b, c.id AS c));
+----
+1	3	2
+1	5	3
+2	4	3
+3	1	1
+
+# an undirected body through both tables, repeated
+query TTTT rowsort
+FROM GRAPH_TABLE (g MATCH (a:P) ((x)-[e:L]-(m)-[f:L]-(y)){1,2} (b) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b, m.name AS ms, e.w AS ws));
+----
+1	2	[q1]	[11]
+
+# an undirected edge whose tables cannot join the two vertices
+statement error
+FROM GRAPH_TABLE (g MATCH (a:P)-[e:K]-(b:Q) COLUMNS (a.id));
+----
+so it cannot join P to Q in either direction
+
+# -[e]->? keeps its zero-hop matches where the one-hop edge cannot leave the vertex (K leaves P only)
+query TTT rowsort
+FROM GRAPH_TABLE (g MATCH (a:Q)-[e:K]->?(b:Q) COLUMNS (a.id AS a, b.id AS b, e.w AS w));
+----
+1	1	NULL
+2	2	NULL
+3	3	NULL
+
+# the same as a group
+query TTT rowsort
+FROM GRAPH_TABLE (g MATCH (a:Q) (()-[e:K]->())? (b:Q) COLUMNS (a.id AS a, b.id AS b, e.w AS w));
+----
+1	1	NULL
+2	2	NULL
+3	3	NULL
+
 # ---------------------------------------------------------------------------------------------------- ABI artifacts
 statement ok
 SET pgq_disable_abi_rewrite = false;
