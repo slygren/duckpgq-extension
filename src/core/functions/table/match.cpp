@@ -7125,6 +7125,9 @@ public:
 	//! kCompletenessProbeBudgetMs (and is then not retried in this process).
 	enum class Look : uint8_t { KNOWN, BOUNDED_PROBE };
 	static constexpr int64_t kCompletenessProbeBudgetMs = 250;
+	//! What the completeness probes of one statement may spend together before it starts no more (the last one may
+	//! run its whole budget past it): what is still unknown it checks itself; the next statement measures on.
+	static constexpr int64_t kStatementProbeBudgetMs = 300;
 
 	// Whether the artifact holds only edges whose endpoints are vertices, so that it answers what the traversal
 	// does (which joins both endpoints). A stored endpoints_complete is trusted: pgq_abi_build reads the edge tables
@@ -7219,8 +7222,21 @@ public:
 				return Endpoints::UNKNOWN;
 			}
 		}
+		auto state = GetDuckPGQState(context);
+		const idx_t query = context.transaction.GetActiveQuery();
+		if (state->completeness_probe_query != query) {
+			state->completeness_probe_query = query;
+			state->completeness_probe_ms = 0;
+		}
+		if (state->completeness_probe_ms >= kStatementProbeBudgetMs) {
+			return Endpoints::UNKNOWN; // this statement's time is spent; a later one measures it
+		}
+		// Always the whole per-probe budget, so that a probe over it is over it for good (and not retried).
 		bool over_budget = false;
+		const auto started = std::chrono::steady_clock::now();
 		const bool value = Probe(key, sql, kCompletenessProbeBudgetMs, &over_budget);
+		state->completeness_probe_ms +=
+		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
 		if (over_budget) {
 			return Endpoints::UNKNOWN;
 		}
@@ -7668,7 +7684,8 @@ private:
 	// is false, which keeps the pattern on the traversal.
 	// budget_ms > 0: the probe gives up after that long, sets *over_budget and records only that it did (so it is
 	// not retried in this process): the caller then treats the answer as unknown.
-	bool Probe(const string &key, const string &sql, int64_t budget_ms = 0, bool *over_budget = nullptr) {
+	bool Probe(const string &key, const string &sql, int64_t budget_ms = 0, bool *over_budget = nullptr,
+	           bool remember_over_budget = true) {
 		auto &store = *cache.exactness;
 		{
 			lock_guard<mutex> guard(store.lock);
@@ -7708,7 +7725,9 @@ private:
 		{
 			lock_guard<mutex> guard(store.lock);
 			if (timed_out) {
-				store.results["over_budget|" + key] = true;
+				if (remember_over_budget) {
+					store.results["over_budget|" + key] = true;
+				}
 			} else {
 				store.results[key] = value;
 			}
@@ -9164,7 +9183,7 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 		// a path is the traversal's exactly when every vertex on it is one, and that touches only those vertices.
 		for (const auto *info : stepped) {
 			// A step's near vertex is the path's previous one (the source, or checked itself): its far end only.
-			const auto endpoints = exactness.ColumnsState(*info, PGQExactness::Look::KNOWN, true, 1, 1);
+			const auto endpoints = exactness.ColumnsState(*info, PGQExactness::Look::BOUNDED_PROBE, true, 1, 1);
 			if (endpoints == PGQExactness::Endpoints::INCOMPLETE) {
 				return nullptr;
 			}
@@ -9184,8 +9203,8 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 		    !exactness.CountsExactly(*artifact.info)) {
 			continue;
 		}
-		const auto endpoints =
-		    exactness.ColumnsState(*artifact.info, PGQExactness::Look::KNOWN, true, 1, DConstants::INVALID_INDEX);
+		const auto endpoints = exactness.ColumnsState(*artifact.info, PGQExactness::Look::BOUNDED_PROBE, true, 1,
+		                                              DConstants::INVALID_INDEX);
 		if (endpoints != PGQExactness::Endpoints::INCOMPLETE) {
 			if (endpoints == PGQExactness::Endpoints::UNKNOWN) {
 				check_path_vertices = true;
@@ -12229,7 +12248,7 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 	// Keys read from the artifact stand for vertices only where every artifact row reaches one (stored or
 	// measured); otherwise every vertex is joined, which drops an edge to a vertex that is gone.
 	const bool keys_are_vertices =
-	    exactness.EndpointsState(*path_info, PGQExactness::Look::KNOWN) == PGQExactness::Endpoints::COMPLETE;
+	    exactness.EndpointsState(*path_info, PGQExactness::Look::BOUNDED_PROBE) == PGQExactness::Endpoints::COMPLETE;
 	const bool src_fully_covered =
 	    keys_are_vertices && BindingReferencesOnlyCovered(match_ref, hops[0].src_binding, src_covered_properties);
 	if (src_fully_covered) {

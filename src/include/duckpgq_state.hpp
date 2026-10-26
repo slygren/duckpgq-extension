@@ -91,6 +91,10 @@ public:
 
 	//! The last query that bound a GRAPH_TABLE; CommonSubplanGuard protects that query's plan.
 	idx_t graph_table_query = DConstants::INVALID_INDEX;
+	//! Time the completeness probes of one statement (completeness_probe_query) have spent: each statement may
+	//! measure for a bounded time, and what it cannot measure it checks itself (PGQExactness::Measure).
+	idx_t completeness_probe_query = DConstants::INVALID_INDEX;
+	int64_t completeness_probe_ms = 0;
 
 	//! Used to build the CSR data structures required for path-finding queries
 	std::unordered_map<int32_t, unique_ptr<CSR>> csr_list;
