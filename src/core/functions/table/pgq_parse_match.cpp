@@ -77,8 +77,14 @@ string DumpPattern(const PathPattern &pattern) {
 	if (pattern.cheapest) {
 		result += pattern.all ? "ALL CHEAPEST " : "ANY CHEAPEST ";
 	} else if (pattern.shortest) {
-		result += pattern.topk > 1 ? "SHORTEST " + to_string(pattern.topk) + " "
-		                           : (pattern.all ? "ALL SHORTEST " : "ANY SHORTEST ");
+		if (pattern.group) {
+			result += "SHORTEST " + to_string(pattern.topk) + " GROUPS ";
+		} else if (pattern.any) {
+			result += "ANY " + to_string(pattern.topk) + " ";
+		} else {
+			result += pattern.topk > 1 ? "SHORTEST " + to_string(pattern.topk) + " "
+			                           : (pattern.all ? "ALL SHORTEST " : "ANY SHORTEST ");
+		}
 	}
 	for (idx_t i = 0; i < pattern.path_elements.size(); i++) {
 		result += (i > 0 ? " " : "") + DumpReference(*pattern.path_elements[i]);

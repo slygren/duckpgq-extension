@@ -14,5 +14,6 @@ set(EXTENSION_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/reachability.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/shortest_path.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/shortest_k_paths.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/union_path.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/csr_creation.cpp
     PARENT_SCOPE)

@@ -14,6 +14,7 @@
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 
 #include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/expression/case_expression.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/between_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
@@ -1260,6 +1261,35 @@ static bool IsVariableLengthEdge(const SubPath &edge_subpath) {
 static shared_ptr<PropertyGraphTable> ResolveLabelExprTable(const string &raw_expr, PGQMatchType match_type,
                                                             CreatePropertyGraphInfo &pg_table);
 
+//! A MATCH whose elements span several tables is first translated as written, so that an ABI route answering it as
+//! written keeps doing so. Meanwhile this holds the element variables the traversal would bind to one table only;
+//! a traversal step reaching one of them, or a label that cannot resolve to one table, throws PGQTableSplitNeeded,
+//! and the MATCH is answered per choice of tables instead (BuildTableSplitNode). Binding runs on one thread.
+struct PGQTableSplitNeeded {};
+static thread_local const case_insensitive_set_t *pgq_table_split_guard = nullptr;
+
+static void CheckTableSplitGuard(const PathReference &reference) {
+	if (!pgq_table_split_guard) {
+		return;
+	}
+	if (reference.path_reference_type == PGQPathReferenceType::PATH_ELEMENT) {
+		auto &element = static_cast<const PathElement &>(reference);
+		if (pgq_table_split_guard->count(element.variable_binding)) {
+			throw PGQTableSplitNeeded();
+		}
+		return;
+	}
+	for (auto &child : static_cast<const SubPath &>(reference).path_list) {
+		CheckTableSplitGuard(*child);
+	}
+}
+
+static void CheckTableSplitGuard(const vector<unique_ptr<PathReference>> &references) {
+	for (auto &reference : references) {
+		CheckTableSplitGuard(*reference);
+	}
+}
+
 // Resolve the table for a label expression string (simple or compound).
 // Delegates to ResolveLabelExprTable which validates that compound expressions
 // don't span multiple tables.
@@ -1504,6 +1534,9 @@ static shared_ptr<PropertyGraphTable> ResolveLabelExprTable(const string &raw_ex
 		if (tables.size() == 1) {
 			return tables[0];
 		}
+		if (pgq_table_split_guard) {
+			throw PGQTableSplitNeeded();
+		}
 		throw Exception(ExceptionType::BINDER,
 		                string("Unlabeled ") + (is_vertex ? "vertex" : "edge") +
 		                    " pattern is ambiguous: property graph '" + pg_table.property_graph_name + "' has " +
@@ -1527,6 +1560,9 @@ static shared_ptr<PropertyGraphTable> ResolveLabelExprTable(const string &raw_ex
 				if (!result) {
 					result = tbl;
 				} else if (result.get() != tbl.get()) {
+					if (pgq_table_split_guard) {
+						throw PGQTableSplitNeeded();
+					}
 					throw Exception(ExceptionType::BINDER,
 					                "Cross-table label disjunctions are not yet supported. Labels '" + e +
 					                    "' span multiple tables in property graph '" +
@@ -1543,6 +1579,9 @@ static shared_ptr<PropertyGraphTable> ResolveLabelExprTable(const string &raw_ex
 				if (!result) {
 					result = tbl;
 				} else if (result.get() != tbl.get()) {
+					if (pgq_table_split_guard) {
+						throw PGQTableSplitNeeded();
+					}
 					throw Exception(ExceptionType::BINDER,
 					                "Cross-table label conjunctions are not supported. Labels '" + e +
 					                    "' span multiple tables in property graph '" +
@@ -1625,53 +1664,6 @@ void PGQMatchFunction::CheckEdgeTableConstraints(const string &src_reference, co
 		                      "reference for edge pattern of table %s (which declares %s)",
 		                      dst_reference, PGQStr(edge_table->table_name), PGQStr(edge_table->destination_reference));
 	}
-}
-
-// Expand ALL_DIFFERENT(e1, e2, ..., en) into pairwise rowid inequality conjunctions.
-// Recurses into AND/OR/NOT to handle ALL_DIFFERENT nested inside boolean expressions.
-static unique_ptr<ParsedExpression> RewriteAllDifferent(unique_ptr<ParsedExpression> expr) {
-	if (!expr) {
-		return expr;
-	}
-
-	auto *func = dynamic_cast<FunctionExpression *>(expr.get());
-	if (func && StringUtil::Lower(func->FunctionName().GetIdentifierName()) == "all_different") {
-		vector<unique_ptr<ParsedExpression>> ne_exprs;
-		for (idx_t i = 0; i < func->GetArgumentsMutable().size(); i++) {
-			for (idx_t j = i + 1; j < func->GetArgumentsMutable().size(); j++) {
-				auto *col_i = dynamic_cast<ColumnRefExpression *>(func->GetArgumentsMutable()[i].GetExpressionMutable().get());
-				auto *col_j = dynamic_cast<ColumnRefExpression *>(func->GetArgumentsMutable()[j].GetExpressionMutable().get());
-				if (!col_i || !col_j) {
-					throw BinderException("ALL_DIFFERENT arguments must be element variable references");
-				}
-				string var_i = PGQStr(col_i->ColumnNames().back());
-				string var_j = PGQStr(col_j->ColumnNames().back());
-				ne_exprs.push_back(make_uniq<ComparisonExpression>(
-				    ExpressionType::COMPARE_NOTEQUAL, PGQColRef("rowid", var_i),
-				    PGQColRef("rowid", var_j)));
-			}
-		}
-		if (ne_exprs.empty()) {
-			return ConstantExpression::FromValue(Value::BOOLEAN(true));
-		}
-		auto result = std::move(ne_exprs[0]);
-		for (idx_t k = 1; k < ne_exprs.size(); k++) {
-			result = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(result),
-			                                          std::move(ne_exprs[k]));
-		}
-		return result;
-	}
-
-	// Recurse into conjunction/disjunction children
-	auto *conj = dynamic_cast<ConjunctionExpression *>(expr.get());
-	if (conj) {
-		for (auto &child : conj->GetChildrenMutable()) {
-			child = RewriteAllDifferent(std::move(child));
-		}
-		return expr;
-	}
-
-	return expr;
 }
 
 // Return true if expr contains an EXISTS { ... } graph pattern predicate (EXISTS / NOT EXISTS).
@@ -2336,110 +2328,453 @@ static bool PatternHasCostExpr(const vector<unique_ptr<PathReference>> &path_ele
 	return false;
 }
 
-// Rewrite element_id(x) → x.rowid and label(x) → constant string in WHERE clause expressions.
-static unique_ptr<ParsedExpression>
-RewriteGraphFunctions(unique_ptr<ParsedExpression> expr,
-                      const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_map) {
-	if (!expr) {
-		return expr;
-	}
+//! What the element functions of a MATCH -- element_id(x), label(x), x IS [NOT] LABELED l, ALL_DIFFERENT(...) --
+//! need to know about its variables where they become SQL.
+struct PGQElementScope {
+	//! Element variable -> its element table.
+	const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> *tables = nullptr;
+	//! Variables whose table is a placeholder (no label, no edge implying one): their label varies per row.
+	const case_insensitive_set_t *stubs = nullptr;
+	//! Edge variables read from the undirected edge union, whose row id is the union's __pgq_erowid column.
+	case_insensitive_set_t undirected_edges;
+	//! Variables NULL in the rows where their OPTIONAL MATCH found nothing: a function of such an element is NULL there.
+	case_insensitive_set_t optional;
+	//! Each single (unquantified) edge variable's neighbours in its pattern, and the pattern's direction for it.
+	struct EdgeEnds {
+		string previous;
+		string next;
+		PGQMatchType direction;
+	};
+	case_insensitive_map_t<EdgeEnds> edge_ends;
+	//! The property graph, for what is defined on any of its tables.
+	const CreatePropertyGraphInfo *graph = nullptr;
+};
 
-	auto *func = dynamic_cast<FunctionExpression *>(expr.get());
-	if (func) {
-		// element_id(x) → x.rowid
-		if (func->FunctionName().GetIdentifierName() == "element_id" && func->GetArgumentsMutable().size() == 1) {
-			auto *col = dynamic_cast<ColumnRefExpression *>(func->GetArgumentsMutable()[0].GetExpressionMutable().get());
-			if (col != nullptr && !col->ColumnNames().empty()) {
-				auto rowid_ref = PGQColRef("rowid", col->ColumnNames().back());
-				rowid_ref->SetAlias(Identifier(func->GetAlias().GetIdentifierName()));
-				return rowid_ref;
+//! The names of the properties an element of `table` has, as declared (`PROPERTIES (c AS name)` names it `name`).
+static const vector<Identifier> &ElementPropertyNames(const PropertyGraphTable &table) {
+	return table.column_aliases.size() == table.column_names.size() ? table.column_aliases : table.column_names;
+}
+
+static bool ElementHasProperty(const PropertyGraphTable &table, const string &property) {
+	for (auto &name : ElementPropertyNames(table)) {
+		if (StringUtil::CIEquals(PGQStr(name), property)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//! The element of a pattern position: the element itself, or the one inside its element-WHERE subpath.
+static PathElement *PositionElement(const unique_ptr<PathReference> &reference, bool &single) {
+	single = true;
+	if (reference->path_reference_type == PGQPathReferenceType::PATH_ELEMENT) {
+		return static_cast<PathElement *>(reference.get());
+	}
+	auto &subpath = static_cast<SubPath &>(*reference);
+	single = subpath.lower == 1 && subpath.upper == 1 && !subpath.quantified_group;
+	if (subpath.path_list.size() != 1 || subpath.path_list[0]->path_reference_type != PGQPathReferenceType::PATH_ELEMENT) {
+		return nullptr;
+	}
+	return static_cast<PathElement *>(subpath.path_list[0].get());
+}
+
+//! Records the ends of every single edge of a pattern's element sequence, looking inside named-path subpaths.
+static void CollectEdgeEnds(const vector<unique_ptr<PathReference>> &sequence, PGQElementScope &scope) {
+	if (sequence.size() == 1 && sequence[0]->path_reference_type == PGQPathReferenceType::SUBPATH) {
+		auto &wrapper = static_cast<SubPath &>(*sequence[0]);
+		if (wrapper.path_list.size() > 1 && wrapper.lower == 1 && wrapper.upper == 1 && !wrapper.quantified_group) {
+			CollectEdgeEnds(wrapper.path_list, scope);
+			return;
+		}
+	}
+	for (idx_t i = 1; i + 1 < sequence.size(); i += 2) {
+		bool single = true;
+		bool previous_single = true;
+		bool next_single = true;
+		auto *edge = PositionElement(sequence[i], single);
+		auto *previous = PositionElement(sequence[i - 1], previous_single);
+		auto *next = PositionElement(sequence[i + 1], next_single);
+		if (!edge || !previous || !next || !single || edge->match_type == PGQMatchType::MATCH_VERTEX ||
+		    previous->match_type != PGQMatchType::MATCH_VERTEX || next->match_type != PGQMatchType::MATCH_VERTEX) {
+			continue;
+		}
+		scope.edge_ends[edge->variable_binding] = {previous->variable_binding, next->variable_binding, edge->match_type};
+	}
+}
+
+static void CollectEdgeEnds(const MatchExpression &match, PGQElementScope &scope) {
+	for (auto &pattern : match.path_patterns) {
+		CollectEdgeEnds(pattern->path_elements, scope);
+	}
+	for (auto &group : match.optional_match_patterns) {
+		for (auto &pattern : group) {
+			CollectEdgeEnds(pattern->path_elements, scope);
+		}
+	}
+}
+
+//! The element variable an element function's argument names, or empty when it is not a plain variable reference.
+static string ElementArgument(FunctionExpression &function, idx_t index) {
+	auto &argument = function.GetArgumentsMutable()[index].GetExpressionMutable();
+	if (!argument || argument->GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+		return string();
+	}
+	auto &names = argument->Cast<ColumnRefExpression>().ColumnNames();
+	return names.size() == 1 ? PGQStr(names[0]) : string();
+}
+
+//! The column holding the row id of element `variable`.
+static unique_ptr<ParsedExpression> ElementRowid(const PGQElementScope &scope, const string &variable) {
+	return PGQColRef(scope.undirected_edges.count(variable) ? "__pgq_erowid" : "rowid", variable);
+}
+
+//! `value`, or NULL in the rows where an OPTIONAL element `variable` is NULL.
+static unique_ptr<ParsedExpression> NullWhereElementNull(const PGQElementScope &scope, const string &variable,
+                                                         unique_ptr<ParsedExpression> value) {
+	if (!scope.optional.count(variable)) {
+		return value;
+	}
+	auto missing = make_uniq<OperatorExpression>(ExpressionType::OPERATOR_IS_NULL, ElementRowid(scope, variable));
+	auto result = make_uniq<CaseExpression>();
+	CaseCheck check;
+	check.when_expr = std::move(missing);
+	check.then_expr = ConstantExpression::FromValue(Value());
+	result->CaseChecksMutable().push_back(std::move(check));
+	result->ElseMutable() = std::move(value);
+	return std::move(result);
+}
+
+//! Whether an element of `table` has label `label`: TRUE for its main label, the row's discriminator bit for one of
+//! its sub-labels, FALSE otherwise.
+static unique_ptr<ParsedExpression> ElementHasLabel(const shared_ptr<PropertyGraphTable> &table, const string &label,
+                                                    const string &variable) {
+	if (StringUtil::CIEquals(PGQStr(table->main_label), label)) {
+		return ConstantExpression::FromValue(Value::BOOLEAN(true));
+	}
+	for (auto &sub_label : table->sub_labels) {
+		if (StringUtil::CIEquals(PGQStr(sub_label), label)) {
+			return MakeSingleLabelCond(PGQStr(sub_label), table, variable);
+		}
+	}
+	return ConstantExpression::FromValue(Value::BOOLEAN(false));
+}
+
+//! The SQL of one element function call, or null when `function` is none or does not name an element variable.
+static unique_ptr<ParsedExpression> RewriteElementFunction(FunctionExpression &function, const PGQElementScope &scope) {
+	const auto name = StringUtil::Lower(PGQStr(function.FunctionName()));
+	const auto argument_count = function.GetArgumentsMutable().size();
+	auto table_of = [&](const string &variable) -> shared_ptr<PropertyGraphTable> {
+		if (variable.empty() || !scope.tables) {
+			return nullptr;
+		}
+		auto entry = scope.tables->find(variable);
+		return entry == scope.tables->end() ? nullptr : entry->second;
+	};
+	if (name == "element_id" && argument_count == 1) {
+		auto variable = ElementArgument(function, 0);
+		if (variable.empty()) {
+			return nullptr;
+		}
+		return ElementRowid(scope, variable);
+	}
+	if (name == "label" && argument_count == 1) {
+		auto variable = ElementArgument(function, 0);
+		auto table = table_of(variable);
+		if (!table) {
+			return nullptr;
+		}
+		if (scope.stubs && scope.stubs->count(variable)) {
+			// A stub entry is a placeholder table picked for column validation, not this binding's actual label:
+			// folding it into a constant would report a confidently wrong answer.
+			throw BinderException(
+			    "label(%s) cannot be resolved: '%s' has no label in the pattern and the edge reaching it does not "
+			    "determine one, so its label varies per row. Give the vertex a label (%s:SOME_LABEL), or name a "
+			    "single edge label so the destination table is implied. For a variable-length pattern, label() is "
+			    "answered per row and works without either.",
+			    variable.c_str(), variable.c_str(), variable.c_str());
+		}
+		return NullWhereElementNull(scope, variable, ConstantExpression::FromValue(Value(PGQStr(table->main_label))));
+	}
+	if (name == "labels" && argument_count == 1) {
+		auto variable = ElementArgument(function, 0);
+		auto table = table_of(variable);
+		if (!table) {
+			return nullptr;
+		}
+		if (scope.stubs && scope.stubs->count(variable)) {
+			throw BinderException("labels(%s) cannot be resolved: '%s' has no label in the pattern and the edge reaching "
+			                      "it does not determine one. Give it a label in the pattern",
+			                      variable, variable);
+		}
+		// The main label, then each discriminator sub-label the row has, in declaration order and declared case.
+		unique_ptr<ParsedExpression> result = ConstantExpression::FromValue(
+		    Value::LIST(LogicalType::VARCHAR, {Value(PGQStr(table->main_label))}));
+		for (auto &sub_label : table->sub_labels) {
+			auto has = make_uniq<CaseExpression>();
+			CaseCheck check;
+			check.when_expr = MakeSingleLabelCond(PGQStr(sub_label), table, variable);
+			check.then_expr = ConstantExpression::FromValue(Value::LIST(LogicalType::VARCHAR, {Value(PGQStr(sub_label))}));
+			has->CaseChecksMutable().push_back(std::move(check));
+			has->ElseMutable() = ConstantExpression::FromValue(Value::LIST(LogicalType::VARCHAR, vector<Value>()));
+			vector<unique_ptr<ParsedExpression>> arguments;
+			arguments.push_back(std::move(result));
+			arguments.push_back(std::move(has));
+			result = make_uniq<FunctionExpression>("list_concat", std::move(arguments));
+		}
+		return NullWhereElementNull(scope, variable, std::move(result));
+	}
+	if ((name == "is_labeled" || name == "not_labeled") && argument_count == 2) {
+		auto variable = ElementArgument(function, 0);
+		auto table = table_of(variable);
+		auto &label_argument = function.GetArgumentsMutable()[1].GetExpressionMutable();
+		if (!table || label_argument->GetExpressionClass() != ExpressionClass::CONSTANT) {
+			return nullptr;
+		}
+		if (scope.stubs && scope.stubs->count(variable)) {
+			throw BinderException("%s IS [NOT] LABELED cannot be resolved: '%s' has no label in the pattern and the "
+			                      "edge reaching it does not determine one. Give it a label in the pattern",
+			                      variable, variable);
+		}
+		const auto label = label_argument->Cast<ConstantExpression>().GetLiteral().ToValue().ToString();
+		auto test = ElementHasLabel(table, label, variable);
+		if (name == "not_labeled") {
+			test = make_uniq<OperatorExpression>(ExpressionType::OPERATOR_NOT, std::move(test));
+		}
+		return NullWhereElementNull(scope, variable, std::move(test));
+	}
+	if (name == "property_exists" && argument_count == 2) {
+		auto variable = ElementArgument(function, 0);
+		auto table = table_of(variable);
+		if (!table) {
+			throw BinderException("PROPERTY_EXISTS: '%s' must be an element variable of the MATCH",
+			                      variable.empty() ? function.GetArgumentsMutable()[0].GetExpression().ToString()
+			                                       : variable);
+		}
+		// The property is a name (PROPERTY_EXISTS(a, age)), or a string literal.
+		auto &argument = function.GetArgumentsMutable()[1].GetExpressionMutable();
+		string property;
+		if (argument->GetExpressionClass() == ExpressionClass::COLUMN_REF &&
+		    argument->Cast<ColumnRefExpression>().ColumnNames().size() == 1) {
+			property = PGQStr(argument->Cast<ColumnRefExpression>().ColumnNames()[0]);
+		} else if (argument->GetExpressionClass() == ExpressionClass::CONSTANT &&
+		           argument->Cast<ConstantExpression>().GetLiteral().ToValue().type().id() == LogicalTypeId::VARCHAR) {
+			property = argument->Cast<ConstantExpression>().GetLiteral().ToValue().GetValue<string>();
+		} else {
+			throw BinderException("PROPERTY_EXISTS(%s, ...): the property must be a property name", variable);
+		}
+		if (scope.stubs && scope.stubs->count(variable)) {
+			throw BinderException("PROPERTY_EXISTS(%s, %s) cannot be resolved: '%s' has no label in the pattern and the "
+			                      "edge reaching it does not determine one. Give it a label in the pattern",
+			                      variable, property, variable);
+		}
+		if (scope.graph) {
+			bool defined = false;
+			for (auto *tables : {&scope.graph->vertex_tables, &scope.graph->edge_tables}) {
+				for (auto &candidate : *tables) {
+					defined = defined || ElementHasProperty(*candidate, property);
+				}
+			}
+			if (!defined) {
+				throw BinderException("PROPERTY_EXISTS(%s, %s): no vertex or edge table of property graph '%s' has a "
+				                      "property '%s'",
+				                      variable, property, scope.graph->property_graph_name, property);
 			}
 		}
-		// label(x) → string constant of x's label
-		if (func->FunctionName().GetIdentifierName() == "label" && func->GetArgumentsMutable().size() == 1) {
-			auto *col = dynamic_cast<ColumnRefExpression *>(func->GetArgumentsMutable()[0].GetExpressionMutable().get());
-			if (col != nullptr && !col->ColumnNames().empty()) {
-				auto tbl_iter = alias_map.find(PGQStr(col->ColumnNames().back()));
-				if (tbl_iter != alias_map.end()) {
-					auto label_const = ConstantExpression::FromValue(Value(PGQStr(tbl_iter->second->main_label)));
-					label_const->SetAlias(Identifier(func->GetAlias().GetIdentifierName()));
-					return label_const;
+		return NullWhereElementNull(scope, variable,
+		                            ConstantExpression::FromValue(Value::BOOLEAN(ElementHasProperty(*table, property))));
+	}
+	if ((name == "is_source_of" || name == "is_destination_of") && argument_count == 2) {
+		const bool source = name == "is_source_of";
+		const char *predicate = source ? "IS SOURCE OF" : "IS DESTINATION OF";
+		auto vertex = ElementArgument(function, 0);
+		auto edge = ElementArgument(function, 1);
+		auto vertex_table = table_of(vertex);
+		auto edge_table = table_of(edge);
+		if (!vertex_table || !vertex_table->is_vertex_table) {
+			throw BinderException("%s: '%s' must be a vertex variable of the MATCH", predicate,
+			                      vertex.empty() ? function.GetArgumentsMutable()[0].GetExpression().ToString() : vertex);
+		}
+		if (!edge_table || edge_table->is_vertex_table) {
+			throw BinderException("%s: '%s' must be an edge variable of the MATCH", predicate,
+			                      edge.empty() ? function.GetArgumentsMutable()[1].GetExpression().ToString() : edge);
+		}
+		auto ends = scope.edge_ends.find(edge);
+		if (ends == scope.edge_ends.end()) {
+			throw BinderException("%s needs a single edge: '%s' is a quantified edge or group variable, which stands for "
+			                      "a list of edges",
+			                      predicate, edge);
+		}
+		// The vertex at the edge's source (destination) end, by the pattern's direction.
+		auto same_vertex = [&](const string &end) -> unique_ptr<ParsedExpression> {
+			if (StringUtil::CIEquals(end, vertex)) {
+				return ConstantExpression::FromValue(Value::BOOLEAN(true));
+			}
+			auto end_table = table_of(end);
+			if (!end_table || !end_table->SameTableIdentity(*vertex_table)) {
+				return ConstantExpression::FromValue(Value::BOOLEAN(false));
+			}
+			return make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL, ElementRowid(scope, vertex),
+			                                       ElementRowid(scope, end));
+		};
+		auto &previous = ends->second.previous;
+		auto &next = ends->second.next;
+		unique_ptr<ParsedExpression> result;
+		switch (ends->second.direction) {
+		case PGQMatchType::MATCH_EDGE_RIGHT:
+			result = same_vertex(source ? previous : next);
+			break;
+		case PGQMatchType::MATCH_EDGE_LEFT:
+			result = same_vertex(source ? next : previous);
+			break;
+		default: {
+			auto end_table = edge_table->source_pg_table;
+			auto far_table = edge_table->destination_pg_table;
+			if (!source) {
+				std::swap(end_table, far_table);
+			}
+			auto previous_table = table_of(previous);
+			auto next_table = table_of(next);
+			const bool previous_fits = previous_table && end_table && previous_table->SameTableIdentity(*end_table);
+			const bool next_fits = next_table && end_table && next_table->SameTableIdentity(*end_table);
+			if (previous_fits && next_fits) {
+				// Read both ways: the union's __pgq_edir says which (0 as stored, from previous to next).
+				if (!scope.undirected_edges.count(edge)) {
+					throw NotImplementedException("%s over the undirected edge '%s' is not supported on the route "
+					                              "chosen for this pattern",
+					                              predicate, edge);
+				}
+				auto stored = make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+				                                              PGQColRef("__pgq_edir", edge),
+				                                              ConstantExpression::FromValue(Value::INTEGER(0)));
+				auto choice = make_uniq<CaseExpression>();
+				CaseCheck check;
+				check.when_expr = std::move(stored);
+				check.then_expr = same_vertex(source ? previous : next);
+				choice->CaseChecksMutable().push_back(std::move(check));
+				choice->ElseMutable() = same_vertex(source ? next : previous);
+				result = std::move(choice);
+			} else if (previous_fits) {
+				result = same_vertex(previous);
+			} else if (next_fits) {
+				result = same_vertex(next);
+			} else {
+				result = ConstantExpression::FromValue(Value::BOOLEAN(false));
+			}
+			break;
+		}
+		}
+		return NullWhereElementNull(scope, vertex, NullWhereElementNull(scope, edge, std::move(result)));
+	}
+	if (name == "all_different" || name == "same") {
+		// SAME: every element is the first one; ALL_DIFFERENT: no two are the same. An element is its table and row.
+		const bool same = name == "same";
+		vector<string> variables;
+		for (idx_t i = 0; i < argument_count; i++) {
+			variables.push_back(ElementArgument(function, i));
+			if (variables.back().empty()) {
+				throw BinderException("%s arguments must be element variable references", same ? "SAME" : "ALL_DIFFERENT");
+			}
+		}
+		// Whether two variables are the same element: a constant when their tables decide it, else by row id. A
+		// placeholder table (stub) decides nothing.
+		// A term decided by the tables is not NULL by itself where an OPTIONAL element is missing; a row comparison is.
+		bool decided = false;
+		auto identical = [&](const string &left, const string &right, bool equal) -> unique_ptr<ParsedExpression> {
+			if (StringUtil::CIEquals(left, right)) {
+				decided = true;
+				return ConstantExpression::FromValue(Value::BOOLEAN(equal));
+			}
+			auto left_table = table_of(left);
+			auto right_table = table_of(right);
+			const bool stub = scope.stubs && (scope.stubs->count(left) || scope.stubs->count(right));
+			if (left_table && right_table && !stub && !left_table->SameTableIdentity(*right_table)) {
+				decided = true;
+				return ConstantExpression::FromValue(Value::BOOLEAN(!equal));
+			}
+			return make_uniq<ComparisonExpression>(equal ? ExpressionType::COMPARE_EQUAL
+			                                             : ExpressionType::COMPARE_NOTEQUAL,
+			                                       ElementRowid(scope, left), ElementRowid(scope, right));
+		};
+		unique_ptr<ParsedExpression> result;
+		auto add = [&](unique_ptr<ParsedExpression> term) {
+			result = result ? make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(result),
+			                                                   std::move(term))
+			                : std::move(term);
+		};
+		if (same) {
+			for (idx_t i = 1; i < variables.size(); i++) {
+				add(identical(variables[0], variables[i], true));
+			}
+		} else {
+			for (idx_t i = 0; i < variables.size(); i++) {
+				for (idx_t j = i + 1; j < variables.size(); j++) {
+					add(identical(variables[i], variables[j], false));
 				}
 			}
 		}
-		// x IS LABELED 'lbl' → label matches (case-insensitive)
-		if (func->FunctionName().GetIdentifierName() == "is_labeled" && func->GetArgumentsMutable().size() == 2) {
-			auto *col = dynamic_cast<ColumnRefExpression *>(func->GetArgumentsMutable()[0].GetExpressionMutable().get());
-			auto *lbl = dynamic_cast<ConstantExpression *>(func->GetArgumentsMutable()[1].GetExpressionMutable().get());
-			if (col != nullptr && lbl != nullptr && !col->ColumnNames().empty()) {
-				string var = PGQStr(col->ColumnNames().back());
-				auto tbl_iter = alias_map.find(var);
-				if (tbl_iter != alias_map.end()) {
-					string expected = StringUtil::Lower(lbl->GetLiteral().ToValue().ToString());
-					bool matches = tbl_iter->second->main_label == expected;
-					if (!matches) {
-						for (const auto &sub : tbl_iter->second->sub_labels) {
-							if (StringUtil::Lower(PGQStr(sub)) == expected) {
-								matches = true;
-								break;
-							}
-						}
-					}
-					return ConstantExpression::FromValue(Value::BOOLEAN(matches));
-				}
+		if (!result) {
+			return ConstantExpression::FromValue(Value::BOOLEAN(true));
+		}
+		for (idx_t i = 0; decided && i < variables.size(); i++) {
+			result = NullWhereElementNull(scope, variables[i], std::move(result));
+		}
+		return result;
+	}
+	return nullptr;
+}
+
+//! Rewrites every element function in `expression`, at any depth, into SQL over the variables' tables. A subquery is
+//! left alone: an EXISTS pattern has its own variables and is rewritten where it is built.
+static unique_ptr<ParsedExpression> RewriteElementFunctions(unique_ptr<ParsedExpression> expression,
+                                                            const PGQElementScope &scope) {
+	if (!expression || expression->GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		return expression;
+	}
+	if (expression->GetExpressionClass() == ExpressionClass::FUNCTION) {
+		if (auto rewritten = RewriteElementFunction(expression->Cast<FunctionExpression>(), scope)) {
+			rewritten->SetAlias(expression->GetAlias());
+			return rewritten;
+		}
+	}
+	ParsedExpressionIterator::EnumerateChildren(*expression, [&](unique_ptr<ParsedExpression> &child) {
+		child = RewriteElementFunctions(std::move(child), scope);
+	});
+	return expression;
+}
+
+//! The variables of `from` read from an undirected edge union: a subquery whose rows carry __pgq_erowid.
+static void CollectUndirectedEdgeBindings(const TableRef *from, case_insensitive_set_t &bindings) {
+	if (!from) {
+		return;
+	}
+	switch (from->type) {
+	case TableReferenceType::JOIN: {
+		auto &join = from->Cast<JoinRef>();
+		CollectUndirectedEdgeBindings(join.left.get(), bindings);
+		CollectUndirectedEdgeBindings(join.right.get(), bindings);
+		return;
+	}
+	case TableReferenceType::SUBQUERY: {
+		auto &subquery = from->Cast<SubqueryRef>();
+		auto *node = subquery.subquery && subquery.subquery->node ? subquery.subquery->node.get() : nullptr;
+		while (node && node->type == QueryNodeType::SET_OPERATION_NODE) {
+			auto &set_operation = node->Cast<SetOperationNode>();
+			node = set_operation.children.empty() ? nullptr : set_operation.children[0].get();
+		}
+		if (!node || node->type != QueryNodeType::SELECT_NODE || subquery.alias.empty()) {
+			return;
+		}
+		for (auto &column : node->Cast<SelectNode>().select_list) {
+			if (StringUtil::CIEquals(column->GetAlias().GetIdentifierName(), "__pgq_erowid")) {
+				bindings.insert(PGQStr(subquery.alias));
+				return;
 			}
 		}
-		// x IS NOT LABELED 'lbl' → negation of is_labeled
-		if (func->FunctionName().GetIdentifierName() == "not_labeled" && func->GetArgumentsMutable().size() == 2) {
-			auto *col = dynamic_cast<ColumnRefExpression *>(func->GetArgumentsMutable()[0].GetExpressionMutable().get());
-			auto *lbl = dynamic_cast<ConstantExpression *>(func->GetArgumentsMutable()[1].GetExpressionMutable().get());
-			if (col != nullptr && lbl != nullptr && !col->ColumnNames().empty()) {
-				string var = PGQStr(col->ColumnNames().back());
-				auto tbl_iter = alias_map.find(var);
-				if (tbl_iter != alias_map.end()) {
-					string expected = StringUtil::Lower(lbl->GetLiteral().ToValue().ToString());
-					bool matches = tbl_iter->second->main_label == expected;
-					if (!matches) {
-						for (const auto &sub : tbl_iter->second->sub_labels) {
-							if (StringUtil::Lower(PGQStr(sub)) == expected) {
-								matches = true;
-								break;
-							}
-						}
-					}
-					return ConstantExpression::FromValue(Value::BOOLEAN(!matches));
-				}
-			}
-		}
+		return;
 	}
-
-	// Recurse into children of conjunction/disjunction
-	auto *conj = dynamic_cast<ConjunctionExpression *>(expr.get());
-	if (conj) {
-		for (auto &child : conj->GetChildrenMutable()) {
-			child = RewriteGraphFunctions(std::move(child), alias_map);
-		}
-		return expr;
+	default:
+		return;
 	}
-
-	// Recurse into children of comparison (e.g. label(x) = 'Person')
-	auto *comp = dynamic_cast<ComparisonExpression *>(expr.get());
-	if (comp) {
-		comp->LeftMutable() = RewriteGraphFunctions(std::move(comp->LeftMutable()), alias_map);
-		comp->RightMutable() = RewriteGraphFunctions(std::move(comp->RightMutable()), alias_map);
-		return expr;
-	}
-
-	// Recurse into other function expressions
-	if (func) {
-		for (auto &argument : func->GetArgumentsMutable()) {
-			auto &child = argument.GetExpressionMutable();
-			child = RewriteGraphFunctions(std::move(child), alias_map);
-		}
-		return expr;
-	}
-
-	return expr;
 }
 
 unique_ptr<ParsedExpression> PGQMatchFunction::CreateMatchJoinExpression(vector<string> vertex_keys,
@@ -2887,21 +3222,30 @@ void PGQMatchFunction::EdgeTypeAny(const shared_ptr<PropertyGraphTable> &edge_ta
 	} else {
 		from_clause = std::move(union_subquery);
 	}
+	// The union's first two columns, named after the edge's source and destination columns, hold the edge's ends in
+	// the order of the traversal: prev's end, then next's. Prev is joined on the key of its own table -- the
+	// destination's when only the reversed reading fits (prev is of the destination table).
+	const auto orientations = UndirectedOrientations(*edge_table, prev_table, next_table);
+	const bool reversed = !orientations.forward && orientations.reverse;
+	auto &prev_pk = reversed ? edge_table->destination_pk : edge_table->source_pk;
+	auto &next_pk = reversed ? edge_table->source_pk : edge_table->destination_pk;
+	auto &prev_vertex_table = reversed ? edge_table->destination_pg_table : edge_table->source_pg_table;
+	auto &next_vertex_table = reversed ? edge_table->source_pg_table : edge_table->destination_pg_table;
 	// (a) src.key = edge.src
-	auto src_left_expr =
-	    CreateMatchJoinExpression(PGQStrs(edge_table->source_pk), PGQStrs(edge_table->source_fk), prev_binding, edge_binding);
+	auto src_left_expr = CreateMatchJoinExpression(PGQStrs(prev_pk), PGQStrs(edge_table->source_fk), prev_binding,
+	                                               edge_binding);
 	// (b) dst.key = edge.dst
-	auto dst_left_expr =
-	    CreateMatchJoinExpression(PGQStrs(edge_table->destination_pk), PGQStrs(edge_table->destination_fk), next_binding, edge_binding);
+	auto dst_left_expr = CreateMatchJoinExpression(PGQStrs(next_pk), PGQStrs(edge_table->destination_fk), next_binding,
+	                                               edge_binding);
 	// (a) AND (b)
 	auto combined_left_expr = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND,
 	                                                           std::move(src_left_expr), std::move(dst_left_expr));
 
 	conditions.push_back(std::move(combined_left_expr));
-	PGQVertexJoinRecorder::Record(prev_binding, edge_table->source_pk, edge_binding, edge_table->source_fk, edge_table,
-	                              edge_table->source_pg_table, true);
-	PGQVertexJoinRecorder::Record(next_binding, edge_table->destination_pk, edge_binding, edge_table->destination_fk,
-	                              edge_table, edge_table->destination_pg_table, true);
+	PGQVertexJoinRecorder::Record(prev_binding, prev_pk, edge_binding, edge_table->source_fk, edge_table,
+	                              prev_vertex_table, true);
+	PGQVertexJoinRecorder::Record(next_binding, next_pk, edge_binding, edge_table->destination_fk, edge_table,
+	                              next_vertex_table, true);
 }
 
 void PGQMatchFunction::EdgeTypeLeft(const shared_ptr<PropertyGraphTable> &edge_table, const string &next_table_name,
@@ -5398,6 +5742,7 @@ void PGQMatchFunction::ProcessPathList(ClientContext &context, vector<unique_ptr
                                        MatchExpression &original_ref, int32_t &csr_id_counter, PGQCSRSlot &csr_slot,
                                        bool all_shortest, bool any_shortest,
                                        const PGQPathTableCache *path_table_cache, int64_t vl_fallback_budget) {
+	CheckTableSplitGuard(path_list);
 	PathElement *previous_vertex_element = GetPathElement(path_list[0]);
 	if (!previous_vertex_element) {
 		const auto previous_vertex_subpath = reinterpret_cast<SubPath *>(path_list[0].get());
@@ -5923,8 +6268,12 @@ void PGQMatchFunction::ProcessOptionalPathList(
     const PGQPathTableCache &path_table_cache,
     bool require_abi_paths, const ParsedExpression *where_hint,
     const std::function<bool(const PGQPathTableInfo &)> &counts_exactly,
-    const std::function<bool(const PGQPathTableInfo &)> &endpoints_complete) {
+    const std::function<bool(const PGQPathTableInfo &)> &endpoints_complete,
+    const case_insensitive_set_t *referenced_bindings) {
 	const string &graph_name = pg_table.property_graph_name;
+	for (auto &path_pattern : opt_patterns) {
+		CheckTableSplitGuard(path_pattern->path_elements);
+	}
 
 	for (auto &path_pattern : opt_patterns) {
 		auto &path_elements = path_pattern->path_elements;
@@ -6032,8 +6381,14 @@ void PGQMatchFunction::ProcessOptionalPathList(
 				// the edge and its far vertex match together or not at all. The union is the one a MATCH reads
 				// (a self-loop once, not once per direction).
 				auto un_sub = UndirectedEdgeUnionBetween(*edge_table, edge_binding, prev_vertex_table, next_vertex_table);
+				// The union's ends are in traversal order; each vertex is joined on its own table's key (see
+				// EdgeTypeAny).
+				const auto orientations = UndirectedOrientations(*edge_table, prev_vertex_table, next_vertex_table);
+				const bool reversed = !orientations.forward && orientations.reverse;
+				auto &prev_pk = reversed ? edge_table->destination_pk : edge_table->source_pk;
+				auto &next_pk = reversed ? edge_table->source_pk : edge_table->destination_pk;
 				unique_ptr<ParsedExpression> vertex_on = CreateMatchJoinExpression(
-				    PGQStrs(edge_table->destination_pk), PGQStrs(edge_table->destination_fk), next_binding, edge_binding);
+				    PGQStrs(next_pk), PGQStrs(edge_table->destination_fk), next_binding, edge_binding);
 				bool far_end_cannot_fail = pg_table.verified;
 				if (!next_elem->label.empty()) {
 					vector<unique_ptr<ParsedExpression>> label_conds;
@@ -6045,14 +6400,14 @@ void PGQMatchFunction::ProcessOptionalPathList(
 					}
 				}
 				JoinOptionalHop(select_node, std::move(un_sub),
-				                CreateMatchJoinExpression(PGQStrs(edge_table->source_pk), PGQStrs(edge_table->source_fk),
+				                CreateMatchJoinExpression(PGQStrs(prev_pk), PGQStrs(edge_table->source_fk),
 				                                          prev_binding, edge_binding),
 				                next_vertex_table->CreateBaseTableRef(next_binding), std::move(vertex_on),
 				                far_end_cannot_fail,
 				                OptionalSeedSemiJoin(
-				                    where_hint, prev_binding, prev_vertex_table, PGQStr(edge_table->source_pk[0]),
+				                    where_hint, prev_binding, prev_vertex_table, PGQStr(prev_pk[0]),
 				                    PGQColRef(edge_table->source_fk[0], edge_binding),
-				                    SameKeyType(context, *prev_vertex_table, PGQStr(edge_table->source_pk[0]),
+				                    SameKeyType(context, *prev_vertex_table, PGQStr(prev_pk[0]),
 				                                {GraphTableColumnType(context, *edge_table, PGQStr(edge_table->source_fk[0])),
 				                                 GraphTableColumnType(context, *edge_table,
 				                                                      PGQStr(edge_table->destination_fk[0]))}),
@@ -6134,7 +6489,9 @@ void PGQMatchFunction::ProcessOptionalPathList(
 			// next_binding.src_pk = pt.v0.
 			bool used_path_table = false;
 			const bool pt_left_dir = (edge_elem->match_type == PGQMatchType::MATCH_EDGE_LEFT);
-			if ((edge_elem->match_type == PGQMatchType::MATCH_EDGE_RIGHT || pt_left_dir) &&
+			// An artifact row carries no edge: a query that reads the edge variable joins the edge table.
+			const bool edge_read = referenced_bindings && referenced_bindings->count(edge_binding);
+			if ((edge_elem->match_type == PGQMatchType::MATCH_EDGE_RIGHT || pt_left_dir) && !edge_read &&
 			    !edge_table->source_pk.empty() && !edge_table->destination_pk.empty()) {
 				// For right-directed: table is prev_label__edge__next_label, v0=prev pk, v1=next pk.
 				// For left-directed:  table is next_label__edge__prev_label, v0=next pk, v1=prev pk.
@@ -10072,6 +10429,20 @@ static unique_ptr<ParsedExpression> BuildExistsSubquery(
 	if (inner_match.where_clause) {
 		conditions.push_back(std::move(inner_match.where_clause));
 	}
+	// The FROM aliases (outer variables included) and the pattern's own elements: an undirected edge, read from a
+	// union, is not among the FROM aliases.
+	auto element_tables = inner_alias_map;
+	for (auto &entry : PGQMatchFunction::PopulateGraphTableAliasMap(pg_table, inner_match, nullptr)) {
+		element_tables.emplace(entry.first, entry.second);
+	}
+	PGQElementScope element_scope;
+	element_scope.tables = &element_tables;
+	element_scope.graph = &pg_table;
+	CollectEdgeEnds(inner_match, element_scope);
+	CollectUndirectedEdgeBindings(inner_select->from_table.get(), element_scope.undirected_edges);
+	for (auto &condition : conditions) {
+		condition = RewriteElementFunctions(std::move(condition), element_scope);
+	}
 	inner_select->where_clause = PGQMatchFunction::CreateWhereClause(conditions);
 
 	auto stmt = make_uniq<SelectStatement>();
@@ -10454,7 +10825,7 @@ static idx_t RewriteDirectLinkReferences(CreatePropertyGraphInfo &pg_table, uniq
 static vector<unique_ptr<ParsedExpression>>
 BuildFinalColumnList(vector<unique_ptr<ParsedExpression>> col_list,
                      const case_insensitive_map_t<shared_ptr<PropertyGraphTable>> &alias_to_vertex_and_edge_tables,
-                     const case_insensitive_set_t &stub_bindings) {
+                     const PGQElementScope &element_scope) {
 	vector<unique_ptr<ParsedExpression>> final_column_list;
 	for (auto &expression : col_list) {
 		auto *column_ref = dynamic_cast<ColumnRefExpression *>(expression.get());
@@ -10483,48 +10854,10 @@ BuildFinalColumnList(vector<unique_ptr<ParsedExpression>> col_list,
 				                      "...), or the route chosen for the pattern does not provide %s()",
 				                      path_function, argument_name, argument_name, argument_name, path_function);
 			}
-			if (function_ref->FunctionName().GetIdentifierName() == "element_id" && function_ref->GetArgumentsMutable().size() == 1) {
-				column_ref = dynamic_cast<ColumnRefExpression *>(function_ref->GetArgumentsMutable()[0].GetExpressionMutable().get());
-				if (column_ref != nullptr && !column_ref->ColumnNames().empty()) {
-					string var = PGQStr(column_ref->ColumnNames().back());
-					auto rowid_ref = PGQColRef("rowid", var);
-					rowid_ref->SetAlias(Identifier(function_ref->GetAlias().GetIdentifierName().empty() ? "element_id(" + var + ")" : function_ref->GetAlias().GetIdentifierName()));
-					final_column_list.emplace_back(std::move(rowid_ref));
-				} else {
-					final_column_list.push_back(std::move(expression));
-				}
-			} else if (function_ref->FunctionName().GetIdentifierName() == "label" && function_ref->GetArgumentsMutable().size() == 1) {
-				column_ref = dynamic_cast<ColumnRefExpression *>(function_ref->GetArgumentsMutable()[0].GetExpressionMutable().get());
-				if (column_ref != nullptr && !column_ref->ColumnNames().empty()) {
-					string var = PGQStr(column_ref->ColumnNames().back());
-					auto tbl_iter = alias_to_vertex_and_edge_tables.find(var);
-					// A stub entry is a placeholder table picked for column validation, not
-					// this binding's actual label. Folding it into a constant reports a
-					// confidently wrong answer -- the traversal and element_id() stay
-					// correct, so nothing looks broken and the label is simply untrue.
-					// Refuse instead, and say what to write to get an answer.
-					if (tbl_iter != alias_to_vertex_and_edge_tables.end() &&
-					    stub_bindings.find(var) != stub_bindings.end()) {
-						throw BinderException(
-						    "label(%s) cannot be resolved: '%s' has no label in the pattern and the edge reaching it "
-						    "does not determine one, so its label varies per row. Give the vertex a label "
-						    "(%s:SOME_LABEL), or name a single edge label so the destination table is implied. For a "
-						    "variable-length pattern, label() is answered per row and works without either.",
-						    var.c_str(), var.c_str(), var.c_str());
-					}
-					if (tbl_iter != alias_to_vertex_and_edge_tables.end()) {
-						auto label_const = ConstantExpression::FromValue(Value(PGQStr(tbl_iter->second->main_label)));
-						label_const->SetAlias(Identifier(function_ref->GetAlias().GetIdentifierName().empty() ? "label(" + var + ")" : function_ref->GetAlias().GetIdentifierName()));
-						final_column_list.emplace_back(std::move(label_const));
-					} else {
-						final_column_list.push_back(std::move(expression));
-					}
-				} else {
-					final_column_list.push_back(std::move(expression));
-				}
-			} else {
-				final_column_list.push_back(std::move(expression));
+			if (!expression->HasAlias()) {
+				expression->SetAlias(expression->GetName());
 			}
+			final_column_list.push_back(RewriteElementFunctions(std::move(expression), element_scope));
 			continue;
 		}
 
@@ -10551,7 +10884,10 @@ BuildFinalColumnList(vector<unique_ptr<ParsedExpression>> col_list,
 			continue;
 		}
 
-		final_column_list.emplace_back(std::move(expression));
+		if (!expression->HasAlias()) {
+			expression->SetAlias(expression->GetName());
+		}
+		final_column_list.emplace_back(RewriteElementFunctions(std::move(expression), element_scope));
 	}
 	return final_column_list;
 }
@@ -11687,6 +12023,10 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 			// Require explicit, single edge label and same-type (or unlabeled) vertices.
 			if (s.edge->label.empty() || IsCompoundLabel(s.edge->label)) {
 				return false; // undirected enumeration is future work — use Case A path
+			}
+			// The union carries no edge row and no direction: a query that reads the edge variable traverses.
+			if (binding_is_referenced(s.edge->variable_binding)) {
+				return false;
 			}
 			const string &src_label_u = s.src->label;
 			const string &dst_label_u = s.dst->label;
@@ -13374,7 +13714,7 @@ static bool IsGraphAtom(const ParsedExpression &expression) {
 		static const case_insensitive_set_t graph_functions {
 		    "element_id", "label",         "labels",      "vertices",          "edges",        "path_length",
 		    "vertex_labels", "edge_labels", "vertex_properties", "cost", "is_labeled", "not_labeled",
-		    "all_different"};
+		    "all_different", "same", "is_source_of", "is_destination_of", "property_exists"};
 		return graph_functions.find(name) != graph_functions.end();
 	}
 	default:
@@ -13748,11 +14088,13 @@ static unique_ptr<QueryNode> BuildPathPropertyNode(ClientContext &context, Match
 	return std::move(outer);
 }
 
+static unique_ptr<QueryNode> BuildTableSplitAware(ClientContext &context, MatchExpression &block, bool allow_abi);
+
 static unique_ptr<QueryNode> BuildMatchLeafNode(ClientContext &context, MatchExpression &leaf, bool allow_abi) {
 	if (UsesPathPropertyCalls(leaf)) {
 		return BuildPathPropertyNode(context, leaf, allow_abi);
 	}
-	return PGQMatchFunction::BuildMatchQueryNode(context, &leaf, allow_abi);
+	return BuildTableSplitAware(context, leaf, allow_abi);
 }
 
 //------------------------------------------------------------------------------
@@ -15518,6 +15860,955 @@ static unique_ptr<QueryNode> BuildQuantifiedGroupNode(ClientContext &context, Ma
 //------------------------------------------------------------------------------
 // Path pattern unions
 //------------------------------------------------------------------------------
+//------------------------------------------------------------------------------
+// Elements over several tables
+//------------------------------------------------------------------------------
+// SQL/PGQ: a label expression selects the elements of every table whose labels satisfy it, and an element pattern
+// without a label matches every element of its kind. The translation binds each element variable to one table, so
+// a MATCH whose elements span several tables is answered as the UNION ALL of one MATCH per choice of a table for
+// each such element (an assignment; two assignments never bind the same elements), each element's label written as
+// its table's. An edge's table fixes the tables at its ends, which prunes the choices. A MATCH the translation
+// already answers as written -- one table per element, or an ABI route that covers the labels as written (the
+// union of edge artifacts, the context expansion over several edge labels) -- is left to it: it is tried first,
+// with a guard that stops the traversal before it binds a spanning element to one table (PGQTableSplitNeeded).
+
+enum class PGQLabelTruth : uint8_t { NO, YES, ROW };
+
+//! What a label expression says of the elements of one table: none, all, or those whose row has the residual (an
+//! expression over the table's discriminator sub-labels).
+struct PGQLabelOnTable {
+	PGQLabelTruth truth = PGQLabelTruth::NO;
+	string residual;
+};
+
+static PGQLabelOnTable LabelOnTable(const string &raw_expr, const PropertyGraphTable &table,
+                                    const CreatePropertyGraphInfo &graph) {
+	PGQLabelOnTable result;
+	if (raw_expr.empty()) {
+		result.truth = PGQLabelTruth::YES;
+		return result;
+	}
+	auto expr = StripParens(raw_expr);
+	if (!expr.empty() && expr[0] == '!') {
+		auto inner = LabelOnTable(expr.substr(1), table, graph);
+		if (inner.truth == PGQLabelTruth::ROW) {
+			result.truth = PGQLabelTruth::ROW;
+			result.residual = "!(" + inner.residual + ")";
+		} else {
+			result.truth = inner.truth == PGQLabelTruth::YES ? PGQLabelTruth::NO : PGQLabelTruth::YES;
+		}
+		return result;
+	}
+	for (char op : {'|', '&'}) {
+		auto parts = SplitTopLevel(expr, op);
+		if (parts.size() < 2) {
+			continue;
+		}
+		bool any_yes = false;
+		bool any_no = false;
+		vector<string> rows;
+		for (auto &part : parts) {
+			auto value = LabelOnTable(part, table, graph);
+			any_yes = any_yes || value.truth == PGQLabelTruth::YES;
+			any_no = any_no || value.truth == PGQLabelTruth::NO;
+			if (value.truth == PGQLabelTruth::ROW) {
+				rows.push_back("(" + value.residual + ")");
+			}
+		}
+		if (op == '|' ? any_yes : any_no) {
+			result.truth = op == '|' ? PGQLabelTruth::YES : PGQLabelTruth::NO;
+		} else if (rows.empty()) {
+			result.truth = op == '|' ? PGQLabelTruth::NO : PGQLabelTruth::YES;
+		} else {
+			result.truth = PGQLabelTruth::ROW;
+			result.residual = StringUtil::Join(rows, string(1, op));
+		}
+		return result;
+	}
+	if (graph.label_map.find(expr) == graph.label_map.end()) {
+		throw BinderException("The label %s is not registered in property graph %s", expr, graph.property_graph_name);
+	}
+	if (StringUtil::CIEquals(PGQStr(table.main_label), expr)) {
+		result.truth = PGQLabelTruth::YES;
+		return result;
+	}
+	for (auto &sub_label : table.sub_labels) {
+		if (StringUtil::CIEquals(PGQStr(sub_label), expr)) {
+			result.truth = PGQLabelTruth::ROW;
+			result.residual = PGQStr(sub_label);
+			return result;
+		}
+	}
+	return result;
+}
+
+static PGQLabelOnTable LabelConjunction(const PGQLabelOnTable &left, const PGQLabelOnTable &right) {
+	if (left.truth == PGQLabelTruth::NO || right.truth == PGQLabelTruth::NO) {
+		return PGQLabelOnTable();
+	}
+	if (left.truth == PGQLabelTruth::YES) {
+		return right;
+	}
+	if (right.truth == PGQLabelTruth::YES) {
+		return left;
+	}
+	PGQLabelOnTable result;
+	result.truth = PGQLabelTruth::ROW;
+	result.residual = "(" + left.residual + ")&(" + right.residual + ")";
+	return result;
+}
+
+//! The edge tables a quantified edge's label expression selects, when they touch more than one vertex table: its
+//! walks then cross tables, which a search over one id space for all of them follows (AddUnionPathSearch). Within
+//! one vertex table, or over one edge table, the variable-length routes answer the label expression as written.
+struct PGQUnionSpace {
+	bool applies = false;
+	vector<shared_ptr<PropertyGraphTable>> edge_tables;
+	vector<PGQLabelOnTable> edge_labels;
+	//! The vertex tables at the ends of the edge tables, in the graph's order
+	vector<shared_ptr<PropertyGraphTable>> vertex_tables;
+};
+
+static PGQUnionSpace UnionSpaceFor(const PathElement &edge, const CreatePropertyGraphInfo &graph) {
+	PGQUnionSpace space;
+	if (edge.match_type == PGQMatchType::MATCH_VERTEX) {
+		return space;
+	}
+	for (auto &table : graph.edge_tables) {
+		auto value = LabelOnTable(edge.label, *table, graph);
+		if (value.truth == PGQLabelTruth::NO) {
+			continue;
+		}
+		if (!table->source_pg_table || !table->destination_pg_table) {
+			return PGQUnionSpace();
+		}
+		space.edge_tables.push_back(table);
+		space.edge_labels.push_back(value);
+	}
+	for (auto &vertex_table : graph.vertex_tables) {
+		for (auto &table : space.edge_tables) {
+			if (table->source_pg_table->SameTableIdentity(*vertex_table) ||
+			    table->destination_pg_table->SameTableIdentity(*vertex_table)) {
+				space.vertex_tables.push_back(vertex_table);
+				break;
+			}
+		}
+	}
+	space.applies = space.edge_tables.size() > 1 && space.vertex_tables.size() > 1;
+	return space;
+}
+
+static bool LabelsRegistered(const string &raw_expr, const CreatePropertyGraphInfo &graph);
+
+//! The label that selects, of `table`, what `value` selects: its main label, or the residual over its sub-labels.
+static string TableLabelText(const PropertyGraphTable &table, const PGQLabelOnTable &value) {
+	return value.truth == PGQLabelTruth::ROW ? value.residual : PGQStr(table.main_label);
+}
+
+//! The element patterns of a MATCH part (its patterns, an OPTIONAL group, an EXISTS pattern) and how they connect.
+struct PGQTableSplitPart {
+	//! False when the part has a shape this lowering does not take apart (a union, a quantified path pattern).
+	bool handled = true;
+	vector<string> variables;
+	case_insensitive_map_t<vector<PathElement *>> occurrences;
+	struct Edge {
+		string edge;
+		string previous;
+		string next;
+		PGQMatchType direction;
+		int64_t lower;
+		bool quantified;
+		PathElement *element;
+	};
+	//! A quantified edge whose walks cross vertex tables (PGQUnionSpace)
+	bool union_space = false;
+	vector<Edge> edges;
+	//! Vertex occurrences whose table an adjacent directed single-table edge fixes (the translation reads it there)
+	unordered_set<PathElement *> edge_pinned;
+	//! The variables of quantified edges: the variable-length routes read their label expression as written (over
+	//! several edge tables too), so they are never relabeled and constrain their ends by any of their tables.
+	case_insensitive_set_t quantified;
+};
+
+static void CollectTableSplitSequence(const vector<unique_ptr<PathReference>> &sequence, PGQTableSplitPart &part,
+                                      CreatePropertyGraphInfo &graph) {
+	if (sequence.size() == 1 && sequence[0]->path_reference_type == PGQPathReferenceType::SUBPATH) {
+		auto &wrapper = static_cast<SubPath &>(*sequence[0]);
+		if (wrapper.path_list.size() > 1 && !wrapper.quantified_group && wrapper.lower == 1 && wrapper.upper == 1) {
+			CollectTableSplitSequence(wrapper.path_list, part, graph);
+			return;
+		}
+	}
+	vector<PathElement *> positions;
+	vector<int64_t> lowers;
+	vector<bool> quantified;
+	for (auto &reference : sequence) {
+		if (reference->path_reference_type == PGQPathReferenceType::PATH_ELEMENT) {
+			positions.push_back(static_cast<PathElement *>(reference.get()));
+			lowers.push_back(1);
+			quantified.push_back(false);
+			continue;
+		}
+		auto &subpath = static_cast<SubPath &>(*reference);
+		if (subpath.quantified_group || subpath.path_list.size() != 1 ||
+		    subpath.path_list[0]->path_reference_type != PGQPathReferenceType::PATH_ELEMENT) {
+			part.handled = false;
+			return;
+		}
+		positions.push_back(static_cast<PathElement *>(subpath.path_list[0].get()));
+		lowers.push_back(subpath.lower);
+		quantified.push_back(!(subpath.lower == 1 && subpath.upper == 1));
+	}
+	for (idx_t i = 0; i < positions.size(); i++) {
+		auto &name = positions[i]->variable_binding;
+		if (!part.occurrences.count(name)) {
+			part.variables.push_back(name);
+		}
+		part.occurrences[name].push_back(positions[i]);
+		const bool vertex = positions[i]->match_type == PGQMatchType::MATCH_VERTEX;
+		if (vertex != (i % 2 == 0)) {
+			part.handled = false;
+			return;
+		}
+	}
+	for (idx_t i = 1; i + 1 < positions.size(); i += 2) {
+		auto *edge = positions[i];
+		part.edges.push_back({edge->variable_binding, positions[i - 1]->variable_binding,
+		                      positions[i + 1]->variable_binding, edge->match_type, lowers[i], quantified[i], edge});
+		if (quantified[i]) {
+			part.quantified.insert(edge->variable_binding);
+			// The variable-length routes read an unlabeled end of a quantified edge per row, as written -- unless its
+			// walks cross vertex tables, where the ends are searched per table.
+			if (LabelsRegistered(edge->label, graph) && UnionSpaceFor(*edge, graph).applies) {
+				part.union_space = true;
+			} else if (LabelsRegistered(edge->label, graph)) {
+				// Ends left to the routes only where every table the label selects stays within one vertex table.
+				bool within_one_table = true;
+				for (auto &table : graph.edge_tables) {
+					if (LabelOnTable(edge->label, *table, graph).truth != PGQLabelTruth::NO) {
+						within_one_table = within_one_table && table->source_pg_table && table->destination_pg_table &&
+						                   table->source_pg_table->SameTableIdentity(*table->destination_pg_table);
+					}
+				}
+				if (within_one_table) {
+					part.edge_pinned.insert(positions[i - 1]);
+					part.edge_pinned.insert(positions[i + 1]);
+				}
+			}
+		}
+		// The translation reads an unlabeled end's table from a directed edge with one table (ProcessPathList).
+		const bool directed =
+		    edge->match_type == PGQMatchType::MATCH_EDGE_RIGHT || edge->match_type == PGQMatchType::MATCH_EDGE_LEFT;
+		if (directed && !edge->label.empty() && !IsCompoundLabel(edge->label) &&
+		    graph.label_map.find(edge->label) != graph.label_map.end()) {
+			part.edge_pinned.insert(positions[i - 1]);
+			part.edge_pinned.insert(positions[i + 1]);
+		}
+	}
+}
+
+static PGQTableSplitPart CollectTableSplitPart(const vector<unique_ptr<PathPattern>> &patterns,
+                                               CreatePropertyGraphInfo &graph) {
+	PGQTableSplitPart part;
+	for (auto &pattern : patterns) {
+		if (!pattern->union_operands.empty()) {
+			part.handled = false;
+			return part;
+		}
+		CollectTableSplitSequence(pattern->path_elements, part, graph);
+		if (!part.handled) {
+			return part;
+		}
+	}
+	return part;
+}
+
+static const vector<shared_ptr<PropertyGraphTable>> &ElementTables(const CreatePropertyGraphInfo &graph,
+                                                                   const PathElement &element) {
+	return element.match_type == PGQMatchType::MATCH_VERTEX ? graph.vertex_tables : graph.edge_tables;
+}
+
+//! Whether every label a label expression names is a label of the graph (else the translation reports it).
+static bool LabelsRegistered(const string &raw_expr, const CreatePropertyGraphInfo &graph) {
+	auto expr = StripParens(raw_expr);
+	if (expr.empty()) {
+		return true;
+	}
+	if (expr[0] == '!') {
+		return LabelsRegistered(expr.substr(1), graph);
+	}
+	for (char op : {'|', '&'}) {
+		auto parts = SplitTopLevel(expr, op);
+		if (parts.size() > 1) {
+			for (auto &part : parts) {
+				if (!LabelsRegistered(part, graph)) {
+					return false;
+				}
+			}
+			return true;
+		}
+	}
+	return graph.label_map.find(expr) != graph.label_map.end();
+}
+
+//! The variables of a part the translation would bind wrongly or not at all: a label that does not resolve to
+//! exactly the one table it selects, or no label where the kind has several tables and nothing fixes one.
+static void MismatchedVariables(const PGQTableSplitPart &part, CreatePropertyGraphInfo &graph,
+                                const case_insensitive_set_t &bound, case_insensitive_set_t &mismatched) {
+	for (auto &variable : part.variables) {
+		if (bound.count(variable)) {
+			continue;
+		}
+		if (part.quantified.count(variable)) {
+			// The variable-length routes read a quantified edge's label as written, over several edge tables too; only
+			// a label that selects one table and resolves to another (!Knows) would be read wrongly.
+			auto &edge = *part.occurrences.at(variable)[0];
+			if (edge.label.empty() || !LabelsRegistered(edge.label, graph)) {
+				continue;
+			}
+			vector<shared_ptr<PropertyGraphTable>> selected;
+			for (auto &table : graph.edge_tables) {
+				if (LabelOnTable(edge.label, *table, graph).truth != PGQLabelTruth::NO) {
+					selected.push_back(table);
+				}
+			}
+			if (selected.size() != 1) {
+				continue;
+			}
+			shared_ptr<PropertyGraphTable> resolved;
+			try {
+				resolved = ResolveLabelExprTable(edge.label, edge.match_type, graph);
+			} catch (std::exception &) {
+				resolved = nullptr;
+			}
+			if (!resolved || !resolved->SameTableIdentity(*selected[0])) {
+				mismatched.insert(variable);
+			}
+			continue;
+		}
+		auto &occurrences = part.occurrences.at(variable);
+		bool labeled = false;
+		bool registered = true;
+		for (auto *element : occurrences) {
+			labeled = labeled || !element->label.empty();
+			registered = registered && LabelsRegistered(element->label, graph);
+		}
+		if (!registered) {
+			continue; // the translation reports the unknown label
+		}
+		for (auto *element : occurrences) {
+			auto &tables = ElementTables(graph, *element);
+			if (element->label.empty()) {
+				if (!labeled && tables.size() > 1 && !part.edge_pinned.count(element)) {
+					mismatched.insert(variable);
+				}
+				continue;
+			}
+			vector<shared_ptr<PropertyGraphTable>> selected;
+			for (auto &table : tables) {
+				if (LabelOnTable(element->label, *table, graph).truth != PGQLabelTruth::NO) {
+					selected.push_back(table);
+				}
+			}
+			shared_ptr<PropertyGraphTable> resolved;
+			try {
+				resolved = ResolveLabelExprTable(element->label, element->match_type, graph);
+			} catch (std::exception &) {
+				resolved = nullptr;
+			}
+			if (selected.size() != 1 || !resolved || !resolved->SameTableIdentity(*selected[0])) {
+				mismatched.insert(variable);
+			}
+		}
+	}
+}
+
+//! Every element pattern of `expression`'s EXISTS { } patterns, as parts.
+static void CollectExistsParts(ParsedExpression *expression, vector<MatchExpression *> &patterns) {
+	if (!expression) {
+		return;
+	}
+	if (auto inner = DuckPGQGetExistsPattern(*expression)) {
+		patterns.push_back(inner.get());
+		return;
+	}
+	ParsedExpressionIterator::EnumerateChildren(
+	    *expression, [&](ParsedExpression &child) { CollectExistsParts(&child, patterns); });
+}
+
+//! A choice of table per variable.
+using PGQTableAssignment = case_insensitive_map_t<shared_ptr<PropertyGraphTable>>;
+
+static bool EdgeConnects(const PropertyGraphTable &edge, const PropertyGraphTable &previous,
+                         const PropertyGraphTable &next, PGQMatchType direction, int64_t lower) {
+	auto fits = [&](const PropertyGraphTable &from, const PropertyGraphTable &to) {
+		return (!edge.source_pg_table || edge.source_pg_table->SameTableIdentity(from)) &&
+		       (!edge.destination_pg_table || edge.destination_pg_table->SameTableIdentity(to));
+	};
+	bool connects;
+	switch (direction) {
+	case PGQMatchType::MATCH_EDGE_RIGHT:
+		connects = fits(previous, next);
+		break;
+	case PGQMatchType::MATCH_EDGE_LEFT:
+		connects = fits(next, previous);
+		break;
+	default:
+		connects = fits(previous, next) || fits(next, previous);
+		break;
+	}
+	// Zero hops bind the end to the start.
+	return connects || (lower == 0 && previous.SameTableIdentity(next));
+}
+
+//! Every assignment of tables to the part's variables under which its labels can hold and its edges connect, the
+//! variables in `fixed` keeping the table given there. At most `limit`.
+static vector<PGQTableAssignment> TableAssignments(const PGQTableSplitPart &part, CreatePropertyGraphInfo &graph,
+                                                   const PGQTableAssignment &fixed, idx_t limit) {
+	vector<string> variables;
+	vector<vector<shared_ptr<PropertyGraphTable>>> candidates;
+	case_insensitive_map_t<vector<shared_ptr<PropertyGraphTable>>> quantified_tables;
+	for (auto &variable : part.variables) {
+		vector<shared_ptr<PropertyGraphTable>> tables;
+		auto entry = fixed.find(variable);
+		if (entry != fixed.end()) {
+			tables.push_back(entry->second);
+		} else {
+			auto &occurrences = part.occurrences.at(variable);
+			for (auto &table : ElementTables(graph, *occurrences[0])) {
+				PGQLabelOnTable value;
+				value.truth = PGQLabelTruth::YES;
+				for (auto *element : occurrences) {
+					value = LabelConjunction(value, LabelOnTable(element->label, *table, graph));
+				}
+				if (value.truth != PGQLabelTruth::NO) {
+					tables.push_back(table);
+				}
+			}
+		}
+		if (part.quantified.count(variable)) {
+			quantified_tables[variable] = std::move(tables);
+			continue;
+		}
+		variables.push_back(variable);
+		candidates.push_back(std::move(tables));
+	}
+	vector<PGQTableAssignment> result;
+	PGQTableAssignment current;
+	auto consistent = [&]() {
+		for (auto &edge : part.edges) {
+			auto previous = current.find(edge.previous);
+			auto next = current.find(edge.next);
+			if (previous == current.end() || next == current.end()) {
+				continue;
+			}
+			if (edge.quantified) {
+				bool any = edge.lower == 0 && previous->second->SameTableIdentity(*next->second);
+				auto space = UnionSpaceFor(*edge.element, graph);
+				if (space.applies) {
+					// A walk may cross its vertex tables: any two of them can be its ends.
+					bool previous_in = false;
+					bool next_in = false;
+					for (auto &table : space.vertex_tables) {
+						previous_in = previous_in || table->SameTableIdentity(*previous->second);
+						next_in = next_in || table->SameTableIdentity(*next->second);
+					}
+					any = any || (previous_in && next_in);
+				}
+				for (auto &table : quantified_tables[edge.edge]) {
+					any = any || EdgeConnects(*table, *previous->second, *next->second, edge.direction, edge.lower);
+				}
+				if (!any) {
+					return false;
+				}
+				continue;
+			}
+			auto e = current.find(edge.edge);
+			if (e == current.end()) {
+				continue;
+			}
+			if (!EdgeConnects(*e->second, *previous->second, *next->second, edge.direction, edge.lower)) {
+				return false;
+			}
+		}
+		return true;
+	};
+	std::function<void(idx_t)> choose = [&](idx_t index) {
+		if (index == variables.size()) {
+			if (result.size() >= limit) {
+				throw BinderException("This MATCH has more than %llu combinations of tables for its elements; give its "
+				                      "vertices and edges labels",
+				                      static_cast<unsigned long long>(limit));
+			}
+			result.push_back(current);
+			return;
+		}
+		for (auto &table : candidates[index]) {
+			current[variables[index]] = table;
+			if (consistent()) {
+				choose(index + 1);
+			}
+		}
+		current.erase(variables[index]);
+	};
+	choose(0);
+	return result;
+}
+
+//! Writes each variable's label as the label of its table in `assignment`, for the variables in `relabel`.
+static void RelabelPart(PGQTableSplitPart &part, const PGQTableAssignment &assignment,
+                        const case_insensitive_set_t &relabel, CreatePropertyGraphInfo &graph) {
+	for (auto &variable : part.variables) {
+		if (!relabel.count(variable)) {
+			continue;
+		}
+		auto &table = assignment.at(variable);
+		PGQLabelOnTable value;
+		value.truth = PGQLabelTruth::YES;
+		for (auto *element : part.occurrences[variable]) {
+			value = LabelConjunction(value, LabelOnTable(element->label, *table, graph));
+		}
+		for (auto *element : part.occurrences[variable]) {
+			element->label = TableLabelText(*table, value);
+		}
+	}
+}
+
+static constexpr idx_t kTableSplitMaxLeaves = 256;
+
+//! What the per-table lowering of a block has to do, or nothing (needs = false).
+struct PGQTableSplitPlan {
+	bool needs = false;
+	case_insensitive_set_t guard;
+	//! A quantified edge of the block's patterns crosses vertex tables
+	bool union_space = false;
+};
+
+static PGQTableSplitPlan PlanTableSplit(MatchExpression &block, CreatePropertyGraphInfo &graph) {
+	PGQTableSplitPlan plan;
+	if (graph.vertex_tables.size() <= 1 && graph.edge_tables.size() <= 1) {
+		bool compound = false;
+		std::function<void(const PathReference &)> visit = [&](const PathReference &reference) {
+			if (reference.path_reference_type == PGQPathReferenceType::PATH_ELEMENT) {
+				compound = compound || IsCompoundLabel(static_cast<const PathElement &>(reference).label);
+				return;
+			}
+			for (auto &child : static_cast<const SubPath &>(reference).path_list) {
+				visit(*child);
+			}
+		};
+		for (auto &pattern : block.path_patterns) {
+			for (auto &reference : pattern->path_elements) {
+				visit(*reference);
+			}
+		}
+		if (!compound) {
+			return plan; // one table of each kind and plain labels: every element has its one table
+		}
+	}
+	auto part = CollectTableSplitPart(block.path_patterns, graph);
+	if (part.handled) {
+		MismatchedVariables(part, graph, case_insensitive_set_t(), plan.guard);
+		plan.union_space = part.union_space;
+	}
+	case_insensitive_set_t bound(part.variables.begin(), part.variables.end());
+	for (auto &group : block.optional_match_patterns) {
+		auto optional = CollectTableSplitPart(group, graph);
+		if (optional.handled) {
+			MismatchedVariables(optional, graph, bound, plan.guard);
+			bound.insert(optional.variables.begin(), optional.variables.end());
+		}
+	}
+	vector<MatchExpression *> exists_patterns;
+	CollectExistsParts(block.where_clause.get(), exists_patterns);
+	for (auto *inner : exists_patterns) {
+		auto exists = CollectTableSplitPart(inner->path_patterns, graph);
+		if (exists.handled) {
+			MismatchedVariables(exists, graph, bound, plan.guard);
+		}
+	}
+	plan.needs = !plan.guard.empty();
+	return plan;
+}
+
+static bool HasRowsFunction(ClientContext &context, const vector<unique_ptr<ParsedExpression>> &columns);
+static unique_ptr<ParsedExpression> SplitRowsFunctionInputs(ClientContext &context,
+                                                            unique_ptr<ParsedExpression> expression,
+                                                            vector<unique_ptr<ParsedExpression>> &inputs);
+
+//! EXISTS { <match> }, as the grammar writes the predicate.
+static unique_ptr<ParsedExpression> MakeExistsExpression(unique_ptr<MatchExpression> match) {
+	auto pattern_ref = make_uniq<TableFunctionRef>();
+	pattern_ref->function = make_uniq<FunctionExpression>(Identifier(DUCKPGQ_EXISTS_PATTERN_FUNCTION),
+	                                                      vector<unique_ptr<ParsedExpression>>());
+	pattern_ref->bind_info = make_shared_ptr<DuckPGQMatchInfo>(std::move(match));
+	auto select_node = make_uniq<SelectNode>();
+	select_node->select_list.push_back(make_uniq<ConstantExpression>(Literal::Integer(1)));
+	select_node->from_table = std::move(pattern_ref);
+	auto select = make_uniq<SelectStatement>();
+	select->node = std::move(select_node);
+	auto exists = make_uniq<SubqueryExpression>();
+	exists->GetSubqueryTypeMutable() = SubqueryType::EXISTS;
+	exists->SubqueryMutable() = std::move(select);
+	return std::move(exists);
+}
+
+//! Every element WHERE of a pattern list.
+static void VisitElementWheres(vector<unique_ptr<PathReference>> &references,
+                               const std::function<void(unique_ptr<ParsedExpression> &)> &visit) {
+	for (auto &reference : references) {
+		if (reference->path_reference_type != PGQPathReferenceType::SUBPATH) {
+			continue;
+		}
+		auto &subpath = static_cast<SubPath &>(*reference);
+		if (subpath.where_clause) {
+			visit(subpath.where_clause);
+		}
+		VisitElementWheres(subpath.path_list, visit);
+	}
+}
+
+//! `variable.p` read where its table has no column p, as NULL: the element has no such property. Left alone when
+//! no table the variable may have has the column, so a misspelt property is still reported.
+static unique_ptr<ParsedExpression> NullMissingProperties(ClientContext &context, unique_ptr<ParsedExpression> expression,
+                                                          const string &variable, const PropertyGraphTable &table,
+                                                          const vector<shared_ptr<PropertyGraphTable>> &candidates) {
+	if (!expression) {
+		return expression;
+	}
+	if (expression->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+		auto &names = expression->Cast<ColumnRefExpression>().ColumnNames();
+		if (names.size() == 2 && StringUtil::CIEquals(PGQStr(names[0]), variable) &&
+		    !StringUtil::CIEquals(PGQStr(names[1]), "rowid") &&
+		    PathPropertyColumnType(context, table, PGQStr(names[1])).id() == LogicalTypeId::INVALID) {
+			for (auto &candidate : candidates) {
+				auto type = PathPropertyColumnType(context, *candidate, PGQStr(names[1]));
+				if (type.id() != LogicalTypeId::INVALID) {
+					auto null_value = make_uniq<CastExpression>(type, ConstantExpression::FromValue(Value()));
+					null_value->SetAlias(expression->GetAlias().empty() ? names[1] : expression->GetAlias());
+					return std::move(null_value);
+				}
+			}
+		}
+		return expression;
+	}
+	if (expression->GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		return expression;
+	}
+	ParsedExpressionIterator::EnumerateChildren(*expression, [&](unique_ptr<ParsedExpression> &child) {
+		child = NullMissingProperties(context, std::move(child), variable, table, candidates);
+	});
+	return expression;
+}
+
+//! The variables a part binds that none of `known` binds.
+static case_insensitive_set_t NewVariables(const PGQTableSplitPart &part, const case_insensitive_set_t &known) {
+	case_insensitive_set_t result;
+	for (auto &variable : part.variables) {
+		if (!known.count(variable)) {
+			result.insert(variable);
+		}
+	}
+	return result;
+}
+
+static unique_ptr<QueryNode> BuildMatchLeafNode(ClientContext &context, MatchExpression &leaf, bool allow_abi);
+static void NormalizeCrossTableQuantifiers(MatchExpression &block, CreatePropertyGraphInfo &pg_table);
+
+//! The block as the UNION ALL of one block per assignment of tables to its spanning elements.
+static unique_ptr<QueryNode> BuildTableSplitNode(ClientContext &context, MatchExpression &block, bool allow_abi,
+                                                 CreatePropertyGraphInfo &graph) {
+	// Aggregates and window functions in COLUMNS run over all the blocks' rows together.
+	if (HasRowsFunction(context, block.column_list)) {
+		vector<unique_ptr<ParsedExpression>> outer_columns;
+		vector<unique_ptr<ParsedExpression>> inputs;
+		for (auto &column : block.column_list) {
+			const auto name = column->GetName();
+			auto outer = SplitRowsFunctionInputs(context, column->Copy(), inputs);
+			outer->SetAlias(Identifier(column->HasAlias() ? column->GetAlias() : Identifier(name)));
+			outer_columns.push_back(std::move(outer));
+		}
+		if (inputs.empty()) {
+			inputs.push_back(ConstantExpression::FromValue(Value::BOOLEAN(true)));
+			inputs.back()->SetAlias(Identifier("__pgq_agg_input_0"));
+		}
+		auto inner = unique_ptr_cast<ParsedExpression, MatchExpression>(block.Copy());
+		inner->column_list = std::move(inputs);
+		auto outer = make_uniq<SelectNode>();
+		auto subquery = make_uniq<SelectStatement>();
+		subquery->node = BuildTableSplitNode(context, *inner, allow_abi, graph);
+		outer->from_table = make_uniq<SubqueryRef>(std::move(subquery), Identifier("__pgq_split"));
+		outer->select_list = std::move(outer_columns);
+		return std::move(outer);
+	}
+	if (block.one_row_per != OneRowPerMode::NONE && !block.optional_match_patterns.empty()) {
+		throw NotImplementedException("ONE ROW PER with OPTIONAL MATCH over elements that span several tables is not "
+		                              "supported");
+	}
+	auto part = CollectTableSplitPart(block.path_patterns, graph);
+	if (!part.handled) {
+		// A shape this lowering does not take apart: the translation answers it as it can.
+		return PGQMatchFunction::BuildMatchQueryNode(context, &block, allow_abi);
+	}
+	case_insensitive_set_t mandatory(part.variables.begin(), part.variables.end());
+
+	// An OPTIONAL MATCH group that spans tables: the left join of the bindings with the union of the group's
+	// assignments is the bindings joined with the group (one block per assignment, the group a mandatory part),
+	// together with the bindings the group does not extend (NOT EXISTS the group), its variables NULL there.
+	case_insensitive_set_t bound = mandatory;
+	for (idx_t g = 0; g < block.optional_match_patterns.size(); g++) {
+		auto optional = CollectTableSplitPart(block.optional_match_patterns[g], graph);
+		if (!optional.handled) {
+			continue;
+		}
+		case_insensitive_set_t mismatched;
+		MismatchedVariables(optional, graph, bound, mismatched);
+		auto added = NewVariables(optional, bound);
+		if (mismatched.empty()) {
+			bound.insert(added.begin(), added.end());
+			continue;
+		}
+		for (idx_t later = g + 1; later < block.optional_match_patterns.size(); later++) {
+			auto other = CollectTableSplitPart(block.optional_match_patterns[later], graph);
+			for (auto &variable : other.variables) {
+				if (added.count(variable)) {
+					throw NotImplementedException("An OPTIONAL MATCH that reads a variable of an earlier OPTIONAL MATCH "
+					                              "whose elements span several tables is not supported");
+				}
+			}
+		}
+		auto matched = unique_ptr_cast<ParsedExpression, MatchExpression>(block.Copy());
+		for (auto &pattern : matched->optional_match_patterns[g]) {
+			matched->path_patterns.push_back(std::move(pattern));
+		}
+		matched->optional_match_patterns.erase(matched->optional_match_patterns.begin() + static_cast<int64_t>(g));
+		auto unmatched = unique_ptr_cast<ParsedExpression, MatchExpression>(block.Copy());
+		auto group = make_uniq<MatchExpression>();
+		group->pg_name = block.pg_name;
+		group->pg_catalog = block.pg_catalog;
+		group->pg_schema = block.pg_schema;
+		for (auto &pattern : unmatched->optional_match_patterns[g]) {
+			group->path_patterns.push_back(std::move(pattern));
+		}
+		unmatched->optional_match_patterns.erase(unmatched->optional_match_patterns.begin() + static_cast<int64_t>(g));
+		for (auto &column : unmatched->column_list) {
+			const bool top_level_missing = column->GetAlias().empty();
+			auto name = column->GetName();
+			column = NullMissingVariables(std::move(column), added);
+			if (top_level_missing && column->GetExpressionClass() == ExpressionClass::CONSTANT) {
+				column->SetAlias(name);
+			}
+		}
+		unmatched->where_clause = NullMissingVariables(std::move(unmatched->where_clause), added);
+		unique_ptr<ParsedExpression> not_extended =
+		    make_uniq<OperatorExpression>(ExpressionType::OPERATOR_NOT, MakeExistsExpression(std::move(group)));
+		if (unmatched->where_clause) {
+			not_extended = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(not_extended),
+			                                                std::move(unmatched->where_clause));
+		}
+		unmatched->where_clause = std::move(not_extended);
+		vector<unique_ptr<QueryNode>> nodes;
+		nodes.push_back(BuildMatchLeafNode(context, *matched, allow_abi));
+		nodes.push_back(BuildMatchLeafNode(context, *unmatched, allow_abi));
+		return CombineUnionAll(std::move(nodes));
+	}
+
+	case_insensitive_set_t mismatched;
+	MismatchedVariables(part, graph, case_insensitive_set_t(), mismatched);
+	auto assignments = TableAssignments(part, graph, PGQTableAssignment(), kTableSplitMaxLeaves);
+	if (assignments.empty()) {
+		return EmptyGroupResult(block);
+	}
+	// Relabeled: the variables the translation would bind wrongly, and those of more than one table.
+	case_insensitive_map_t<vector<shared_ptr<PropertyGraphTable>>> candidates;
+	for (auto &assignment : assignments) {
+		for (auto &entry : assignment) {
+			auto &tables = candidates[entry.first];
+			bool seen = false;
+			for (auto &table : tables) {
+				seen = seen || table->SameTableIdentity(*entry.second);
+			}
+			if (!seen) {
+				tables.push_back(entry.second);
+			}
+		}
+	}
+	case_insensitive_set_t relabel = mismatched;
+	for (auto &entry : candidates) {
+		if (entry.second.size() > 1) {
+			relabel.insert(entry.first);
+		}
+	}
+	// A quantified edge read wrongly is given its one table (assignments do not choose quantified edges).
+	PGQTableAssignment quantified_tables;
+	for (auto &variable : part.quantified) {
+		if (!relabel.count(variable)) {
+			continue;
+		}
+		for (auto &table : graph.edge_tables) {
+			if (LabelOnTable(part.occurrences[variable][0]->label, *table, graph).truth != PGQLabelTruth::NO) {
+				quantified_tables[variable] = table;
+			}
+		}
+	}
+	// A search prefix chooses among the paths of each pair of endpoints: exact per assignment only when every
+	// element that spans tables is an endpoint of its pattern (two assignments then never share a pair).
+	for (auto &pattern : block.path_patterns) {
+		if (!(pattern->shortest || pattern->topk || pattern->cheapest)) {
+			continue;
+		}
+		vector<unique_ptr<PathPattern>> one;
+		one.push_back(pattern->Copy());
+		auto pattern_part = CollectTableSplitPart(one, graph);
+		for (idx_t i = 0; i < pattern_part.variables.size(); i++) {
+			auto &variable = pattern_part.variables[i];
+			const bool endpoint = i == 0 || (pattern_part.edges.size() > 0 && StringUtil::CIEquals(
+			                                                                    variable, pattern_part.edges.back().next));
+			if (relabel.count(variable) && !endpoint) {
+				throw NotImplementedException("A search prefix over a pattern whose interior elements span several "
+				                              "vertex or edge tables is not supported; give them labels of one table");
+			}
+		}
+	}
+	// x.* of a variable of several tables: every property of any of them, NULL where its table has none.
+	vector<unique_ptr<ParsedExpression>> columns;
+	for (auto &column : block.column_list) {
+		if (column->GetExpressionClass() == ExpressionClass::STAR) {
+			auto relation = PGQStr(column->Cast<StarExpression>().RelationName().GetIdentifierName());
+			if (relation.empty() && !relabel.empty()) {
+				throw NotImplementedException("COLUMNS (*) over elements that span several tables is not supported; "
+				                              "list the properties, or use v.* per variable");
+			}
+			if (!relation.empty() && relabel.count(relation)) {
+				case_insensitive_set_t names;
+				for (auto &table : candidates[relation]) {
+					for (auto &name : table->column_names) {
+						if (names.insert(PGQStr(name)).second) {
+							auto reference = PGQColRef(vector<string> {relation, PGQStr(name)});
+							reference->SetAlias(name);
+							columns.push_back(std::move(reference));
+						}
+					}
+				}
+				continue;
+			}
+		}
+		columns.push_back(column->Copy());
+	}
+	vector<unique_ptr<QueryNode>> nodes;
+	for (auto &assignment : assignments) {
+		auto leaf = unique_ptr_cast<ParsedExpression, MatchExpression>(block.Copy());
+		leaf->column_list.clear();
+		for (auto &column : columns) {
+			leaf->column_list.push_back(column->Copy());
+		}
+		auto leaf_part = CollectTableSplitPart(leaf->path_patterns, graph);
+		auto leaf_assignment = assignment;
+		for (auto &entry : quantified_tables) {
+			leaf_assignment[entry.first] = entry.second;
+		}
+		RelabelPart(leaf_part, leaf_assignment, relabel, graph);
+		// A quantified edge between two vertex tables takes at most one hop; that reads its table, now known.
+		NormalizeCrossTableQuantifiers(*leaf, graph);
+		for (auto &variable : relabel) {
+			if (quantified_tables.count(variable)) {
+				continue; // a group variable: its properties are read along the path
+			}
+			auto &table = *assignment.at(variable);
+			auto &variable_candidates = candidates[variable];
+			auto rewrite = [&](unique_ptr<ParsedExpression> &expression) {
+				expression = NullMissingProperties(context, std::move(expression), variable, table, variable_candidates);
+			};
+			for (auto &column : leaf->column_list) {
+				rewrite(column);
+			}
+			rewrite(leaf->where_clause);
+			for (auto &pattern : leaf->path_patterns) {
+				VisitElementWheres(pattern->path_elements, rewrite);
+			}
+		}
+		// EXISTS patterns that span tables: the OR of one EXISTS per assignment of the pattern's own variables, the
+		// outer ones keeping this leaf's tables.
+		std::function<void(unique_ptr<ParsedExpression> &)> split_exists = [&](unique_ptr<ParsedExpression> &expression) {
+			if (!expression) {
+				return;
+			}
+			if (auto inner = DuckPGQGetExistsPattern(*expression)) {
+				auto inner_part = CollectTableSplitPart(inner->path_patterns, graph);
+				if (!inner_part.handled) {
+					return;
+				}
+				case_insensitive_set_t inner_mismatched;
+				MismatchedVariables(inner_part, graph, mandatory, inner_mismatched);
+				if (inner_mismatched.empty()) {
+					return;
+				}
+				PGQTableAssignment fixed;
+				for (auto &variable : inner_part.variables) {
+					if (mandatory.count(variable)) {
+						fixed[variable] = assignment.at(variable);
+					}
+				}
+				auto inner_assignments = TableAssignments(inner_part, graph, fixed, kTableSplitMaxLeaves);
+				case_insensitive_set_t inner_relabel = inner_mismatched;
+				for (auto &variable : inner_part.variables) {
+					if (!mandatory.count(variable)) {
+						inner_relabel.insert(variable);
+					}
+				}
+				unique_ptr<ParsedExpression> any;
+				for (auto &inner_assignment : inner_assignments) {
+					auto copy = unique_ptr_cast<ParsedExpression, MatchExpression>(inner->Copy());
+					auto copy_part = CollectTableSplitPart(copy->path_patterns, graph);
+					RelabelPart(copy_part, inner_assignment, inner_relabel, graph);
+					auto exists = MakeExistsExpression(std::move(copy));
+					any = any ? make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_OR, std::move(any),
+					                                             std::move(exists))
+					          : std::move(exists);
+				}
+				expression = any ? std::move(any) : ConstantExpression::FromValue(Value::BOOLEAN(false));
+				return;
+			}
+			if (expression->GetExpressionClass() == ExpressionClass::SUBQUERY) {
+				return;
+			}
+			ParsedExpressionIterator::EnumerateChildren(*expression, split_exists);
+		};
+		split_exists(leaf->where_clause);
+		nodes.push_back(BuildMatchLeafNode(context, *leaf, allow_abi));
+	}
+	return CombineUnionAll(std::move(nodes));
+}
+
+//! A block translated as written when it can be, else per assignment of tables (see the top of this section).
+static unique_ptr<QueryNode> BuildTableSplitAware(ClientContext &context, MatchExpression &block, bool allow_abi) {
+	auto duckpgq_state = GetDuckPGQState(context);
+	QualifiedName graph_name(Identifier(block.pg_catalog), Identifier(block.pg_schema), Identifier(block.pg_name));
+	auto &graph = *duckpgq_state->GetPropertyGraph(context, graph_name);
+	auto plan = PlanTableSplit(block, graph);
+	if (!plan.needs) {
+		return PGQMatchFunction::BuildMatchQueryNode(context, &block, allow_abi);
+	}
+	auto attempt = unique_ptr_cast<ParsedExpression, MatchExpression>(block.Copy());
+	const auto diagnostics = duckpgq_state->rewrite_diagnostics.size();
+	const auto *outer_guard = pgq_table_split_guard;
+	pgq_table_split_guard = &plan.guard;
+	try {
+		auto node = PGQMatchFunction::BuildMatchQueryNode(context, attempt.get(), allow_abi);
+		pgq_table_split_guard = outer_guard;
+		return node;
+	} catch (PGQTableSplitNeeded &) {
+		pgq_table_split_guard = outer_guard;
+	} catch (...) {
+		pgq_table_split_guard = outer_guard;
+		throw;
+	}
+	if (duckpgq_state->rewrite_diagnostics.size() > diagnostics) {
+		duckpgq_state->rewrite_diagnostics.resize(diagnostics);
+	}
+	return BuildTableSplitNode(context, block, allow_abi, graph);
+}
+
 struct PGQUnionLeaf {
 	unique_ptr<MatchExpression> match;
 	vector<idx_t> choice;
@@ -16792,10 +18083,54 @@ static unique_ptr<QueryNode> ApplyMixedPathSelection(unique_ptr<QueryNode> node,
 	return std::move(outer->node);
 }
 
+//! A MATCH without the lowered constructs: translated as written, unless one of its blocks has elements that span
+//! several tables and the translation as written does not answer it (BuildTableSplitAware); then block by block.
+static unique_ptr<QueryNode> BuildMatchRefNode(ClientContext &context, MatchExpression &match) {
+	auto duckpgq_state = GetDuckPGQState(context);
+	QualifiedName graph_name(Identifier(match.pg_catalog), Identifier(match.pg_schema), Identifier(match.pg_name));
+	auto &graph = *duckpgq_state->GetPropertyGraph(context, graph_name);
+	auto plan = PlanTableSplit(match, graph);
+	bool union_space = plan.union_space;
+	for (auto &branch : match.union_matches) {
+		auto branch_plan = PlanTableSplit(*branch, graph);
+		plan.needs = plan.needs || branch_plan.needs;
+		plan.guard.insert(branch_plan.guard.begin(), branch_plan.guard.end());
+		union_space = union_space || branch_plan.union_space;
+	}
+	if (union_space && !match.union_matches.empty()) {
+		// The union-space search is a route of the first block's translation: the blocks are built one by one.
+		return PGQMatchFunction::BuildLoweredMatchQueryNode(context, match);
+	}
+	if (!plan.needs) {
+		return PGQMatchFunction::BuildMatchQueryNode(context, &match, true);
+	}
+	if (match.union_matches.empty()) {
+		return BuildTableSplitAware(context, match, true);
+	}
+	auto attempt = unique_ptr_cast<ParsedExpression, MatchExpression>(match.Copy());
+	const auto diagnostics = duckpgq_state->rewrite_diagnostics.size();
+	const auto *outer_guard = pgq_table_split_guard;
+	pgq_table_split_guard = &plan.guard;
+	try {
+		auto node = PGQMatchFunction::BuildMatchQueryNode(context, attempt.get(), true);
+		pgq_table_split_guard = outer_guard;
+		return node;
+	} catch (PGQTableSplitNeeded &) {
+		pgq_table_split_guard = outer_guard;
+	} catch (...) {
+		pgq_table_split_guard = outer_guard;
+		throw;
+	}
+	if (duckpgq_state->rewrite_diagnostics.size() > diagnostics) {
+		duckpgq_state->rewrite_diagnostics.resize(diagnostics);
+	}
+	return PGQMatchFunction::BuildLoweredMatchQueryNode(context, match);
+}
+
 unique_ptr<TableRef> PGQMatchFunction::BuildMatchRef(ClientContext &context, MatchExpression &match) {
 	const auto selection = PrepareMixedPathSelection(match);
 	auto node = NeedsLoweredMatch(match) ? BuildLoweredMatchQueryNode(context, match)
-	                                     : BuildMatchQueryNode(context, &match, true);
+	                                     : BuildMatchRefNode(context, match);
 	if (selection.applies) {
 		node = ApplyMixedPathSelection(std::move(node), selection);
 	}
@@ -16836,11 +18171,26 @@ static void CollectSelectionElements(PathReference &reference, vector<PathElemen
 	}
 }
 
+//! The selector as written, for messages.
+static string SelectorName(const PathPattern &pattern) {
+	if (pattern.group) {
+		return "SHORTEST k GROUPS";
+	}
+	if (pattern.any) {
+		return "ANY k";
+	}
+	if (pattern.topk > 0) {
+		return "SHORTEST k";
+	}
+	return pattern.all ? "ALL SHORTEST" : "ANY SHORTEST";
+}
+
 static PGQFixedPathSelection SelectorOverFixedPattern(PathPattern &pattern, MatchExpression &block) {
 	PGQFixedPathSelection selection;
-	if (!pattern.shortest || pattern.cheapest || pattern.topk > 0 || !pattern.union_operands.empty()) {
+	if (!pattern.shortest || pattern.cheapest || !pattern.union_operands.empty()) {
 		return selection;
 	}
+	const bool counted = pattern.topk > 0;
 	auto *elements = &pattern.path_elements;
 	if (elements->size() == 1) {
 		auto *wrapper = PGQMatchFunction::GetSubPath((*elements)[0]);
@@ -16849,6 +18199,13 @@ static PGQFixedPathSelection SelectorOverFixedPattern(PathPattern &pattern, Matc
 		}
 	}
 	if (elements->size() < 3) {
+		// One vertex: its zero-length path is the only one, whatever the selector asks for.
+		if (counted) {
+			pattern.shortest = false;
+			pattern.group = false;
+			pattern.any = false;
+			pattern.topk = 0;
+		}
 		return selection;
 	}
 	idx_t fixed = 0;
@@ -16867,20 +18224,35 @@ static PGQFixedPathSelection SelectorOverFixedPattern(PathPattern &pattern, Matc
 		CollectSelectionElements(*reference, path);
 	}
 	if (variable > 0) {
+		if (fixed > 0 && counted) {
+			throw NotImplementedException("%s is supported for one quantified edge between two vertices, or for a "
+			                              "fixed-length pattern; this pattern mixes fixed hops with a variable-length "
+			                              "one",
+			                              SelectorName(pattern));
+		}
 		if (fixed > 0 && !MixedPathSelectionSupported(block)) {
 			throw NotImplementedException(
 			    "%s over a pattern that mixes fixed hops with a variable-length one is supported when it is the only "
 			    "pattern of its MATCH, without OPTIONAL MATCH, UNION or ONE ROW PER",
-			    pattern.all ? "ALL SHORTEST" : "ANY SHORTEST");
+			    SelectorName(pattern));
 		}
+		return selection;
+	}
+	// Every path of a fixed-length pattern has its one length: the k shortest lengths hold all of them, as ALL
+	// SHORTEST does, and the pattern is matched without a selector.
+	if (pattern.group) {
+		pattern.shortest = false;
+		pattern.group = false;
+		pattern.topk = 0;
 		return selection;
 	}
 	if (pattern.all) {
 		return selection;
 	}
 	if (!block.optional_match_patterns.empty()) {
-		throw NotImplementedException("ANY SHORTEST over a fixed-length pattern is not supported in a MATCH with "
-		                              "OPTIONAL MATCH yet");
+		throw NotImplementedException("%s over a fixed-length pattern is not supported in a MATCH with OPTIONAL "
+		                              "MATCH yet",
+		                              SelectorName(pattern));
 	}
 	auto *start = path.front();
 	auto *end = path.back();
@@ -16902,9 +18274,9 @@ static PGQFixedPathSelection SelectorOverFixedPattern(PathPattern &pattern, Matc
 		}
 		for (auto *element : other_elements) {
 			if (interior.find(element->variable_binding) != interior.end()) {
-				throw NotImplementedException("ANY SHORTEST over a fixed-length pattern whose interior variable '%s' is "
-				                              "also used by another pattern of the MATCH is not supported",
-				                              element->variable_binding);
+				throw NotImplementedException("%s over a fixed-length pattern whose interior variable '%s' is also "
+				                              "used by another pattern of the MATCH is not supported",
+				                              SelectorName(pattern), element->variable_binding);
 			}
 			if (others.insert(element->variable_binding).second) {
 				partition.push_back(SelectionIdentity(*element));
@@ -16917,8 +18289,8 @@ static PGQFixedPathSelection SelectorOverFixedPattern(PathPattern &pattern, Matc
 	}
 	Parser parser(ParserOptions::Builtin());
 	auto expressions = parser.ParseExpressionList(
-	    StringUtil::Format("row_number() OVER (PARTITION BY %s ORDER BY %s) = 1", StringUtil::Join(partition, ", "),
-	                       StringUtil::Join(order, ", ")));
+	    StringUtil::Format("row_number() OVER (PARTITION BY %s ORDER BY %s) <= %d", StringUtil::Join(partition, ", "),
+	                       StringUtil::Join(order, ", "), counted ? pattern.topk : 1));
 	selection.applies = true;
 	selection.qualify = std::move(expressions[0]);
 	return selection;
@@ -16930,8 +18302,10 @@ struct PGQNativePathSearch {
 	//! A CHEAPEST pattern whose COST varies by edge, outside what the long-standing routes answer (see
 	//! NativePathSearchFor): searched by cost (pgq_cheapest_paths).
 	bool cheapest = false;
-	//! paths per destination, < 0 for all; ignored with all_shortest
+	//! paths per destination, < 0 for all; ignored with all_shortest; with groups, the number of path lengths
 	int64_t k = 1;
+	//! SHORTEST k GROUPS: every path of the k least lengths per pair
+	bool groups = false;
 	bool all_shortest = false;
 	string mode = "walk";
 	//! ANY / ALL SHORTEST under walk semantics: no artifact holds such walks, so the search answers it directly
@@ -16996,9 +18370,10 @@ static PGQNativePathSearch NativePathSearchFor(PathPattern &pattern, bool one_ro
 	const bool topk = pattern.topk > 0;
 	auto refuse = [&](const string &why) {
 		if (topk) {
-			throw NotImplementedException("SHORTEST k is supported for one quantified edge between two vertices, "
-			                              "over one edge table whose two ends are one vertex table: %s",
-			                              why);
+			throw NotImplementedException("%s is supported for one quantified edge between two vertices, over one "
+			                              "edge table whose two ends are one vertex table, or for a fixed-length "
+			                              "pattern: %s",
+			                              SelectorName(pattern), why);
 		}
 		return search;
 	};
@@ -17049,6 +18424,7 @@ static PGQNativePathSearch NativePathSearchFor(PathPattern &pattern, bool one_ro
 	const bool shortest = pattern.shortest || constant_cost;
 	if (topk) {
 		search.k = pattern.topk;
+		search.groups = pattern.group;
 		search.mode = PathModeName(mode);
 	} else if (pattern.cheapest && !constant_cost) {
 		return search;
@@ -17089,6 +18465,9 @@ static PGQNativePathSearch NativePathSearchFor(PathPattern &pattern, bool one_ro
 static void AddNativePathSearch(ClientContext &context, const PGQNativePathSearch &search, MatchExpression &ref,
                                 CreatePropertyGraphInfo &pg_table, unique_ptr<SelectNode> &select_node,
                                 vector<unique_ptr<ParsedExpression>> &conditions, PGQCSRSlot &csr_slot) {
+	CheckTableSplitGuard(*search.src);
+	CheckTableSplitGuard(*search.edge);
+	CheckTableSplitGuard(*search.dst);
 	auto &edge = *search.edge;
 	shared_ptr<PropertyGraphTable> edge_table;
 	try {
@@ -17148,7 +18527,8 @@ static void AddNativePathSearch(ClientContext &context, const PGQNativePathSearc
 	    "(SELECT 0 * count(cte1.temp) AS temp FROM cte1) AS __x%s",
 	    q_src, csr_slot.slot, vertices, q_src, destinations, static_cast<long long>(search.k),
 	    static_cast<long long>(search.quantifier->lower), static_cast<long long>(search.quantifier->upper),
-	    search.mode, all_shortest ? "all_shortest" : "k", static_cast<long long>(MaxVLFallbackRows(context)), vertices,
+	    search.mode, all_shortest ? "all_shortest" : search.groups ? "groups" : "k",
+	    static_cast<long long>(MaxVLFallbackRows(context)), vertices,
 	    q_src, src_seed.empty() ? "" : " WHERE " + src_seed);
 	auto search_info = make_uniq<CommonTableExpressionInfo>();
 	search_info->query_node = std::move(ParseSelectStatement(search_sql)->node);
@@ -17188,11 +18568,366 @@ static void AddNativePathSearch(ClientContext &context, const PGQNativePathSearc
 	                                       all_shortest ? "all shortest"
 	                                       : search.k < 0
 	                                           ? "every path"
-	                                           : StringUtil::Format("first %lld per pair", static_cast<long long>(search.k)),
+	                                           : search.groups
+	                                               ? StringUtil::Format("the %lld shortest lengths per pair",
+	                                                                    static_cast<long long>(search.k))
+	                                               : StringUtil::Format("first %lld per pair", static_cast<long long>(search.k)),
 	                                       search.mode, static_cast<long long>(search.quantifier->lower),
 	                                       static_cast<long long>(search.quantifier->upper));
 	diagnostic.edge_label_sequence = edge.label.empty() ? "*" : edge.label;
 	RecordRewriteDiagnostic(context, std::move(diagnostic));
+}
+
+//! A pattern of one quantified edge between two vertices whose walks cross vertex tables (PGQUnionSpace), and how
+//! the native search answers it over one id space for all the tables.
+struct PGQUnionSpaceSearch {
+	bool applies = false;
+	PGQUnionSpace space;
+	PathElement *src = nullptr;
+	SubPath *src_wrapper = nullptr;
+	SubPath *quantifier = nullptr;
+	PathElement *edge = nullptr;
+	PathElement *dst = nullptr;
+	SubPath *dst_wrapper = nullptr;
+	//! The path variable, when the pattern names its path
+	string path_variable;
+	int64_t k = -1;
+	bool all_shortest = false;
+	bool groups = false;
+	string mode = "acyclic";
+};
+
+static PGQUnionSpaceSearch UnionSpaceSearchFor(PathPattern &pattern, CreatePropertyGraphInfo &graph) {
+	PGQUnionSpaceSearch search;
+	vector<unique_ptr<PathReference>> *elements = &pattern.path_elements;
+	PGQPathMode mode = PGQPathMode::NONE;
+	if (elements->size() == 1) {
+		auto *wrapper = PGQMatchFunction::GetSubPath((*elements)[0]);
+		if (wrapper && wrapper->path_list.size() > 1 && !wrapper->quantified_group) {
+			mode = wrapper->path_mode;
+			search.path_variable = wrapper->path_variable;
+			elements = &wrapper->path_list;
+		}
+	}
+	if (elements->size() != 3) {
+		return search;
+	}
+	search.quantifier = PGQMatchFunction::GetSubPath((*elements)[1]);
+	if (!search.quantifier || search.quantifier->quantified_group || search.quantifier->path_list.size() != 1 ||
+	    (search.quantifier->lower == 1 && search.quantifier->upper == 1)) {
+		return search;
+	}
+	search.edge = PGQMatchFunction::GetPathElement(search.quantifier->path_list[0]);
+	if (!search.edge || !LabelsRegistered(search.edge->label, graph)) {
+		return search;
+	}
+	search.space = UnionSpaceFor(*search.edge, graph);
+	if (!search.space.applies) {
+		return search;
+	}
+	search.src = NativeSearchVertex((*elements)[0], search.src_wrapper);
+	search.dst = NativeSearchVertex((*elements)[2], search.dst_wrapper);
+	if (!search.src || !search.dst) {
+		return search;
+	}
+	if (pattern.cheapest || search.quantifier->cost_expr) {
+		throw NotImplementedException("CHEAPEST over a quantified edge whose walks cross vertex tables is not supported");
+	}
+	if (search.quantifier->where_clause) {
+		throw NotImplementedException("A quantified edge whose walks cross vertex tables cannot have an element WHERE");
+	}
+	if (search.quantifier->path_mode != PGQPathMode::NONE) {
+		mode = search.quantifier->path_mode;
+	}
+	if (pattern.topk > 0) {
+		search.k = pattern.topk;
+		search.groups = pattern.group;
+		search.mode = PathModeName(mode);
+	} else if (pattern.shortest) {
+		search.k = 1;
+		search.all_shortest = pattern.all;
+		search.mode = PathModeName(mode);
+	} else {
+		// Without a selector a walk visits no vertex twice, as on every other route.
+		search.k = -1;
+		search.mode = "acyclic";
+	}
+	search.applies = true;
+	return search;
+}
+
+//! The table of an endpoint of a union-space search: its label's one table. A vertex the label leaves to several
+//! tables is answered per table (the guard sends it to BuildTableSplitNode).
+static shared_ptr<PropertyGraphTable> UnionSpaceEndTable(const PathElement &vertex, const PGQUnionSpace &space,
+                                                         CreatePropertyGraphInfo &graph) {
+	CheckTableSplitGuard(vertex);
+	shared_ptr<PropertyGraphTable> result;
+	for (auto &table : space.vertex_tables) {
+		if (LabelOnTable(vertex.label, *table, graph).truth == PGQLabelTruth::NO) {
+			continue;
+		}
+		if (result) {
+			throw BinderException("Vertex '%s' at the end of a quantified edge over several vertex tables can be of "
+			                      "more than one table; give it a label",
+			                      vertex.variable_binding);
+		}
+		result = table;
+	}
+	return result;
+}
+
+//! Sets up the search over one id space for a union-space pattern: a table's rows take the ids from its offset on
+//! (__pgq_union_space holds the offsets), the steps of every edge table its label selects form one CSR, and the
+//! paths found are read back per table (pgq_union_path_rowids / _labels) into "shortest_path_cte" (path, src_rowid,
+//! dst_rowid, __pgq_vertex_labels, __pgq_edge_labels), joined to both endpoints. ProcessPathList then binds the
+//! vertices and the path functions with csr_slot.path_search_premade set.
+static void AddUnionPathSearch(ClientContext &context, const PGQUnionSpaceSearch &search, MatchExpression &ref,
+                               CreatePropertyGraphInfo &pg_table, unique_ptr<SelectNode> &select_node,
+                               vector<unique_ptr<ParsedExpression>> &conditions, PGQCSRSlot &csr_slot) {
+	auto &space = search.space;
+	auto src_table = UnionSpaceEndTable(*search.src, space, pg_table);
+	auto dst_table = UnionSpaceEndTable(*search.dst, space, pg_table);
+	if (!src_table || !dst_table) {
+		// An end no edge table reaches: only zero hops could bind it, to itself.
+		throw NotImplementedException("A quantified edge over several vertex tables needs its two ends to be vertices "
+		                              "its edge tables reach");
+	}
+	auto table_name = [](const PropertyGraphTable &table) {
+		return QualifiedTableName(PGQStr(table.catalog_name), PGQStr(table.schema_name), PGQStr(table.table_name));
+	};
+	auto vertex_index = [&](const PropertyGraphTable &table) {
+		for (idx_t i = 0; i < space.vertex_tables.size(); i++) {
+			if (space.vertex_tables[i]->SameTableIdentity(table)) {
+				return i;
+			}
+		}
+		throw InternalException("AddUnionPathSearch: a vertex table outside the id space");
+	};
+	// The offsets: v<i> / e<j> where table i / j starts, v<n> / e<m> the totals.
+	vector<string> offset_columns;
+	auto add_offsets = [&](const char *prefix, const vector<shared_ptr<PropertyGraphTable>> &tables) {
+		string sum = "0";
+		for (idx_t i = 0; i <= tables.size(); i++) {
+			offset_columns.push_back(StringUtil::Format("CAST(%s AS BIGINT) AS %s%llu", sum, prefix,
+			                                            static_cast<unsigned long long>(i)));
+			if (i < tables.size()) {
+				sum += StringUtil::Format(" + (SELECT coalesce(max(__t.rowid) + 1, 0) FROM %s __t)",
+				                          table_name(*tables[i]));
+			}
+		}
+	};
+	add_offsets("v", space.vertex_tables);
+	add_offsets("e", space.edge_tables);
+	const string offsets_cte = "__pgq_union_space_" + std::to_string(select_node->cte_map.map.size());
+	auto offsets_info = make_uniq<CommonTableExpressionInfo>();
+	offsets_info->query_node =
+	    std::move(ParseSelectStatement("SELECT " + StringUtil::Join(offset_columns, ", "))->node);
+	offsets_info->materialized = CTEMaterialize::CTE_MATERIALIZE_ALWAYS;
+	select_node->cte_map.map[Identifier(offsets_cte)] = std::move(offsets_info);
+
+	// Every step of every edge table, in the pattern's direction, as ids of the space.
+	vector<string> steps;
+	for (idx_t j = 0; j < space.edge_tables.size(); j++) {
+		auto &edge_table = *space.edge_tables[j];
+		const auto from = vertex_index(*edge_table.source_pg_table);
+		const auto to = vertex_index(*edge_table.destination_pg_table);
+		auto label = space.edge_labels[j].truth == PGQLabelTruth::ROW
+		                 ? BuildLabelExprCond(space.edge_labels[j].residual, space.edge_tables[j], "__e",
+		                                      PGQStr(edge_table.table_name))
+		                 : nullptr;
+		const string stored = StringUtil::Format(
+		    " FROM %s __e JOIN %s __a ON __a.%s = __e.%s JOIN %s __b ON __b.%s = __e.%s, %s __o WHERE %s",
+		    table_name(edge_table), table_name(*edge_table.source_pg_table),
+		    KeywordHelper::WriteOptionallyQuoted(PGQStr(edge_table.source_pk[0])),
+		    KeywordHelper::WriteOptionallyQuoted(PGQStr(edge_table.source_fk[0])),
+		    table_name(*edge_table.destination_pg_table),
+		    KeywordHelper::WriteOptionallyQuoted(PGQStr(edge_table.destination_pk[0])),
+		    KeywordHelper::WriteOptionallyQuoted(PGQStr(edge_table.destination_fk[0])), offsets_cte,
+		    label ? label->ToString() : "true");
+		const string forward = StringUtil::Format(
+		    "SELECT __o.v%llu + __a.rowid AS src_rowid, __o.v%llu + __b.rowid AS dst_rowid, __o.e%llu + __e.rowid AS "
+		    "edge_rowid",
+		    static_cast<unsigned long long>(from), static_cast<unsigned long long>(to), static_cast<unsigned long long>(j));
+		const string backward = StringUtil::Format(
+		    "SELECT __o.v%llu + __b.rowid AS src_rowid, __o.v%llu + __a.rowid AS dst_rowid, __o.e%llu + __e.rowid AS "
+		    "edge_rowid",
+		    static_cast<unsigned long long>(to), static_cast<unsigned long long>(from), static_cast<unsigned long long>(j));
+		switch (search.edge->match_type) {
+		case PGQMatchType::MATCH_EDGE_RIGHT:
+			steps.push_back(forward + stored);
+			break;
+		case PGQMatchType::MATCH_EDGE_LEFT:
+			steps.push_back(backward + stored);
+			break;
+		default:
+			// Both ways, a self-loop once.
+			steps.push_back(forward + stored);
+			steps.push_back(backward + stored + (from == to ? " AND __a.rowid <> __b.rowid" : ""));
+			break;
+		}
+	}
+	const string step_sql = StringUtil::Join(steps, " UNION ALL ");
+	vector<string> vertex_ids;
+	for (idx_t i = 0; i < space.vertex_tables.size(); i++) {
+		vertex_ids.push_back(StringUtil::Format("SELECT __o.v%llu + __t.rowid AS dense_id FROM %s __t, %s __o",
+		                                        static_cast<unsigned long long>(i), table_name(*space.vertex_tables[i]),
+		                                        offsets_cte));
+	}
+	const string v_size = StringUtil::Format("(SELECT v%llu FROM %s)",
+	                                         static_cast<unsigned long long>(space.vertex_tables.size()), offsets_cte);
+	vector<string> labels;
+	for (auto &edge_label : space.edge_labels) {
+		labels.push_back(edge_label.truth == PGQLabelTruth::ROW ? edge_label.residual : "*");
+	}
+	ClaimCSRSlot(csr_slot,
+	             "union|" + StringUtil::Join(labels, ",") + "|" + std::to_string(static_cast<int>(search.edge->match_type)),
+	             CSRIdCounter(context));
+	const string csr_cte = "__pgq_union_csr_" + std::to_string(select_node->cte_map.map.size());
+	auto csr_info = make_uniq<CommonTableExpressionInfo>();
+	csr_info->query_node = std::move(
+	    ParseSelectStatement(StringUtil::Format(
+	                             "SELECT create_csr_edge(%d, %s, CAST((SELECT sum(create_csr_vertex(%d, %s, __sub.dense_id, "
+	                             "__sub.cnt)) FROM (SELECT __v.dense_id, count(__s.src_rowid) AS cnt FROM (%s) __v LEFT "
+	                             "JOIN (%s) __s ON __s.src_rowid = __v.dense_id GROUP BY __v.dense_id) __sub) AS BIGINT), "
+	                             "(SELECT count(*) FROM (%s) __c), __s.src_rowid, __s.dst_rowid, __s.edge_rowid) AS temp "
+	                             "FROM (%s) __s",
+	                             csr_slot.slot, v_size, csr_slot.slot, v_size, StringUtil::Join(vertex_ids, " UNION ALL "),
+	                             step_sql, step_sql, step_sql))
+	        ->node);
+	select_node->cte_map.map[Identifier(csr_cte)] = std::move(csr_info);
+
+	// The search, from the sources the MATCH WHERE admits to the destinations it admits.
+	const string &src = search.src->variable_binding;
+	const string &dst = search.dst->variable_binding;
+	auto seed = [&](const string &binding, SubPath *wrapper) -> string {
+		vector<string> parts;
+		if (wrapper && wrapper->where_clause) {
+			parts.push_back("(" + wrapper->where_clause->ToString() + ")");
+		}
+		if (ref.where_clause) {
+			if (auto pushed = ExtractSrcFilter(*ref.where_clause, binding)) {
+				parts.push_back("(" + pushed->ToString() + ")");
+			}
+		}
+		return StringUtil::Join(parts, " AND ");
+	};
+	const string src_seed = seed(src, search.src_wrapper);
+	const string dst_seed = seed(dst, search.dst_wrapper);
+	const string q_src = KeywordHelper::WriteOptionallyQuoted(src);
+	const string q_dst = KeywordHelper::WriteOptionallyQuoted(dst);
+	const auto src_index = vertex_index(*src_table);
+	const auto dst_index = vertex_index(*dst_table);
+	const string destinations =
+	    dst_seed.empty()
+	        ? "NULL::BIGINT[]"
+	        : StringUtil::Format("(SELECT list(__o2.v%llu + %s.rowid) FROM %s AS %s, %s __o2 WHERE %s)",
+	                             static_cast<unsigned long long>(dst_index), q_dst, table_name(*dst_table), q_dst,
+	                             offsets_cte, dst_seed);
+	const string paths_cte = "__pgq_paths_" + std::to_string(select_node->cte_map.map.size());
+	const string selector = search.all_shortest ? "all_shortest" : search.groups ? "groups" : "k";
+	const string search_sql = StringUtil::Format(
+	    "SELECT %s.rowid AS src_rowid, unnest(pgq_shortest_k_paths(%d, %s, __o.v%llu + %s.rowid, %s, %lld, %lld, %lld, "
+	    "'%s', '%s', %lld, __x.temp)) AS __found FROM %s AS %s, %s __o, (SELECT 0 * count(%s.temp) AS temp FROM %s) AS "
+	    "__x%s",
+	    q_src, csr_slot.slot, v_size, static_cast<unsigned long long>(src_index), q_src, destinations,
+	    static_cast<long long>(search.k), static_cast<long long>(search.quantifier->lower),
+	    static_cast<long long>(search.quantifier->upper), search.mode, selector,
+	    static_cast<long long>(MaxVLFallbackRows(context)), table_name(*src_table), q_src, offsets_cte, csr_cte, csr_cte,
+	    src_seed.empty() ? "" : " WHERE " + src_seed);
+	auto search_info = make_uniq<CommonTableExpressionInfo>();
+	search_info->query_node = std::move(ParseSelectStatement(search_sql)->node);
+	select_node->cte_map.map[Identifier(paths_cte)] = std::move(search_info);
+
+	auto offsets_list = [&](const char *prefix, idx_t count) {
+		vector<string> items;
+		for (idx_t i = 0; i <= count; i++) {
+			items.push_back(StringUtil::Format("__o.%s%llu", prefix, static_cast<unsigned long long>(i)));
+		}
+		return "[" + StringUtil::Join(items, ", ") + "]";
+	};
+	auto label_list = [](const vector<shared_ptr<PropertyGraphTable>> &tables) {
+		vector<string> items;
+		for (auto &table : tables) {
+			items.push_back(KeywordHelper::WriteQuoted(PGQStr(table->main_label), '\''));
+		}
+		return "[" + StringUtil::Join(items, ", ") + "]";
+	};
+	const string vo = offsets_list("v", space.vertex_tables.size());
+	const string eo = offsets_list("e", space.edge_tables.size());
+	auto path_info = make_uniq<CommonTableExpressionInfo>();
+	path_info->query_node = std::move(
+	    ParseSelectStatement(
+	        StringUtil::Format(
+	            "SELECT pgq_union_path_rowids(__found.path, %s, %s) AS path, src_rowid, __found.dst - __o.v%llu AS "
+	            "dst_rowid, pgq_union_path_labels(__found.path, %s, %s, %s, true) AS __pgq_vertex_labels, "
+	            "pgq_union_path_labels(__found.path, %s, %s, %s, false) AS __pgq_edge_labels FROM %s, %s __o WHERE "
+	            "__found.dst >= __o.v%llu AND __found.dst < __o.v%llu",
+	            vo, eo, static_cast<unsigned long long>(dst_index), vo, eo, label_list(space.vertex_tables), vo, eo,
+	            label_list(space.edge_tables), KeywordHelper::WriteOptionallyQuoted(paths_cte), offsets_cte,
+	            static_cast<unsigned long long>(dst_index), static_cast<unsigned long long>(dst_index + 1)))
+	        ->node);
+	path_info->materialized = CTEMaterialize::CTE_MATERIALIZE_ALWAYS;
+	select_node->cte_map.map["shortest_path_cte"] = std::move(path_info);
+
+	auto path_ref = make_uniq<BaseTableRef>();
+	path_ref->SetTable(Identifier("shortest_path_cte"));
+	if (select_node->from_table) {
+		auto join = make_uniq<JoinRef>(JoinRefType::CROSS);
+		join->left = std::move(select_node->from_table);
+		join->right = std::move(path_ref);
+		select_node->from_table = std::move(join);
+	} else {
+		select_node->from_table = std::move(path_ref);
+	}
+	conditions.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+	                                                     PGQColRef("src_rowid", "shortest_path_cte"),
+	                                                     PGQColRef("rowid", src)));
+	conditions.push_back(make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
+	                                                     PGQColRef("dst_rowid", "shortest_path_cte"),
+	                                                     PGQColRef("rowid", dst)));
+	// The ends' labels, for the binding of the vertices: the one table each.
+	search.src->label = PGQStr(src_table->main_label);
+	search.dst->label = PGQStr(dst_table->main_label);
+
+	PGQRewriteDiagnostic diagnostic;
+	diagnostic.graph_name = pg_table.property_graph_name;
+	diagnostic.rewrite_type = "path_search";
+	diagnostic.status = "traversal";
+	diagnostic.reason = StringUtil::Format(
+	    "native path search over %llu edge tables and %llu vertex tables: %s, %s, steps %lld..%lld",
+	    static_cast<unsigned long long>(space.edge_tables.size()),
+	    static_cast<unsigned long long>(space.vertex_tables.size()),
+	    search.all_shortest ? "all shortest"
+	    : search.k < 0      ? "every path"
+	    : search.groups     ? StringUtil::Format("the %lld shortest lengths per pair", static_cast<long long>(search.k))
+	                        : StringUtil::Format("first %lld per pair", static_cast<long long>(search.k)),
+	    search.mode, static_cast<long long>(search.quantifier->lower), static_cast<long long>(search.quantifier->upper));
+	diagnostic.edge_label_sequence = search.edge->label.empty() ? "*" : search.edge->label;
+	RecordRewriteDiagnostic(context, std::move(diagnostic));
+}
+
+//! vertex_labels(p) / edge_labels(p) of the path a union-space search answers: the labels it read back per row.
+static unique_ptr<ParsedExpression> UnionSpaceLabelColumns(unique_ptr<ParsedExpression> expression,
+                                                           const string &path_variable) {
+	if (!expression) {
+		return expression;
+	}
+	for (const char *name : {"vertex_labels", "edge_labels"}) {
+		if (IsPathFunctionOn(*expression, path_variable, name)) {
+			auto column = PGQColRef(StringUtil::CIEquals(name, "vertex_labels") ? "__pgq_vertex_labels"
+			                                                                  : "__pgq_edge_labels",
+			                        "shortest_path_cte");
+			column->SetAlias(expression->HasAlias() ? expression->GetAlias() : Identifier(expression->GetName()));
+			return std::move(column);
+		}
+	}
+	if (expression->GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		return expression;
+	}
+	ParsedExpressionIterator::EnumerateChildren(*expression, [&](unique_ptr<ParsedExpression> &child) {
+		child = UnionSpaceLabelColumns(std::move(child), path_variable);
+	});
+	return expression;
 }
 
 //! Sets up the search by cost for a CHEAPEST pattern `search` (NativePathSearchFor's `cheapest`): the costed step CSR
@@ -17203,6 +18938,9 @@ static void AddNativePathSearch(ClientContext &context, const PGQNativePathSearc
 static void AddCheapestPathSearch(ClientContext &context, const PGQNativePathSearch &search, MatchExpression &ref,
                                   CreatePropertyGraphInfo &pg_table, unique_ptr<SelectNode> &select_node,
                                   vector<unique_ptr<ParsedExpression>> &conditions, PGQCSRSlot &csr_slot) {
+	CheckTableSplitGuard(*search.src);
+	CheckTableSplitGuard(*search.edge);
+	CheckTableSplitGuard(*search.dst);
 	auto &edge = *search.edge;
 	auto &quantifier = *search.quantifier;
 	shared_ptr<PropertyGraphTable> edge_table;
@@ -17574,6 +19312,39 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 			    "(e.g. -[e:Label COST e.weight]->). Without a cost the request is undefined; use SHORTEST.");
 		}
 		FoldStaticPathFunctions(*ref, path_pattern->path_elements, *pg_table);
+		// A quantified edge whose walks cross vertex tables: the artifacts as written first (an expansion over several
+		// edge labels), else the search over one id space for all its tables.
+		auto union_search = UnionSpaceSearchFor(*path_pattern, *pg_table);
+		if (union_search.applies) {
+			if (allow_abi &&
+			    TryPathTableRewrite(context, *pg_table, path_pattern->path_elements, *ref, conditions, final_select_node,
+			                        alias_map, extra_alias_counter, path_table_cache, referenced_bindings,
+			                        covered_columns, ref->one_row_per, ref->where_clause.get(),
+			                        PatternSelector(*path_pattern))) {
+				continue;
+			}
+			if (ref->one_row_per != OneRowPerMode::NONE) {
+				throw NotImplementedException("ONE ROW PER over a compound edge label ('%s') is not yet supported when its "
+				                              "walks cross vertex tables",
+				                              union_search.edge->label);
+			}
+			if (require_abi_paths) {
+				ThrowABIPathRequired();
+			}
+			if (!union_search.path_variable.empty()) {
+				for (auto &column : ref->column_list) {
+					column = UnionSpaceLabelColumns(std::move(column), union_search.path_variable);
+				}
+				ref->where_clause = UnionSpaceLabelColumns(std::move(ref->where_clause), union_search.path_variable);
+			}
+			AddUnionPathSearch(context, union_search, *ref, *pg_table, final_select_node, conditions, cte1_slot);
+			cte1_slot.path_search_premade = true;
+			ProcessPathList(context, path_pattern->path_elements, conditions, final_select_node, alias_map, *pg_table,
+			                extra_alias_counter, *ref, CSRIdCounter(context), cte1_slot, true, false, nullptr,
+			                MaxVLFallbackRows(context));
+			cte1_slot.path_search_premade = false;
+			continue;
+		}
 		auto fixed_selection = SelectorOverFixedPattern(*path_pattern, *ref);
 		if (fixed_selection.applies) {
 			// The selection reads every element's row: traversed (no artifact keeps the parallel edges apart).
@@ -17713,7 +19484,7 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 		}
 		ProcessOptionalPathList(context, opt_group, final_select_node, optional_alias_map, *pg_table, extra_alias_counter, alias_map,
 		                        path_table_cache, require_abi_paths, ref->where_clause.get(), optional_counts_exactly,
-		                        endpoints_complete);
+		                        endpoints_complete, &referenced_bindings);
 	}
 
 	// Maps from table alias to table, including vertex and edge tables.
@@ -17722,6 +19493,16 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 	// Merge optional aliases so column binding and function rewriting cover them too.
 	for (auto &entry : optional_alias_map) {
 		alias_to_vertex_and_edge_tables.emplace(entry.first, entry.second);
+	}
+	PGQElementScope element_scope;
+	element_scope.tables = &alias_to_vertex_and_edge_tables;
+	element_scope.stubs = &stub_bindings;
+	element_scope.graph = pg_table;
+	CollectEdgeEnds(*ref, element_scope);
+	for (auto &entry : optional_alias_map) {
+		if (alias_map.find(entry.first) == alias_map.end()) {
+			element_scope.optional.insert(entry.first);
+		}
 	}
 
 	// ONE ROW PER: replace the from_clause and conditions with step-unnested equivalents.
@@ -17754,8 +19535,7 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 			if (!wraps_orp_path_source) {
 				auto cte_filter = ExtractSafeCTEConjuncts(*ref->where_clause);
 				if (cte_filter) {
-					cte_filter = RewriteAllDifferent(std::move(cte_filter));
-					cte_filter = RewriteGraphFunctions(std::move(cte_filter), alias_to_vertex_and_edge_tables);
+					cte_filter = RewriteElementFunctions(std::move(cte_filter), element_scope);
 					if (inner_sel) {
 						if (inner_sel->where_clause) {
 							inner_sel->where_clause = make_uniq<ConjunctionExpression>(
@@ -17792,9 +19572,12 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 		// Rewrite PGQ EXISTS/NOT EXISTS predicates first, then standard rewrites.
 		ref->where_clause = RewritePGQExists(std::move(ref->where_clause), context, *pg_table, alias_map,
 		                                      path_table_cache);
-		auto where = RewriteAllDifferent(std::move(ref->where_clause));
-		where = RewriteGraphFunctions(std::move(where), alias_to_vertex_and_edge_tables);
-		conditions.push_back(std::move(where));
+		conditions.push_back(std::move(ref->where_clause));
+	}
+	// Element functions in the MATCH WHERE and in the element WHEREs the translation moved into the conditions.
+	CollectUndirectedEdgeBindings(final_select_node->from_table.get(), element_scope.undirected_edges);
+	for (auto &condition : conditions) {
+		condition = RewriteElementFunctions(std::move(condition), element_scope);
 	}
 
 	// A UNION branch either has its own COLUMNS or shares the head's: deep-copy the shared list for each branch before
@@ -17815,7 +19598,7 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 		final_select_node->qualify = CreateWhereClause(selection_qualify);
 	}
 	final_select_node->select_list =
-	    BuildFinalColumnList(std::move(ref->column_list), alias_to_vertex_and_edge_tables, stub_bindings);
+	    BuildFinalColumnList(std::move(ref->column_list), alias_to_vertex_and_edge_tables, element_scope);
 	PGQEliminateVertexJoins(context, *final_select_node, vertex_joins, alias_map);
 
 	if (ref->union_matches.empty()) {
@@ -17949,13 +19732,23 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 			}
 			ProcessOptionalPathList(context, opt_group, branch_select, branch_opt_alias_map, *pg_table, branch_counter,
 			                        branch_alias_map, path_table_cache, require_abi_paths, branch.where_clause.get(),
-			                        optional_counts_exactly, endpoints_complete);
+			                        optional_counts_exactly, endpoints_complete, &branch_referenced_bindings);
 		}
 
 		case_insensitive_set_t branch_stub_bindings;
 		auto branch_alias_to_ve = PopulateGraphTableAliasMap(*pg_table, branch, &branch_stub_bindings);
 		for (auto &entry : branch_opt_alias_map) {
 			branch_alias_to_ve.emplace(entry.first, entry.second);
+		}
+		PGQElementScope branch_scope;
+		branch_scope.tables = &branch_alias_to_ve;
+		branch_scope.stubs = &branch_stub_bindings;
+		branch_scope.graph = pg_table;
+		CollectEdgeEnds(branch, branch_scope);
+		for (auto &entry : branch_opt_alias_map) {
+			if (branch_alias_map.find(entry.first) == branch_alias_map.end()) {
+				branch_scope.optional.insert(entry.first);
+			}
 		}
 
 		if (branch.one_row_per != OneRowPerMode::NONE) {
@@ -17980,9 +19773,11 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 		if (branch.where_clause) {
 			branch.where_clause = RewritePGQExists(std::move(branch.where_clause), context, *pg_table,
 			                                       branch_alias_map, path_table_cache);
-			auto where = RewriteAllDifferent(std::move(branch.where_clause));
-			where = RewriteGraphFunctions(std::move(where), branch_alias_to_ve);
-			branch_conditions.push_back(std::move(where));
+			branch_conditions.push_back(std::move(branch.where_clause));
+		}
+		CollectUndirectedEdgeBindings(branch_select->from_table.get(), branch_scope.undirected_edges);
+		for (auto &condition : branch_conditions) {
+			condition = RewriteElementFunctions(std::move(condition), branch_scope);
 		}
 
 		if (own_columns) {
@@ -17993,7 +19788,7 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 			branch_select->qualify = CreateWhereClause(branch_selection_qualify);
 		}
 		branch_select->select_list =
-		    BuildFinalColumnList(std::move(branch_columns), branch_alias_to_ve, branch_stub_bindings);
+		    BuildFinalColumnList(std::move(branch_columns), branch_alias_to_ve, branch_scope);
 		// Branches are combined by position, as in SQL. A star expands at bind time; DuckDB reports a mismatch there.
 		if (own_columns && !head_has_star && !HasStarExpression(branch_select->select_list) &&
 		    branch_select->select_list.size() != head_column_count) {

@@ -20,7 +20,10 @@ public:
 	bool all = false;
 	bool shortest = false;
 	bool cheapest = false;
+	//! SHORTEST k GROUP(S): every path of the k shortest lengths (k in topk).
 	bool group = false;
+	//! ANY k: k paths per pair (k in topk), answered as SHORTEST k answers them.
+	bool any = false;
 	int32_t topk = false;
 	//! Path pattern union `A | B` (set semantics) or multiset alternation `A |+| B`: the operands after the first,
 	//! which is path_elements. Empty for an ordinary path pattern.

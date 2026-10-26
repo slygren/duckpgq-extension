@@ -1,0 +1,240 @@
+# name: test/sql/pattern_matching/source_destination.test
+# description: a IS [NOT] SOURCE OF e and b IS [NOT] DESTINATION OF e (SQL/PGQ). Every edge has a source (the vertex
+#              its SOURCE KEY references) and a destination, whatever direction the pattern reads it in. Each answer
+#              is compared with the same question asked of the edge table's keys, in every direction, for a vertex
+#              next to the edge or anywhere in the MATCH, under OPTIONAL MATCH (NULL), in COLUMNS, in an element
+#              WHERE, an EXISTS pattern and a path pattern union; traversed and with ABI artifacts built.
+# group: [pattern_matching]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE P(id BIGINT PRIMARY KEY, name VARCHAR);
+
+statement ok
+INSERT INTO P VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e');
+
+statement ok
+CREATE TABLE C(cid BIGINT PRIMARY KEY, title VARCHAR);
+
+statement ok
+INSERT INTO C VALUES (1, 'x'), (2, 'y');
+
+# parallel edges 1->2, a reciprocal pair 1<->2, a self-loop on 5
+statement ok
+CREATE TABLE K(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO K VALUES (1, 2), (1, 2), (2, 3), (1, 3), (3, 4), (2, 4), (4, 1), (2, 1), (3, 5), (5, 5);
+
+statement ok
+CREATE TABLE L(pid BIGINT, cid BIGINT);
+
+statement ok
+INSERT INTO L VALUES (1, 1), (2, 2), (3, 1);
+
+statement ok
+CREATE PROPERTY GRAPH g
+VERTEX TABLES (P LABEL Person, C LABEL Course)
+EDGE TABLES (K SOURCE KEY (src) REFERENCES P (id) DESTINATION KEY (dst) REFERENCES P (id) LABEL Knows,
+             L SOURCE KEY (pid) REFERENCES P (id) DESTINATION KEY (cid) REFERENCES C (cid) LABEL Takes);
+
+# The reference: every way to read each edge, with whether a / b is its source / destination by key.
+statement ok
+CREATE TABLE ref_k AS
+SELECT src AS a, dst AS b, rowid AS e, true AS a_src, true AS b_dst, src = dst AS b_src, src = dst AS a_dst, 0 AS rev FROM K
+UNION ALL
+SELECT dst, src, rowid, false, false, true, true, 1 FROM K WHERE src <> dst;
+
+# --- traversed (and again below with ABI artifacts)
+
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+loop pass 0 2
+
+# undirected: the edge read both ways, the predicate tells which
+statement ok
+CREATE OR REPLACE TABLE r AS FROM GRAPH_TABLE (g MATCH (a:Person)-[e:Knows]-(b:Person) WHERE a IS SOURCE OF e
+                                                COLUMNS (a.id AS a, b.id AS b, element_id(e) AS e));
+
+query I
+SELECT count(*) FROM ((FROM r EXCEPT ALL SELECT a, b, e FROM ref_k WHERE a_src) UNION ALL (SELECT a, b, e FROM ref_k WHERE a_src EXCEPT ALL FROM r));
+----
+0
+
+# ... and it gives the directed pattern's rows
+query I
+SELECT count(*) FROM r;
+----
+10
+
+statement ok
+CREATE OR REPLACE TABLE r AS FROM GRAPH_TABLE (g MATCH (a:Person)-[e:Knows]-(b:Person) WHERE b IS NOT DESTINATION OF e
+                                                COLUMNS (a.id AS a, b.id AS b, element_id(e) AS e));
+
+query I
+SELECT count(*) FROM ((FROM r EXCEPT ALL SELECT a, b, e FROM ref_k WHERE NOT b_dst) UNION ALL (SELECT a, b, e FROM ref_k WHERE NOT b_dst EXCEPT ALL FROM r));
+----
+0
+
+# every combination as columns, undirected
+statement ok
+CREATE OR REPLACE TABLE r AS FROM GRAPH_TABLE (g MATCH (a:Person)-[e:Knows]-(b:Person)
+    COLUMNS (a.id AS a, b.id AS b, element_id(e) AS e, a IS SOURCE OF e AS a_src, b IS DESTINATION OF e AS b_dst,
+             b IS SOURCE OF e AS b_src, a IS DESTINATION OF e AS a_dst));
+
+query I
+SELECT count(*) FROM ((FROM r EXCEPT ALL SELECT a, b, e, a_src, b_dst, b_src, a_dst FROM ref_k)
+                      UNION ALL (SELECT a, b, e, a_src, b_dst, b_src, a_dst FROM ref_k EXCEPT ALL FROM r));
+----
+0
+
+# directed both ways: the pattern's direction decides
+query IIII
+FROM GRAPH_TABLE (g MATCH (a:Person)-[e:Knows]->(b:Person)
+    COLUMNS (count(*) FILTER (WHERE a IS SOURCE OF e) AS a1, count(*) FILTER (WHERE b IS DESTINATION OF e) AS b1,
+             count(*) FILTER (WHERE b IS SOURCE OF e) AS b2, count(*) FILTER (WHERE a IS NOT DESTINATION OF e) AS a2));
+----
+10	10	1	9
+
+query IIII
+FROM GRAPH_TABLE (g MATCH (a:Person)<-[e:Knows]-(b:Person)
+    COLUMNS (count(*) FILTER (WHERE a IS SOURCE OF e) AS a1, count(*) FILTER (WHERE b IS DESTINATION OF e) AS b1,
+             count(*) FILTER (WHERE b IS SOURCE OF e) AS b2, count(*) FILTER (WHERE a IS DESTINATION OF e) AS a2));
+----
+1	1	10	10
+
+# a vertex that is not next to the edge: by identity
+statement ok
+CREATE OR REPLACE TABLE r AS FROM GRAPH_TABLE (g MATCH (x:Person), (a:Person)-[e:Knows]-(b:Person)
+                                                WHERE x IS SOURCE OF e AND x.id < 4 COLUMNS (x.id AS x, element_id(e) AS e));
+
+statement ok
+CREATE OR REPLACE TABLE ref_x AS SELECT src AS x, rowid AS e FROM K WHERE src < 4 UNION ALL SELECT src, rowid FROM K WHERE src < 4 AND src <> dst;
+
+query I
+SELECT count(*) FROM ((FROM r EXCEPT ALL FROM ref_x) UNION ALL (FROM ref_x EXCEPT ALL FROM r));
+----
+0
+
+# a two-hop chain: the middle vertex is the destination of one edge and the source of the next
+query I
+FROM GRAPH_TABLE (g MATCH (a:Person)-[e:Knows]-(b:Person)-[f:Knows]-(c:Person)
+                  WHERE b IS DESTINATION OF e AND b IS SOURCE OF f COLUMNS (count(*)));
+----
+20
+
+query I
+SELECT count(*) FROM K x JOIN K y ON y.src = x.dst;
+----
+20
+
+# between two vertex tables (the undirected edge reads the one direction that fits)
+query IIII
+FROM GRAPH_TABLE (g MATCH (a:Person)-[t:Takes]-(c:Course)
+                  COLUMNS (c.cid, a.id, a IS SOURCE OF t AS a_src, c IS SOURCE OF t AS c_src)) ORDER BY ALL;
+----
+1	1	true	false
+1	3	true	false
+2	2	true	false
+
+query IIII
+FROM GRAPH_TABLE (g MATCH (c:Course)<-[t:Takes]-(a:Person)
+                  COLUMNS (c.cid, a.id, c IS DESTINATION OF t AS c_dst, c IS NOT SOURCE OF t AS c_src)) ORDER BY ALL;
+----
+1	1	true	true
+1	3	true	true
+2	2	true	true
+
+# OPTIONAL MATCH: NULL where the edge is missing
+query III
+FROM GRAPH_TABLE (g MATCH (a:Person) OPTIONAL MATCH (a)-[t:Takes]->(c:Course)
+                  COLUMNS (a.id, a IS SOURCE OF t AS s, c IS NOT DESTINATION OF t AS d)) ORDER BY ALL;
+----
+1	true	false
+2	true	false
+3	true	false
+4	NULL	NULL
+5	NULL	NULL
+
+query I
+FROM GRAPH_TABLE (g MATCH (a:Person) OPTIONAL MATCH (a)-[e:Knows]-(b:Person) WHERE a IS SOURCE OF e AND b.id = 5
+                  COLUMNS (a.id)) ORDER BY ALL;
+----
+3
+5
+
+# in an element WHERE, an EXISTS pattern and a path pattern union
+query II
+FROM GRAPH_TABLE (g MATCH (a:Person WHERE a.id = 2)-[e:Knows WHERE a IS SOURCE OF e]-(b:Person) COLUMNS (a.id, b.id)) ORDER BY ALL;
+----
+2	1
+2	3
+2	4
+
+query I
+FROM GRAPH_TABLE (g MATCH (a:Person) WHERE EXISTS { (a)-[e:Knows]-(b:Person) WHERE b IS SOURCE OF e AND b.id = 5 }
+                  COLUMNS (a.id)) ORDER BY ALL;
+----
+5
+
+query II
+FROM GRAPH_TABLE (g MATCH (a:Person)-[e:Knows]-(b:Person) |+| (a:Person)-[e:Takes]-(b:Course)
+                  WHERE a IS DESTINATION OF e COLUMNS (a.id, element_id(e) AS e)) ORDER BY ALL;
+----
+1	6
+1	7
+2	0
+2	1
+3	2
+3	3
+4	4
+4	5
+5	8
+5	9
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('g', exclude_self_referential := false, max_hops := 2);
+
+endloop
+
+# --- refusals
+
+statement error
+FROM GRAPH_TABLE (g MATCH (a:Person)-[e:Knows]->(b:Person) WHERE e IS SOURCE OF a COLUMNS (a.id));
+----
+IS SOURCE OF: 'e' must be a vertex variable of the MATCH
+
+statement error
+FROM GRAPH_TABLE (g MATCH (a:Person)-[e:Knows]->(b:Person) WHERE a IS DESTINATION OF b COLUMNS (a.id));
+----
+IS DESTINATION OF: 'b' must be an edge variable of the MATCH
+
+statement error
+FROM GRAPH_TABLE (g MATCH (a:Person)-[e:Knows]->{1,2}(b:Person) WHERE a IS SOURCE OF e COLUMNS (a.id));
+----
+stands for a list of elements
+
+statement error
+SELECT x IS SOURCE OF y FROM (SELECT 1 AS x, 2 AS y);
+----
+only allowed inside a GRAPH_TABLE
+
+# --- the grammar: IS keeps every meaning it has in SQL
+
+query IIII
+SELECT x IS NOT NULL, x IS DISTINCT FROM 2, x IS NOT DISTINCT FROM 1, (x = 1) IS TRUE FROM (SELECT 1 AS x);
+----
+true	true	true	true
+
+query I
+SELECT source FROM (SELECT 3 AS source) WHERE source IS NOT NULL;
+----
+3

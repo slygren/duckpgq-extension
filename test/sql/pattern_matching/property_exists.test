@@ -1,0 +1,137 @@
+# name: test/sql/pattern_matching/property_exists.test
+# description: PROPERTY_EXISTS(a, p) (SQL/PGQ): whether element a has property p, as the graph declares it --
+#              PROPERTIES (...) names, an alias (c AS name) naming the property, ALL COLUMNS [EXCEPT ...], NO
+#              PROPERTIES, the default of all columns. A property no table of the graph has is an error (a typo is
+#              caught). NULL for an OPTIONAL element that matched nothing. Traversed and with ABI artifacts built.
+# group: [pattern_matching]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE P(id BIGINT PRIMARY KEY, name VARCHAR, age INTEGER);
+
+statement ok
+INSERT INTO P VALUES (1, 'a', 30), (2, 'b', 40), (3, 'c', 50);
+
+statement ok
+CREATE TABLE C(cid BIGINT PRIMARY KEY, title VARCHAR, credits INTEGER);
+
+statement ok
+INSERT INTO C VALUES (1, 'x', 5), (2, 'y', 6);
+
+statement ok
+CREATE TABLE R(rid BIGINT PRIMARY KEY, note VARCHAR);
+
+statement ok
+INSERT INTO R VALUES (1, 'r');
+
+statement ok
+CREATE TABLE K(src BIGINT, dst BIGINT, since INTEGER);
+
+statement ok
+INSERT INTO K VALUES (1, 2, 2000), (2, 3, 2001), (3, 1, 2002);
+
+statement ok
+CREATE TABLE L(pid BIGINT, cid BIGINT, grade VARCHAR);
+
+statement ok
+INSERT INTO L VALUES (1, 1, 'A'), (2, 2, 'B');
+
+statement ok
+CREATE PROPERTY GRAPH g
+VERTEX TABLES (P PROPERTIES ARE ALL COLUMNS EXCEPT (age) LABEL Person,
+               C PROPERTIES (cid, title AS name) LABEL Course,
+               R NO PROPERTIES LABEL Room)
+EDGE TABLES (K SOURCE KEY (src) REFERENCES P (id) DESTINATION KEY (dst) REFERENCES P (id) LABEL Knows,
+             L SOURCE KEY (pid) REFERENCES P (id) DESTINATION KEY (cid) REFERENCES C (cid) LABEL Takes);
+
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+loop pass 0 2
+
+query IIIII
+FROM GRAPH_TABLE (g MATCH (a:Person)-[t:Takes]->(c:Course) WHERE a.id = 1
+    COLUMNS (PROPERTY_EXISTS(a, name) AS a_name, PROPERTY_EXISTS(a, cid) AS a_cid, PROPERTY_EXISTS(c, name) AS c_name,
+             PROPERTY_EXISTS(c, since) AS c_since, PROPERTY_EXISTS(c, cid) AS c_cid));
+----
+true	false	true	false	true
+
+# edges, the default (all columns), a string literal, case-insensitive names
+query IIII
+FROM GRAPH_TABLE (g MATCH (a:Person)-[e:Knows]->(b:Person) WHERE a.id = 1
+    COLUMNS (PROPERTY_EXISTS(e, since) AS s, PROPERTY_EXISTS(e, 'grade') AS g, PROPERTY_EXISTS(e, SRC) AS src,
+             PROPERTY_EXISTS(b, ID) AS id));
+----
+true	false	true	true
+
+query II
+FROM GRAPH_TABLE (g MATCH (r:Room) COLUMNS (PROPERTY_EXISTS(r, id) AS id, PROPERTY_EXISTS(r, since) AS since));
+----
+false	false
+
+# in WHERE, nested
+query I
+FROM GRAPH_TABLE (g MATCH (a:Person)-[t:Takes]->(c:Course) WHERE PROPERTY_EXISTS(c, name) AND NOT PROPERTY_EXISTS(a, grade)
+                  COLUMNS (a.id)) ORDER BY ALL;
+----
+1
+2
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH (a:Person)-[t:Takes]->(c:Course) WHERE PROPERTY_EXISTS(t, since) COLUMNS (a.id));
+----
+0
+
+# OPTIONAL MATCH: NULL where the element is missing
+query II
+FROM GRAPH_TABLE (g MATCH (a:Person) OPTIONAL MATCH (a)-[t:Takes]->(c:Course)
+                  COLUMNS (a.id, PROPERTY_EXISTS(c, cid) AS p)) ORDER BY ALL;
+----
+1	true
+2	true
+3	NULL
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('g', exclude_self_referential := false, max_hops := 2);
+
+endloop
+
+# --- refusals
+
+statement error
+FROM GRAPH_TABLE (g MATCH (a:Person) WHERE PROPERTY_EXISTS(a, nmae) COLUMNS (a.id));
+----
+no vertex or edge table of property graph 'g' has a property 'nmae'
+
+# a column left out of every table's properties is no property of the graph, and neither is an aliased column's name
+statement error
+FROM GRAPH_TABLE (g MATCH (c:Course) WHERE PROPERTY_EXISTS(c, title) COLUMNS (c.cid));
+----
+no vertex or edge table of property graph 'g' has a property 'title'
+
+statement error
+FROM GRAPH_TABLE (g MATCH (a:Person) WHERE PROPERTY_EXISTS(a, age) COLUMNS (a.id));
+----
+no vertex or edge table of property graph 'g' has a property 'age'
+
+statement error
+FROM GRAPH_TABLE (g MATCH (a:Person) WHERE PROPERTY_EXISTS(x, name) COLUMNS (a.id));
+----
+PROPERTY_EXISTS: 'x' must be an element variable of the MATCH
+
+statement error
+FROM GRAPH_TABLE (g MATCH (a:Person) WHERE PROPERTY_EXISTS(a, a.name) COLUMNS (a.id));
+----
+the property must be a property name
+
+statement error
+SELECT property_exists(1, 2);
+----
+only allowed inside a GRAPH_TABLE

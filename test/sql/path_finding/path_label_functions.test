@@ -190,11 +190,18 @@ FROM GRAPH_TABLE (g MATCH p = (a:Person)-[:Knows]->(b:Person)-[:HasInterest]->(t
 1	Tag
 2	Tag
 
-# An edge that could be any of three tables has no single label: refuse rather than guess
-statement error
+# An edge that could be any of three tables: every one of them (SQL/PGQ), each row its own labels
+query T rowsort
 FROM GRAPH_TABLE (g MATCH p = (a:Person)-[]->(x) COLUMNS (vertex_labels(p)));
 ----
-ambiguous
+[Person, Org]
+[Person, Org]
+[Person, Person]
+[Person, Person]
+[Person, Person]
+[Person, Tag]
+[Person, Tag]
+[Person, Tag]
 
 # =====================================================================================================================
 # The same queries answered by ABI artifacts

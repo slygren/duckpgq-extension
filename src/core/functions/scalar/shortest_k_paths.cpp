@@ -20,7 +20,12 @@ namespace duckdb {
 // The paths from one source over a CSR whose rows are the steps of a quantified edge (CreateStepCSRCTE), for every
 // destination in `dsts` (NULL: every vertex), as interleaved [v0, e1, v1, ..., ek, vk] row ids:
 //   selector 'k':            the first k paths per destination (k < 0: every path; only under a path mode);
-//   selector 'all_shortest': every path of the destination's least length.
+//   selector 'all_shortest': every path of the destination's least length;
+//   selector 'groups':       every path of the destination's k least lengths (SHORTEST k GROUPS; 'all_shortest' is
+//                            k = 1).
+// Under walk semantics a vertex is expanded at its first k depths from `lower` on only, with every walk reaching it
+// there: a walk reaching it later ends no path of a destination's k least lengths, since the k earlier ones followed
+// by the same rest give that destination k shorter lengths within the bounds.
 // Paths have lower..upper steps and satisfy the mode:
 //   walk     any sequence of steps;
 //   trail    no edge row twice;
@@ -40,9 +45,10 @@ enum class PathSearchMode : uint8_t { WALK, TRAIL, ACYCLIC, SIMPLE };
 
 struct ShortestKPathsBindData : public FunctionData {
 	ShortestKPathsBindData(ClientContext &context, int32_t csr_id, int64_t k, int64_t lower, int64_t upper,
-	                       PathSearchMode mode, bool all_shortest, int64_t budget,
+	                       PathSearchMode mode, bool all_shortest, bool groups, int64_t budget,
 	                       shared_ptr<std::atomic<int64_t>> explored)
 	    : context(context), csr_id(csr_id), k(k), lower(lower), upper(upper), mode(mode), all_shortest(all_shortest),
+	      groups(groups),
 	      budget(budget), explored(std::move(explored)) {
 	}
 	ClientContext &context;
@@ -52,6 +58,8 @@ struct ShortestKPathsBindData : public FunctionData {
 	int64_t upper;
 	PathSearchMode mode;
 	bool all_shortest;
+	//! every path of the k least lengths per destination
+	bool groups;
 	int64_t budget;
 	//! Partial paths built so far by this query, shared by every thread evaluating the function.
 	shared_ptr<std::atomic<int64_t>> explored;
@@ -59,7 +67,7 @@ struct ShortestKPathsBindData : public FunctionData {
 	shared_ptr<std::atomic<idx_t>> explored_query = make_shared_ptr<std::atomic<idx_t>>(DConstants::INVALID_INDEX);
 
 	unique_ptr<FunctionData> Copy() const override {
-		auto copy = make_uniq<ShortestKPathsBindData>(context, csr_id, k, lower, upper, mode, all_shortest, budget,
+		auto copy = make_uniq<ShortestKPathsBindData>(context, csr_id, k, lower, upper, mode, all_shortest, groups, budget,
 		                                              explored);
 		copy->explored_query = explored_query;
 		return std::move(copy);
@@ -67,7 +75,8 @@ struct ShortestKPathsBindData : public FunctionData {
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<ShortestKPathsBindData>();
 		return csr_id == other.csr_id && k == other.k && lower == other.lower && upper == other.upper &&
-		       mode == other.mode && all_shortest == other.all_shortest && budget == other.budget;
+		       mode == other.mode && all_shortest == other.all_shortest && groups == other.groups &&
+		       budget == other.budget;
 	}
 };
 
@@ -101,10 +110,14 @@ static unique_ptr<FunctionData> ShortestKPathsBind(BindScalarFunctionInput &inpu
 	} else {
 		throw InvalidInputException("pgq_shortest_k_paths: unknown path mode '%s'", mode_name);
 	}
-	if (selector != "k" && selector != "all_shortest") {
+	if (selector != "k" && selector != "all_shortest" && selector != "groups") {
 		throw InvalidInputException("pgq_shortest_k_paths: unknown selector '%s'", selector);
 	}
 	const bool all_shortest = selector == "all_shortest";
+	const bool groups = selector == "groups";
+	if (groups && k <= 0) {
+		throw InvalidInputException("pgq_shortest_k_paths: the number of groups must be positive");
+	}
 	if (lower < 0 || upper < lower) {
 		throw InvalidInputException("pgq_shortest_k_paths: bounds %lld..%lld", static_cast<long long>(lower),
 		                            static_cast<long long>(upper));
@@ -116,7 +129,7 @@ static unique_ptr<FunctionData> ShortestKPathsBind(BindScalarFunctionInput &inpu
 	if (!all_shortest && k == 0) {
 		throw InvalidInputException("pgq_shortest_k_paths: k must be positive");
 	}
-	return make_uniq<ShortestKPathsBindData>(context, csr_id, k, lower, upper, mode, all_shortest, budget,
+	return make_uniq<ShortestKPathsBindData>(context, csr_id, k, lower, upper, mode, all_shortest, groups, budget,
 	                                         make_shared_ptr<std::atomic<int64_t>>(0));
 }
 
@@ -148,6 +161,8 @@ public:
 		first_depth.clear();
 		kept.clear();
 		walk_depth.clear();
+		group_depths.clear();
+		walk_depths.clear();
 		const bool all_targets = targets.empty();
 		target_set.clear();
 		for (auto t : targets) {
@@ -173,6 +188,21 @@ public:
 					}
 				} else if (entry->second != node.depth) {
 					return;
+				}
+				found.push_back({node.vertex, index});
+				return;
+			}
+			if (info.groups) {
+				// The destination's lengths so far, in increasing order (the search is breadth-first).
+				auto &lengths = group_depths[node.vertex];
+				if (lengths.empty() || lengths.back() != node.depth) {
+					if (static_cast<int64_t>(lengths.size()) >= info.k) {
+						return;
+					}
+					lengths.push_back(node.depth);
+					if (!all_targets && static_cast<int64_t>(lengths.size()) == info.k) {
+						unsatisfied--;
+					}
 				}
 				found.push_back({node.vertex, index});
 				return;
@@ -257,6 +287,18 @@ public:
 							continue;
 						}
 					}
+				} else if (info.mode == PathSearchMode::WALK && info.groups) {
+					// Every walk of the k least lengths: a vertex is kept at its first k depths from `lower` on, with
+					// all its walks there (see the top of this file). Below `lower` every walk is kept.
+					if (depth + 1 >= info.lower) {
+						auto &depths = walk_depths[candidate.vertex];
+						if (depths.empty() || depths.back() != depth + 1) {
+							if (static_cast<int64_t>(depths.size()) >= info.k) {
+								continue;
+							}
+							depths.push_back(depth + 1);
+						}
+					}
 				} else if (info.mode == PathSearchMode::WALK) {
 					// Keep a vertex's first k walks of each length below `lower`, and its first k from `lower` on.
 					auto &count = depth + 1 < info.lower ? level_count[candidate.vertex] : kept[candidate.vertex];
@@ -272,7 +314,7 @@ public:
 			}
 			std::swap(frontier, next);
 			std::swap(rank, next_rank);
-			if (info.all_shortest && !all_targets && unsatisfied == 0) {
+			if ((info.all_shortest || info.groups) && !all_targets && unsatisfied == 0) {
 				break;
 			}
 		}
@@ -311,6 +353,7 @@ private:
 		if (info.mode == PathSearchMode::WALK && nodes[index].depth >= lower) {
 			kept[nodes[index].vertex]++;
 			walk_depth[nodes[index].vertex] = nodes[index].depth;
+			walk_depths[nodes[index].vertex].push_back(nodes[index].depth);
 		}
 	}
 
@@ -348,6 +391,9 @@ private:
 	std::unordered_map<int64_t, int64_t> kept;
 	//! all shortest walks: the depth (from `lower` on) at which each vertex is kept
 	std::unordered_map<int64_t, int64_t> walk_depth;
+	//! groups: each destination's lengths found so far, and (walks) the depths at which each vertex is kept
+	std::unordered_map<int64_t, vector<int64_t>> group_depths;
+	std::unordered_map<int64_t, vector<int64_t>> walk_depths;
 	std::unordered_set<int64_t> target_set;
 };
 

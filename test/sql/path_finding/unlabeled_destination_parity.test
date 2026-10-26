@@ -111,18 +111,18 @@ FROM GRAPH_TABLE ( g MATCH (x)<-[:HasWorkorder]-(t:Tag) WHERE t.id = 'T1'
 Workorder
 Workorder
 
-# ── when it is genuinely ambiguous, refuse ──────────────────────────────────────
-# An unlabeled edge can reach Workorder, Note or Tag, so x has no single label. The
-# only wrong behaviour is to answer anyway. On a graph without ABI artifacts the
-# generic path refuses first, with its own wording; on an artifact-backed graph the
-# traversal is answerable and label() itself refuses (see abi_context_mixed_key_types).
-# Either message is fine -- returning a label is not.
+# ── an unlabeled edge and vertex over several tables ────────────────────────────
+# An unlabeled edge can reach Workorder, Note or Tag, so x has no single label: SQL/PGQ matches
+# every one of them, and label(x) is each row's own (the union of one match per table).
 
-statement error
+query T rowsort
 FROM GRAPH_TABLE ( g MATCH (t:Tag)-[]->(x) WHERE t.id = 'T1'
     COLUMNS (label(x) AS lbl) );
 ----
-ambiguous
+Note
+Tag
+Workorder
+Workorder
 
 # ── ONE ROW PER over a compound edge label ──────────────────────────────────────
 # Named edge: works, and is the baseline the compound form is measured against.
@@ -161,49 +161,41 @@ SELECT list_sort(list(title)) AS got FROM GRAPH_TABLE ( g MATCH (t:Tag)-[:HasWor
 ----
 [WO-10, WO-11]
 
-# A negated edge label with a Workorder destination correctly returns NOTHING here, and
-# the reason is worth pinning: '!HasParent' is resolved to has_parent itself rather than
-# to its complement (a separate pre-existing defect, see the note at the end of this
-# file), so the walk stays on tag->tag and never reaches a Workorder.
-#
-# Before traversal keyed on the vertex key this returned ONE row -- a PHANTOM. The walk
-# landed on tag T2 (rowid 1) and the outer join matched it against workorder rowid 1,
-# WO-11. Nothing about that row was real. An earlier version of this test asserted that
-# 1, which is exactly the "freeze the wrong number in as expected behaviour" trap; the
-# empty result below is the correct answer.
+# A negated edge label selects every edge table but the one it names (SQL/PGQ): '!HasParent' is HasWorkorder and
+# HasNote here, so T1 reaches its two Workorders in one hop. (It was resolved to has_parent itself and returned
+# nothing; before traversal keyed on the vertex key it returned a phantom row from a rowid collision.)
 query I rowsort
 SELECT DISTINCT depth FROM GRAPH_TABLE ( g MATCH p = (t:Tag)-[:!HasParent]->{1,2}(x:Workorder)
     WHERE t.id = 'T1' COLUMNS (path_length(p) AS depth) );
 ----
+1
 
-# ── variable length on a graph with NO ABI artifacts ────────────────────────────
-# The artifact-backed expansion answers an unlabeled variable-length destination per
-# row (see abi_context_mixed_key_types). This graph has no artifacts, so the same
-# query falls to the generic path, which cannot enumerate the destination table. That
-# is a real capability difference and it is allowed -- what matters is that it SAYS so
-# instead of returning a partial or empty result. These assertions exist to catch the
-# day that refusal silently becomes zero rows.
+# ── one hop on a graph with NO ABI artifacts ────────────────────────────────────
+# The artifact-backed expansion answers an unlabeled destination per row (see
+# abi_context_mixed_key_types). Without artifacts the pattern is answered per table: the
+# edges that are not HasParent are HasWorkorder (to two Workorders) and HasNote (to a Note).
+# (These refused before; what mattered was never to return a partial or empty result.)
 
-statement error
+query IT rowsort
 FROM GRAPH_TABLE ( g MATCH p = (t:Tag)-[:!HasParent]->{1,1}(x) WHERE t.id = 'T1'
     COLUMNS (path_length(p) AS depth, label(x) AS lbl) );
 ----
-Unlabeled vertex pattern is ambiguous
+1	Note
+1	Workorder
+1	Workorder
 
-statement error
+query I
 FROM GRAPH_TABLE ( g MATCH p = (t:Tag)-[:!HasParent]->{1,1}() WHERE t.id = 'T1'
-    COLUMNS (path_length(p) AS depth) );
+    COLUMNS (count(*) AS n) );
 ----
-Unlabeled vertex pattern is ambiguous
+3
 
 # Two further PRE-EXISTING defects were found here and deliberately left unasserted,
 # because writing them down as expectations would freeze wrong behaviour in place. Both
 # reproduce on a build with none of the 2026-07-28 changes:
 #
-#   * {1,1} with a negated edge label fails with "Label tag is not registered as a
-#     destination reference for edge pattern of table has_parent" -- the negation is
-#     resolved to the single table it names instead of to its complement. {1,2} of the
-#     same shape works, so it is specific to the degenerate one-hop quantifier.
+#   * (fixed 2026-10-26) a negated edge label was resolved to the single table it names
+#     instead of to its complement; it selects every other edge table now.
 #   * (fixed 2026-07-28) the generic traversal addressed vertices by rowid, so a
 #     cross-vertex-table edge leaked rows between unrelated vertices -- see
 #     rowid_id_space_collision.test. It now carries vertex keys.

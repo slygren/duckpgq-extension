@@ -50,7 +50,7 @@ EXISTS { ... } graph pattern predicates are only allowed in the WHERE clause of 
 statement error
 SELECT x IS LABELED Foo FROM (SELECT 1 AS x);
 ----
-IS [NOT] LABELED is only allowed in the WHERE clause of a GRAPH_TABLE
+IS [NOT] LABELED is only allowed inside a GRAPH_TABLE
 
 # Binding.
 statement ok

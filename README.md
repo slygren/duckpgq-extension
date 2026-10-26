@@ -118,8 +118,8 @@ put over DuckLake catalogs. A graph is stored in the database it is created in a
 
 | Pattern | Meaning |
 | --- | --- |
-| `(v)`, `()`, `(v:Label)` | vertex with any label, anonymous, labelled |
-| `(v:A\|B)`, `(v:A&B)`, `(v:!A)` | label disjunction, conjunction, negation (`!` binds tightest, then `&`, then `\|`) |
+| `(v)`, `()`, `(v:Label)` | vertex with any label (every vertex table), anonymous, labelled |
+| `(v:A\|B)`, `(v:A&B)`, `(v:!A)` | label disjunction, conjunction, negation (`!` binds tightest, then `&`, then `\|`), over every table whose labels satisfy it: `(v:Person\|Course)` matches both tables' rows, `(v:!Person)` every vertex of another table |
 | `(v:Person WHERE v.age > 30)` | element-level predicate |
 | `-[e:Knows]->`, `<-[e:Knows]-`, `-[e:Knows]-`, `<-[e:Knows]->` | directed, reversed, either direction; `<-[ ]->` is SQL/PGQ's "left or right", which over directed edges is the same as `-[ ]-` |
 | `->`, `<-`, `-`, `<->` | anonymous edge of any label |
@@ -129,7 +129,11 @@ put over DuckLake catalogs. A graph is stored in the database it is created in a
 | `MATCH (t)-[:A]->(a), (t)-[:B]->(b)` | several patterns sharing a variable |
 | `MATCH p = …` | path variable |
 | `ANY SHORTEST`, `ALL SHORTEST`, `ANY CHEAPEST`, `ALL CHEAPEST` | path search; `COST expr [DEFAULT n]` on an edge gives its weight, a number (`DEFAULT` where `expr` is NULL). A NULL cost without `DEFAULT`, and a negative or non-finite one, is an error. CHEAPEST returns the path(s) of the least total cost within the quantifier's bounds (`ALL`: every tied path), in every direction, from any lower bound, and the path functions, `ONE ROW PER` and `cost(p)` (in `COLUMNS` and `WHERE`) all describe them. The `COST` and an element `WHERE` on the costed edge (which filters its steps) may read the edge and the pattern's two endpoints (see [CHEAPEST](#cheapest-paths)) |
-| `SHORTEST k` | the k shortest paths per endpoint pair (one quantified edge between two vertices); walks unless a path mode is given |
+| `SHORTEST k` | the k shortest paths per endpoint pair (one quantified edge between two vertices, or a fixed-length pattern); walks unless a path mode is given |
+| `SHORTEST k GROUPS`, `SHORTEST k GROUP`, `SHORTEST GROUP` | every path of the k shortest distinct lengths per endpoint pair (`SHORTEST GROUP` is one length: `ALL SHORTEST`); a mode goes before `GROUP`: `SHORTEST 2 TRAIL GROUPS` |
+| `ANY k`, `ANY` | k paths per endpoint pair (`ANY` is `ANY 1`): the k that `SHORTEST k` returns |
+| `ALL` | every path, as without a search prefix |
+| `… PATH`, `… PATHS` | optional after a search prefix or path mode: `ANY SHORTEST PATHS`, `ALL TRAIL PATH` |
 | `WALK`, `TRAIL`, `SIMPLE`, `ACYCLIC` | path mode |
 | `OPTIONAL MATCH …` | the whole pattern left-joined onto the bindings so far (a row without a match keeps NULLs); any pattern a `MATCH` answers, `ANY`/`ALL CHEAPEST` included |
 | `WHERE EXISTS { (t)-[:HAS_WORKORDER]->() }`, `NOT EXISTS { … }` | correlated pattern existence |
@@ -137,6 +141,22 @@ put over DuckLake catalogs. A graph is stored in the database it is created in a
 | `MATCH … COLUMNS (…) UNION [ALL] MATCH … COLUMNS (…)` | each MATCH block with its own `COLUMNS`, combined by position as in a SQL `UNION` |
 | `MATCH (a)-[:R]->(b) \| (a)-[:S]->(b)`, `… \|+\| …` | path pattern union: either operand; `\|` removes duplicate path bindings, `\|+\|` (multiset alternation) keeps them. A variable an operand does not bind is NULL in its rows |
 | `ONE ROW PER VERTEX (v)`, `ONE ROW PER EDGE (e)`, `ONE ROW PER STEP (v1, e, v2)` | one output row per element of each matched path |
+
+An element whose label expression selects several tables, or that has no label where its kind has several tables,
+matches the elements of all of them (SQL/PGQ). The MATCH is answered as the union of one match per choice of a table
+for each such element, an edge's table fixing the tables at its ends; each choice keeps every route a single-table
+pattern has, ABI artifacts included. A property one of the tables lacks is NULL on its rows, `v.*` is every property
+of any of the tables, and `label(v)`, `labels(v)` and the other element functions are each row's own.
+`element_id(v)` is the row id within the element's table, so `label(v)` together with `element_id(v)` identifies an
+element across tables. A MATCH the translation answers as written (an ABI route covering a label expression over
+several edge tables, a quantified edge over several edge tables of one vertex table) keeps answering it that way.
+
+A quantified edge whose label (or the lack of one) selects edge tables over several vertex tables walks across them:
+`(a:Person)-[e:Knows|Takes]->{1,3}(b)`, `(t:Tag)-[:!HasParent]->+(x)`. Where no ABI artifact answers it, it is searched
+over one id space for all those tables (a table's rows numbered from its offset), with every selector and path
+mode, its ends one table each (an unlabeled end per table, as above); `vertices(p)` and `edges(p)` give row ids
+within each table and `vertex_labels(p)` / `edge_labels(p)` the tables along the path. Ties between paths are
+broken by the edges along the path, an edge by its table in the graph's order, then its row id.
 
 Cypher's quantifier inside the edge means what it means in Cypher, so a pattern copied from Neo4j returns the same
 paths. Its lower bound defaults to 1, so **a bare `*` is one or more hops here, but zero or more in the arrow form
@@ -179,10 +199,17 @@ matched over such an edge.
 `SHORTEST k` is the k shortest of those walks per endpoint pair, so `SHORTEST 1` and `ANY SHORTEST` give paths of
 the same length for every pair, closed walks included. SQL/PGQ leaves the choice among paths tied at the k-th
 length to the implementation; here the paths of one length are taken in the order of their edge row ids along the
-path, compared position by position, so the answer is deterministic. The search runs from each source the `MATCH
+path, compared position by position, so the answer is deterministic. `ANY k` leaves the choice of the k paths to
+the implementation altogether; here they are the ones `SHORTEST k` returns. `SHORTEST k GROUPS` chooses nothing:
+it is every walk whose length is among the pair's k shortest (fewer when fewer lengths exist), and `SHORTEST 1 GROUP`
+returns what `ALL SHORTEST` returns. Over walks the search keeps a vertex only at its first k depths, which is
+exact (a walk reaching it later ends no walk of a destination's k least lengths) and ends on cycles. Over a
+fixed-length pattern every path has the one length: `ANY k` and `SHORTEST k` keep the first k per pair of
+endpoints by element row ids, and `SHORTEST k GROUPS` keeps every path. The search runs from each source the `MATCH
 WHERE` admits (a filter on the source alone seeds it, one on the destination alone ends it early) and counts every
 partial path it builds against `pgq_max_vl_fallback_rows`, so an unseeded search on a large graph fails rather than
-runs on. No artifact holds k paths per pair: `SHORTEST k` always traverses.
+runs on. No artifact holds k paths per pair or the paths of k lengths: `SHORTEST k`, `ANY k` and `SHORTEST k
+GROUPS` always traverse.
 
 ### Quantified path patterns
 
@@ -234,9 +261,12 @@ else by its text (`path_length(p)`, `(p.id + 1)`) -- on every route, ABI artifac
 | --- | --- |
 | `v.prop`, `v.{a, b}` | a property; a struct of several (`struct_pack(a := v.a, b := v.b)`) |
 | `v.link.prop`, `v.link.{a, b}` | a property of the vertex a single-valued link points to, when the graph's ABI catalog declares that link |
-| `element_id(x)`, `label(x)` | element id; label as declared in `CREATE PROPERTY GRAPH` (a table with sub-labels reports its main label). `label(x) = 'Person'` is case-sensitive; `IS LABELED` is not |
-| `x IS [NOT] LABELED L` | label test (WHERE only) |
-| `ALL_DIFFERENT(a, b, …)` | the bound elements are pairwise distinct |
+| `element_id(x)`, `label(x)` | element id (the row id; for an undirected edge the edge's own row); label as declared in `CREATE PROPERTY GRAPH` (a table with sub-labels reports its main label). `label(x) = 'Person'` is case-sensitive; `IS LABELED` is not |
+| `labels(x)` | every label of the element, in declaration order and declared case: its table's label, then each discriminator sub-label the row has (`[Member, Student]`) |
+| `x IS [NOT] LABELED L` | label test; for a discriminator sub-label (`LABEL Member IN kind (Student, Teacher)`) the row's own bit |
+| `SAME(a, b, …)`, `ALL_DIFFERENT(a, b, …)` | all arguments are the same element / no two are. An element is its table and its row, so elements of two tables (a vertex and an edge, a `Person` and a `Course` with the same row id) are never the same |
+| `PROPERTY_EXISTS(a, p)` | whether element `a` has property `p` as the graph declares its table's properties (an alias in `PROPERTIES (c AS p)` names the property; `NO PROPERTIES` has none). A name no table of the graph has as a property is an error, which catches a misspelt name |
+| `a IS [NOT] SOURCE OF e`, `a IS [NOT] DESTINATION OF e` | whether vertex `a` is the vertex edge `e` leaves (its `SOURCE KEY`) / enters, whatever direction the pattern reads `e` in (`(a)-[e]-(b) WHERE a IS SOURCE OF e` is `(a)-[e]->(b)`); `a` need not be next to `e`. `e` is a single edge, not a quantified one |
 | `path_length(p)`, `vertices(p)`, `edges(p)` | hops; the path's vertices (row ids when traversed, keys when an ABI artifact answers) and edges (row ids; no artifact has them, so a pattern asking for `edges(p)` is traversed) |
 | `vertex_labels(p)`, `edge_labels(p)` | declared labels along the path, in path order, traversed or answered by an ABI artifact. They need each vertex and edge of the path to have one table, from its label or from the edge next to it |
 | `g.x`, `element_id(g)`, `label(g)` of a group variable `g` (declared in a quantified path pattern, or on a quantified edge) | the list of its elements' values in repetition (path) order; `[]` for zero repetitions |
@@ -244,6 +274,12 @@ else by its text (`path_length(p)`, `(p.id + 1)`) -- on every route, ABI artifac
 | `vertex_property(p, 'x')`, `edge_property(p, 'x')` | property `x` of every vertex / edge of path `p`, in path order (NULL where an element's table has no `x`), for aggregating along the path: `list_sum(edge_property(p, 'weight'))`, `list_avg`, `list_min`, `list_max`, `len`. In COLUMNS and WHERE, on every route that answers `vertices(p)` / `edges(p)`, ABI artifacts included; `edge_property` is traversed, like `edges(p)` |
 | `cost(p)` | total cost of an `ANY`/`ALL CHEAPEST` path, its steps' costs added in path order: BIGINT for integer costs, DOUBLE for any other number (DECIMAL included). For a constant `COST c` (the pattern is then `SHORTEST`), `c` added once per step |
 | `path_tree_json(…)`, `graph_tree_json(…)` | nest paths into a JSON tree |
+
+The element functions and predicates (`element_id`, `label`, `labels`, `IS [NOT] LABELED`, `SAME`, `ALL_DIFFERENT`,
+`PROPERTY_EXISTS`, `IS SOURCE OF`, `IS DESTINATION OF`) can stand anywhere an expression can: nested in other
+expressions (`NOT`, `CASE`, function arguments), in `COLUMNS`, in an element `WHERE`, in the `WHERE` of an
+`EXISTS { }` pattern and of a `UNION` branch. Of an `OPTIONAL MATCH` element that matched nothing they are NULL, so
+`WHERE c IS LABELED Course` drops the rows where `c` is missing.
 
 Examples on a larger graph (the maintenance graph the ABI work was built for) are in
 [docs/pgql_abi_extension_handoff.md](docs/pgql_abi_extension_handoff.md#maintenance-graph-examples); that document
@@ -654,6 +690,12 @@ building in [abi_build.cpp](src/core/functions/table/abi_build.cpp); vertex-join
   - `SHORTEST k` and `CHEAPEST` over a group;
   - `ONE ROW PER` or a search prefix over a group whose pattern is not the MATCH's only one;
   - a path variable or search prefix inside the group.
+- **Elements over several tables** (above): a search prefix over a pattern whose interior elements span several
+  tables, `COLUMNS (*)` over them, and an `OPTIONAL MATCH` reading a variable of an earlier `OPTIONAL MATCH` whose
+  elements span tables are refused; a MATCH has at most 256 choices of tables. A quantified edge walking across
+  vertex tables takes one quantified edge between two vertices (no element `WHERE` on it, no `CHEAPEST`, no
+  `ONE ROW PER`, not inside `EXISTS { }`); of its edge variable `label(e)` and `element_id(e)` are read, a property
+  `e.x` is not (use `edge_property(p, 'x')`).
 - **Path pattern unions** (`|`, `|+|`) stand at the top level of a MATCH pattern, and take no search prefix
   (`ANY SHORTEST … | …`), OPTIONAL MATCH or ONE ROW PER. `|` removes duplicates only between fixed-length, directed
   operands; operands that may match the same variable-length walk need `|+|` or disjoint labels.
@@ -661,8 +703,9 @@ building in [abi_build.cpp](src/core/functions/table/abi_build.cpp); vertex-join
   after the match (one join per element table), so they cost about what the equivalent hand-written join does.
 - **`OPTIONAL MATCH`**: its path variable can be read in `COLUMNS` and `WHERE` (NULL where it did not match), `cost(p)`
   of an `ANY` / `ALL CHEAPEST` pattern included, but not in `COLUMNS` shared by `UNION` branches.
-- **`SHORTEST k`** takes one quantified edge between two vertices over one edge table (no element `WHERE` on the
-  edge); longer patterns are refused. Inside a longer pattern, an unbounded quantifier with only a path mode or with a
+- **`SHORTEST k`, `ANY k`, `SHORTEST k GROUPS`** take one quantified edge between two vertices over one edge table
+  (no element `WHERE` on the edge), or a fixed-length pattern; a pattern mixing fixed hops with a quantified edge
+  is refused. k is a literal (not a parameter). Inside a longer pattern, an unbounded quantifier with only a path mode or with a
   lower bound above 1 is answered from the CSR, which finds one shortest path per pair (refused for `<-`).
 - **ABI rewrites** cover the common path shapes, not every pattern. Fixed-length chains longer than three hops, and
   chains with an undirected hop between two different vertex tables or an edge variable on an undirected hop,

@@ -71,11 +71,14 @@ EDGE TABLES (
   cb SOURCE KEY (s) REFERENCES c (id) DESTINATION KEY (t) REFERENCES b (id) LABEL CB
 );
 
-# Without artifacts there is no route for an unlabeled edge over five families
-statement error
-FROM GRAPH_TABLE (m MATCH p = (s:A)-[]->{1,2}(x) COLUMNS (path_length(p)));
+# Without artifacts an unlabeled edge over five families is searched over all of them (SQL/PGQ: any edge): from the
+# A vertices, 4 one-hop walks (ab) and 7 two-hop walks that visit no vertex twice (1-007-2, 1-007-10, 1-8-7, 1-8-12,
+# 2-8-1, 2-8-7, 2-8-12; 1-8-1 returns to its start)
+query II
+SELECT len, count(*) FROM GRAPH_TABLE (m MATCH p = (s:A)-[]->{1,2}(x) COLUMNS (path_length(p) AS len)) GROUP BY len ORDER BY len;
 ----
-ambiguous
+1	4
+2	7
 
 statement ok
 FROM pgq_abi_build('m', exclude_self_referential := false);

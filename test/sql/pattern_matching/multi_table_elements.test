@@ -1,0 +1,292 @@
+# name: test/sql/pattern_matching/multi_table_elements.test
+# description: SQL/PGQ: a label expression selects the elements of every table whose labels satisfy it (Person|Course,
+#              !Person), and an element without a label matches every element of its kind. Each pattern below spans
+#              several vertex or edge tables and is compared with the union of one plain-SQL join per choice of
+#              tables, written by hand from all_vertices / all_edges: fixed vertices and edges in every direction,
+#              chains and shared variables, OPTIONAL MATCH, EXISTS, aggregates, properties a table lacks (NULL),
+#              x.*, the element functions per row. Traversed, then with ABI artifacts built.
+# group: [pattern_matching]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE P(id BIGINT PRIMARY KEY, name VARCHAR);
+
+statement ok
+INSERT INTO P VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd');
+
+statement ok
+CREATE TABLE C(cid BIGINT PRIMARY KEY, title VARCHAR);
+
+statement ok
+INSERT INTO C VALUES (1, 'x'), (2, 'y'), (3, 'z');
+
+statement ok
+CREATE TABLE R(rid BIGINT PRIMARY KEY, name VARCHAR);
+
+statement ok
+INSERT INTO R VALUES (7, 'room');
+
+statement ok
+CREATE TABLE K(src BIGINT, dst BIGINT, since INTEGER);
+
+statement ok
+INSERT INTO K VALUES (1, 2, 2000), (1, 2, 2001), (2, 3, 2002), (3, 1, 2003), (4, 4, 2004);
+
+statement ok
+CREATE TABLE LI(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO LI VALUES (2, 1), (3, 3);
+
+statement ok
+CREATE TABLE T(pid BIGINT, cid BIGINT, grade VARCHAR);
+
+statement ok
+INSERT INTO T VALUES (1, 1, 'A'), (2, 2, 'B'), (2, 3, 'C');
+
+statement ok
+CREATE TABLE H(cid BIGINT, rid BIGINT);
+
+statement ok
+INSERT INTO H VALUES (1, 7), (3, 7);
+
+statement ok
+CREATE PROPERTY GRAPH g
+VERTEX TABLES (P LABEL Person, C LABEL Course, R LABEL Room)
+EDGE TABLES (K SOURCE KEY (src) REFERENCES P (id) DESTINATION KEY (dst) REFERENCES P (id) LABEL Knows,
+             LI SOURCE KEY (src) REFERENCES P (id) DESTINATION KEY (dst) REFERENCES P (id) LABEL Likes,
+             T SOURCE KEY (pid) REFERENCES P (id) DESTINATION KEY (cid) REFERENCES C (cid) LABEL Takes,
+             H SOURCE KEY (cid) REFERENCES C (cid) DESTINATION KEY (rid) REFERENCES R (rid) LABEL HeldIn);
+
+# The reference: every vertex and every edge as (label, element id), the edges with their ends.
+statement ok
+CREATE TABLE all_vertices AS
+SELECT 'Person' AS l, rowid AS i FROM P UNION ALL SELECT 'Course', rowid FROM C UNION ALL SELECT 'Room', rowid FROM R;
+
+statement ok
+CREATE TABLE all_edges AS
+SELECT 'Knows' AS el, e.rowid AS ei, 'Person' AS sl, s.rowid AS si, 'Person' AS dl, d.rowid AS di FROM K e JOIN P s ON s.id = e.src JOIN P d ON d.id = e.dst
+UNION ALL SELECT 'Likes', e.rowid, 'Person', s.rowid, 'Person', d.rowid FROM LI e JOIN P s ON s.id = e.src JOIN P d ON d.id = e.dst
+UNION ALL SELECT 'Takes', e.rowid, 'Person', s.rowid, 'Course', d.rowid FROM T e JOIN P s ON s.id = e.pid JOIN C d ON d.cid = e.cid
+UNION ALL SELECT 'HeldIn', e.rowid, 'Course', s.rowid, 'Room', d.rowid FROM H e JOIN C s ON s.cid = e.cid JOIN R d ON d.rid = e.rid;
+
+# every edge read both ways for an undirected pattern (a self-loop once)
+statement ok
+CREATE TABLE all_steps AS
+SELECT el, ei, sl, si, dl, di FROM all_edges
+UNION ALL SELECT el, ei, dl, di, sl, si FROM all_edges WHERE NOT (sl = dl AND si = di);
+
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+loop pass 0 2
+
+# --- vertices
+
+statement ok
+CREATE OR REPLACE TABLE got AS FROM GRAPH_TABLE (g MATCH (x:Person|Course) COLUMNS (label(x) AS l, element_id(x) AS i));
+
+query I
+SELECT count(*) FROM ((FROM got EXCEPT ALL FROM all_vertices WHERE l IN ('Person', 'Course')) UNION ALL (FROM all_vertices WHERE l IN ('Person', 'Course') EXCEPT ALL FROM got));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE got AS FROM GRAPH_TABLE (g MATCH (x) COLUMNS (label(x) AS l, element_id(x) AS i));
+
+query I
+SELECT count(*) FROM ((FROM got EXCEPT ALL FROM all_vertices) UNION ALL (FROM all_vertices EXCEPT ALL FROM got));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE got AS FROM GRAPH_TABLE (g MATCH (x:!Person) COLUMNS (label(x) AS l, element_id(x) AS i));
+
+query I
+SELECT count(*) FROM ((FROM got EXCEPT ALL FROM all_vertices WHERE l <> 'Person') UNION ALL (FROM all_vertices WHERE l <> 'Person' EXCEPT ALL FROM got));
+----
+0
+
+# no table is both: nothing matches
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH (x:Person&Course) COLUMNS (element_id(x) AS i));
+----
+0
+
+# properties a table lacks are NULL; x.* is every property of any of the tables; the functions are per row
+query IIIIII
+FROM GRAPH_TABLE (g MATCH (x:Course|Room) COLUMNS (label(x) AS l, x.cid, x.rid, x.name, labels(x) AS ls, PROPERTY_EXISTS(x, title) AS t)) ORDER BY ALL;
+----
+Course	1	NULL	NULL	[Course]	true
+Course	2	NULL	NULL	[Course]	true
+Course	3	NULL	NULL	[Course]	true
+Room	NULL	7	room	[Room]	false
+
+query IIII
+FROM GRAPH_TABLE (g MATCH (x:Room|Course) WHERE element_id(x) = 0 COLUMNS (x.*)) ORDER BY ALL;
+----
+1	x	NULL	NULL
+NULL	NULL	room	7
+
+query II
+FROM GRAPH_TABLE (g MATCH (x:Person|Room) WHERE x.name IN ('a', 'room') COLUMNS (label(x) AS l, x.name)) ORDER BY ALL;
+----
+Person	a
+Room	room
+
+# --- edges: every direction
+
+statement ok
+CREATE OR REPLACE TABLE got AS FROM GRAPH_TABLE (g MATCH (a)-[e]->(b) COLUMNS (label(e) AS el, element_id(e) AS ei, label(a) AS sl, element_id(a) AS si, label(b) AS dl, element_id(b) AS di));
+
+query II
+SELECT count(*), (SELECT count(*) FROM ((FROM got EXCEPT ALL FROM all_edges) UNION ALL (FROM all_edges EXCEPT ALL FROM got))) FROM got;
+----
+12	0
+
+statement ok
+CREATE OR REPLACE TABLE got AS FROM GRAPH_TABLE (g MATCH (b)<-[e]-(a) COLUMNS (label(e) AS el, element_id(e) AS ei, label(a) AS sl, element_id(a) AS si, label(b) AS dl, element_id(b) AS di));
+
+query I
+SELECT count(*) FROM ((FROM got EXCEPT ALL FROM all_edges) UNION ALL (FROM all_edges EXCEPT ALL FROM got));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE got AS FROM GRAPH_TABLE (g MATCH (a)-[e]-(b) COLUMNS (label(e) AS el, element_id(e) AS ei, label(a) AS sl, element_id(a) AS si, label(b) AS dl, element_id(b) AS di));
+
+query II
+SELECT count(*), (SELECT count(*) FROM ((FROM got EXCEPT ALL FROM all_steps) UNION ALL (FROM all_steps EXCEPT ALL FROM got))) FROM got;
+----
+22	0
+
+# a label expression over edge tables, and a vertex of several tables at the far end
+statement ok
+CREATE OR REPLACE TABLE got AS FROM GRAPH_TABLE (g MATCH (a:Person)-[e:Knows|Takes]->(b) COLUMNS (label(e) AS el, element_id(e) AS ei, label(a) AS sl, element_id(a) AS si, label(b) AS dl, element_id(b) AS di));
+
+query I
+SELECT count(*) FROM ((FROM got EXCEPT ALL FROM all_edges WHERE el IN ('Knows', 'Takes')) UNION ALL (FROM all_edges WHERE el IN ('Knows', 'Takes') EXCEPT ALL FROM got));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE got AS FROM GRAPH_TABLE (g MATCH (a)-[e:!Knows]->(b:!Person) COLUMNS (label(e) AS el, element_id(e) AS ei, label(a) AS sl, element_id(a) AS si, label(b) AS dl, element_id(b) AS di));
+
+query I
+SELECT count(*) FROM ((FROM got EXCEPT ALL FROM all_edges WHERE el <> 'Knows' AND dl <> 'Person') UNION ALL (FROM all_edges WHERE el <> 'Knows' AND dl <> 'Person' EXCEPT ALL FROM got));
+----
+0
+
+# --- chains and shared variables
+
+statement ok
+CREATE OR REPLACE TABLE got AS FROM GRAPH_TABLE (g MATCH (a)-[e]->(b)-[f]->(c)
+    COLUMNS (label(a) AS al, element_id(a) AS ai, label(e) AS el, element_id(e) AS ei, label(b) AS bl, element_id(b) AS bi,
+             label(f) AS fl, element_id(f) AS fi, label(c) AS cl, element_id(c) AS ci));
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT x.sl, x.si, x.el, x.ei, x.dl, x.di, y.el, y.ei, y.dl, y.di FROM all_edges x JOIN all_edges y ON y.sl = x.dl AND y.si = x.di;
+
+query II
+SELECT count(*) = (SELECT count(*) FROM want), (SELECT count(*) FROM ((FROM got EXCEPT ALL FROM want) UNION ALL (FROM want EXCEPT ALL FROM got))) FROM got;
+----
+true	0
+
+statement ok
+CREATE OR REPLACE TABLE got AS FROM GRAPH_TABLE (g MATCH (a:Person)-[e]-(b), (b)-[f]->(c:Room)
+    COLUMNS (element_id(a) AS ai, label(e) AS el, element_id(e) AS ei, label(b) AS bl, element_id(b) AS bi, element_id(f) AS fi, element_id(c) AS ci));
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT x.si, x.el, x.ei, x.dl, x.di, y.ei, y.di FROM all_steps x JOIN all_edges y ON y.sl = x.dl AND y.si = x.di
+WHERE x.sl = 'Person' AND y.dl = 'Room';
+
+query II
+SELECT count(*) = (SELECT count(*) FROM want), (SELECT count(*) FROM ((FROM got EXCEPT ALL FROM want) UNION ALL (FROM want EXCEPT ALL FROM got))) FROM got;
+----
+true	0
+
+# SAME / IS SOURCE OF per row across tables
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH (a)-[e]-(b) WHERE SAME(a, b) AND a IS SOURCE OF e COLUMNS (element_id(a)));
+----
+2
+
+# --- aggregates, WHERE over properties of some tables
+
+query II
+FROM GRAPH_TABLE (g MATCH (a)-[e]->(b) COLUMNS (count(*) AS n, count(DISTINCT label(b)) AS k));
+----
+12	3
+
+query I
+FROM GRAPH_TABLE (g MATCH (a:Person)-[e]->(b) WHERE b.title = 'y' OR b.name = 'a' COLUMNS (count(*) AS n));
+----
+3
+
+# --- OPTIONAL MATCH over several tables
+
+statement ok
+CREATE OR REPLACE TABLE got AS FROM GRAPH_TABLE (g MATCH (a:Person) OPTIONAL MATCH (a)-[e]->(x)
+    COLUMNS (element_id(a) AS ai, label(e) AS el, element_id(e) AS ei, label(x) AS xl, element_id(x) AS xi));
+
+statement ok
+CREATE OR REPLACE TABLE want AS SELECT v.i, e.el, e.ei, e.dl, e.di FROM all_vertices v LEFT JOIN all_edges e ON e.sl = 'Person' AND e.si = v.i WHERE v.l = 'Person';
+
+query II
+SELECT count(*), (SELECT count(*) FROM ((FROM got EXCEPT ALL FROM want) UNION ALL (FROM want EXCEPT ALL FROM got))) FROM got;
+----
+10	0
+
+query II
+FROM GRAPH_TABLE (g MATCH (c:Course) OPTIONAL MATCH (c)-[h]-(y) WHERE label(y) IS DISTINCT FROM 'Person' COLUMNS (c.cid, label(y) AS l)) ORDER BY ALL;
+----
+1	Room
+3	Room
+
+# --- EXISTS over several tables
+
+query I
+FROM GRAPH_TABLE (g MATCH (a:Person) WHERE EXISTS { (a)-[e]->(x:!Person) } COLUMNS (a.id)) ORDER BY ALL;
+----
+1
+2
+
+query I
+FROM GRAPH_TABLE (g MATCH (a:Person) WHERE NOT EXISTS { (a)-[]-(x) WHERE label(x) <> 'Person' } COLUMNS (a.id)) ORDER BY ALL;
+----
+3
+4
+
+# --- UNION MATCH blocks and path pattern unions
+
+query II
+FROM GRAPH_TABLE (g MATCH (x:Room|Course) WHERE element_id(x) = 0 COLUMNS (label(x) AS l, element_id(x) AS i)
+                  UNION ALL MATCH (y:!Course) WHERE element_id(y) = 3 COLUMNS (label(y), element_id(y))) ORDER BY ALL;
+----
+Course	0
+Person	3
+Room	0
+
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH (a:Person)-[e:Knows]->(b) |+| (a:Person)-[e]->(b:Course|Room) COLUMNS (element_id(e)));
+----
+8
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('g', exclude_self_referential := false, max_hops := 2);
+
+endloop
+
+# --- refusals
+
+statement error
+FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a)-[e]->(b) COLUMNS (element_id(a)));
+----
+A search prefix over a pattern whose interior elements span several vertex or edge tables is not supported

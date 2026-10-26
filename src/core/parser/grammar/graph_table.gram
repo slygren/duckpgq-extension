@@ -21,11 +21,19 @@ DuckPGQColumns <- 'COLUMNS' Parens(TargetList)
 
 # A path pattern: optional path variable, search prefix and path mode, then the element sequence. Further sequences
 # after '|' (path pattern union) or '|+|' (multiset alternation) are alternatives binding the same variables.
-DuckPGQPathPattern <- DuckPGQPathVariable? DuckPGQSearchPrefix? DuckPGQPathMode? DuckPGQPathSequence DuckPGQPathUnionOperand*
+DuckPGQPathPattern <- DuckPGQPathVariable? DuckPGQSearchPrefix? DuckPGQPathMode? DuckPGQPathOrPaths? DuckPGQPathSequence DuckPGQPathUnionOperand*
 DuckPGQPathUnionOperand <- DuckPGQPathUnionOperator DuckPGQPathSequence
 DuckPGQPathUnionOperator <- '|+|' / ('|' '+' '|') / '|'
 DuckPGQPathVariable <- Identifier '='
-DuckPGQSearchPrefix <- DuckPGQAllShortest / DuckPGQAnyShortest / DuckPGQTopKShortest / DuckPGQAllCheapest / DuckPGQAnyCheapest
+# The search prefixes of SQL/PGQ: ALL SHORTEST, ANY SHORTEST, SHORTEST k, SHORTEST [k] [mode] [PATH|PATHS] GROUP(S), ANY [k], ALL
+# (every path, as without a prefix), plus CHEAPEST. The group form carries its path mode before GROUP; it is tried before
+# SHORTEST k, which would otherwise take its first two words.
+DuckPGQSearchPrefix <- DuckPGQAllShortest / DuckPGQAnyShortest / DuckPGQShortestGroups / DuckPGQTopKShortest / DuckPGQAllCheapest / DuckPGQAnyCheapest / DuckPGQAnyPaths / DuckPGQAllPaths
+DuckPGQShortestGroups <- 'SHORTEST' NumberLiteral? DuckPGQPathMode? DuckPGQPathOrPaths? DuckPGQGroupOrGroups
+DuckPGQGroupOrGroups <- 'GROUPS' / 'GROUP'
+DuckPGQAnyPaths <- 'ANY' NumberLiteral?
+DuckPGQAllPaths <- 'ALL'
+DuckPGQPathOrPaths <- 'PATHS' / 'PATH'
 DuckPGQAllShortest <- 'ALL' 'SHORTEST'
 DuckPGQAnyShortest <- 'ANY' 'SHORTEST'
 DuckPGQTopKShortest <- 'SHORTEST' NumberLiteral
@@ -96,9 +104,12 @@ DuckPGQLabelFactor <- DuckPGQLabelNegation / DuckPGQLabelParens / ColId
 DuckPGQLabelNegation <- '!' DuckPGQLabelFactor
 DuckPGQLabelParens <- '(' DuckPGQLabelExpression ')'
 
-# Expressions, available wherever the grammar extension is active. IS LABELED and EXISTS { } are bound only inside a
-# GRAPH_TABLE; a property projection v.{a, b} or v.link.{a, b} is shorthand for struct_pack(a := v.a, b := v.b).
+# Expressions, available wherever the grammar extension is active. IS LABELED, IS SOURCE OF, IS DESTINATION OF and
+# EXISTS { } are bound only inside a GRAPH_TABLE; a property projection v.{a, b} or v.link.{a, b} is shorthand for struct_pack(a := v.a, b := v.b).
 DuckPGQIsLabeled <- ColId 'IS' 'NOT'? 'LABELED' ColId
+# a IS [NOT] SOURCE OF e, b IS [NOT] DESTINATION OF e: whether vertex a is the vertex edge e leaves (enters).
+DuckPGQIsSourceOf <- ColId 'IS' 'NOT'? 'SOURCE' 'OF' ColId
+DuckPGQIsDestinationOf <- ColId 'IS' 'NOT'? 'DESTINATION' 'OF' ColId
 DuckPGQExistsPattern <- 'EXISTS' '{' List(DuckPGQPathPattern) WhereClause? '}'
 DuckPGQPropertyProjection <- ColId DuckPGQProjectionLink? '.' '{' List(ColId) '}'
 DuckPGQProjectionLink <- '.' ColId
