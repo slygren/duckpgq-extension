@@ -485,9 +485,11 @@ UPDATE abi_c.__pgq_path_catalog SET built_by = NULL, endpoints_complete = false 
 statement ok
 FROM GRAPH_TABLE (c MATCH (p:Person)-[:Likes]->(t:Tag) COLUMNS (p.id AS p, t.id AS t));
 
+# No measurement: a query never waits on a probe of whole tables. The edge artifact answers, and since nothing says
+# its rows all reach vertices, the route joins both vertex tables (which drops an edge to a vertex that is gone).
 query II
 SELECT (SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected') > 0,
-       (SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE rewrite_type = 'multiplicity_probe' AND reason LIKE 'far_ends|%' AND status = 'exact') > 0;
+       (SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE rewrite_type = 'multiplicity_probe' AND reason LIKE 'far_ends|%') = 0;
 ----
 true	true
 
@@ -844,11 +846,14 @@ SELECT count(*), list(v) FROM GRAPH_TABLE (c MATCH p = (a:Person)-[:!Knows]->{1,
 ----
 1	[[2, 10]]
 
-# A family holding an edge of the deleted person: the expansion declines rather than step along it
-statement error
-FROM GRAPH_TABLE (h MATCH p = (a:Person)-[:!Knows]->{1,2}(x) WHERE a.id = 2 COLUMNS (vertices(p) AS v));
+# Families holding edges to vertices that are gone, without a proof either way: the expansion checks the vertices
+# of the paths it produces (no probe of the tables) and drops a path through one that is gone -- person 2's like of
+# the missing tag 99 -- so it answers what the complete artifacts answer
+query II
+SELECT count(*), list(v) FROM GRAPH_TABLE (h MATCH p = (a:Person)-[:!Knows]->{1,2}(x) WHERE a.id = 2
+                                           COLUMNS (vertices(p) AS v));
 ----
-ambiguous
+1	[[2, 10]]
 
 # =====================================================================================================================
 # F. Keys of different types (a BIGINT vertex key referenced by a VARCHAR edge column, as some lake bridges do): the
@@ -893,8 +898,9 @@ FROM GRAPH_TABLE (mg MATCH (v:V)-[:E]->(t:T) COLUMNS (v.id AS v, t.code AS t)) O
 1	x
 2	y
 
+# The artifact answers with its vertices joined; no probe of the tables runs
 query II
 SELECT (SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected') > 0,
-       (SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE reason LIKE 'far_ends|%' AND status = 'exact');
+       (SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE reason LIKE 'far_ends|%');
 ----
-true	2
+true	0
