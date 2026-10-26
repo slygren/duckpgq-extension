@@ -26,6 +26,7 @@ struct CoreScalarFunctions {
 		RegisterReachabilityScalarFunction(loader);
 		RegisterShortestPathScalarFunction(loader);
 		RegisterShortestKPathsScalarFunction(loader);
+		RegisterUnionPathScalarFunctions(loader);
 		RegisterCheapestPathsScalarFunction(loader);
 		RegisterGraphPredicateScalarFunctions(loader);
 		RegisterGraphTreeJsonScalarFunction(loader);
@@ -44,6 +45,7 @@ private:
 	static void RegisterReachabilityScalarFunction(ExtensionLoader &loader);
 	static void RegisterShortestPathScalarFunction(ExtensionLoader &loader);
 	static void RegisterShortestKPathsScalarFunction(ExtensionLoader &loader);
+	static void RegisterUnionPathScalarFunctions(ExtensionLoader &loader);
 	static void RegisterCheapestPathsScalarFunction(ExtensionLoader &loader);
 	static void RegisterGraphTreeJsonScalarFunction(ExtensionLoader &loader);
 };

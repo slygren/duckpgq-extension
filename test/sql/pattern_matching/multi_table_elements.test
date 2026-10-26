@@ -289,4 +289,4 @@ endloop
 statement error
 FROM GRAPH_TABLE (g MATCH ANY SHORTEST (a)-[e]->(b) COLUMNS (element_id(a)));
 ----
-A search prefix over a pattern whose elements span several vertex or edge tables is not supported
+A search prefix over a pattern whose interior elements span several vertex or edge tables is not supported

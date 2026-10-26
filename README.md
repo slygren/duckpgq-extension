@@ -149,7 +149,14 @@ pattern has, ABI artifacts included. A property one of the tables lacks is NULL 
 of any of the tables, and `label(v)`, `labels(v)` and the other element functions are each row's own.
 `element_id(v)` is the row id within the element's table, so `label(v)` together with `element_id(v)` identifies an
 element across tables. A MATCH the translation answers as written (an ABI route covering a label expression over
-several edge tables, a quantified edge over several edge tables) keeps answering it that way.
+several edge tables, a quantified edge over several edge tables of one vertex table) keeps answering it that way.
+
+A quantified edge whose label (or the lack of one) selects edge tables over several vertex tables walks across them:
+`(a:Person)-[e:Knows|Takes]->{1,3}(b)`, `(t:Tag)-[:!HasParent]->+(x)`. Where no ABI artifact answers it, it is searched
+over one id space for all those tables (a table's rows numbered from its offset), with every selector and path
+mode, its ends one table each (an unlabeled end per table, as above); `vertices(p)` and `edges(p)` give row ids
+within each table and `vertex_labels(p)` / `edge_labels(p)` the tables along the path. Ties between paths are
+broken by the edges along the path, an edge by its table in the graph's order, then its row id.
 
 Cypher's quantifier inside the edge means what it means in Cypher, so a pattern copied from Neo4j returns the same
 paths. Its lower bound defaults to 1, so **a bare `*` is one or more hops here, but zero or more in the arrow form
@@ -683,9 +690,12 @@ building in [abi_build.cpp](src/core/functions/table/abi_build.cpp); vertex-join
   - `SHORTEST k` and `CHEAPEST` over a group;
   - `ONE ROW PER` or a search prefix over a group whose pattern is not the MATCH's only one;
   - a path variable or search prefix inside the group.
-- **Elements over several tables** (above): a search prefix over a pattern whose fixed elements span several tables,
-  `COLUMNS (*)` over them, and an `OPTIONAL MATCH` reading a variable of an earlier `OPTIONAL MATCH` whose elements
-  span tables are refused; a MATCH has at most 256 choices of tables.
+- **Elements over several tables** (above): a search prefix over a pattern whose interior elements span several
+  tables, `COLUMNS (*)` over them, and an `OPTIONAL MATCH` reading a variable of an earlier `OPTIONAL MATCH` whose
+  elements span tables are refused; a MATCH has at most 256 choices of tables. A quantified edge walking across
+  vertex tables takes one quantified edge between two vertices (no element `WHERE` on it, no `CHEAPEST`, no
+  `ONE ROW PER`, not inside `EXISTS { }`); of its edge variable `label(e)` and `element_id(e)` are read, a property
+  `e.x` is not (use `edge_property(p, 'x')`).
 - **Path pattern unions** (`|`, `|+|`) stand at the top level of a MATCH pattern, and take no search prefix
   (`ANY SHORTEST … | …`), OPTIONAL MATCH or ONE ROW PER. `|` removes duplicates only between fixed-length, directed
   operands; operands that may match the same variable-length walk need `|+|` or disjoint labels.
