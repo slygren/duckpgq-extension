@@ -2,7 +2,8 @@
 # description: Several GRAPH_TABLEs in one statement give the same rows as each one alone. DuckDB 2.0.0's
 #              common_subplan optimizer merged two occurrences of a subplan and read one scan's column in the other's
 #              place (x came back as y). A plain-SQL statement of the same shape shows it without duckpgq; the
-#              extension keeps the optimizer off the scans of statements that bind a GRAPH_TABLE, and only those.
+#              extension keeps the optimizer off the subplans of that shape in statements that bind a GRAPH_TABLE:
+#              one that occurs twice and scans a table twice. A repeated subplan that scans each table once keeps it.
 # group: [sql]
 
 require duckpgq
@@ -133,3 +134,35 @@ query II
 EXECUTE q(1);
 ----
 6	[(2, 2), (2, 2), (2, 4), (2, 4), (3, 2), (3, 4)]
+
+# A subplan the rewrite repeats that scans its table once -- a seed subquery, pushed into the closure and kept in the
+# MATCH WHERE -- is still merged by the optimizer and runs once (the guard used to keep it off every scan)
+statement ok
+CREATE TABLE T AS SELECT range AS id FROM range(1, 40);
+
+statement ok
+CREATE TABLE H AS SELECT range AS child, range // 2 AS parent FROM range(2, 40);
+
+statement ok
+CREATE TABLE S AS SELECT 7 AS v;
+
+statement ok
+CREATE PROPERTY GRAPH h VERTEX TABLES (T LABEL T) EDGE TABLES (H SOURCE KEY (child) REFERENCES T (id) DESTINATION KEY (parent) REFERENCES T (id) LABEL H);
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('h', closures := ['H']);
+
+query II
+EXPLAIN FROM GRAPH_TABLE (h MATCH ANY SHORTEST (c:T)-[:H]->{1,5}(a:T) WHERE c.id = (SELECT v FROM S LIMIT 1) COLUMNS (c.id AS c, a.id AS a));
+----
+physical_plan	<REGEX>:.*CTE.*
+
+query II rowsort
+FROM GRAPH_TABLE (h MATCH ANY SHORTEST (c:T)-[:H]->{1,5}(a:T) WHERE c.id = (SELECT v FROM S LIMIT 1) COLUMNS (c.id AS c, a.id AS a));
+----
+7	1
+7	3
+

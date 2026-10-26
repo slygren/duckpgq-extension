@@ -88,7 +88,8 @@ In every such case the old rows were wrong.
     artifact answered; it is `id` on every route (an expression without `AS` is named by its text).
   - **Several `GRAPH_TABLE`s in one statement** (a join, `EXCEPT`, two scalar subqueries over the same graph) give
     the rows each gives alone. DuckDB 2.0.0's `common_subplan` optimizer merged their subplans and could read one
-    vertex scan's column in place of another's; it is kept off the scans of statements with a `GRAPH_TABLE`.
+    vertex scan's column in place of another's; in a statement with a `GRAPH_TABLE` it is kept off the subplans of
+    that shape (one that occurs twice and scans a table twice), and still merges the others.
 
 **Errors where there used to be silent wrong output**
 - **A path function on a name that isn't a path** (`path_length(o)` with no `o = …`) is an error. The column used to

@@ -20,8 +20,15 @@ namespace duckdb {
 //! test/sql/optimizer/common_subplan_guard.test); the plans GRAPH_TABLE generates have exactly that shape, since
 //! a pattern scans its vertex table once per vertex. The optimizer only merges subtrees whose every operator it
 //! can serialize, and a LogicalGet whose function does not ask for serialization verification is one it cannot,
-//! so clearing that flag on every scan of such a statement takes all its scan-bearing subtrees out of it. Nothing
-//! else reads the flag but the serializer round trip of debug plan verification.
+//! so clearing that flag on a scan takes every subtree holding it out of the optimizer. Nothing else reads the flag
+//! but the serializer round trip of debug plan verification.
+//!
+//! Only the subtrees at risk are taken out: one that scans a table twice and has a disjoint twin in the plan that
+//! scans the same tables as often -- a candidate for the merge with the bug's shape. The optimizer compares
+//! subplans after filter pushdown and join ordering, with every scan reading all columns, so this compares what
+//! those keep: each scan's function and table, counted, no shape, columns or expressions. Every pair the optimizer
+//! could merge passes it (a false pair only takes more out). A subplan used twice that scans each table once, such
+//! as a seed subquery a pattern repeats, keeps the optimizer: it is merged and runs once.
 class CommonSubplanGuard {
 public:
 	static constexpr const char *SETTING_NAME = "duckpgq_common_subplan_guard";
