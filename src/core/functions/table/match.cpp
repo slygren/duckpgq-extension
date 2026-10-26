@@ -5962,8 +5962,7 @@ void PGQMatchFunction::ProcessOptionalPathList(
     const PGQPathTableCache &path_table_cache,
     bool require_abi_paths, const ParsedExpression *where_hint,
     const std::function<bool(const PGQPathTableInfo &)> &counts_exactly,
-    const std::function<bool(const PGQPathTableInfo &, const string &, const PropertyGraphTable &, const string &)>
-        &far_ends_complete) {
+    const std::function<bool(const PGQPathTableInfo &)> &endpoints_complete) {
 	const string &graph_name = pg_table.property_graph_name;
 
 	for (auto &path_pattern : opt_patterns) {
@@ -6209,11 +6208,11 @@ void PGQMatchFunction::ProcessOptionalPathList(
 					bt->alias = Identifier(pt_alias);
 					unique_ptr<ParsedExpression> vertex_on_cond = make_uniq<ComparisonExpression>(
 					    ExpressionType::COMPARE_EQUAL, PGQColRef(free_pk, next_binding), PGQColRef(free_col, pt_alias));
-					// An artifact whose every row reaches a vertex (measured once per lake state) cannot leave a
-					// half-matched row either.
+					// An artifact whose every row reaches a vertex at both ends (recorded by the builder, or measured
+					// once per lake state: PGQExactness::EndpointsComplete, the probe that also gates every artifact)
+					// cannot leave a half-matched row either.
 					bool far_end_cannot_fail =
-					    pg_table.verified ||
-					    (far_ends_complete && far_ends_complete(*path_info, free_col, *next_vertex_table, free_pk));
+					    pg_table.verified || (endpoints_complete && endpoints_complete(*path_info));
 					if (!next_elem->label.empty()) {
 						vector<unique_ptr<ParsedExpression>> label_conds;
 						CheckInheritance(next_vertex_table, next_elem, label_conds);
@@ -7035,8 +7034,8 @@ public:
 		                                static_cast<unsigned long long>(edges.size())));
 	}
 
-	// Every row of an artifact reaches a vertex at its `column` end: an OPTIONAL MATCH hop over it then needs no
-	// guard against a half-matched row. Measured once per lake state, like the multiplicity probes.
+	// Every row of an artifact reaches a vertex at its `column` end: EndpointsComplete's probe of one vertex column
+	// (keyed far_ends|<artifact>|<column>). Measured once per lake state, like the multiplicity probes.
 	bool FarEndsComplete(const PGQPathTableInfo &info, const string &column, const PropertyGraphTable &vertex_table,
 	                     const string &key) {
 		if (info.endpoints_complete) {
@@ -17216,11 +17215,6 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 	PGQArtifactGate artifact_gate_scope(&endpoints_complete);
 	const std::function<bool(const PGQPathTableInfo &)> optional_counts_exactly =
 	    [&optional_exactness](const PGQPathTableInfo &info) { return optional_exactness.CountsExactly(info); };
-	const std::function<bool(const PGQPathTableInfo &, const string &, const PropertyGraphTable &, const string &)>
-	    optional_far_ends_complete = [&optional_exactness](const PGQPathTableInfo &info, const string &column,
-	                                                        const PropertyGraphTable &vertex_table, const string &key) {
-		    return optional_exactness.FarEndsComplete(info, column, vertex_table, key);
-	    };
 	const ReferencedBindings referenced_bindings = CollectReferencedBindings(*ref);
 	const bool require_abi_paths = RequireABIPaths(context);
 	CoveredBindingMap covered_columns;
@@ -17393,7 +17387,7 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 		}
 		ProcessOptionalPathList(context, opt_group, final_select_node, optional_alias_map, *pg_table, extra_alias_counter, alias_map,
 		                        path_table_cache, require_abi_paths, ref->where_clause.get(), optional_counts_exactly,
-		                        optional_far_ends_complete);
+		                        endpoints_complete);
 	}
 
 	// Maps from table alias to table, including vertex and edge tables.
@@ -17629,7 +17623,7 @@ unique_ptr<QueryNode> PGQMatchFunction::BuildMatchQueryNode(ClientContext &conte
 			}
 			ProcessOptionalPathList(context, opt_group, branch_select, branch_opt_alias_map, *pg_table, branch_counter,
 			                        branch_alias_map, path_table_cache, require_abi_paths, branch.where_clause.get(),
-			                        optional_counts_exactly, optional_far_ends_complete);
+			                        optional_counts_exactly, endpoints_complete);
 		}
 
 		case_insensitive_set_t branch_stub_bindings;
