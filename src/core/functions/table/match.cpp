@@ -2029,6 +2029,20 @@ static bool BindingSpansMultiplePatterns(const MatchExpression &ref, const strin
 			return true;
 		}
 	}
+	// An OPTIONAL MATCH group, or a pattern matched on its own and joined (joined_patterns), that names the binding
+	// is joined to it by the vertex's rowid: the vertex must be there to join on.
+	for (const auto &group : ref.optional_match_patterns) {
+		for (const auto &pattern : group) {
+			if (pattern && contains(pattern->path_elements)) {
+				return true;
+			}
+		}
+	}
+	for (const auto &pattern : ref.joined_patterns) {
+		if (pattern && contains(pattern->path_elements)) {
+			return true;
+		}
+	}
 	return false;
 }
 
@@ -9243,11 +9257,11 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 		                                                  edge_table.table_name);
 		edge_selects.push_back(StringUtil::Format(
 		    "SELECT %s::VARCHAR AS src_label, %s::VARCHAR AS dst_label, %s::VARCHAR AS edge_label, v0, v1 "
-		    "FROM %s",
+		    "FROM %s%s",
 		    KeywordHelper::WriteQuoted(edge_table.src_label, '\''),
 		    KeywordHelper::WriteQuoted(edge_table.dst_label, '\''),
 		    KeywordHelper::WriteQuoted(edge_table.edge_label, '\''),
-		    qualified_table));
+		    qualified_table, edge_table.info && edge_table.info->endpoints_complete ? "" : " WHERE v1 IS NOT NULL"));
 	}
 
 	const string src_table_name = QualifiedTableName(PGQStr(src_table->catalog_name), PGQStr(src_table->schema_name),
@@ -9431,7 +9445,7 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 				         ")";
 			}
 			artifact_filters.push_back(simple);
-			for (idx_t idx = 0; idx <= artifact.hops; idx++) {
+			for (idx_t idx = 0; idx <= artifact.hops && !artifact.info->endpoints_complete; idx++) {
 				artifact_filters.push_back("a.v" + to_string(idx) + " IS NOT NULL");
 			}
 			string artifact_where;
@@ -9674,9 +9688,10 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 				    "list_append(c.path_edge_labels, %s::VARCHAR) AS path_edge_labels, "
 				    "list_append(c.path_participants, %s::VARCHAR || ':' || CAST(%s AS VARCHAR)) AS path_participants "
 				    "FROM %s c JOIN %s a ON %s = c.dst_id "
-				    "WHERE a.v1 IS NOT NULL AND (NOT list_contains(c.path_participants, %s::VARCHAR || ':' || CAST(%s AS VARCHAR))%s)",
+				    "WHERE %s(NOT list_contains(c.path_participants, %s::VARCHAR || ':' || CAST(%s AS VARCHAR))%s)",
 				    dst_sql, v1, dst_type.ToString(), v1, dst_sql,
 				    KeywordHelper::WriteQuoted(edge_table.edge_label, '\''), dst_sql, v1, source->second, artifact, v0,
+				    edge_table.info && edge_table.info->endpoints_complete ? "" : "a.v1 IS NOT NULL AND ",
 				    dst_sql, v1,
 				    closed_walks ? StringUtil::Format(closing_unrolled, dst_sql, v1) : string()));
 				if (!next.count(edge_table.dst_label)) {
@@ -9749,7 +9764,7 @@ static unique_ptr<TableRef> BuildABIContextNamedPathRef(const PGQPathTableCache 
 	    "         list_append(c.path_edge_labels, e.edge_label) AS path_edge_labels, "
 	    "         list_append(c.path_participants, e.dst_label || ':' || CAST(e.v1 AS VARCHAR)) AS path_participants "
 	    "  FROM __pgq_ctx c "
-	    "  JOIN (SELECT * FROM (%s) WHERE v1 IS NOT NULL AND v0 IN (SELECT f.dst_id FROM __pgq_ctx f WHERE f.depth < %s)) e "
+	    "  JOIN (SELECT * FROM (%s) WHERE v0 IN (SELECT f.dst_id FROM __pgq_ctx f WHERE f.depth < %s)) e "
 	    "    ON lower(e.src_label) = lower(c.dst_label) AND e.v0 = c.dst_id "
 	    "  WHERE c.depth < %s "
 	    "    AND (NOT list_contains(c.path_participants, e.dst_label || ':' || CAST(e.v1 AS VARCHAR))%s)"
@@ -12251,10 +12266,10 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 	    exactness.EndpointsState(*path_info, PGQExactness::Look::BOUNDED_PROBE) == PGQExactness::Endpoints::COMPLETE;
 	const bool src_fully_covered =
 	    keys_are_vertices && BindingReferencesOnlyCovered(match_ref, hops[0].src_binding, src_covered_properties);
-	if (src_fully_covered) {
-		// A NULL key is no vertex (the join it stands in for would drop it)
+	if (src_fully_covered && !path_info->endpoints_complete) {
+		// A NULL key is no vertex (the join it stands in for would drop it); a stored proof already excludes it
 		conditions.push_back(make_uniq<OperatorExpression>(ExpressionType::OPERATOR_IS_NOT_NULL, PGQColRef("v0", pt_alias)));
-	} else {
+	} else if (!src_fully_covered) {
 		alias_map[hops[0].src_binding] = hops[0].src_vtable;
 		auto lhs = PGQColRef(hops[0].src_pk, hops[0].src_binding);
 		auto rhs = PGQColRef("v0", pt_alias);
@@ -12276,9 +12291,9 @@ static bool TryPathTableRewrite(ClientContext &context, CreatePropertyGraphInfo 
 		covered_columns[hops[i].dst_binding] = dst_covered_properties;
 		const bool dst_fully_covered =
 		    keys_are_vertices && BindingReferencesOnlyCovered(match_ref, hops[i].dst_binding, dst_covered_properties);
-		if (dst_fully_covered) {
+		if (dst_fully_covered && !path_info->endpoints_complete) {
 			conditions.push_back(make_uniq<OperatorExpression>(ExpressionType::OPERATOR_IS_NOT_NULL, PGQColRef(vcol, pt_alias)));
-		} else {
+		} else if (!dst_fully_covered) {
 			alias_map[hops[i].dst_binding] = hops[i].dst_vtable;
 			auto lhs = PGQColRef(hops[i].dst_pk, hops[i].dst_binding);
 			auto rhs = PGQColRef(vcol, pt_alias);

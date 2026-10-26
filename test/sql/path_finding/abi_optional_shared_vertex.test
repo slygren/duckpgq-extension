@@ -1,0 +1,205 @@
+# name: test/sql/path_finding/abi_optional_shared_vertex.test
+# description: An OPTIONAL MATCH group that names a vertex of the mandatory pattern is joined to it by the vertex's
+#              rowid, so the edge route that answers the mandatory pattern from an artifact must keep that vertex's
+#              join even when the COLUMNS read only its key. It took the key from the artifact and dropped the
+#              vertex: "Variable 't' in OPTIONAL MATCH is not bound by a preceding MATCH clause" (cdc0934d too, with
+#              artifacts and an exact edge artifact, which self-loops make the route here). Every form equals the
+#              explicit LEFT JOIN over the tables; each side is materialized on its own.
+# group: [path_finding]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE P AS SELECT range AS id, 'n' || range AS name FROM range(1, 6);
+
+statement ok
+CREATE TABLE K(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO K VALUES (1,5),(5,5),(4,4),(2,4),(4,5),(5,2),(3,4),(3,1);
+
+statement ok
+CREATE PROPERTY GRAPH g VERTEX TABLES (P LABEL P) EDGE TABLES (K SOURCE KEY (src) REFERENCES P (id) DESTINATION KEY (dst) REFERENCES P (id) LABEL K);
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('g', max_hops := 2);
+
+statement ok
+CREATE TABLE edges AS SELECT k.src, k.dst FROM K k JOIN P a ON a.id = k.src JOIN P b ON b.id = k.dst;
+
+# (t)-[e]->(x) OPTIONAL (t)<-[f]-(y)
+statement ok
+CREATE TABLE ref1 AS SELECT m.src AS t, m.dst AS x, o.src AS y FROM edges m LEFT JOIN edges o ON o.dst = m.src;
+
+statement ok
+CREATE TABLE got1 AS FROM GRAPH_TABLE (g MATCH (t:P)-[e:K]->(x:P) OPTIONAL MATCH (t)<-[f:K]-(y:P) COLUMNS (t.id AS t, x.id AS x, y.id AS y));
+
+query TT
+SELECT rewrite_type, status FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+edge	selected
+
+query II
+SELECT (SELECT count(*) FROM got1), (SELECT count(*) FROM ((FROM got1 EXCEPT ALL FROM ref1) UNION ALL (FROM ref1 EXCEPT ALL FROM got1)));
+----
+16	0
+
+# unlabeled y
+statement ok
+CREATE TABLE got2 AS FROM GRAPH_TABLE (g MATCH (t:P)-[e:K]->(x:P) OPTIONAL MATCH (t)<-[f:K]-(y) COLUMNS (t.id AS t, x.id AS x, y.id AS y));
+
+query I
+SELECT count(*) FROM ((FROM got2 EXCEPT ALL FROM ref1) UNION ALL (FROM ref1 EXCEPT ALL FROM got2));
+----
+0
+
+# (t)-[e]->(x) OPTIONAL (t)-[f]->(y)
+statement ok
+CREATE TABLE ref3 AS SELECT m.src AS t, m.dst AS x, o.dst AS y FROM edges m LEFT JOIN edges o ON o.src = m.src;
+
+statement ok
+CREATE TABLE got3 AS FROM GRAPH_TABLE (g MATCH (t:P)-[e:K]->(x:P) OPTIONAL MATCH (t)-[f:K]->(y:P) COLUMNS (t.id AS t, x.id AS x, y.id AS y));
+
+query II
+SELECT (SELECT count(*) FROM got3), (SELECT count(*) FROM ((FROM got3 EXCEPT ALL FROM ref3) UNION ALL (FROM ref3 EXCEPT ALL FROM got3)));
+----
+14	0
+
+# the far vertex shared: (t)-[e]->(x) OPTIONAL (x)<-[f]-(y)
+statement ok
+CREATE TABLE ref4 AS SELECT m.src AS t, m.dst AS x, o.src AS y FROM edges m LEFT JOIN edges o ON o.dst = m.dst;
+
+statement ok
+CREATE TABLE got4 AS FROM GRAPH_TABLE (g MATCH (t:P)-[e:K]->(x:P) OPTIONAL MATCH (x)<-[f:K]-(y:P) COLUMNS (t.id AS t, x.id AS x, y.id AS y));
+
+query II
+SELECT (SELECT count(*) FROM got4), (SELECT count(*) FROM ((FROM got4 EXCEPT ALL FROM ref4) UNION ALL (FROM ref4 EXCEPT ALL FROM got4)));
+----
+20	0
+
+# only the optional side read, and a WHERE on it
+statement ok
+CREATE TABLE ref5 AS SELECT m.src AS t, o.src AS y FROM edges m LEFT JOIN edges o ON o.dst = m.src WHERE m.src <> 3;
+
+statement ok
+CREATE TABLE got5 AS FROM GRAPH_TABLE (g MATCH (t:P)-[e:K]->(x:P) OPTIONAL MATCH (t)<-[f:K]-(y:P) WHERE t.id <> 3 COLUMNS (t.id AS t, y.id AS y));
+
+query I
+SELECT count(*) FROM ((FROM got5 EXCEPT ALL FROM ref5) UNION ALL (FROM ref5 EXCEPT ALL FROM got5));
+----
+0
+
+# The same forms traversed
+statement ok
+SET pgq_disable_abi_rewrite = true;
+
+statement ok
+CREATE TABLE trav1 AS FROM GRAPH_TABLE (g MATCH (t:P)-[e:K]->(x:P) OPTIONAL MATCH (t)<-[f:K]-(y:P) COLUMNS (t.id AS t, x.id AS x, y.id AS y));
+
+query I
+SELECT count(*) FROM ((FROM trav1 EXCEPT ALL FROM ref1) UNION ALL (FROM ref1 EXCEPT ALL FROM trav1));
+----
+0
+
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+# =====================================================================================================================
+# A stored endpoints_complete = true is trusted by every route: no completeness probe runs and no per-query check is
+# added. To show it, the proof is made false after the build (a vertex deleted): the routes then answer what the
+# artifacts hold, which a check would have filtered.
+# =====================================================================================================================
+statement ok
+DELETE FROM P WHERE id = 4;
+
+query I
+SELECT count(*) FROM graph.__pgq_path_catalog WHERE graph_name = 'g' AND endpoints_complete;
+----
+<REGEX>:[1-9][0-9]*
+
+# edge route, keys only: the artifact's edges of 4 are answered (a check would drop them)
+query I
+SELECT count(*) FROM GRAPH_TABLE (g MATCH (t:P)-[e:K]->(x:P) COLUMNS (t.id AS t, x.id AS x));
+----
+8
+
+query I
+SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE rewrite_type = 'multiplicity_probe' AND (reason LIKE 'far_ends|%' OR reason LIKE 'complete|%');
+----
+0
+
+# A context expansion and a closure over their own graph, with the proof made false the same way
+statement ok
+CREATE TABLE Person(id BIGINT);
+
+statement ok
+INSERT INTO Person VALUES (1), (2), (3);
+
+statement ok
+CREATE TABLE Tag(id BIGINT);
+
+statement ok
+INSERT INTO Tag VALUES (10), (11);
+
+statement ok
+CREATE TABLE likes(personId BIGINT, tagId BIGINT);
+
+statement ok
+INSERT INTO likes VALUES (1, 10), (1, 11), (3, 11);
+
+statement ok
+CREATE TABLE knows(src BIGINT, dst BIGINT);
+
+statement ok
+INSERT INTO knows VALUES (1, 2), (2, 3);
+
+statement ok
+CREATE PROPERTY GRAPH h VERTEX TABLES (Person LABEL Person, Tag LABEL Tag)
+EDGE TABLES (likes SOURCE KEY (personId) REFERENCES Person (id) DESTINATION KEY (tagId) REFERENCES Tag (id) LABEL Likes,
+             knows SOURCE KEY (src) REFERENCES Person (id) DESTINATION KEY (dst) REFERENCES Person (id) LABEL Knows);
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('h', schema := 'abi_h', closures := ['Knows']);
+
+statement ok
+DELETE FROM Tag WHERE id = 10;
+
+statement ok
+DELETE FROM Person WHERE id = 2;
+
+# context expansion: person 1's like of the deleted tag 10 is answered (a path check would drop it)
+query II
+SELECT count(*), list(v ORDER BY v) FROM GRAPH_TABLE (h MATCH p = (a:Person)-[:!Knows]->{1,2}(x) WHERE a.id = 1
+                                                      COLUMNS (vertices(p) AS v));
+----
+2	[[1, 10], [1, 11]]
+
+query II
+SELECT (SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE rewrite_type = 'abi_context_expansion' AND status = 'selected'),
+       (SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE rewrite_type = 'multiplicity_probe' AND (reason LIKE 'far_ends|%' OR reason LIKE 'complete|%'));
+----
+1	0
+
+# closure: 1 reaches 3 through the deleted person 2 (the closure is used without measuring its edge table)
+query II
+FROM GRAPH_TABLE (h MATCH ANY SHORTEST (a:Person)-[:Knows]->{1,3}(b:Person) WHERE a.id = 1 COLUMNS (a.id AS a, b.id AS b));
+----
+1	3
+
+query II
+SELECT (SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE rewrite_type = 'transitive_closure' AND status = 'selected'),
+       (SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE rewrite_type = 'multiplicity_probe' AND (reason LIKE 'far_ends|%' OR reason LIKE 'complete|%'));
+----
+1	0
+
+# OPTIONAL hop over the artifact: no far-end measurement either
+statement ok
+FROM GRAPH_TABLE (h MATCH (a:Person) OPTIONAL MATCH (a)-[:Likes]->(t:Tag) COLUMNS (a.id AS a, t.id AS t));
+
+query I
+SELECT count(*) FROM pgq_last_rewrite_diagnostics() WHERE rewrite_type = 'multiplicity_probe' AND (reason LIKE 'far_ends|%' OR reason LIKE 'complete|%');
+----
+0
