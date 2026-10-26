@@ -13,12 +13,9 @@ struct CoreScalarFunctions {
 		RegisterIterativeLengthScalarFunction(loader);
 		RegisterIterativeLength2ScalarFunction(loader);
 		RegisterIterativeLengthBidirectionalScalarFunction(loader);
-		RegisterLocalClusteringCoefficientScalarFunction(loader);
 		RegisterReachabilityScalarFunction(loader);
 		RegisterShortestPathScalarFunction(loader);
 		RegisterShortestKPathsScalarFunction(loader);
-		RegisterWeaklyConnectedComponentScalarFunction(loader);
-		RegisterPageRankScalarFunction(loader);
 		RegisterGraphPredicateScalarFunctions(loader);
 		RegisterGraphTreeJsonScalarFunction(loader);
 	}
@@ -33,12 +30,9 @@ private:
 	static void RegisterIterativeLengthScalarFunction(ExtensionLoader &loader);
 	static void RegisterIterativeLength2ScalarFunction(ExtensionLoader &loader);
 	static void RegisterIterativeLengthBidirectionalScalarFunction(ExtensionLoader &loader);
-	static void RegisterLocalClusteringCoefficientScalarFunction(ExtensionLoader &loader);
 	static void RegisterReachabilityScalarFunction(ExtensionLoader &loader);
 	static void RegisterShortestPathScalarFunction(ExtensionLoader &loader);
 	static void RegisterShortestKPathsScalarFunction(ExtensionLoader &loader);
-	static void RegisterWeaklyConnectedComponentScalarFunction(ExtensionLoader &loader);
-	static void RegisterPageRankScalarFunction(ExtensionLoader &loader);
 	static void RegisterGraphTreeJsonScalarFunction(ExtensionLoader &loader);
 };
 

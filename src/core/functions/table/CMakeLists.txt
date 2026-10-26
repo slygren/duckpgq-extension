@@ -6,13 +6,10 @@ set(EXTENSION_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/explain_abi_path.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/last_rewrite_diagnostics.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/verify_abi_rewrite.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/local_clustering_coefficient.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/match.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/pagerank.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/pgq_parse_match.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/pgq_scan.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/summarize_property_graph.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/vertex_elimination.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/weakly_connected_component.cpp
     ${EXTENSION_SOURCES}
     PARENT_SCOPE)

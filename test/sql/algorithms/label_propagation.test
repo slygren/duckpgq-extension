@@ -1,0 +1,75 @@
+# name: test/sql/algorithms/label_propagation.test
+# description: label_propagation: asynchronous label propagation on the undirected simple graph, deterministic for
+#              a seed. scripts/compare_graph_algorithms.py checks on generated graphs that the result is a fixed point
+#              (every vertex holds a most frequent neighbour label) and that planted partitions are recovered.
+# group: [algorithms]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+# Two 5-cliques joined by the single edge 4 - 5, and an isolated 10.
+statement ok
+CREATE TABLE v AS SELECT range AS id FROM range(11);
+
+statement ok
+CREATE TABLE e AS SELECT a.id AS src, b.id AS dst FROM v a, v b WHERE a.id < b.id AND a.id < 5 AND b.id < 5
+    UNION ALL SELECT a.id, b.id FROM v a, v b WHERE a.id < b.id AND a.id BETWEEN 5 AND 9 AND b.id BETWEEN 5 AND 9
+    UNION ALL SELECT 4, 5 UNION ALL SELECT 5, 4 UNION ALL SELECT 3, 3;
+
+statement ok
+CREATE PROPERTY GRAPH g VERTEX TABLES (v) EDGE TABLES (e SOURCE KEY (src) REFERENCES v (id) DESTINATION KEY (dst) REFERENCES v (id));
+
+# A community's id is the smallest rowid among its members.
+query II
+SELECT id, community FROM label_propagation('g', 'v', 'e') ORDER BY id;
+----
+0	0
+1	0
+2	0
+3	0
+4	0
+5	5
+6	5
+7	5
+8	5
+9	5
+10	10
+
+query I
+SELECT list(community ORDER BY id) FROM label_propagation('g', 'v', 'e', seed := 2, max_iterations := 10);
+----
+[0, 0, 0, 0, 0, 5, 5, 5, 5, 5, 10]
+
+# The same seed gives the same communities, on a graph where the outcome depends on the visiting order.
+statement ok
+CREATE TABLE rv AS SELECT range AS id FROM range(300);
+
+statement ok
+CREATE TABLE re AS SELECT (range * 7919) % 300 AS src, (range * 104729 + 13) % 300 AS dst FROM range(900);
+
+statement ok
+CREATE PROPERTY GRAPH rg VERTEX TABLES (rv) EDGE TABLES (re SOURCE KEY (src) REFERENCES rv (id) DESTINATION KEY (dst) REFERENCES rv (id));
+
+query I
+SELECT count(*) FROM label_propagation('rg', 'rv', 're', seed := 5) a JOIN label_propagation('rg', 'rv', 're', seed := 5) b USING (id) WHERE a.community = b.community;
+----
+300
+
+statement error
+FROM label_propagation('g', 'v', 'e', max_iterations := 0);
+----
+Invalid Input Error: label_propagation: max_iterations must be at least 1, not 0
+
+# No edges: every vertex is its own community.
+statement ok
+CREATE TABLE ne (src BIGINT, dst BIGINT);
+
+statement ok
+CREATE PROPERTY GRAPH ng VERTEX TABLES (v) EDGE TABLES (ne SOURCE KEY (src) REFERENCES v (id) DESTINATION KEY (dst) REFERENCES v (id));
+
+query I
+SELECT count(DISTINCT community) FROM label_propagation('ng', 'v', 'ne');
+----
+11

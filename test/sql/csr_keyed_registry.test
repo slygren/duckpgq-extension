@@ -56,18 +56,18 @@ EDGE TABLES (
 query IR
 select id, round(pagerank, 4) from pagerank(g, p, knows) ORDER BY id;
 ----
-0	0.2899
-1	0.2899
-2	0.2899
-3	0.0435
+0	0.3175
+1	0.3175
+2	0.3175
+3	0.0476
 
 query IR
 select id, round(pagerank, 4) from pagerank(g, p, likes) ORDER BY id;
 ----
-0	0.3846
-1	0.0577
-2	0.0577
-3	0.3846
+0	0.4348
+1	0.0652
+2	0.0652
+3	0.4348
 
 # Two CSRs in one query. Each column must equal its baseline above -- that equality is the
 # assertion; a shared slot cannot produce it.
@@ -75,10 +75,10 @@ query IRR
 select k.id, round(k.pagerank, 4) AS pr_knows, round(l.pagerank, 4) AS pr_likes
 from pagerank(g, p, knows) k join pagerank(g, p, likes) l on k.id = l.id ORDER BY k.id;
 ----
-0	0.2899	0.3846
-1	0.2899	0.0577
-2	0.2899	0.0577
-3	0.0435	0.3846
+0	0.3175	0.4348
+1	0.3175	0.0652
+2	0.3175	0.0652
+3	0.0476	0.4348
 
 # Two DIFFERENT algorithms, each needing its own CSR.
 #
@@ -93,16 +93,16 @@ select w.id, count(*) OVER (PARTITION BY w.componentId) AS component_size,
        round(p.pagerank, 4) AS pr
 from weakly_connected_component(g, p, knows) w join pagerank(g, p, likes) p on w.id = p.id ORDER BY w.id;
 ----
-0	3	0.3846
-1	3	0.0577
-2	3	0.0577
-3	1	0.3846
+0	3	0.4348
+1	3	0.0652
+2	3	0.0652
+3	1	0.4348
 
 # Sequential queries in one connection must not inherit a previous query's CSR either.
 query IR
 select id, round(pagerank, 4) from pagerank(g, p, knows) ORDER BY id;
 ----
-0	0.2899
-1	0.2899
-2	0.2899
-3	0.0435
+0	0.3175
+1	0.3175
+2	0.3175
+3	0.0476

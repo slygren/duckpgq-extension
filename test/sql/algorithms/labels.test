@@ -1,0 +1,96 @@
+# name: test/sql/algorithms/labels.test
+# description: The graph algorithms with sub-labels (LABEL ... IN discriminator (...)): they run on the vertices
+#              with the vertex label and the edges with the edge label between them. Before, a sub-label was
+#              resolved to its table and every row of it was used.
+# group: [algorithms]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+# Students 1, 2 (kind bit 0), teachers 3, 4 (bit 1). Knows edges (bit 0): 1 -> 2, 3 -> 4. Likes (bit 1): 2 -> 3, 4 -> 1.
+# All four edges form the cycle 1 -> 2 -> 3 -> 4 -> 1.
+statement ok
+CREATE TABLE p (id BIGINT, kind BIGINT);
+
+statement ok
+INSERT INTO p VALUES (1, 1), (2, 1), (3, 2), (4, 2);
+
+statement ok
+CREATE TABLE r (src BIGINT, dst BIGINT, kind BIGINT);
+
+statement ok
+INSERT INTO r VALUES (1, 2, 1), (2, 3, 2), (3, 4, 1), (4, 1, 2);
+
+statement ok
+CREATE PROPERTY GRAPH g VERTEX TABLES (p LABEL Person IN kind (Student, Teacher)) EDGE TABLES (r SOURCE KEY (src) REFERENCES p (id) DESTINATION KEY (dst) REFERENCES p (id) LABEL Rel IN kind (Knows, Likes));
+
+# Main labels: the whole cycle.
+query II
+SELECT id, componentId FROM strongly_connected_component('g', 'Person', 'Rel') ORDER BY id;
+----
+1	0
+2	0
+3	0
+4	0
+
+# An edge sub-label: only 1 -> 2 and 3 -> 4.
+query II
+SELECT id, componentId FROM strongly_connected_component('g', 'Person', 'Knows') ORDER BY id;
+----
+1	0
+2	1
+3	2
+4	3
+
+query II
+SELECT id, componentId FROM weakly_connected_component('g', 'Person', 'Knows') ORDER BY id;
+----
+1	0
+2	0
+3	2
+4	2
+
+query IIII
+SELECT id, in_degree, out_degree, degree FROM degree('g', 'Person', 'Likes') ORDER BY id;
+----
+1	1	0	1
+2	0	1	1
+3	1	0	1
+4	0	1	1
+
+# A vertex sub-label: only the students, and only edges between students (1 -> 2).
+query II
+SELECT id, round(pagerank, 10) FROM pagerank('g', 'Student', 'Rel') ORDER BY id;
+----
+1	0.3508773619
+2	0.6491226381
+
+query IIII
+SELECT id, in_degree, out_degree, degree FROM degree('g', 'Teacher', 'Rel') ORDER BY id;
+----
+3	0	1	1
+4	1	0	1
+
+query II
+FROM shortest_path_lengths('g', 'Student', 'Rel', 1) ORDER BY id;
+----
+1	0
+2	1
+
+statement error
+FROM shortest_path_lengths('g', 'Student', 'Rel', 3);
+----
+Invalid Input Error: shortest_path_lengths: no vertex has the source key 3
+
+query I
+FROM total_triangle_count('g', 'Teacher', 'Likes');
+----
+0
+
+query II
+SELECT id, betweenness_centrality FROM betweenness_centrality('g', 'Teacher', 'Knows', normalized := false) ORDER BY id;
+----
+3	0.0
+4	0.0

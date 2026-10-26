@@ -366,13 +366,101 @@ refuses a fallback traversal whose estimate is over budget.
 
 ## Graph algorithms
 
-From upstream, as table functions over a graph, a vertex label and an edge label:
+Table functions over a graph, a vertex label and an edge label. The edge label's edges must start and end in that
+vertex table. A sub-label (`LABEL Person IN kind (Student, Teacher)`) restricts the run to the vertices with the
+vertex label and the edges with the edge label between them. Each call returns one row per vertex, keyed by the vertex table's (first) key column, whatever its
+type. Each call builds its own CSR (compressed sparse row) copy of the edges, runs the algorithm once and drops the
+CSR at the end of the query. Every loop checks for query cancellation and `max_execution_time`.
 
 ```sql
 FROM pagerank('social', 'Person', 'Knows');
 FROM weakly_connected_component('social', 'Person', 'Knows');
 FROM local_clustering_coefficient('social', 'Person', 'Knows');
+FROM strongly_connected_component('social', 'Person', 'Knows');
+FROM triangle_count('social', 'Person', 'Knows');
+FROM total_triangle_count('social', 'Person', 'Knows');    -- one row
+FROM betweenness_centrality('social', 'Person', 'Knows', k := 256, seed := 7, normalized := true, directed := true);
+FROM label_propagation('social', 'Person', 'Knows', seed := 7, max_iterations := 100);
+FROM louvain('social', 'Person', 'Knows', resolution := 1.0, seed := 7);
+FROM k_core('social', 'Person', 'Knows');
+FROM shortest_path_lengths('social', 'Person', 'Knows', 42, directed := true);   -- 42 = the source's key
+FROM degree('social', 'Person', 'Knows');
 ```
+
+How each function reads the edges (n vertices, m edges):
+
+| Function | Graph | Self-loops | Parallel edges | Result | Time |
+| --- | --- | --- | --- | --- | --- |
+| `pagerank(g, v, e, damping, max_iterations, tolerance)` | directed | out-edge to itself | each counts | `pagerank DOUBLE` | O(n + m) per iteration |
+| `weakly_connected_component(g, v, e)` | undirected | no effect | no effect | `componentId BIGINT` | O(m α(n)) |
+| `local_clustering_coefficient(g, v, e)` | undirected | ignored | count once | `local_clustering_coefficient FLOAT` | O(m^1.5) |
+| `strongly_connected_component(g, v, e)` | directed | no effect | no effect | `componentId BIGINT` | O(n + m) |
+| `triangle_count(g, v, e)` | undirected | ignored | count once | `triangle_count BIGINT` | O(m^1.5) |
+| `total_triangle_count(g, v, e)` | undirected | ignored | count once | one row, `triangle_count BIGINT` | O(m^1.5) |
+| `betweenness_centrality(g, v, e, k, normalized, directed, seed)` | directed (default) or undirected | ignored | count once | `betweenness_centrality DOUBLE` | O(n m), O(k m) sampled |
+| `label_propagation(g, v, e, seed, max_iterations)` | undirected | ignored | count once | `community BIGINT` | O(m) per round |
+| `louvain(g, v, e, resolution, seed)` | undirected, unweighted | ignored | count once | `community BIGINT` | about O(m) per level |
+| `k_core(g, v, e)` | undirected | ignored | count once | `core_number BIGINT` | O(n + m) |
+| `shortest_path_lengths(g, v, e, source, directed)` | directed (default) or undirected | no effect | no effect | `distance BIGINT`, reachable vertices only | O(n + m) |
+| `degree(g, v, e)` | directed | 1 in + 1 out | each counts | `in_degree, out_degree, degree BIGINT` | O(n + m), plain SQL |
+
+- **`pagerank`**: power iteration exactly as `networkx.pagerank` (on a MultiDiGraph) does it, so the values agree
+  to rounding. It starts from 1/n. Each step gives `damping` (default 0.85) of a vertex's rank to its out-edges in
+  equal shares and spreads the rank of vertices without out-edges over all n. It stops when the summed change is below
+  n * `tolerance` (default 1e-6). Not converging within `max_iterations` (default 100) is an error, as in NetworkX.
+  Rows deleted from the vertex table are not vertices and take no part.
+- **`weakly_connected_component`**: union-find over the edges, ignoring direction. The `componentId` is the smallest
+  rowid among the component's vertices, as for `strongly_connected_component`. Matches
+  `networkx.weakly_connected_components`.
+- **`local_clustering_coefficient`**: 2 T / (d (d - 1)), where T counts the triangles through the vertex and d
+  its distinct neighbours other than itself. It is 0 below two neighbours. Matches `networkx.clustering`. The result
+  stays FLOAT, as upstream had it.
+- **`strongly_connected_component`**: Tarjan's algorithm, iterative, so long chains are no problem. Two vertices
+  share a `componentId` when each reaches the other. The id is the smallest rowid among the component's vertices,
+  so it depends only on the partition and the table's row order. Matches `networkx.strongly_connected_components`.
+- **`triangle_count`**: the number of triangles through each vertex in the undirected simple graph. Direction is
+  ignored, `a -> b` and `b -> a` are one edge, and parallel edges count once. Edges are oriented from lower to higher
+  (degree, rowid) and out-lists are intersected. `total_triangle_count` is the sum divided by 3. Matches
+  `networkx.triangles`.
+- **`betweenness_centrality`**: Brandes' algorithm over unweighted shortest paths, endpoints excluded. Named
+  parameters: `k` samples that many source vertices (default: every vertex, the exact value); `seed` (default 0)
+  fixes the sample, so the same seed gives the same result; `normalized` (default `true`) divides by
+  (n - 1)(n - 2); `directed` (default `true`) can be set to `false` to ignore edge direction. Values and scaling
+  are `networkx.betweenness_centrality`'s (3.5), including its estimator for sampled sources, so `k = n` gives the
+  exact values. With `k = 1`, the sampled vertex's own value is NULL (NetworkX returns NaN).
+- **`label_propagation`**: asynchronous label propagation (Raghavan et al. 2007), the rule
+  `networkx.asyn_lpa_communities` uses. Every vertex starts with its own label. Each round visits the vertices in a
+  random order drawn from `seed` (default 0). A vertex whose label is not among its neighbours' most frequent labels
+  takes one of them, chosen at random from the same seed. It stops after a round with no change, when every vertex
+  holds a most frequent neighbour label, or after `max_iterations` rounds (default 100). The same seed gives the same
+  communities on every platform. NetworkX uses Python's random generator, so labels differ from NetworkX's. A
+  `community` is the smallest rowid among its members.
+- **`louvain`**: Louvain modularity optimisation (Blondel et al. 2008). Vertices move one at a time, from a queue
+  in a random order drawn from `seed`, to the neighbouring community with the best modularity gain. A vertex that
+  moves queues its neighbours again (Leiden's fast local move), and up to two sweeps over all vertices catch the
+  remaining moves. Each community then becomes a vertex of the next level. It stops, as
+  `networkx.louvain_communities` does, when a level moves nothing or raises modularity by at most 1e-7. NetworkX
+  instead sweeps until a sweep moves nothing. On 1M vertices / 5M edges that rule takes 416 s against 8 s here, and
+  on the test graphs the mean modularity over five seeds is within 0.006 of NetworkX's. `resolution` (default 1)
+  above 1 favours smaller communities, below 1 larger ones; 0 merges every connected part. The result is
+  deterministic for a seed but is not NetworkX's partition (different random generator). Planted partitions are
+  recovered exactly. As with any Louvain, a community can be internally disconnected; Leiden's refinement step,
+  which prevents that, is not implemented.
+- **`k_core`**: each vertex's core number, the largest k such that the vertex lies in a subgraph where every vertex
+  has at least k neighbours, computed by Batagelj-Zaversnik bucket peeling. The k-core is
+  `WHERE core_number >= k`. `networkx.core_number` refuses graphs with self-loops; here they are dropped, which gives
+  NetworkX's answer for the graph without them.
+- **`shortest_path_lengths`**: hop distances by BFS from the vertex whose key is `source`, of any key type. Only
+  vertices the source reaches are returned, the source itself at 0, as in
+  `networkx.single_source_shortest_path_length`. `directed := false` ignores edge direction. An unknown or NULL
+  source key is an error. For paths themselves, or weighted costs, use `MATCH ... ANY SHORTEST` / `CHEAPEST`.
+- **`degree`**: edge rows per vertex, counted at each endpoint, over the edges whose two endpoints are vertices (the
+  edges the other functions see). These are the degrees of a `networkx.MultiDiGraph`. It runs as plain SQL (two
+  aggregations), with no CSR.
+
+`scripts/compare_graph_algorithms.py` compares every function with NetworkX (or a brute force) on generated graphs:
+directed and undirected readings, disconnected parts, self-loops, parallel and reciprocal edges, empty edge and vertex
+tables, and integer, sparse-integer and string keys.
 
 Shortest-path searches inside `MATCH` (`ANY SHORTEST`, `CHEAPEST`) use upstream's CSR-based operators where no ABI
 artifact applies. A pattern seeded on a few vertices searches once from each seed and answers every destination from

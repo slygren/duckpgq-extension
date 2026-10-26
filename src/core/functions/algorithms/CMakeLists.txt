@@ -1,0 +1,15 @@
+set(EXTENSION_SOURCES
+    ${EXTENSION_SOURCES}
+    ${CMAKE_CURRENT_SOURCE_DIR}/graph_algorithm.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/strongly_connected_component.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/triangle_count.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/betweenness_centrality.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/label_propagation.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/louvain.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/k_core.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/shortest_path_lengths.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/degree.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/pagerank.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/weakly_connected_component.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/local_clustering_coefficient.cpp
+    PARENT_SCOPE)
