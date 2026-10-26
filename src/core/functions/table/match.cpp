@@ -258,62 +258,6 @@ static bool GetOptionalBool(PGQMaterializedResult &result, idx_t column, idx_t r
 	return !value.IsNull() && value.GetValue<bool>();
 }
 
-static case_insensitive_set_t LoadCatalogTableColumns(Connection &connection, const string &catalog_name,
-                                                      const string &schema_name, const string &table_name) {
-	case_insensitive_set_t columns;
-	const string query = StringUtil::Format(
-	    "SELECT column_name FROM information_schema.columns "
-	    "WHERE lower(table_catalog) = lower(%s) "
-	    "  AND lower(table_schema) = lower(%s) "
-	    "  AND lower(table_name) = lower(%s)",
-	    KeywordHelper::WriteQuoted(catalog_name, '\''), KeywordHelper::WriteQuoted(schema_name, '\''),
-	    KeywordHelper::WriteQuoted(table_name, '\''));
-	auto query_result = connection.Query(query);
-	if (!query_result || query_result->HasError()) {
-		return columns;
-	}
-	PGQMaterializedResult materialized_result(*query_result);
-	for (idx_t row_idx = 0; row_idx < materialized_result.RowCount(); row_idx++) {
-		columns.insert(GetOptionalString(materialized_result, 0, row_idx));
-	}
-	return columns;
-}
-
-static case_insensitive_set_t LatestPathCatalogColumns() {
-	case_insensitive_set_t columns;
-	columns.insert("semantic_grain");
-	columns.insert("temporal_mode");
-	columns.insert("multiplicity_mode");
-	columns.insert("property_support");
-	columns.insert("freshness_policy");
-	columns.insert("covered_target_properties");
-	columns.insert("is_sorted_by_v1");
-	columns.insert("preserves_multiplicity");
-	columns.insert("endpoints_complete");
-	columns.insert("source_snapshot");
-	columns.insert("source_tables");
-	columns.insert("built_by");
-	return columns;
-}
-
-static string OptionalStringCatalogColumn(const case_insensitive_set_t &columns, const string &column_name,
-                                          const string &default_value) {
-	if (columns.find(column_name) != columns.end()) {
-		return column_name;
-	}
-	return KeywordHelper::WriteQuoted(default_value, '\'') + " AS " + column_name;
-}
-
-// Boolean counterpart of OptionalStringCatalogColumn: substitutes a literal when the
-// catalog predates the column, so older generated catalogs keep loading unchanged.
-static string OptionalBoolCatalogColumn(const case_insensitive_set_t &columns, const string &column_name,
-                                        bool default_value) {
-	if (columns.find(column_name) != columns.end()) {
-		return column_name;
-	}
-	return string(default_value ? "true" : "false") + " AS " + column_name;
-}
-
 // An artifact is identified by WHERE it lives, not only by what it is called.
 //
 // Every frozen snapshot of a lake is generated from the same layout, so they all carry
@@ -501,89 +445,79 @@ static void LoadDirectLinkCatalogs(ClientContext &context, Connection &connectio
 }
 
 static void LoadPathTableCatalogMetadata(Connection &connection, const string &catalog_name, const string &schema_name,
-                                         const string &graph_name, PGQPathTableCatalog &path_table_catalog,
-                                         bool assume_latest_columns = false) {
-	const string catalog_table = QualifiedPathTableName(catalog_name, schema_name, "__pgq_path_catalog");
-	auto columns = assume_latest_columns ? LatestPathCatalogColumns()
-	                                     : LoadCatalogTableColumns(connection, catalog_name, schema_name,
-	                                                               "__pgq_path_catalog");
-	auto build_query = [&](const case_insensitive_set_t &columns) {
-		return StringUtil::Format(
-		    "SELECT path_table_name, path_kind, "
-		    "       CAST(hop_count AS BIGINT) AS hop_count, "
-		    "       src_label, dst_label, vertex_label_sequence, edge_label_sequence, "
-		    "       supports_one_row_per_step, is_deduplicated, "
-		    "       CAST(estimated_rows AS BIGINT) AS estimated_rows, "
-		    "       is_sorted_by_v0, "
-		    "       CAST(min_depth AS BIGINT) AS min_depth, "
-		    "       CAST(max_depth AS BIGINT) AS max_depth, "
-		    "       bridge_table_names, "
-		    "       %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s "
-		    "FROM %s WHERE lower(graph_name) = lower(%s)",
-		    OptionalStringCatalogColumn(columns, "semantic_grain", "identity"),
-		    OptionalStringCatalogColumn(columns, "temporal_mode", "snapshot"),
-		    OptionalStringCatalogColumn(columns, "multiplicity_mode", "unknown"),
-		    OptionalStringCatalogColumn(columns, "property_support", "unknown"),
-		    OptionalStringCatalogColumn(columns, "freshness_policy", "unknown"),
-		    OptionalStringCatalogColumn(columns, "covered_target_properties", ""),
-		    OptionalBoolCatalogColumn(columns, "is_sorted_by_v1", false),
-		    // Absent column defaults to FALSE: an artifact that has not been *proven* to
-		    // preserve edge multiplicity must not be substituted into walk-mode traversal.
-		    // Erring to false costs performance; erring to true would change answers.
-		    OptionalBoolCatalogColumn(columns, "preserves_multiplicity", false),
-		    OptionalStringCatalogColumn(columns, "source_snapshot", ""),
-		    OptionalStringCatalogColumn(columns, "source_tables", ""),
-		    // Which builder wrote the row: only pgq_abi_build's preserves_multiplicity is measured for every
-		    // kind; for any other row the binder measures it itself (PGQExactness).
-		    OptionalStringCatalogColumn(columns, "built_by", ""),
-		    // Absent: not recorded, so measured before the artifact answers.
-		    OptionalBoolCatalogColumn(columns, "endpoints_complete", false), catalog_table,
-		    KeywordHelper::WriteQuoted(graph_name, '\''));
-	};
-
-	auto query_result = connection.Query(build_query(columns));
-	if (assume_latest_columns && (!query_result || query_result->HasError())) {
-		// A catalog written by the layout compiler or an older pgq_abi_build lacks some of the newest columns (the
-		// compiler writes endpoints_complete but no provenance): read the ones it has, the others take their
-		// defaults. Dropping a fixed list instead lost a stored endpoints_complete along with the provenance.
-		columns = LoadCatalogTableColumns(connection, catalog_name, schema_name, "__pgq_path_catalog");
-		query_result = connection.Query(build_query(columns));
-	}
+                                         const string &graph_name, PGQPathTableCatalog &path_table_catalog) {
+	// Every column, read by name: one query whatever the catalog's generation, and the columns it lacks (the layout
+	// compiler writes no provenance, older catalogs lack the newer columns) take their defaults. Naming the columns
+	// fails on a catalog that lacks one, and asking information_schema.columns which it has lists every column of
+	// every attached table -- about 10 ms per catalog on a lake, at each process's first bind.
+	auto query_result = connection.Query(StringUtil::Format(
+	    "SELECT * FROM %s WHERE lower(graph_name) = lower(%s)",
+	    QualifiedPathTableName(catalog_name, schema_name, "__pgq_path_catalog"),
+	    KeywordHelper::WriteQuoted(graph_name, '\'')));
 	if (!query_result || query_result->HasError()) {
 		return;
+	}
+	case_insensitive_map_t<idx_t> column_index;
+	const auto &names = query_result->GetNames();
+	for (idx_t idx = 0; idx < names.size(); idx++) {
+		column_index.emplace(PGQStr(names[idx]), idx);
+	}
+	for (const char *required : {"path_table_name", "path_kind", "hop_count", "src_label", "dst_label",
+	                             "vertex_label_sequence", "edge_label_sequence", "supports_one_row_per_step",
+	                             "is_deduplicated", "estimated_rows", "is_sorted_by_v0", "min_depth", "max_depth",
+	                             "bridge_table_names"}) {
+		if (column_index.find(required) == column_index.end()) {
+			return;
+		}
 	}
 
 	PGQMaterializedResult materialized_result(*query_result);
 	for (idx_t row_idx = 0; row_idx < materialized_result.RowCount(); row_idx++) {
+		auto text = [&](const char *column, const string &absent = string()) {
+			auto entry = column_index.find(column);
+			return entry == column_index.end() ? absent : GetOptionalString(materialized_result, entry->second, row_idx);
+		};
+		auto number = [&](const char *column) {
+			return GetOptionalInt64(materialized_result, column_index.at(column), row_idx);
+		};
+		auto flag = [&](const char *column) {
+			auto entry = column_index.find(column);
+			return entry != column_index.end() && GetOptionalBool(materialized_result, entry->second, row_idx);
+		};
 		PGQPathTableInfo info;
 		info.catalog_name = catalog_name;
 		info.schema_name = schema_name;
-		info.table_name = GetOptionalString(materialized_result, 0, row_idx);
-		info.path_kind = GetOptionalString(materialized_result, 1, row_idx);
-		info.hop_count = GetOptionalInt64(materialized_result, 2, row_idx);
-		info.src_label = GetOptionalString(materialized_result, 3, row_idx);
-		info.dst_label = GetOptionalString(materialized_result, 4, row_idx);
-		info.vertex_label_sequence = GetOptionalString(materialized_result, 5, row_idx);
-		info.edge_label_sequence = GetOptionalString(materialized_result, 6, row_idx);
-		info.supports_one_row_per_step = GetOptionalBool(materialized_result, 7, row_idx);
-		info.is_deduplicated = GetOptionalBool(materialized_result, 8, row_idx);
-		info.estimated_rows = GetOptionalInt64(materialized_result, 9, row_idx);
-		info.is_sorted_by_v0 = GetOptionalBool(materialized_result, 10, row_idx);
-		info.min_depth = GetOptionalInt64(materialized_result, 11, row_idx);
-		info.max_depth = GetOptionalInt64(materialized_result, 12, row_idx);
-		info.bridge_table_names = GetOptionalString(materialized_result, 13, row_idx);
-		info.semantic_grain = GetOptionalString(materialized_result, 14, row_idx);
-		info.temporal_mode = GetOptionalString(materialized_result, 15, row_idx);
-		info.multiplicity_mode = GetOptionalString(materialized_result, 16, row_idx);
-		info.property_support = GetOptionalString(materialized_result, 17, row_idx);
-		info.freshness_policy = GetOptionalString(materialized_result, 18, row_idx);
-		info.covered_target_properties = GetOptionalString(materialized_result, 19, row_idx);
-		info.is_sorted_by_v1 = GetOptionalBool(materialized_result, 20, row_idx);
-		info.preserves_multiplicity = GetOptionalBool(materialized_result, 21, row_idx);
-		info.source_snapshot = GetOptionalString(materialized_result, 22, row_idx);
-		info.source_tables = GetOptionalString(materialized_result, 23, row_idx);
-		info.built_by = GetOptionalString(materialized_result, 24, row_idx);
-		info.endpoints_complete = GetOptionalBool(materialized_result, 25, row_idx);
+		info.table_name = text("path_table_name");
+		info.path_kind = text("path_kind");
+		info.hop_count = number("hop_count");
+		info.src_label = text("src_label");
+		info.dst_label = text("dst_label");
+		info.vertex_label_sequence = text("vertex_label_sequence");
+		info.edge_label_sequence = text("edge_label_sequence");
+		info.supports_one_row_per_step = flag("supports_one_row_per_step");
+		info.is_deduplicated = flag("is_deduplicated");
+		info.estimated_rows = number("estimated_rows");
+		info.is_sorted_by_v0 = flag("is_sorted_by_v0");
+		info.min_depth = number("min_depth");
+		info.max_depth = number("max_depth");
+		info.bridge_table_names = text("bridge_table_names");
+		info.semantic_grain = text("semantic_grain", "identity");
+		info.temporal_mode = text("temporal_mode", "snapshot");
+		info.multiplicity_mode = text("multiplicity_mode", "unknown");
+		info.property_support = text("property_support", "unknown");
+		info.freshness_policy = text("freshness_policy", "unknown");
+		info.covered_target_properties = text("covered_target_properties");
+		info.is_sorted_by_v1 = flag("is_sorted_by_v1");
+		// Absent: false. An artifact that has not been *proven* to preserve edge multiplicity must not be substituted
+		// into walk-mode traversal. Erring to false costs performance; erring to true would change answers.
+		info.preserves_multiplicity = flag("preserves_multiplicity");
+		info.source_snapshot = text("source_snapshot");
+		info.source_tables = text("source_tables");
+		// Which builder wrote the row: only pgq_abi_build's preserves_multiplicity is measured for every kind; for
+		// any other row the binder measures it itself (PGQExactness).
+		info.built_by = text("built_by");
+		// Absent: not recorded, so measured before the artifact answers.
+		info.endpoints_complete = flag("endpoints_complete");
 		info.from_metadata = true;
 		AddPathTableInfo(path_table_catalog, std::move(info));
 	}
@@ -667,8 +601,7 @@ static PGQPathTableCatalog BuildPathTableCatalogFromGraphTables(ClientContext &c
 	const auto candidate_catalogs = CandidateGraphArtifactCatalogs(pg_table);
 
 	for (const auto &entry : candidate_catalogs) {
-		LoadPathTableCatalogMetadata(*metadata_connection, entry.first, entry.second, graph_name,
-		                             path_table_catalog, true);
+		LoadPathTableCatalogMetadata(*metadata_connection, entry.first, entry.second, graph_name, path_table_catalog);
 	}
 	if (!path_table_catalog.empty()) {
 		return path_table_catalog;
