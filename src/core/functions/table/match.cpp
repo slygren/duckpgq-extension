@@ -9176,9 +9176,13 @@ static string JsonEscapeSQLPropertyName(const string &input) {
 	return result;
 }
 
+// A property value as a JSON string (or null). __pgq_json_string escapes in C++: DuckDB's string literals have no
+// backslash escapes, so the replace() chain this used turned every quote into `\\"` -- invalid JSON for any value
+// holding a quote -- and left single backslashes and control characters unescaped.
 static string BuildJsonScalarSQL(const string &value_expr) {
-	return "CASE WHEN " + value_expr + " IS NULL THEN 'null' ELSE '\"' || " +
-	       "replace(replace(CAST(" + value_expr + " AS VARCHAR), '\\\\', '\\\\\\\\'), '\"', '\\\\\"') || '\"' END";
+	// A JSON-typed property is JSON already: it nests as it is (null when NULL) instead of becoming a string of JSON.
+	return "CASE WHEN typeof(" + value_expr + ") = 'JSON' THEN coalesce(CAST(" + value_expr +
+	       " AS VARCHAR), 'null') ELSE __pgq_json_string(CAST(" + value_expr + " AS VARCHAR)) END";
 }
 
 static string BuildJsonObjectExpression(const shared_ptr<PropertyGraphTable> &vertex_table, const string &table_alias) {

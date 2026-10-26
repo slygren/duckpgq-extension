@@ -350,6 +350,26 @@ static void GraphTreeJsonFunction(DataChunk &args, ExpressionState &, Vector &re
 	}
 }
 
+// A property value as a JSON string literal, for the JSON objects vertex_properties(p) builds in SQL: NULL is
+// `null`, anything else its VARCHAR text, quoted and escaped as RFC 8259 asks (quote, backslash, every control
+// character). Done here rather than with replace() in SQL, whose string literals have no backslash escapes.
+static void JsonStringFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &input = args.data[0];
+	UnifiedVectorFormat format;
+	input.ToUnifiedFormat(args.size(), format);
+	auto values = UnifiedVectorFormat::GetData<string_t>(format);
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto out = FlatVector::GetDataMutable<string_t>(result);
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto idx = format.sel->get_index(row);
+		out[row] = StringVector::AddString(
+		    result, format.validity.RowIsValid(idx) ? JsonString(values[idx].GetString()) : string("null"));
+	}
+	if (args.AllConstant()) {
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	}
+}
+
 } // namespace
 
 void CoreScalarFunctions::RegisterGraphTreeJsonScalarFunction(ExtensionLoader &loader) {
@@ -378,6 +398,10 @@ void CoreScalarFunctions::RegisterGraphTreeJsonScalarFunction(ExtensionLoader &l
 		                                     GraphTreeJsonFunction));
 	}
 	loader.RegisterFunction(Fallible(path_tree));
+
+	ScalarFunction json_string("__pgq_json_string", {LogicalType::VARCHAR}, LogicalType::VARCHAR, JsonStringFunction);
+	json_string.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	loader.RegisterFunction(json_string);
 }
 
 } // namespace duckdb
