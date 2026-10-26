@@ -1256,3 +1256,55 @@ SELECT count(*) FROM (
     EXCEPT ALL (SELECT src, dst, cost, vs, es FROM any_w WHERE src < 6 UNION ALL SELECT src, dst, cost, vs, es FROM all_l3));
 ----
 0
+
+# ── DOUBLE ties that rounding makes: 0.2 + 0.1 is not 0.3, but 0.2 + 0.1 + 0.7 is 0.3 + 0.7 ───────────────────────
+# Both paths 9-7-5-1 and 9-5-1 cost 1.0 added left to right; ALL CHEAPEST returns both on every route.
+statement ok
+CREATE TABLE tv(id BIGINT);
+
+statement ok
+INSERT INTO tv SELECT i FROM range(10) r(i);
+
+statement ok
+CREATE TABLE te(src BIGINT, dst BIGINT, d DOUBLE);
+
+statement ok
+INSERT INTO te VALUES (9, 7, 0.2), (7, 5, 0.1), (9, 5, 0.3), (5, 1, 0.7);
+
+statement ok
+CREATE PROPERTY GRAPH tie VERTEX TABLES (tv LABEL V)
+EDGE TABLES (te SOURCE KEY (src) REFERENCES tv (id) DESTINATION KEY (dst) REFERENCES tv (id) LABEL E);
+
+query TR
+FROM GRAPH_TABLE (tie MATCH p = ALL CHEAPEST (a:V)-[e:E COST e.d]->+(b:V) WHERE a.id = 9 AND b.id = 1 COLUMNS (vertices(p), COST(p)))
+ORDER BY ALL;
+----
+[9, 5, 1]	1.0
+[9, 7, 5, 1]	1.0
+
+query TR
+FROM GRAPH_TABLE (tie MATCH p = ALL CHEAPEST (a:V)-[e:E COST e.d]-+(b:V) WHERE a.id = 9 AND b.id = 1 COLUMNS (vertices(p), COST(p)))
+ORDER BY ALL;
+----
+[9, 5, 1]	1.0
+[9, 7, 5, 1]	1.0
+
+query TR
+FROM GRAPH_TABLE (tie MATCH p = ALL CHEAPEST (a:V)-[e:E COST e.d]->{2,}(b:V) WHERE a.id = 9 AND b.id = 1 COLUMNS (vertices(p), COST(p)))
+ORDER BY ALL;
+----
+[9, 5, 1]	1.0
+[9, 7, 5, 1]	1.0
+
+query TR
+FROM GRAPH_TABLE (tie MATCH p = ALL CHEAPEST (a:V)-[e:E COST e.d]->{1,3}(b:V) WHERE a.id = 9 AND b.id = 1 COLUMNS (vertices(p), COST(p)))
+ORDER BY ALL;
+----
+[9, 5, 1]	1.0
+[9, 7, 5, 1]	1.0
+
+# and to 5, where they do not tie (0.3 against 0.30000000000000004)
+query T
+FROM GRAPH_TABLE (tie MATCH p = ALL CHEAPEST (a:V)-[e:E COST e.d]->+(b:V) WHERE a.id = 9 AND b.id = 5 COLUMNS (vertices(p)));
+----
+[9, 5]

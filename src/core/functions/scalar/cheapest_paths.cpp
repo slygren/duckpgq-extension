@@ -121,6 +121,25 @@ bool AddStepCost(int64_t left, int64_t right, int64_t &result) {
 	return true;
 }
 
+//! Walking a cheapest path back from its destination: the most its prefix up to the step's start may cost, given the
+//! most the prefix up to the step's end may cost. BIGINT: exact, which makes the walk the tight steps. DOUBLE: a path
+//! whose prefix is not the cheapest to its vertex can still tie the least cost once rounded, so the budget keeps a
+//! slack (a relative 1e-12, far above the rounding of one addition); every path so found is checked exactly.
+template <class T>
+static bool PrefixBudget(T budget, T weight, T &prefix_budget);
+
+template <>
+bool PrefixBudget(int64_t budget, int64_t weight, int64_t &prefix_budget) {
+	prefix_budget = budget - weight;
+	return prefix_budget >= 0;
+}
+
+template <>
+bool PrefixBudget(double budget, double weight, double &prefix_budget) {
+	prefix_budget = (budget - weight) + budget * 1e-12;
+	return prefix_budget >= 0;
+}
+
 template <class T>
 struct FoundCheapest {
 	int64_t dst;
@@ -142,7 +161,7 @@ public:
 		if (info.lower <= 1 && info.upper >= kUnbounded) {
 			RunDijkstra(src, targets, found);
 		} else {
-			RunBestFirst(src, targets, found);
+			RunLayered(src, targets, found);
 		}
 	}
 
@@ -274,65 +293,303 @@ private:
 		return node;
 	}
 
-	//! Every simple path of tight steps from src to t (a zero-cost cycle makes the tight steps cyclic), walked back
-	//! from t without recursion.
+	//! Every simple path from src to t of the least cost: walked back from t over the steps whose start is cheap enough
+	//! (PrefixBudget; a zero-cost cycle makes them cyclic, so no vertex is taken twice), without recursion.
 	void AllTight(int64_t src, int64_t t, vector<FoundCheapest<T>> &found) {
+		WalkBack(src, t, 0, dist[static_cast<idx_t>(t)], 1, false, found,
+		         [&](int64_t v, int64_t) -> T { return done[static_cast<idx_t>(v)] ? dist[static_cast<idx_t>(v)]
+		                                                                          : Unreachable(); });
+	}
+
+	//! The walk back from (t, k) to (src, 0) over steps whose start's least cost (least(v, class)) fits the prefix
+	//! budget, no vertex twice, the source only as the start; each path found is kept if its cost, added from the
+	//! source, is `cost`. With classes > 1 a step into class c comes from class c - 1 (and from class c itself in the
+	//! last class when `unbounded`, which holds every walk of at least that many steps). ANY stops at the first.
+	template <class LEAST>
+	void WalkBack(int64_t src, int64_t t, int64_t k, T cost, int64_t classes, bool unbounded,
+	              vector<FoundCheapest<T>> &found, const LEAST &least) {
 		PrepareReverse();
 		on_path.resize(static_cast<idx_t>(v_size), false);
+		auto from_classes = [&](int64_t c, int64_t out[2]) -> int {
+			if (classes == 1) {
+				out[0] = 0;
+				return 1;
+			}
+			if (c == 0) {
+				return 0;
+			}
+			if (unbounded && c == classes - 1) {
+				out[0] = c - 1;
+				out[1] = c;
+				return 2;
+			}
+			out[0] = c - 1;
+			return 1;
+		};
 		struct Frame {
 			int64_t vertex;
+			int64_t cls;
 			int64_t next; // next reverse position to try
+			int option;   // which from-class
+			T budget;     // the most the prefix up to this vertex may cost
 		};
 		vector<Frame> stack;
-		vector<int64_t> edges_in; // edges_in[i]: the edge from stack[i + 1].vertex into stack[i].vertex
-		stack.push_back({t, reverse_offsets[static_cast<idx_t>(t)]});
+		vector<int64_t> edges_in;  // edges_in[i]: the edge from stack[i + 1].vertex into stack[i].vertex
+		vector<T> weights_in;      // and its cost
+		stack.push_back({t, k, reverse_offsets[static_cast<idx_t>(t)], 0, cost});
 		on_path[static_cast<idx_t>(t)] = true;
+		const bool single_class = classes == 1;
 		idx_t steps = 0;
 		while (!stack.empty()) {
 			if (++steps % 4096 == 0) {
 				info.context.BlockingInterruptCheck();
 			}
 			auto &frame = stack.back();
-			if (frame.vertex == src) {
-				// stack: t ... src; the path runs src ... t
-				int64_t node = AddChainNode(src, -1, -1);
+			if (frame.vertex == src && (single_class || frame.cls == 0)) {
+				// stack: t ... src; the path runs src ... t. Kept if it costs exactly the least, added from the source.
+				T total = 0;
+				bool fits = true;
 				for (idx_t i = stack.size() - 1; i-- > 0;) {
-					node = AddChainNode(stack[i].vertex, edges_in[i], node);
+					fits = fits && AddStepCost(total, weights_in[i], total);
 				}
-				found.push_back({t, node, dist[static_cast<idx_t>(t)]});
-				on_path[static_cast<idx_t>(frame.vertex)] = false;
+				if (fits && total == cost) {
+					int64_t node = AddChainNode(src, -1, -1);
+					for (idx_t i = stack.size() - 1; i-- > 0;) {
+						node = AddChainNode(stack[i].vertex, edges_in[i], node);
+					}
+					found.push_back({t, node, cost});
+				}
 				stack.pop_back();
-				if (!edges_in.empty()) {
-					edges_in.pop_back();
+				edges_in.pop_back();
+				weights_in.pop_back();
+				if (!info.all && fits && total == cost) {
+					break;
 				}
 				continue;
 			}
+			int64_t from[2];
+			const int options = from_classes(frame.cls, from);
 			const auto vertex = static_cast<idx_t>(frame.vertex);
 			bool pushed = false;
-			while (frame.next < reverse_offsets[vertex + 1]) {
+			while (frame.option < options) {
+				if (frame.next >= reverse_offsets[vertex + 1]) {
+					frame.option++;
+					frame.next = reverse_offsets[vertex];
+					continue;
+				}
 				const auto pos = static_cast<idx_t>(frame.next++);
-				const auto from = static_cast<idx_t>(reverse_from[pos]);
-				if (!done[from] || on_path[from]) {
+				const auto previous = reverse_from[pos];
+				const auto previous_class = from[frame.option];
+				// The source only as the path's start; any other vertex once.
+				if (previous == src ? !(single_class || previous_class == 0)
+				                    : (on_path[static_cast<idx_t>(previous)] || (!single_class && previous_class == 0))) {
 					continue;
 				}
-				T candidate;
-				if (!AddStepCost(dist[from], reverse_weight[pos], candidate) || candidate != dist[vertex]) {
+				T prefix_budget;
+				if (!PrefixBudget(frame.budget, reverse_weight[pos], prefix_budget)) {
 					continue;
 				}
-				on_path[from] = true;
+				const T previous_least = least(previous, previous_class);
+				if (previous_least == Unreachable() || previous_least > prefix_budget) {
+					continue;
+				}
+				CountNode(); // a walk back through many steps that repeat vertices is bounded by the budget too
+				if (previous != src) {
+					on_path[static_cast<idx_t>(previous)] = true;
+				}
 				edges_in.push_back(reverse_edge[pos]);
-				stack.push_back({static_cast<int64_t>(from), reverse_offsets[from]});
+				weights_in.push_back(reverse_weight[pos]);
+				stack.push_back(
+				    {previous, previous_class, reverse_offsets[static_cast<idx_t>(previous)], 0, prefix_budget});
 				pushed = true;
 				break;
 			}
 			if (!pushed) {
-				on_path[vertex] = false;
+				if (frame.vertex != src) {
+					on_path[vertex] = false;
+				}
 				stack.pop_back();
 				if (!edges_in.empty()) {
 					edges_in.pop_back();
+					weights_in.pop_back();
 				}
 			}
 		}
+		// Unwind what an early stop (ANY) left on the path.
+		for (auto &frame : stack) {
+			if (frame.vertex != src) {
+				on_path[static_cast<idx_t>(frame.vertex)] = false;
+			}
+		}
+	}
+
+	//! Within bounds other than 0..1 to unbounded: Dijkstra over (vertex, class) states, the class being the steps
+	//! taken (capped at the lower bound when there is no upper one), gives the cheapest walk within the bounds to every
+	//! destination. A walk may repeat a vertex; but if one of a destination's cheapest walks is a simple path, its
+	//! cheapest simple paths are exactly the simple ones among its cheapest walks (each walk costs at least the least
+	//! walk). Those are found by walking the tight steps back from the destination, refusing a vertex already on the
+	//! path. Only a destination none of whose cheapest walks is simple takes the best-first search over simple paths.
+	void RunLayered(int64_t src, const vector<int64_t> &targets, vector<FoundCheapest<T>> &found) {
+		const bool unbounded = info.upper >= kUnbounded;
+		const int64_t classes = unbounded ? info.lower + 1 : info.upper + 1;
+		auto next_class = [&](int64_t k) -> int64_t {
+			if (unbounded) {
+				return std::min<int64_t>(k + 1, info.lower);
+			}
+			return k < info.upper ? k + 1 : -1;
+		};
+		auto valid = [&](int64_t k) {
+			return unbounded ? k == info.lower : k >= info.lower;
+		};
+		const auto states = static_cast<idx_t>(v_size) * static_cast<idx_t>(classes);
+		if (layer_dist.size() != states) {
+			layer_dist.assign(states, Unreachable());
+			layer_done.assign(states, false);
+			layer_touched.clear();
+		}
+		for (auto state : layer_touched) {
+			layer_dist[state] = Unreachable();
+			layer_done[state] = false;
+		}
+		layer_touched.clear();
+		auto state_of = [&](int64_t v, int64_t k) {
+			return static_cast<idx_t>(v) * static_cast<idx_t>(classes) + static_cast<idx_t>(k);
+		};
+		const bool all_targets = targets.empty();
+		// The destinations still to reach (explicit ones), and the dearest cost reached so far.
+		idx_t open = all_targets ? 0 : targets.size();
+		if (!all_targets) {
+			MarkTargets(targets);
+		}
+		vector<bool> reached_target;
+		if (!all_targets) {
+			reached_target.assign(targets.size(), false);
+		}
+		T reached_max = 0;
+		using Item = std::pair<T, idx_t>;
+		std::priority_queue<Item, vector<Item>, std::greater<Item>> queue;
+		const auto start = state_of(src, 0);
+		layer_dist[start] = 0;
+		layer_touched.push_back(start);
+		queue.push({0, start});
+		idx_t pops = 0;
+		while (!queue.empty()) {
+			if (++pops % 4096 == 0) {
+				info.context.BlockingInterruptCheck();
+			}
+			auto item = queue.top();
+			// Every destination reached: every state on a cheapest walk to one is final once the queue passes them all.
+			if (!all_targets && open == 0 && item.first > reached_max) {
+				break;
+			}
+			queue.pop();
+			const auto state = item.second;
+			if (layer_done[state] || item.first != layer_dist[state]) {
+				continue;
+			}
+			layer_done[state] = true;
+			const auto vertex = static_cast<int64_t>(state / static_cast<idx_t>(classes));
+			const auto k = static_cast<int64_t>(state % static_cast<idx_t>(classes));
+			if (!all_targets && valid(k) && is_target[static_cast<idx_t>(vertex)]) {
+				for (idx_t i = 0; i < targets.size(); i++) {
+					if (targets[i] == vertex && !reached_target[i]) {
+						reached_target[i] = true;
+						open--;
+						reached_max = std::max(reached_max, item.first);
+					}
+				}
+			}
+			const auto to_class = next_class(k);
+			if (to_class < 0) {
+				continue;
+			}
+			for (int64_t pos = offsets[vertex]; pos < offsets[vertex + 1]; pos++) {
+				const auto to = csr.e[static_cast<idx_t>(pos)];
+				if (to == src) {
+					continue; // no simple path returns to its source
+				}
+				T candidate;
+				if (!AddStepCost(item.first, weights[static_cast<idx_t>(pos)], candidate)) {
+					throw ConstraintException("A CHEAPEST path cost exceeds the BIGINT range");
+				}
+				const auto next = state_of(to, to_class);
+				if (candidate < layer_dist[next]) {
+					if (layer_dist[next] == Unreachable()) {
+						layer_touched.push_back(next);
+					}
+					layer_dist[next] = candidate;
+					queue.push({candidate, next});
+				}
+			}
+		}
+
+		auto report = [&](int64_t t) {
+			if (t == src && info.lower > 0) {
+				return;
+			}
+			// The destination's least walk cost over its valid classes.
+			T least = Unreachable();
+			for (int64_t k = 0; k < classes; k++) {
+				const auto state = state_of(t, k);
+				if (valid(k) && layer_done[state]) {
+					least = std::min(least, layer_dist[state]);
+				}
+			}
+			if (least == Unreachable()) {
+				return;
+			}
+			if (t == src) {
+				found.push_back({t, AddChainNode(src, -1, -1), 0});
+				return;
+			}
+			const idx_t before = found.size();
+			for (int64_t k = 0; k < classes; k++) {
+				const auto state = state_of(t, k);
+				if (valid(k) && layer_done[state] && layer_dist[state] == least) {
+					TightSimplePaths(src, t, k, least, classes, unbounded, found);
+					if (!info.all && found.size() > before) {
+						return;
+					}
+				}
+			}
+			if (found.size() > before) {
+				return;
+			}
+			// No cheapest walk is a simple path: the cheapest simple paths cost more; search them for t alone.
+			vector<FoundCheapest<T>> alone;
+			RunBestFirst(src, vector<int64_t> {t}, alone);
+			for (auto &entry : alone) {
+				found.push_back(entry);
+			}
+		};
+		if (all_targets) {
+			vector<int64_t> reached;
+			for (auto state : layer_touched) {
+				const auto vertex = static_cast<int64_t>(state / static_cast<idx_t>(classes));
+				const auto k = static_cast<int64_t>(state % static_cast<idx_t>(classes));
+				if (valid(k) && layer_done[state]) {
+					reached.push_back(vertex);
+				}
+			}
+			std::sort(reached.begin(), reached.end());
+			reached.erase(std::unique(reached.begin(), reached.end()), reached.end());
+			for (auto t : reached) {
+				report(t);
+			}
+		} else {
+			for (auto t : targets) {
+				report(t);
+			}
+		}
+	}
+
+	//! The simple paths among the cheapest walks ending in state (t, k), walked back to (src, 0) (WalkBack).
+	void TightSimplePaths(int64_t src, int64_t t, int64_t k, T cost, int64_t classes, bool unbounded,
+	                      vector<FoundCheapest<T>> &found) {
+		WalkBack(src, t, k, cost, classes, unbounded, found, [&](int64_t v, int64_t c) -> T {
+			const auto state = static_cast<idx_t>(v) * static_cast<idx_t>(classes) + static_cast<idx_t>(c);
+			return layer_done[state] ? layer_dist[state] : Unreachable();
+		});
 	}
 
 	int64_t AddChainNode(int64_t vertex, int64_t edge, int64_t parent) {
@@ -532,11 +789,12 @@ private:
 	//! heuristic[v]: the least cost from v to any destination, over every walk (a lower bound of every simple
 	//! completion), by Dijkstra over the reversed CSR. Shrunk for DOUBLE costs, whose sums depend on their order.
 	void PrepareHeuristic(const vector<int64_t> &targets) {
+		// The marks may have been set for other destinations since (RunLayered marks its own): always set them.
+		MarkTargets(targets);
 		if (targets == heuristic_targets && !heuristic.empty()) {
 			return;
 		}
 		heuristic_targets = targets;
-		MarkTargets(targets);
 		PrepareReverse();
 		heuristic.assign(static_cast<idx_t>(v_size), Unreachable());
 		using Item = std::pair<T, int64_t>;
@@ -645,6 +903,10 @@ private:
 	vector<bool> done;
 	vector<idx_t> dist_touched;
 	vector<bool> on_path;
+	// Layered Dijkstra over (vertex, class)
+	vector<T> layer_dist;
+	vector<bool> layer_done;
+	vector<idx_t> layer_touched;
 };
 
 template <>
