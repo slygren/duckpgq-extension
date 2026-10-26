@@ -43,6 +43,7 @@
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/storage/object_cache.hpp"
+#include "duckdb/storage/external_file_cache/external_file_cache.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckpgq/core/utils/materialized_result.hpp"
@@ -6980,6 +6981,51 @@ static bool ChainAnswers(PGQPathSelector selector, int64_t lower, const std::fun
 // exceptions, each run at most once per cache: a bridge without a 1-hop artifact (count DISTINCT over its
 // key columns), a hierarchy closure queried past its deepest row (a key self-join of tc_chain), and a closure
 // that is not a hierarchy (one join of tc with the bridge).
+//! Keeps the reads of a measurement (PGQExactness's probes) out of DuckDB's external file cache. A probe scans
+//! artifacts and vertex tables once per process, mostly columns no query reads (every key of a vertex table); on a
+//! lake those blocks stayed cached and, under a memory limit, pushed the queries' own blocks out (a process
+//! rotating through queries re-read them from object storage: 322 -> 1285 ms for one under 10 GB). A file the
+//! probes brought into the cache is dropped from it again afterwards; a file that was cached before keeps its blocks.
+class PGQProbeCacheScope {
+public:
+	explicit PGQProbeCacheScope(ClientContext &context) : cache(ExternalFileCache::Get(context)) {
+		try {
+			if (!cache.IsEnabled()) {
+				return;
+			}
+			for (auto &block : cache.GetCachedFileInformation()) {
+				cached_before.insert(block.path);
+			}
+			active = true;
+		} catch (...) {
+			active = false;
+		}
+	}
+	~PGQProbeCacheScope() {
+		if (!active) {
+			return;
+		}
+		try {
+			unordered_set<string> dropped;
+			for (auto &block : cache.GetCachedFileInformation()) {
+				if (cached_before.count(block.path) || !dropped.insert(block.path).second) {
+					continue;
+				}
+				auto file = cache.GetOrCreateCachedFile(block.path);
+				if (file) {
+					cache.DropBlocks(*file);
+				}
+			}
+		} catch (...) {
+		}
+	}
+
+private:
+	ExternalFileCache &cache;
+	unordered_set<string> cached_before;
+	bool active = false;
+};
+
 class PGQExactness {
 public:
 	PGQExactness(ClientContext &context, const PGQPathTableCache &cache, CreatePropertyGraphInfo &pg_table)
@@ -7173,6 +7219,9 @@ public:
 		const auto started = std::chrono::steady_clock::now();
 		case_insensitive_map_t<bool> measured;
 		try {
+			if (!probe_cache) {
+				probe_cache = make_uniq<PGQProbeCacheScope>(context);
+			}
 			Connection connection(*context.db);
 			auto result = connection.Query(StringUtil::Join(selects, " UNION ALL "));
 			if (!result || result->HasError()) {
@@ -7516,6 +7565,9 @@ public:
 		const auto started = std::chrono::steady_clock::now();
 		case_insensitive_map_t<bool> measured;
 		try {
+			if (!probe_cache) {
+				probe_cache = make_uniq<PGQProbeCacheScope>(context);
+			}
 			Connection connection(*context.db);
 			auto result = connection.Query(StringUtil::Join(selects, " UNION ALL "));
 			if (!result || result->HasError()) {
@@ -7564,6 +7616,9 @@ private:
 		bool value = false;
 		const auto started = std::chrono::steady_clock::now();
 		try {
+			if (!probe_cache) {
+				probe_cache = make_uniq<PGQProbeCacheScope>(context);
+			}
 			Connection connection(*context.db);
 			auto result = connection.Query(sql);
 			if (result && !result->HasError()) {
@@ -7595,6 +7650,9 @@ private:
 	ClientContext &context;
 	const PGQPathTableCache &cache;
 	CreatePropertyGraphInfo &pg_table;
+	//! From the first measurement to the end of this object: the files its probes brought into the external file
+	//! cache are dropped from it then, so the probes of one block share their reads and leave nothing behind.
+	unique_ptr<PGQProbeCacheScope> probe_cache;
 };
 
 // A COST on any element changes which paths match (CHEAPEST is chosen by it); the artifact routes have no
