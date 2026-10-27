@@ -90,6 +90,10 @@ In every such case the old rows were wrong.
     the rows each gives alone. DuckDB 2.0.0's `common_subplan` optimizer merged their subplans and could read one
     vertex scan's column in place of another's; in a statement with a `GRAPH_TABLE` it is kept off the subplans of
     that shape (one that occurs twice and scans a table twice), and still merges the others.
+  - **`EXISTS { … }` stays tied to the outer row on ABI routes.** When the outer pattern read only a vertex's key,
+    an ABI edge route left that vertex's table out, and the subpattern then matched a vertex of its own. On the
+    maintenance graph this made every outer row pass or fail together (54 rows where 1 was right; 0 where 44 were),
+    with no error. Small graphs that read more than the key were unaffected.
   - **`vertex_properties(p)` and `graph_tree_json` return valid JSON for any property value.** A quote in a value
     used to come out as `\\"`, which ends the string early. Single backslashes and control characters were
     passed through unescaped. Every `attributes_json` on the product lake hit this.
