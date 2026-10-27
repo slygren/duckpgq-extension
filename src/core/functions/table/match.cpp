@@ -1961,9 +1961,63 @@ static void RewriteCoveredPathColumns(vector<unique_ptr<ParsedExpression>> &expr
 //! product, because each leg's vertex join was elided as "fully covered" and nothing was left
 //! tying the two path tables together. `count(DISTINCT n)` was 4 in both, so every DISTINCT
 //! query looked right and every count/sum/avg was wrong by six orders of magnitude.
+static void CollectExistsPatternBindings(const MatchExpression &pattern, case_insensitive_set_t &bindings);
+
+//! While an EXISTS { } subquery is translated: the variables of the scopes around it. The subquery correlates on
+//! them, so no route of its pattern may read one from an artifact instead of joining it (a covered binding is no
+//! correlation). Binding runs on one thread.
+static thread_local const case_insensitive_set_t *pgq_exists_outer_bindings = nullptr;
+
+static bool IsExistsOuterBinding(const string &binding) {
+	return pgq_exists_outer_bindings && pgq_exists_outer_bindings->count(binding);
+}
+
+//! The variables the EXISTS { } patterns of a MATCH's COLUMNS, WHERE and element WHEREs name. Each correlates its
+//! subquery on the outer element of that name, so the outer translation must bind that element's table.
+static case_insensitive_set_t ExistsPatternBindings(const MatchExpression &ref) {
+	case_insensitive_set_t bindings;
+	std::function<void(const ParsedExpression &)> visit = [&](const ParsedExpression &expression) {
+		if (auto inner = DuckPGQGetExistsPattern(expression)) {
+			CollectExistsPatternBindings(*inner, bindings);
+			return;
+		}
+		ParsedExpressionIterator::EnumerateChildren(expression, visit);
+	};
+	std::function<void(const vector<unique_ptr<PathReference>> &)> visit_elements =
+	    [&](const vector<unique_ptr<PathReference>> &elements) {
+		    for (const auto &element : elements) {
+			    if (auto *subpath = PGQMatchFunction::GetSubPath(element)) {
+				    if (subpath->where_clause) {
+					    visit(*subpath->where_clause);
+				    }
+				    visit_elements(subpath->path_list);
+			    }
+		    }
+	    };
+	for (const auto &column : ref.column_list) {
+		if (column) {
+			visit(*column);
+		}
+	}
+	if (ref.where_clause) {
+		visit(*ref.where_clause);
+	}
+	for (const auto &pattern : ref.path_patterns) {
+		if (pattern) {
+			visit_elements(pattern->path_elements);
+		}
+	}
+	return bindings;
+}
+
 static bool BindingSpansMultiplePatterns(const MatchExpression &ref, const string &binding) {
 	if (binding.empty()) {
 		return false;
+	}
+	// A variable an EXISTS { } pattern names is that subquery's correlation: the vertex must be there to correlate on.
+	// Inside the subquery, a variable of the scopes around it is the correlation itself.
+	if (IsExistsOuterBinding(binding) || ExistsPatternBindings(ref).count(binding)) {
+		return true;
 	}
 	// The element may sit inside the subpath a path variable or path mode wraps around the pattern, or inside the
 	// subpath that carries an element WHERE.
@@ -2068,6 +2122,13 @@ static bool BindingReferencesOnlyCovered(const MatchExpression &ref, const strin
 
 static bool MatchOnlyUsesKeyColumns(const MatchExpression &ref,
                                     const case_insensitive_map_t<string> &allowed_key_columns) {
+	// An EXISTS { } pattern naming a variable correlates on its element, which keys alone do not provide.
+	const auto exists_bindings = ExistsPatternBindings(ref);
+	for (auto &entry : allowed_key_columns) {
+		if (exists_bindings.count(entry.first) || IsExistsOuterBinding(entry.first)) {
+			return false;
+		}
+	}
 	for (const auto &expr : ref.column_list) {
 		if (!ExpressionOnlyUsesKeyColumns(expr.get(), allowed_key_columns)) {
 			return false;
@@ -10308,17 +10369,59 @@ static void PushEdgeFilterToPathTable(const ParsedExpression *where_hint,
 	conditions.push_back(std::move(exists_expr));
 }
 
+static void CollectReferencedBindings(const ParsedExpression *expr, ReferencedBindings &bindings);
+
+//! The variables an EXISTS { } pattern names, and what its WHEREs read: an outer variable it names is read by the
+//! subquery, which correlates on that variable's vertex or edge, so the outer translation must bind it.
+static void CollectExistsPatternBindings(const MatchExpression &pattern, case_insensitive_set_t &bindings) {
+	std::function<void(const PathReference &)> visit = [&](const PathReference &reference) {
+		if (reference.path_reference_type == PGQPathReferenceType::PATH_ELEMENT) {
+			auto &element = static_cast<const PathElement &>(reference);
+			if (!element.variable_binding.empty()) {
+				bindings.insert(element.variable_binding);
+			}
+			return;
+		}
+		auto &subpath = static_cast<const SubPath &>(reference);
+		CollectReferencedBindings(subpath.where_clause.get(), bindings);
+		for (auto &child : subpath.path_list) {
+			visit(*child);
+		}
+	};
+	auto visit_patterns = [&](const vector<unique_ptr<PathPattern>> &patterns) {
+		for (auto &path_pattern : patterns) {
+			for (auto &element : path_pattern->path_elements) {
+				visit(*element);
+			}
+		}
+	};
+	visit_patterns(pattern.path_patterns);
+	for (auto &group : pattern.optional_match_patterns) {
+		visit_patterns(group);
+	}
+	CollectReferencedBindings(pattern.where_clause.get(), bindings);
+	for (auto &column : pattern.column_list) {
+		CollectReferencedBindings(column.get(), bindings);
+	}
+}
+
 static void CollectReferencedBindings(const ParsedExpression *expr, ReferencedBindings &bindings) {
 	if (!expr) {
 		return;
 	}
-	ParsedExpressionIterator::VisitExpression<ColumnRefExpression>(
-	    *expr, [&](const ColumnRefExpression &col_ref) {
-		    if (col_ref.ColumnNames().empty()) {
-			    return;
-		    }
-		    bindings.insert(PGQStr(col_ref.ColumnNames()[0]));
-	    });
+	if (auto inner = DuckPGQGetExistsPattern(*expr)) {
+		CollectExistsPatternBindings(*inner, bindings);
+		return;
+	}
+	if (expr->GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+		auto &col_ref = expr->Cast<ColumnRefExpression>();
+		if (!col_ref.ColumnNames().empty()) {
+			bindings.insert(PGQStr(col_ref.ColumnNames()[0]));
+		}
+		return;
+	}
+	ParsedExpressionIterator::EnumerateChildren(
+	    *expr, [&](const ParsedExpression &child) { CollectReferencedBindings(&child, bindings); });
 }
 
 static ReferencedBindings CollectReferencedBindings(const MatchExpression &match_expr) {
@@ -10445,6 +10548,23 @@ static unique_ptr<ParsedExpression> BuildExistsSubquery(
 	if (branch_summary_subquery) {
 		return branch_summary_subquery;
 	}
+
+	// The outer variables are this subquery's correlation (see pgq_exists_outer_bindings), with those of any EXISTS
+	// around this one.
+	case_insensitive_set_t outer_bindings = pgq_exists_outer_bindings ? *pgq_exists_outer_bindings
+	                                                                  : case_insensitive_set_t();
+	for (auto &entry : outer_alias_map) {
+		outer_bindings.insert(entry.first);
+	}
+	struct OuterBindingsScope {
+		const case_insensitive_set_t *saved = pgq_exists_outer_bindings;
+		explicit OuterBindingsScope(const case_insensitive_set_t &bindings) {
+			pgq_exists_outer_bindings = &bindings;
+		}
+		~OuterBindingsScope() {
+			pgq_exists_outer_bindings = saved;
+		}
+	} outer_bindings_scope(outer_bindings);
 
 	auto inner_select = make_uniq<SelectNode>();
 	inner_select->select_list.push_back(ConstantExpression::FromValue(Value::INTEGER(1)));

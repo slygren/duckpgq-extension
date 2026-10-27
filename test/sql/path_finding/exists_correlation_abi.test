@@ -1,0 +1,120 @@
+# name: test/sql/path_finding/exists_correlation_abi.test
+# description: An EXISTS { } subpattern is correlated on the outer variable it names, also where an ABI route would
+#              read that variable from an artifact instead of joining it. The outer edge route covered w by its key
+#              (COLUMNS read only w's key) and left w's table out, so the subquery joined a w of its own; and the
+#              subquery's edge route covered its w the same way and dropped w.key = pt.v0. Either way EXISTS was true
+#              or false for every row at once. Every answer here equals the traversal's (pgq_disable_abi_rewrite).
+# group: [path_finding]
+
+require duckpgq
+
+statement ok
+SET active_grammar_extensions = ['duckpgq'];
+
+statement ok
+CREATE TABLE tag AS SELECT * FROM (VALUES ('T1'), ('T2')) t(tagname);
+
+statement ok
+CREATE TABLE wo AS SELECT * FROM (VALUES ('W1'), ('W2'), ('W3'), ('W4')) t(num);
+
+statement ok
+CREATE TABLE op AS SELECT * FROM (VALUES ('O1', ['TECO']), ('O2', ['REL']), ('O3', ['TECO']), ('O4', ['TECO'])) t(id, status);
+
+statement ok
+CREATE TABLE tag_wo AS SELECT * FROM (VALUES ('T1', 'W1'), ('T1', 'W2'), ('T1', 'W3'), ('T2', 'W4')) t(tag, wo);
+
+statement ok
+CREATE TABLE wo_op AS SELECT * FROM (VALUES ('W1', 'O1'), ('W1', 'O2'), ('W2', 'O3'), ('W4', 'O4')) t(wo, op);
+
+statement ok
+CREATE PROPERTY GRAPH g
+VERTEX TABLES (tag LABEL TAG, wo LABEL WORK_ORDER, op LABEL OPERATION)
+EDGE TABLES (
+    tag_wo SOURCE KEY (tag) REFERENCES tag (tagname) DESTINATION KEY (wo) REFERENCES wo (num) LABEL HAS_WORKORDER,
+    wo_op SOURCE KEY (wo) REFERENCES wo (num) DESTINATION KEY (op) REFERENCES op (id) LABEL HAS_OPERATION);
+
+statement ok
+SELECT count(*) FROM pgq_abi_build('g', max_hops := 2);
+
+loop route 0 2
+
+statement ok
+SET pgq_disable_abi_rewrite = {route};
+
+query T
+FROM GRAPH_TABLE (g MATCH (t:TAG)-[:HAS_WORKORDER]->(w:WORK_ORDER) WHERE t.tagname = 'T1'
+    AND EXISTS { (w)-[:HAS_OPERATION]->(o:OPERATION) WHERE w.num = 'W2' } COLUMNS (w.num AS k)) ORDER BY ALL;
+----
+W2
+
+# the inner w labelled: the subquery's own edge route must join it
+query T
+FROM GRAPH_TABLE (g MATCH (t:TAG)-[:HAS_WORKORDER]->(w:WORK_ORDER) WHERE t.tagname = 'T1'
+    AND EXISTS { (w:WORK_ORDER)-[:HAS_OPERATION]->(o:OPERATION) WHERE w.num = 'W2' } COLUMNS (w.num AS k)) ORDER BY ALL;
+----
+W2
+
+query T
+FROM GRAPH_TABLE (g MATCH (t:TAG)-[:HAS_WORKORDER]->(w:WORK_ORDER) WHERE t.tagname = 'T1'
+    AND EXISTS { (w)-[:HAS_OPERATION]->(o:OPERATION) } COLUMNS (w.num AS k)) ORDER BY ALL;
+----
+W1
+W2
+
+# all operations TECO, or none
+query T
+FROM GRAPH_TABLE (g MATCH (t:TAG)-[:HAS_WORKORDER]->(w:WORK_ORDER) WHERE t.tagname = 'T1'
+    AND NOT EXISTS { (w)-[:HAS_OPERATION]->(o:OPERATION) WHERE NOT list_has_any(o.status, ['TECO']) } COLUMNS (w.num AS k))
+ORDER BY ALL;
+----
+W2
+W3
+
+query T
+FROM GRAPH_TABLE (g MATCH (t:TAG)-[:HAS_WORKORDER]->(w:WORK_ORDER) WHERE t.tagname = 'T1'
+    AND EXISTS { (w)-[:HAS_OPERATION]->(o:OPERATION WHERE list_has_any(o.status, ['REL'])) } COLUMNS (w.num AS k)) ORDER BY ALL;
+----
+W1
+
+# under OR, and NOT around it
+query T
+FROM GRAPH_TABLE (g MATCH (t:TAG)-[:HAS_WORKORDER]->(w:WORK_ORDER) WHERE t.tagname = 'T1'
+    AND (w.num = 'W3' OR EXISTS { (w)-[:HAS_OPERATION]->(o:OPERATION) WHERE o.id = 'O3' }) COLUMNS (w.num AS k)) ORDER BY ALL;
+----
+W2
+W3
+
+query T
+FROM GRAPH_TABLE (g MATCH (t:TAG)-[:HAS_WORKORDER]->(w:WORK_ORDER) WHERE t.tagname = 'T1'
+    AND NOT (EXISTS { (w)-[:HAS_OPERATION]->(o:OPERATION) }) COLUMNS (w.num AS k)) ORDER BY ALL;
+----
+W3
+
+# over a fixed path: correlated on its first vertex and on its middle one
+query TT
+FROM GRAPH_TABLE (g MATCH (t:TAG)-[:HAS_WORKORDER]->(w:WORK_ORDER)-[:HAS_OPERATION]->(o:OPERATION)
+    WHERE EXISTS { (t)-[:HAS_WORKORDER]->(:WORK_ORDER WHERE num = 'W4') } COLUMNS (t.tagname AS t, o.id AS o)) ORDER BY ALL;
+----
+T2	O4
+
+query TT
+FROM GRAPH_TABLE (g MATCH (t:TAG)-[:HAS_WORKORDER]->(w:WORK_ORDER)-[:HAS_OPERATION]->(o:OPERATION)
+    WHERE EXISTS { (w)-[:HAS_OPERATION]->(o2:OPERATION) WHERE o2.id = 'O2' } COLUMNS (t.tagname AS t, o.id AS o)) ORDER BY ALL;
+----
+T1	O1
+T1	O2
+
+endloop
+
+# The first pass ran on the artifacts
+statement ok
+SET pgq_disable_abi_rewrite = false;
+
+statement ok
+FROM GRAPH_TABLE (g MATCH (t:TAG)-[:HAS_WORKORDER]->(w:WORK_ORDER) WHERE t.tagname = 'T1'
+    AND EXISTS { (w:WORK_ORDER)-[:HAS_OPERATION]->(o:OPERATION) WHERE w.num = 'W2' } COLUMNS (w.num AS k));
+
+query T
+SELECT string_agg(rewrite_type, ',' ORDER BY rewrite_type) FROM pgq_last_rewrite_diagnostics() WHERE status = 'selected';
+----
+edge,edge
